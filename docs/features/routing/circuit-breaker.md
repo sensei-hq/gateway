@@ -171,6 +171,32 @@ Notable behaviours traced from `engine.rs`:
   `HalfOpen` circuit therefore takes `half_open_max_requests` (default 3)
   separate successful requests.
 
+### Streaming: a mid-stream failure now trips the breaker (SP-ROUTE-1)
+
+The list above describes `Gateway::execute`. **`execute_stream` used to report
+the wrong outcome entirely, and SP-ROUTE-1 fixed it** — so if you are reasoning
+about "what trips my breaker", this is the paragraph that changed.
+
+Previously, the streaming path fired its success outcome the instant a stream
+was *obtained*, and the mid-stream error path returned without dispatching
+anything at all. A stream that died halfway was therefore recorded to every
+health recorder — breaker included — as a **success**.
+
+Now one attempt casts exactly **one** verdict:
+
+| Point | Contributes |
+|---|---|
+| Stream **acquired** | a latency observation and **no** verdict — it does not vote |
+| Stream **completed** | the verdict: success |
+| Stream fails **mid-stream** | the verdict: failure |
+
+So a repeatedly-failing stream now opens its breaker, exactly as a repeatedly
+failing non-streaming call always did. The same correction feeds
+[connection cooldown](connection-cooldown.md) and
+[model lockout](model-lockout.md), which share the recorder fan-out. See
+[provider routing preferences §12](provider-preferences.md#12-related-behaviour-change-mid-stream-failures-now-count)
+for the full argument.
+
 Because selection has already run `can_execute` for every admitted candidate
 (see below), the endpoint entry always exists in the map by the time the engine
 records an outcome. This matters: `record_success` / `record_failure` use

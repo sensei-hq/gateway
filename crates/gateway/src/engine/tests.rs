@@ -6452,13 +6452,19 @@ fn latency_route(gw: &Gateway, config: &GatewayConfig) -> Vec<String> {
 /// `.with_performance(…, 0)`, dropping the `with_resilience` assignment,
 /// `DEFAULT_MIN_SAMPLES = 1` — because nothing observed the THRESHOLD, only the
 /// observations. The `→ 0` direction is the live hazard, and it is what
-/// `StrategyCtx::min_samples`'s own doc warns about: at zero, `s.samples >= 0`
-/// always holds, so an endpoint with ZERO latency observations reports
-/// `mean_latency_ms == 0.0` and sorts FIRST; and `verdict_samples >= 0` always
-/// holds, so a never-verdicted endpoint's `success_rate == 0.0` becomes a
-/// TRUSTED reliability of zero. "A cold process weighs every candidate 0.0 and a
-/// healthy fleet routes as though every provider were dead" stops being a
-/// comment about a bug that was fixed and becomes an operator-reachable config.
+/// `StrategyCtx::min_samples`'s own doc warns about: an endpoint carrying live
+/// samples of ONE counter while the counter being read sits at `0` beside a
+/// mean of `0.0`. At zero that `0.0` is trusted, so a candidate with zero
+/// LATENCY samples (a failed `Complete` casts a verdict and contributes no
+/// latency) sorts first under `sort: latency`, and a candidate with zero
+/// VERDICTS (a `StreamAcquired` with no completion yet) is weighed
+/// `reliability: Some(0.0)` and goes last under the default.
+///
+/// What zero does NOT do — and an earlier version of this comment claimed it
+/// did — is break a cold process. A never-observed endpoint never reaches a
+/// `>=` at all: `PerformanceStore::stats` returns `None` from `m.get()?` or
+/// from its `live.is_empty()` guard, and `None` is unmeasured at every
+/// threshold.
 ///
 /// The fixture holds the OBSERVATIONS fixed at two and varies only the
 /// threshold, so the two halves differ in exactly the quantity under test.

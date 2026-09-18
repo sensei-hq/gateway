@@ -17,15 +17,61 @@ absent field routes and serializes exactly as before.
 |---|---|---|
 | `InferenceRequest` | new field `routing: Option<RoutingPreferences>` | **only if you build the struct literally** (no `Default`): add `routing: None` |
 | `InferenceResponse` / `ExecutionTrace` | new field `routing: Option<RoutingDecision>` | same: add `routing: None` to literals |
-| `ResilienceConfig` | now `#[non_exhaustive]`, and gains `min_samples: u32` | build it from `..Default::default()` instead of naming every field |
-| `RoutingStrategy` | `fn name(&self) -> &'static str` is now **required** (deliberately not defaulted) | implementors add one line returning a stable id |
+| `SelectionCriteria` | new field `preferences: Option<RoutingPreferences>` | add `preferences: None` to literals |
+| `SelectionResult` | new field `decision: Option<RoutingDecision>` | add `decision: None` to literals |
+| `AttemptOutcome` | new fields `duration_ms: u64`, `output_tokens: Option<u32>`, `phase: AttemptPhase` | add all three to literals; a non-streaming attempt is `AttemptPhase::Complete` |
+| `ResilienceConfig` | now `#[non_exhaustive]`, and gains `min_samples: u32`, `perf_samples: usize`, `perf_window: Duration` | `let mut c = ResilienceConfig::default();` then assign — **`..Default::default()` does NOT work** (below) |
+| `RoutingStrategy` | `order` gains a `ctx` parameter **and** a return type, **and** `fn name()` is now required | three edits per implementor, not one (below) |
+| `GatewayError::NoCandidates` | now `{ capability, skipped: Vec<String> }`, and `Display` gained a trailing skipped clause | add `skipped` to any literal / destructuring `match`; re-check anything asserting on the message text |
 | Chains with **tied** `priority` | those entries are now load-balanced rather than kept in authoring order | give entries distinct priorities unless you want a pool |
 | Mid-stream failures | now count toward the circuit breaker, connection cooldown and model lockout | none, but a repeatedly-failing stream can now gate its endpoint |
+| A **failed** attempt | no longer contributes a latency observation (it still casts its verdict) | none — `sort: latency` stops preferring the endpoint that fails fastest |
+| Throughput | now output tokens ÷ **total attempt wall time** on both paths | none, unless you read `AttemptOutcome::duration_ms` for `StreamCompleted` — it now means the whole attempt span, not generation time |
 
-`RoutingStrategy::name()` is un-defaulted on purpose: the alternative is a second
-`match` on `SortKey` at the trace site, which agrees on the day it is written and
-then drifts. Both breaks are right for a pre-1.0 crate and are a one-line edit
-each.
+### `ResilienceConfig` is `#[non_exhaustive]` — `..Default::default()` is not the escape hatch
+
+`#[non_exhaustive]` forbids **every** struct expression outside the defining
+crate, functional-update syntax included. An earlier version of this table told
+you to build from `..Default::default()`; that does not compile:
+
+```text
+error[E0639]: cannot create non-exhaustive struct using struct expression
+```
+
+Build the value, then assign:
+
+```rust
+use gateway::resilience::ResilienceConfig;
+
+let mut resilience = ResilienceConfig::default();
+resilience.min_samples = 5;
+let gateway = Gateway::new(config, adapters, cb).with_resilience(resilience);
+```
+
+### `RoutingStrategy` changed in three ways, not one
+
+Only relevant if you implement the trait yourself. Before and after:
+
+```rust
+// before
+fn order(&self, admitted: &mut Vec<SelectedModel>);
+
+// after
+fn order(&self, admitted: &mut Vec<SelectedModel>, ctx: &StrategyCtx<'_>) -> OrderingReport;
+fn name(&self) -> &'static str;
+```
+
+So: **add the `ctx` parameter** (E0050 if you don't), **add the return value**
+(E0308 — `OrderingReport::default()` is correct for a strategy that consults no
+sample counts and weighs nothing), **and add `name()`**. `ctx` carries the
+performance read port, the random source and `min_samples`; `OrderingReport`
+carries `degraded` plus the per-candidate weights the trace reports.
+
+`name()` is un-defaulted on purpose: the alternative is a second `match` on
+`SortKey` at the trace site, which agrees on the day it is written and then
+drifts — and a default would reintroduce the same failure one step along, with a
+new strategy silently tracing as whatever the default said. All of these breaks
+are right for a pre-1.0 crate.
 
 The last row is the one to read twice. A single mid-stream 429 now locks the
 endpoint for the rate-limit base duration, so on a single-candidate chain the

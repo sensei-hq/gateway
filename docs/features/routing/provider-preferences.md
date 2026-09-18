@@ -53,7 +53,10 @@ pub struct CandidateRef { pub router: Option<String>, pub model: Option<String> 
 
 Every knob is optional and `#[serde(default, skip_serializing_if = …)]`, so a
 request that carries no `routing` field serializes byte-identically to before
-this slice and routes byte-identically too.
+this slice. It also **routes** byte-identically — on any chain whose admitted
+candidates have distinct priorities, which is every chain in this repo. A chain
+that ties two entries at one priority is the exception, and [§8](#8-determinism)
+is the precise statement; do not read this paragraph as the unconditional claim.
 
 **Routers and models are separate axes.** The endpoint key is
 `format!("{router}:{model}")` and **cannot be parsed back** — model ids contain
@@ -96,6 +99,26 @@ is that satisfying `only` does not exempt a candidate from `ignore`.
 `order` and `sort` genuinely **are** sequence-dependent: `order` wins for the
 candidates it names, and `sort` (or the default weighting) orders the unnamed
 tail that follows them. Combining the two is legal and composable, not an error.
+
+### What runs *before* all of this: chain resolution
+
+**`only`/`ignore` filter WITHIN the chain that was already resolved — they
+cannot steer which chain a capability request picks.** Tier 3 (`capability`,
+no `chain`) chooses one chain by **lowest chain id** among those serving the
+capability, and that choice happens *before* any gate runs. An `only:
+{ routers: ["anthropic"] }` on a capability request does not search the other
+chains for an anthropic candidate; it filters the lowest-id chain and, if
+nothing there survives, the request is a terminal `NoCandidates`.
+
+To combine "this chain" with "these providers", pin the chain by name (tier 2)
+and let the preferences filter inside it.
+
+**Tier 1 (a direct `router` + `model` request) IS filtered.** The full gate
+vector runs in `admit` on every resolution path, so an `ignore` that names that
+router or model excludes the one candidate and the request fails with
+`NoCandidates`. What a direct request does *not* get is an ordering — there is
+one candidate, no strategy runs, and `response.routing` is `None` (§10). Absent
+`routing` is "nothing was ordered", not "preferences did not apply".
 
 ---
 
@@ -166,6 +189,17 @@ per token. A model with no `pricing` is treated as free (matching the budget
 gate's reading). A non-finite estimate sorts **last**, not first: an unusable
 price is not a price, and treating it as free would let a broken figure win the
 cheapest slot.
+
+> **"Free" includes a NEGATIVE estimate, and `sort: price` puts one first.**
+> The default's free test is `cost <= 0.0`, not `cost == 0.0`, and `price_key`
+> passes a negative estimate straight through as a finite number, so it sorts
+> ahead of every genuinely free candidate. This is reachable because **nothing
+> validates `ModelPricing` for sign or finiteness** — neither `Gateway::new` /
+> `update_config` nor `GatewayBuilder::build` — so a negative per-1k price in
+> config is accepted silently and wins the cheapest slot outright. That
+> validation is a carry-forward from this slice, not something the routing
+> layer papers over; routing is fenced against a *panic* from a non-finite
+> price, not against a wrong one.
 
 ### `sort: latency` / `sort: throughput`
 
@@ -255,11 +289,17 @@ Within a group:
   is what removes a candidate from consideration.
 
 `reliability` is the windowed success rate, read **only** when the endpoint
-carries at least `min_samples` verdicts; below that it is treated as `1.0`
-(unmeasured is healthy). `success_rate` reads `0.0` both when every attempt
-failed and when nothing has voted yet, so without the count a cold process would
-weigh every candidate zero and a healthy fleet would route as though every
-provider were dead.
+carries at least `min_samples` **verdicts**; below that it is treated as `1.0`
+(unmeasured is healthy). The threshold is `>= min_samples` rather than `> 0`
+deliberately: at `> 0`, one unlucky attempt drives `success_rate` to `0.0`,
+which is weight zero, which is last in the group until the whole window rolls.
+
+`verdict_samples` is a counter of its own because `success_rate` reads `0.0`
+both when every verdict failed and when none has been cast. An endpoint that has
+obtained a stream but not completed one carries `samples: 1, verdict_samples: 0,
+success_rate: 0.0` — indistinguishable from "everything failed" on the rate
+alone, and weighing it zero would bury a perfectly healthy endpoint for having
+nothing to report yet.
 
 ---
 
@@ -294,12 +334,13 @@ same graph may now diverge. That is the feature; ties are the opt-in.
 
 ### Two ways a tie can arise unintentionally
 
-1. **A chain longer than 254 entries.** `catalog::assemble` reassigns ascending
+1. **A chain longer than 255 entries.** `catalog::assemble` reassigns ascending
    1-based priority by final position with
-   `u8::try_from(pos + 1).unwrap_or(u8::MAX)`, which **saturates**. A 300-entry
-   chain therefore has 255 distinct priorities with 46 entries all at 255 — a
-   genuine tie group. Reachable through a `derive` tier predicate over a large
-   catalog.
+   `u8::try_from(pos + 1).unwrap_or(u8::MAX)`, which **saturates**. Measured
+   both ways: a 255-entry chain maps to `1..=255` — 255 distinct priorities and
+   **no** tie — and the first tie appears at 256. A 300-entry chain therefore
+   has 255 distinct priorities with 46 entries all at 255 — a genuine tie group.
+   Reachable through a `derive` tier predicate over a large catalog.
 2. **Hand-authored chains.** `GatewayBuilder::add_chain` and `GatewayConfig`'s
    `Deserialize` both pass `ChainEntry.priority` through verbatim, and config
    validation has **no priority rule at all**. Nothing prevents an operator from
@@ -307,7 +348,7 @@ same graph may now diverge. That is the feature; ties are the opt-in.
 
 So the precise claim is: **byte-identical for every chain whose admitted
 candidates have distinct priorities**, which covers every chain in this repo and
-every `assemble()` output of length ≤ 254. Anything else is opting into load
+every `assemble()` output of length ≤ 255. Anything else is opting into load
 balancing — which is the intended way in, it is just not the only way.
 
 ---
@@ -315,9 +356,22 @@ balancing — which is the intended way in, it is just not the only way.
 ## 9. The operator knob — `ResilienceConfig::min_samples`
 
 ```rust
-let gateway = Gateway::new(config, adapters, cb)
-    .with_resilience(ResilienceConfig { min_samples: 5, ..Default::default() });
+use gateway::resilience::ResilienceConfig;
+
+let mut resilience = ResilienceConfig::default();
+resilience.min_samples = 5;
+
+let gateway = Gateway::new(config, adapters, cb).with_resilience(resilience);
 ```
+
+**`ResilienceConfig` is `#[non_exhaustive]`, and that forbids every struct
+expression outside the gateway crate — `..Default::default()` included.**
+`ResilienceConfig { min_samples: 5, ..Default::default() }` is
+`error[E0639]: cannot create non-exhaustive struct using struct expression` for
+any consumer. Build the value with `default()` and assign the fields you want,
+as above. (This page printed the broken form until the whole-slice review
+compiled it from a real downstream crate;
+`crates/gateway/tests/reexport_paths.rs` now pins the working one.)
 
 `min_samples` (default **3**) is the minimum count of live observations before a
 candidate counts as *measured*. Below it the candidate is treated as unmeasured:
@@ -328,13 +382,6 @@ Three is the smallest count at which a mean is not simply the last observation,
 and the cost of getting it wrong is bounded in both directions — too low and the
 sort reacts to noise, too high and it degrades to priority order, which is the
 documented fallback anyway.
-
-> **Hazard: do not set it to `0`.** Every counter comparison is `>=`, so at zero
-> an endpoint with **no** observations passes. Its `mean_latency_ms` reads `0.0`
-> and it wins every latency race it has never run; its `success_rate` reads
-> `0.0` and becomes a *trusted* reliability of zero, so a cold process weighs
-> every candidate at zero and a healthy fleet routes as though every provider
-> were dead.
 
 Each metric has its **own** counter on `EndpointStats` — `samples` (latency),
 `throughput_samples`, `verdict_samples` (reliability) — and they are
@@ -347,6 +394,31 @@ it is enough to act on: `perf_samples` (retention capacity, default 64) and
 `with_resilience` to **rebuild** the `PerformanceStore`, discarding samples
 recorded before the rebuild; `min_samples` is read per request and needs no
 rebuild.
+
+### Hazard: do not set it to `0`
+
+The advice is right; an earlier version of this section gave the wrong reason
+for it, so here is the mechanism the code actually has.
+
+**A never-observed endpoint is unmeasured at every threshold, zero included.**
+`PerformanceStore::stats` returns `None` before any `>=` comparison can run —
+`m.get(endpoint)?` when the endpoint has no ring at all, then
+`if live.is_empty()` when every sample has aged out — and `None` takes the
+unmeasured path regardless. So a cold process at `min_samples: 0` routes
+normally. It does **not** weigh every candidate at zero, and it does not route
+as though every provider were dead.
+
+What zero reaches is narrower and still worth avoiding: an endpoint whose ring
+holds live samples while **the counter being read** is `0` beside a mean of
+`0.0`. The three counters are independent, so that is an ordinary state:
+
+| At `min_samples: 0` | Stats | Effect |
+|---|---|---|
+| One `StreamAcquired`, no completion yet | `samples: 1`, `verdict_samples: 0`, `success_rate: 0.0` | the default reads `reliability: Some(0.0)` → `weight: Some(0.0)` → **last in its group**, for an endpoint that has simply not finished a request |
+| One **failed** `Complete` (casts a verdict, contributes no latency) | `samples: 0`, `mean_latency_ms: 0.0` | `sort: latency` treats `0.0` as measured → the endpoint **leads a race it has never run** |
+
+Any value `>= 1` makes both unreachable; the default of 3 keeps a margin past
+that.
 
 ---
 
@@ -380,8 +452,18 @@ pub struct RoutedCandidate {
   `response.attempts` is the record of what was attempted.
 - `reliability: None` is **not** `Some(0.0)`. Flattening them is how a healthy
   fleet gets reported as though every provider were dead.
+- **`reliability: None` means two different things, and the reader has to know
+  which.** It is "this endpoint carries fewer than `min_samples` verdicts"
+  *and* "the strategy that ran does not consult reliability at all". Only
+  `GroupedWeightedStrategy` reads it, so under `sort: price`, `sort: latency`,
+  `sort: throughput` or `priority` **every** candidate reports
+  `reliability: null, weight: null` whatever the performance store holds. Read
+  `strategy` first: a whole fleet reporting `null` under `sort: price` says
+  nothing about its health. `weights` is likewise empty for every strategy but
+  the default.
 - `routing` is `None` when no strategy ran — a direct router+model request
-  orders nothing.
+  orders nothing. That is not "preferences were ignored": `only`/`ignore` still
+  filtered it (§2), it just had one candidate and nothing to order.
 
 ### Two known gaps
 
@@ -410,6 +492,18 @@ pub struct RoutedCandidate {
   carry no preferences, and `input_hash` is untouched — the moment a node
   carried them they would have to join the hash, or changing them and resuming
   would silently replay a memo produced under the old policy.
+- **Consensus legs do not inherit the caller's preferences.**
+  `consensus.rs` builds each debate / synthesis / judge / quorum leg from a
+  fresh `InferenceRequest` with `routing: None` hardcoded, so a `sort` or an
+  `ignore` on the outer request reaches none of them. A `panel` request behaves
+  differently — `execute_panel` clones the caller's request, so preferences do
+  carry. The asymmetry is worth stating plainly: **an `ignore` used as an
+  incident switch is honoured for a panel and silently dropped for a
+  consensus.** This is consistent with `budget` and `auth`, which consensus legs
+  already drop for the same reason (a leg is a new request the workflow
+  authored, not a copy of the caller's), and it is documented rather than
+  changed here — threading them through is its own decision about how a
+  workflow's own routing policy composes with a caller's.
 - **Performance stats are per-process and in-memory.** Each worker learns
   independently, exactly as the circuit breaker already does. The
   `EndpointPerformanceRead` port is the seam a durable backend can be swapped
@@ -430,6 +524,24 @@ success.
 One attempt now casts exactly **one** verdict, to every recorder. Stream
 acquisition contributes a latency observation and **no** verdict; completion (or
 mid-stream failure) contributes the verdict.
+
+### Two more corrections to what an attempt observes
+
+- **A failed attempt no longer contributes a latency observation** — it still
+  casts its verdict. `MetricStrategy` reads `mean_latency_ms` with no
+  reliability filter of its own (unlike the default, which multiplies by
+  `reliability` precisely to avoid this), so counting a rejection as a latency
+  sample made `sort: latency` route to the endpoint that **fails fastest** — a
+  provider rejecting every request in 5 ms outranking one answering every
+  request in 500 ms. The breaker does not save that case: `record_success`
+  resets the consecutive-failure count, so an intermittently-failing endpoint
+  never reaches the threshold and stays admitted.
+- **Throughput is output tokens ÷ total attempt wall time, on both paths.** The
+  streaming duration used to start after the stream was obtained, so a streamed
+  and a non-streamed request generating at the same real rate reported different
+  numbers into one mean. `AttemptOutcome::duration_ms` for `StreamCompleted`
+  now means the **total attempt span**, and it feeds throughput only — it is
+  never a latency observation.
 
 **The user-visible consequence:** mid-stream failures now genuinely count toward
 the circuit breaker, connection cooldown and model lockout. A single mid-stream

@@ -36,7 +36,9 @@ Sources:
 3. **Resolve candidates.** A `ModelSelectionService` is built over the config
    and the shared `CircuitBreakerManager`, and `select_all` produces an ordered
    `Vec<SelectedModel>`. If it is empty, `execute` returns
-   `GatewayError::NoCandidates { capability }`.
+   `GatewayError::NoCandidates { capability, skipped }`, where `skipped` carries
+   the same per-candidate `"router:model — reason"` diagnostics `AllGated` does
+   (empty when selection had nothing to reject at all).
 4. **Read fallback triggers.** If a chain was resolved, its
    `fallback_triggers` slice is used; otherwise the trigger set is empty (so a
    direct, chain-less request never falls back).
@@ -393,8 +395,8 @@ Behaviours worth flagging when reading the source:
   SP-ROUTE-1 the default strategy load-balances *within* an equal-priority
   group, so a chain that ties two entries may route two fresh requests
   differently. Every chain in this repo has distinct priorities and is
-  unaffected; the two ways to reach a tie unintentionally (a chain past 254
-  entries, and unvalidated hand-authored priorities) are documented in
+  unaffected; the two ways to reach a tie unintentionally (a chain longer than
+  255 entries, and unvalidated hand-authored priorities) are documented in
   [provider routing preferences §8](provider-preferences.md#8-determinism).
 - **A direct (tier-1) request has no `RoutingDecision`.** It names its one
   candidate outright, so `SelectionResult.decision` and

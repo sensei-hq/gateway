@@ -27,7 +27,57 @@
 | 9 | `662e22c` · `4f58000` | ✅ done; review found a **live-store read inside the sort comparator** that panicked selection |
 | 10 | `d6576b8` · `57b41c7` | ✅ done — **the feature is live**; both planted tripwires confirmed red-before / green-after |
 | 11 | `a9c8652` · `b7ff616` | ✅ done; found that **AC10 named a destination nothing fills** |
-| 12 | *(this commit)* | ✅ done — docs + final verification; **whole-slice review is a separate step, still pending** |
+| 12 | `172b77f` | ✅ done — docs + final verification |
+| **Whole-slice review** | `0c26c8c` (behaviour) · *(this commit)* (docs) | ✅ **COMPLETE** — see below |
+
+### Whole-slice adversarial review — complete
+
+Two rounds landed, and between them they falsified more of the *documentation* than of the code.
+
+**Behavioural round (`0c26c8c`).** Two observation defects, both in what an attempt reports rather
+than in how it is ordered:
+
+1. **A failed attempt was contributing a latency observation.** `MetricStrategy` reads
+   `mean_latency_ms` with no reliability filter of its own, so `sort: latency` preferred the
+   endpoint that FAILS FASTEST — a provider rejecting in 5 ms outranking one answering in 500 ms —
+   and the breaker does not rescue it, because `record_success` resets the consecutive-failure
+   count. A failed `Complete` now casts its verdict and contributes no latency.
+2. **Throughput pooled two unlike spans.** The streaming duration started after the stream was
+   obtained, so a streamed and a non-streamed request generating at the same real rate reported
+   different numbers into one mean. `StreamCompleted`'s `duration_ms` is now the TOTAL attempt
+   span on both paths.
+
+Also in that round: `GatewayError::NoCandidates` gained `skipped: Vec<String>` (a typo'd `only`
+rendered as a bare "no candidates available" with no hint a filter had rejected everything), and
+the `--features local` CI step moved from `cargo check` to `cargo test`.
+
+**Documentation round (this commit).** Three Critical, six Important, ten Minor — every one a
+claim about the code that the code does not support. The three Critical are the ones to remember:
+
+1. **The documented way to set `min_samples` did not compile for any consumer.**
+   `#[non_exhaustive]` forbids *every* struct expression downstream, functional-update syntax
+   included, so `ResilienceConfig { min_samples: 5, ..Default::default() }` is `E0639` outside this
+   crate. Four surfaces printed it — including `ResilienceConfig`'s own rustdoc, which asserted the
+   exact opposite ("downstream must build from `..Default::default()` and keeps compiling"). It
+   survived a whole slice because the suite's only use of that shape is INSIDE the defining crate,
+   where it is legal, and `tests/reexport_paths.rs` — the one external-crate compile surface —
+   never named the type. Fixed to `default()` + field assignment, and now guarded from outside the
+   crate twice: a `reexport_paths.rs` test and a `resilience.rs` doctest.
+2. **The `min_samples: 0` hazard described a mechanism the code does not have.** Four surfaces said
+   a never-observed endpoint passes the `>=` at zero and "wins every latency race it has never
+   run", so "a cold process weighs every candidate at zero". It does not: `PerformanceStore::stats`
+   returns `None` before any comparison runs (`m.get(endpoint)?`, then `live.is_empty()`), and
+   `None` is unmeasured at every threshold. The real hazard is narrower and still real — an
+   endpoint with live samples of a DIFFERENT counter (one `StreamAcquired` ⇒ `verdict_samples: 0`
+   weighed at zero; one failed `Complete` ⇒ `samples: 0` leading a latency race). The advice
+   survived; the mechanism and the blast radius were wrong.
+3. **`upgrading.md` understated the `RoutingStrategy` break as "one line".** `order` also gained a
+   `ctx` parameter and a return type, so an external implementor following it got E0050 + E0308
+   before ever reaching the missing `name()`.
+
+**The lesson, and it is the same one SP-6 recorded: a claim is only as good as the surface it was
+compiled on.** Both Criticals were invisible to a suite that compiles everything from inside the
+defining crate. The external-crate view is a distinct test surface, and this slice now has one.
 
 **Task 11 found a spec defect of mine.** AC10 said the decision goes on `ExecutionTrace`. Nothing in
 the workspace builds one in production — it is constructed only in a `store.rs` test helper, and
@@ -175,8 +225,11 @@ though every provider were dead. The same hazard applies to `throughput_samples`
 tasks' code and fixtures below are already updated; do not "simplify" the `.filter(|s| s.verdict_samples > 0)` away.
 
 Off-slice, landed alongside: `5208952` — revived `facade.rs`'s test module (uncompilable since
-2026-07-23) and added a `cargo check -p sensei-gateway --features local --all-targets` CI step,
-because no CI job had ever enabled a non-default feature.
+2026-07-23) and added a non-default-feature CI step, because no CI job had ever enabled one. The
+whole-slice review upgraded that step from `cargo check` to **`cargo test -p sensei-gateway
+--features local --locked`**: `check` compiled `facade.rs`'s `#[cfg(all(test, feature = "local"))]`
+module and never ran a single test in it, so the gate proved they build while the commit that
+revived them read as though they execute. It is the only step in CI that runs them.
 
 ## The review lesson — apply it to every remaining task
 

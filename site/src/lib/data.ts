@@ -65,6 +65,11 @@ export const features = {
 			body: "Trips on repeated failures and backs off, so a flaky provider can't drag the whole chain down with it."
 		},
 		{
+			tag: 'routing',
+			title: 'Per-request routing preferences',
+			body: 'Shape provider routing per call — sort by price, latency or throughput, allow or exclude routers and models, or name an explicit try-order — on top of a price-weighted, uptime-aware default.'
+		},
+		{
 			tag: 'budget',
 			title: 'Budget filtering & metering',
 			body: 'Filter candidates by cost before a request goes out, and record real per-call spend so burn-rate is queryable.'
@@ -111,7 +116,7 @@ export const crates = {
 		{
 			name: 'gateway',
 			version: TAG,
-			body: 'Provider-agnostic routing engine. Capability-trait adapters, named fallback chains, per-endpoint circuit breaker, budget filtering, multi-model consensus/panels and request tracing — with a store trait for persistence and quotas.',
+			body: 'Provider-agnostic routing engine. Capability-trait adapters, named fallback chains, per-request routing preferences (sort/only/ignore/order), per-endpoint circuit breaker, budget filtering, multi-model consensus/panels and request tracing — with a store trait for persistence and quotas.',
 			chips: ['reqwest', 'rustls', 'tokio']
 		},
 		{

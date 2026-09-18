@@ -202,7 +202,10 @@ Two guards to keep in mind:
    [provider routing preferences](provider-preferences.md). Failing candidates go
    to `skipped`, not to `all_candidates`. So the engine only ever walks
    pre-validated candidates.
-3. **No candidates ⇒** `GatewayError::NoCandidates { capability }`.
+3. **No candidates ⇒** `GatewayError::NoCandidates { capability, skipped }` —
+   `skipped` being the per-candidate `"router:model — reason"` diagnostics, so a
+   filter (or a typo'd `only`) that rejected everything says so rather than
+   rendering as a bare "no candidates available".
 4. **Triggers.** `fallback_triggers` are read from the resolved chain, or an
    **empty slice** when there is no chain (tier 1 direct, or an unresolved
    chain). Direct requests therefore never fall through.
