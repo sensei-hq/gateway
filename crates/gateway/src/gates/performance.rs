@@ -6,9 +6,11 @@ use std::time::{Duration, Instant};
 /// Observed performance for one endpoint over the live window.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EndpointStats {
-    /// Live samples contributing a LATENCY observation (`Complete` and
-    /// `StreamAcquired` phases; NOT `StreamCompleted`, whose duration is
-    /// generation time, a different quantity).
+    /// Live samples contributing a LATENCY observation: a SUCCEEDING
+    /// `Complete`, or any `StreamAcquired`. A FAILED `Complete` contributes
+    /// none (how fast a provider rejects you is not how fast it answers), and
+    /// `StreamCompleted` contributes none either (its duration is total
+    /// attempt wall time, fed to throughput alone).
     pub samples: u32,
     /// Of the live samples, how many carried token counts. Counted SEPARATELY
     /// from `samples` because a throughput sort must not treat a latency-only
@@ -54,13 +56,14 @@ impl EndpointPerformanceRead for NoPerformance {
 /// One observation. A single streaming attempt writes TWO of these (one
 /// `StreamAcquired` then one `StreamCompleted`), so `latency_ms` and `success`
 /// are each optional and independent — exactly one sample carries the verdict,
-/// and `StreamCompleted`'s `duration_ms` (generation time) is never a latency
-/// observation at all. See [`AttemptPhase`] for why.
+/// and `StreamCompleted`'s `duration_ms` (total attempt wall time, a throughput
+/// input) is never a latency observation at all. See [`AttemptPhase`] for why.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Sample {
     pub at: Instant,
-    /// `None` for a `StreamCompleted` sample — its duration is generation
-    /// time, not comparable to the other phases' latency.
+    /// `None` for a `StreamCompleted` sample (its duration feeds throughput,
+    /// not latency) and for a FAILED `Complete` (a rejection's speed is not a
+    /// latency measurement — see `PerformanceRecorder::on_outcome`).
     pub latency_ms: Option<u64>,
     pub tokens_per_sec: Option<f64>,
     /// `None` for `StreamAcquired` — it is a latency observation, not a
@@ -210,9 +213,25 @@ impl HealthRecorder for PerformanceRecorder {
         // One attempt, one latency observation, one verdict — never both from
         // the same phase. `StreamAcquired` is a latency-only observation (the
         // completion dispatch that always follows carries the real verdict);
-        // `StreamCompleted`'s `duration_ms` is generation time, not latency.
+        // `StreamCompleted`'s `duration_ms` is total attempt wall time, fed to
+        // throughput only.
+        //
+        // A FAILED `Complete` contributes its verdict but NO latency:
+        // `MetricStrategy::value` reads `mean_latency_ms` with no reliability
+        // filter at all (unlike `GroupedWeightedStrategy`, which multiplies by
+        // `reliability` precisely to avoid this), so a rejection recorded as a
+        // latency sample makes the endpoint that fails FASTEST win
+        // `sort: latency` outright — a provider rejecting every request in 5ms
+        // outranking one answering every request in 500ms. The breaker does not
+        // save it: `record_success` resets `Closed { failure_count }` to 0, so
+        // an intermittently-failing endpoint never reaches the consecutive
+        // threshold and stays admitted forever. This is the argument the
+        // mid-stream failure dispatch already makes for THROUGHPUT — "a rate
+        // derived from a broken, partial attempt is not a throughput
+        // observation" — applied to the quantity it was never applied to.
+        // The verdict is still cast, so reliability stays correct.
         let (latency_ms, success) = match o.phase {
-            AttemptPhase::Complete => (Some(o.duration_ms), Some(o.success)),
+            AttemptPhase::Complete => (o.success.then_some(o.duration_ms), Some(o.success)),
             AttemptPhase::StreamAcquired => (Some(o.duration_ms), None),
             AttemptPhase::StreamCompleted => (None, Some(o.success)),
         };
@@ -424,15 +443,51 @@ mod tests {
             s.mean_tokens_per_sec
         );
 
-        let without_tokens = outcome("r2:m2", false, 250, None, AttemptPhase::Complete);
+        // `success: true` deliberately: this arm is about the ABSENCE of token
+        // counts, and a failing fixture would now exercise the no-latency rule
+        // instead (a failed `Complete` contributes no latency sample at all),
+        // conflating two independent properties in one assertion.
+        let without_tokens = outcome("r2:m2", true, 250, None, AttemptPhase::Complete);
         rec.on_outcome(&without_tokens);
         let s2 = store.stats("r2:m2").unwrap();
         assert_eq!(s2.samples, 1, "latency is still recorded");
         assert_eq!(s2.throughput_samples, 0, "but no throughput is invented");
         assert!((s2.mean_latency_ms - 250.0).abs() < 1e-9);
         assert!(
-            (s2.success_rate - 0.0).abs() < 1e-9,
-            "a failure is recorded as such"
+            (s2.success_rate - 1.0).abs() < 1e-9,
+            "the verdict is recorded as such"
+        );
+    }
+
+    /// The write-side half of the same rule the strategy-level test
+    /// (`strategy::tests::a_failing_fast_endpoint_does_not_outrank_a_healthy_slow_one_under_latency_sort`)
+    /// pins end-to-end: a FAILED `Complete` casts its verdict but contributes
+    /// NO latency sample, so `mean_latency_ms` cannot be dragged toward
+    /// however fast an endpoint rejects. Both halves are asserted — a fix that
+    /// dropped the verdict along with the latency would break reliability
+    /// instead, and the ordering test alone would not notice.
+    #[test]
+    fn a_failed_complete_casts_its_verdict_but_contributes_no_latency() {
+        let store = PerformanceStore::new(8, Duration::from_secs(60));
+        let rec = PerformanceRecorder::new(store.clone(), 4096);
+        rec.on_outcome(&outcome("r:m", false, 5, None, AttemptPhase::Complete));
+
+        let s = store.stats("r:m").expect("a live sample still reports");
+        assert_eq!(
+            s.samples, 0,
+            "a 5ms REJECTION is not a 5ms latency observation: {s:?}"
+        );
+        assert!(
+            (s.mean_latency_ms - 0.0).abs() < 1e-9,
+            "with no latency contributor the mean stays at its 0.0 fallback: {s:?}"
+        );
+        assert_eq!(
+            s.verdict_samples, 1,
+            "the verdict is still cast, so reliability stays correct: {s:?}"
+        );
+        assert!(
+            (s.success_rate - 0.0).abs() < 1e-9,
+            "and it is a failure: {s:?}"
         );
     }
 

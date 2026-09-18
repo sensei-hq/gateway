@@ -98,8 +98,12 @@ impl super::Gateway {
             if let Some(gated) = super::exhaustion::all_gated_error(&result.skipped, &[]) {
                 return Err(gated);
             }
+            // Same diagnostics as `execute`'s selection-empty branch — a
+            // caller's routing filter must be as visible on the streaming
+            // entry point as on the unary one.
             return Err(GatewayError::NoCandidates {
                 capability: request.capability.clone(),
+                skipped: super::exhaustion::render_skipped(&result.skipped),
             });
         }
 
@@ -285,6 +289,18 @@ impl super::Gateway {
                                         router: &candidate.router,
                                         success: false,
                                         error: Some(&e),
+                                        // GENERATION time, not the total attempt span the
+                                        // completion dispatch below reports — and this is
+                                        // the one place the two differ. It is inert either
+                                        // way: `output_tokens: None` means it reaches no
+                                        // throughput mean, and `StreamCompleted` means it
+                                        // reaches no latency mean. It is carried for
+                                        // tracing and for the recorders that only classify
+                                        // `error`. Anything that starts deriving a RATE
+                                        // from this dispatch must switch it to
+                                        // `attempt_start` first, or it reintroduces
+                                        // exactly the unlike-spans pooling the completion
+                                        // dispatch was fixed for.
                                         duration_ms: stream_start.elapsed().as_millis() as u64,
                                         // Deliberately `None`, even if an earlier chunk
                                         // carried `usage` (some providers report tokens on
@@ -297,8 +313,8 @@ impl super::Gateway {
                                         output_tokens: None,
                                         // The stream ENDED, badly. This is the attempt's
                                         // one and only verdict — the acquisition dispatch
-                                        // deliberately cast none — and its duration is
-                                        // generation time, so it contributes no latency.
+                                        // deliberately cast none — and the phase keeps its
+                                        // duration out of the latency mean.
                                         phase: crate::gates::AttemptPhase::StreamCompleted,
                                     },
                                 );
@@ -318,9 +334,24 @@ impl super::Gateway {
 
                     // Throughput is only knowable here. The acquisition dispatch at the
                     // top of this block recorded LATENCY (time until the stream started
-                    // producing); this second dispatch records the generation rate and
-                    // this attempt's one verdict. The two durations measure different
-                    // spans, and `AttemptPhase` is what keeps them out of one mean.
+                    // producing); this second dispatch records the throughput rate and
+                    // this attempt's one verdict, and `AttemptPhase` is what keeps its
+                    // duration out of the latency mean.
+                    //
+                    // `attempt_start`, NOT `stream_start`: `PerformanceRecorder` derives
+                    // `tokens_per_sec` from `duration_ms` regardless of phase, and
+                    // `execute` writes the SAME `"{router}:{model}"` key with the whole
+                    // call's wall time. Reporting generation time alone here pooled two
+                    // unlike quantities into one `mean_tokens_per_sec` — the very thing
+                    // spec §6.3 forbids for latency — so an identical real rate read
+                    // higher purely because it was served streaming, and an endpoint
+                    // that was faster END TO END could lose to a slower one. Output
+                    // tokens ÷ total attempt wall time is one well-defined quantity on
+                    // both paths, and it includes queueing, which is what a caller
+                    // choosing a provider actually pays. (The alternative — making
+                    // `Complete` contribute no throughput, mirroring the latency rule —
+                    // was rejected: it leaves `sort: throughput` measuring nothing for a
+                    // non-streaming fleet, degrading it to priority order.)
                     //
                     // MUST run before `yield StreamEvent::Done` below, not after: in an
                     // `async_stream` generator, code placed after a `yield` runs only on
@@ -335,7 +366,7 @@ impl super::Gateway {
                             router: &candidate.router,
                             success: true,
                             error: None,
-                            duration_ms: stream_start.elapsed().as_millis() as u64,
+                            duration_ms: attempt_start.elapsed().as_millis() as u64,
                             output_tokens: Some(tokens.output_tokens),
                             phase: crate::gates::AttemptPhase::StreamCompleted,
                         },

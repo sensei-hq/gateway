@@ -95,15 +95,29 @@ pub enum AttemptPhase {
     /// A complete request/response. `duration_ms` is time-to-response and the
     /// verdict is final. Every non-streaming attempt, and every setup failure
     /// (streaming or not — no completion dispatch follows a setup failure).
+    ///
+    /// Its `duration_ms` is a latency observation **only when `success`**. How
+    /// fast a provider rejects a request is not how fast it answers one, and
+    /// `MetricStrategy` sorts `mean_latency_ms` with no reliability filter —
+    /// so counting rejections would route `sort: latency` to whichever
+    /// endpoint fails fastest. The verdict is still cast either way.
     Complete,
     /// A stream was obtained. `duration_ms` is time-to-first-response — the
     /// same quantity as `Complete`'s, hence comparable — but the verdict is
     /// NOT final, because a completion outcome for this same attempt always
     /// follows.
     StreamAcquired,
-    /// A stream ended. `duration_ms` is GENERATION time, which is not
-    /// comparable to the other two phases' `duration_ms`, so it contributes no
-    /// latency observation. The verdict is final.
+    /// A stream ended. `duration_ms` is TOTAL ATTEMPT WALL TIME — the same span
+    /// `Complete` reports — and it is used for THROUGHPUT ONLY. It contributes
+    /// no latency observation, because for a stream that span is not
+    /// time-to-first-response and pooling it with the other two phases' means
+    /// would compare unlike quantities. The verdict is final.
+    ///
+    /// Measuring the total span (rather than generation time from first byte)
+    /// is what makes `mean_tokens_per_sec` a single comparable quantity: the
+    /// SAME endpoint key is written by `execute`, whose `duration_ms` is the
+    /// whole call. Reporting generation time here made an identical real rate
+    /// read higher purely because it was served streaming.
     StreamCompleted,
 }
 
@@ -134,13 +148,30 @@ pub struct AttemptOutcome<'a> {
     pub router: &'a str,
     pub success: bool,
     pub error: Option<&'a GatewayError>,
-    /// Wall time for this attempt/phase, in ms. Its meaning depends on
-    /// `phase` and the three meanings are NOT interchangeable: time-to-response
-    /// for `Complete`, time-to-first-response for `StreamAcquired` (the same
-    /// quantity as `Complete`'s), or generation time for `StreamCompleted`
-    /// (a different quantity, comparable to neither). `PerformanceRecorder`
-    /// reads `phase` to decide whether this value is a latency observation at
-    /// all, rather than pooling unlike spans into one mean.
+    /// Wall time for this attempt/phase, in ms. Its meaning depends on `phase`
+    /// and the meanings are NOT interchangeable:
+    ///
+    /// - `Complete` — time-to-response for the whole attempt. A latency
+    ///   observation when the attempt SUCCEEDED, and a throughput input when it
+    ///   carried tokens.
+    /// - `StreamAcquired` — time-to-first-response (the same quantity as
+    ///   `Complete`'s, hence poolable with it). A latency observation.
+    /// - `StreamCompleted` — total attempt wall time, from the same start
+    ///   instant as `StreamAcquired`'s, so it spans acquisition AND generation.
+    ///   A THROUGHPUT input only, never a latency observation: for a stream
+    ///   that span is not time-to-first-response.
+    ///
+    /// The one exception is the MID-STREAM FAILURE dispatch, which reports
+    /// generation time (from first byte) rather than the total. It passes
+    /// `output_tokens: None` deliberately, so its duration reaches no mean at
+    /// all — neither latency (the phase forbids it) nor throughput (no tokens
+    /// to divide). It is carried for tracing and for future recorders, and
+    /// nothing may start deriving a rate from it without first making it the
+    /// total span too.
+    ///
+    /// `PerformanceRecorder` reads `phase` (and, for `Complete`, `success`) to
+    /// decide what this value is an observation OF, rather than pooling unlike
+    /// spans into one mean.
     pub duration_ms: u64,
     /// Output tokens, when the attempt produced a countable response. `None`
     /// for a setup failure or a stream-acquisition dispatch.
