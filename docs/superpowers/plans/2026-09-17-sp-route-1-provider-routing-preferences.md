@@ -23,7 +23,24 @@
 | 5 | `c21b0e0` · `b1ad6ba` | ✅ done; review found a **production defect** — the breaker could not trip mid-stream |
 | 6 | `5fedd29` · `a252457` | ✅ done; review found all four seam wiring points were deletable with a green suite |
 | 7 | `c7ad5aa` · `4ed2247` · `cf02fba` | ✅ done; review found the **registered default itself** was untested |
-| 8–12 | — | pending |
+| 8 | `201450b` | ✅ done; surfaced a pre-existing config-validation gap — see below |
+| 9–12 | — | pending |
+
+**Carry-forward from Task 8, NOT fixed here: nothing validates `ModelPricing` for finiteness or
+sign.** Both the unchecked path (`Gateway::new` / `update_config`) and the checked one
+(`GatewayBuilder::build` → `collect_validation_errors`) pass pricing through untouched. Confirmed
+empirically: `serde_json` rejects a literal `NaN` and `1e400`, so JSON cannot inject a non-finite
+price directly — but a finite-but-absurd value can overflow during `estimate_cost`
+(`input_tokens × input_per_1k` with `1e300`), and a **negative** price is accepted outright and
+would sort first under `sort: price`.
+
+Consequence is silent mis-ordering, not a crash: `Vec::sort_by` is documented safe with a
+non-total comparator. `PriceStrategy`'s `unwrap_or(Ordering::Equal)` swallows the `NaN`;
+`GroupedWeightedStrategy::classify` incidentally treats it as `Free` via the `!base.is_finite()`
+guard, which is aimed at overflow rather than being a deliberate `NaN` policy.
+
+The right fix is **config validation rejecting non-finite and negative prices**, which is a
+different layer and a different slice. Recorded here so it is a decision rather than an oversight.
 
 **Task 7's Critical is the one to remember.** Reverting `strategy: Box::new(GroupedWeightedStrategy)`
 to `PriorityStrategy` — the single highest-risk line in the feature — passed 381/381. The reason is
@@ -1961,7 +1978,7 @@ every chain assemble() produces."
 - Modify: `crates/gateway/src/strategy.rs`
 - Test: `crates/gateway/src/strategy.rs`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
     /// AC8 — `sort: price` orders across the WHOLE chain and deliberately
@@ -1992,12 +2009,12 @@ every chain assemble() produces."
     }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p sensei-gateway price_sort -- --nocapture`
 Expected: FAIL — `cannot find value 'PriceStrategy'`.
 
-- [ ] **Step 3: Write the strategy**
+- [x] **Step 3: Write the strategy**
 
 ```rust
 /// `sort: price` — ascending estimated cost across every candidate, free first,
@@ -2017,12 +2034,12 @@ impl RoutingStrategy for PriceStrategy {
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test -p sensei-gateway price_sort -- --nocapture`
 Expected: PASS, 2 tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/gateway/src/strategy.rs
