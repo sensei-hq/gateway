@@ -192,6 +192,79 @@ impl RoutingStrategy for PriceStrategy {
     }
 }
 
+/// Which observed quantity a [`MetricStrategy`] sorts on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Metric {
+    Latency,
+    Throughput,
+}
+
+/// `sort: latency | throughput`.
+///
+/// **Reorders only what it knows about.** A fresh process has no observations,
+/// and "observed 400ms" against "never measured" are not comparable quantities
+/// — so rather than impute a value, this sorts the MEASURED subset among the
+/// indices that subset already occupies. Unmeasured candidates never move.
+///
+/// Three properties, no magic constants: zero observations ⇒ pure priority
+/// order; full observations ⇒ a complete metric sort; partial ⇒ a monotone
+/// interpolation between them.
+pub struct MetricStrategy {
+    metric: Metric,
+}
+
+impl MetricStrategy {
+    pub fn latency() -> Self {
+        Self {
+            metric: Metric::Latency,
+        }
+    }
+    pub fn throughput() -> Self {
+        Self {
+            metric: Metric::Throughput,
+        }
+    }
+
+    /// `None` ⇒ not measured for THIS metric.
+    ///
+    /// Throughput reads `throughput_samples`, NOT `samples`: an endpoint with
+    /// plenty of latency observations but no token counts would otherwise sort
+    /// on a mean over nothing. The two counters are independent by design.
+    fn value(&self, m: &SelectedModel, ctx: &StrategyCtx<'_>) -> Option<f64> {
+        let s = ctx.perf.stats(&m.endpoint_key())?;
+        match self.metric {
+            Metric::Latency => (s.samples >= ctx.min_samples).then_some(s.mean_latency_ms),
+            // Negated so an ASCENDING sort puts the highest rate first.
+            Metric::Throughput => {
+                (s.throughput_samples >= ctx.min_samples).then_some(-s.mean_tokens_per_sec)
+            }
+        }
+    }
+}
+
+impl RoutingStrategy for MetricStrategy {
+    fn order(&self, admitted: &mut Vec<SelectedModel>, ctx: &StrategyCtx<'_>) {
+        // The baseline every unmeasured candidate keeps.
+        admitted.sort_by_key(|m| m.priority);
+
+        let slots: Vec<usize> = admitted
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| self.value(m, ctx).is_some())
+            .map(|(i, _)| i)
+            .collect();
+
+        let mut subset: Vec<SelectedModel> = slots.iter().map(|&i| admitted[i].clone()).collect();
+        subset.sort_by(|a, b| {
+            let (va, vb) = (self.value(a, ctx), self.value(b, ctx));
+            va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for (&slot, m) in slots.iter().zip(subset) {
+            admitted[slot] = m;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -858,5 +931,146 @@ mod tests {
                 "seed {seed}: PriceStrategy must not consume the RNG"
             );
         }
+    }
+
+    /// (endpoint suffix, samples, throughput_samples, mean_latency_ms, mean_tokens_per_sec)
+    struct FixedStats(&'static [(&'static str, u32, u32, f64, f64)]);
+    impl EndpointPerformanceRead for FixedStats {
+        fn stats(&self, endpoint: &str) -> Option<EndpointStats> {
+            self.0.iter().find(|(e, ..)| endpoint.ends_with(e)).map(
+                |(_, samples, tput, latency, tps)| EndpointStats {
+                    samples: *samples,
+                    throughput_samples: *tput,
+                    verdict_samples: *samples,
+                    mean_latency_ms: *latency,
+                    mean_tokens_per_sec: *tps,
+                    success_rate: 1.0,
+                },
+            )
+        }
+    }
+
+    /// AC7 — with NO observations a metric sort is exactly priority order.
+    /// Matches `IntraTierStrategy::is_dynamic`'s convention of degrading to
+    /// `Priority` rather than inventing numbers.
+    #[test]
+    fn a_metric_sort_with_no_observations_is_priority_order() {
+        let rng = SplitMix64::seeded(1);
+        let mut v = vec![sm_cost("b", 2, None), sm_cost("a", 1, None)];
+        MetricStrategy::latency().order(&mut v, &test_ctx(&NoPerformance, &rng));
+        assert_eq!(names(&v), vec!["a", "b"]);
+    }
+
+    /// AC7 — with FULL observations it is a complete metric sort, and it
+    /// OVERRIDES priority. `fast` is authored second; if the sort silently
+    /// respected priority this would return the input unchanged.
+    #[test]
+    fn latency_sort_orders_measured_candidates_ascending() {
+        let perf = FixedStats(&[(":slow", 5, 5, 900.0, 10.0), (":fast", 5, 5, 100.0, 90.0)]);
+        let rng = SplitMix64::seeded(1);
+        let mut v = vec![sm_cost("slow", 1, None), sm_cost("fast", 2, None)];
+        MetricStrategy::latency().order(&mut v, &test_ctx(&perf, &rng));
+        assert_eq!(
+            names(&v),
+            vec!["fast", "slow"],
+            "fast must overtake despite priority 2"
+        );
+    }
+
+    /// Throughput is DESCENDING — more tokens per second is better. The mirror
+    /// of the latency test, and it must not accidentally share its direction.
+    #[test]
+    fn throughput_sort_orders_measured_candidates_descending() {
+        let perf = FixedStats(&[(":slow", 5, 5, 100.0, 10.0), (":fast", 5, 5, 900.0, 90.0)]);
+        let rng = SplitMix64::seeded(1);
+        let mut v = vec![sm_cost("slow", 1, None), sm_cost("fast", 2, None)];
+        MetricStrategy::throughput().order(&mut v, &test_ctx(&perf, &rng));
+        assert_eq!(
+            names(&v),
+            vec!["fast", "slow"],
+            "higher tok/s leads — note `slow` has the BETTER latency here, so a \
+             latency comparator would give the opposite answer"
+        );
+    }
+
+    /// AC7, the interesting half — an UNMEASURED candidate holds its INDEX.
+    /// It is neither promoted nor demoted, because "observed 400ms" and "never
+    /// measured" are not comparable quantities.
+    #[test]
+    fn an_unmeasured_candidate_holds_its_index() {
+        // Only slots 0 and 2 are measured; slot 1 is not.
+        let perf = FixedStats(&[(":slow", 5, 5, 900.0, 1.0), (":fast", 5, 5, 100.0, 1.0)]);
+        let rng = SplitMix64::seeded(1);
+        let mut v = vec![
+            sm_cost("slow", 1, None),
+            sm_cost("unmeasured", 2, None),
+            sm_cost("fast", 3, None),
+        ];
+        MetricStrategy::latency().order(&mut v, &test_ctx(&perf, &rng));
+        assert_eq!(
+            names(&v),
+            vec!["fast", "unmeasured", "slow"],
+            "the measured pair swaps within slots 0 and 2; the unmeasured one does not move"
+        );
+    }
+
+    /// Below `ctx.min_samples` a candidate is NOT measured, so a single lucky
+    /// observation cannot reorder a chain.
+    #[test]
+    fn a_candidate_below_min_samples_is_not_measured() {
+        // min_samples is 3 in `test_ctx`; `fast` has 1.
+        let perf = FixedStats(&[(":fast", 1, 1, 10.0, 99.0)]);
+        let rng = SplitMix64::seeded(1);
+        let mut v = vec![sm_cost("slow", 1, None), sm_cost("fast", 2, None)];
+        MetricStrategy::latency().order(&mut v, &test_ctx(&perf, &rng));
+        assert_eq!(
+            names(&v),
+            vec!["slow", "fast"],
+            "1 sample < min 3 ⇒ no reorder"
+        );
+    }
+
+    /// The boundary, pinned in BOTH directions. At exactly `min_samples` a
+    /// candidate IS measured; one below it is not. Without both halves an
+    /// off-by-one in either direction survives.
+    #[test]
+    fn the_min_samples_boundary_is_pinned_in_both_directions() {
+        let rng = SplitMix64::seeded(1);
+        // Exactly at the threshold (3) ⇒ measured ⇒ `fast` overtakes.
+        let at = FixedStats(&[(":fast", 3, 3, 10.0, 1.0), (":slow", 3, 3, 900.0, 1.0)]);
+        let mut v = vec![sm_cost("slow", 1, None), sm_cost("fast", 2, None)];
+        MetricStrategy::latency().order(&mut v, &test_ctx(&at, &rng));
+        assert_eq!(names(&v), vec!["fast", "slow"], "3 >= 3 is measured");
+
+        // One below (2) ⇒ unmeasured ⇒ nothing moves.
+        let below = FixedStats(&[(":fast", 2, 2, 10.0, 1.0), (":slow", 2, 2, 900.0, 1.0)]);
+        let mut v = vec![sm_cost("slow", 1, None), sm_cost("fast", 2, None)];
+        MetricStrategy::latency().order(&mut v, &test_ctx(&below, &rng));
+        assert_eq!(names(&v), vec!["slow", "fast"], "2 < 3 is unmeasured");
+    }
+
+    /// THE counter-confusion test. An endpoint with ample LATENCY samples but
+    /// no token counts must not look measured to a THROUGHPUT sort — it would
+    /// sort on a mean over zero observations. Reading `samples` instead of
+    /// `throughput_samples` is exactly the bug Task 4 shipped.
+    #[test]
+    fn a_throughput_sort_ignores_an_endpoint_with_no_token_counts() {
+        // `latency_only` has 9 latency samples but 0 throughput samples, and a
+        // mean_tokens_per_sec of 0.0 — which is the "never measured" fallback,
+        // not a measurement. `real` has 5 of each.
+        let perf = FixedStats(&[
+            (":latency_only", 9, 0, 10.0, 0.0),
+            (":real", 5, 5, 900.0, 50.0),
+        ]);
+        let rng = SplitMix64::seeded(1);
+        let mut v = vec![sm_cost("latency_only", 1, None), sm_cost("real", 2, None)];
+        MetricStrategy::throughput().order(&mut v, &test_ctx(&perf, &rng));
+        assert_eq!(
+            names(&v),
+            vec!["latency_only", "real"],
+            "only `real` is measured for throughput, so it is the only one that may \
+             move — and it is already in the one measured slot. Reading `samples` \
+             instead would make `latency_only` measured at 0.0 tok/s and demote it."
+        );
     }
 }
