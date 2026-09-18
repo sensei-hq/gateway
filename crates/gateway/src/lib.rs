@@ -11,6 +11,7 @@ pub mod gates;
 pub mod panel;
 pub mod pruning;
 pub mod purpose;
+pub mod random;
 pub mod resilience;
 pub mod selection;
 pub mod skip_reason;
