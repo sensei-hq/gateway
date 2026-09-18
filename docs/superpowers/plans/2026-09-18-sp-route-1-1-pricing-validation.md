@@ -12,6 +12,23 @@
 
 ---
 
+## Progress
+
+| Task | Commits | State |
+|---|---|---|
+| 1 — the one rule | `4d52044` | ✅ done; three mutations confirmed red |
+| 2 — the deserialization boundary | `1170aab` | ✅ done (AC1–AC3, AC7); `#[serde(try_from)]`, `Serialize` untouched |
+| 3 — the checked config paths | `3a091a6` | ✅ done (AC6); Rule 7 in `collect_validation_errors`, the rule **called** not restated |
+| 4 — the facade drops, never neutralises | `cb5fbbf` | ✅ done (AC4–AC5); the `pricing = None` mutation confirmed red, which is the whole point of AC5 |
+| 5 — docs + final verification | *(this commit)* | ✅ done (AC8) |
+
+**Final state:** suite **1918 passed / 0 failed / 60 ignored**, real exit 0, zero
+`panicked at`. Clippy clean under **both** toolchains (Homebrew and rustup stable),
+`fmt --check` clean, `cargo test -p sensei-gateway --features local --locked` green,
+`cargo doc --workspace --no-deps` clean. Closes SP-ROUTE-1's pricing carry-forward.
+
+---
+
 ## Orientation — read before Task 1
 
 **Baseline: 1909 passed, 0 failed, 60 ignored, real exit 0.** Repo root is `/Users/Jerry/Developer/gateway`.
@@ -38,7 +55,11 @@
 - `crates/kernel/src/types/config.rs` — `ModelPricing::validate`, the `try_from` shadow struct
 - `crates/gateway/src/config.rs` — the `collect_validation_errors` rule
 - `crates/gateway/src/facade.rs` — drop-and-warn in `build`
-- `docs/features/routing/provider-preferences.md`, `docs/llms/configuration.md`, `docs/llms/upgrading.md` — the new rejection
+- Docs (Task 5, the six surfaces the audit found): `docs/features/routing/provider-preferences.md`
+  (the stale "nothing validates `ModelPricing`" blockquote + a new subsection),
+  `docs/llms/configuration.md`, `docs/llms/upgrading.md` (the breaking change, with a
+  before/after), `docs/features/catalog/configuration.md`,
+  `docs/features/governance/budget-and-cost.md`, `docs/features/routing/routing-and-selection.md`
 
 No new files. No new dependencies.
 
@@ -50,7 +71,7 @@ No new files. No new dependencies.
 - Modify: `crates/kernel/src/types/config.rs`
 - Test: same file, inline `mod tests`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -86,12 +107,12 @@ fn pricing(input: f64, output: f64, per_request: Option<f64>) -> ModelPricing {
 }
 ```
 
-- [ ] **Step 2: Run them, confirm they fail**
+- [x] **Step 2: Run them, confirm they fail**
 
 Run: `cargo test -p sensei-kernel pricing_validate_rejects -- --nocapture`
 Expected: FAIL — `no method named 'validate'`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
 impl ModelPricing {
@@ -128,7 +149,7 @@ impl ModelPricing {
 }
 ```
 
-- [ ] **Step 4: Confirm green, then mutation-check**
+- [x] **Step 4: Confirm green, then mutation-check**
 
 Run the test. Then apply each and confirm a real `panicked at`, restoring after each:
 - `if v < 0.0` → `if v < -1.0` (a `-0.001` price passes)
@@ -137,7 +158,7 @@ Run the test. Then apply each and confirm a real `panicked at`, restoring after 
 
 Quote each panic line.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A
@@ -154,7 +175,7 @@ git commit -m "feat(kernel): ModelPricing::validate — the one rule (SP-ROUTE-1
 
 This is the site that matters most — it catches a config **file** on every path, checked or unchecked, with no signature change anywhere.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -219,11 +240,11 @@ fn a_valid_pricing_round_trips_unchanged() {
 }
 ```
 
-- [ ] **Step 2: Run them, confirm the negative one fails**
+- [x] **Step 2: Run them, confirm the negative one fails**
 
 The negative test should fail (it deserializes fine today). Quote the actual failure.
 
-- [ ] **Step 3: Implement via `try_from`**
+- [x] **Step 3: Implement via `try_from`**
 
 There is **no custom-`Deserialize` precedent in this workspace**, so use the idiomatic shadow-struct form rather than a hand-rolled visitor — it keeps the derive for `Serialize` and produces a clean error with no `Visitor` boilerplate:
 
@@ -265,18 +286,18 @@ impl TryFrom<ModelPricingRaw> for ModelPricing {
 
 **Watch for:** `#[serde(try_from)]` requires the target to be `Clone`. It is. Confirm `Serialize` still derives on `ModelPricing` itself and that the `skip_serializing_if` behaviour is unchanged — the round-trip test covers it.
 
-- [ ] **Step 4: Confirm green, then mutation-check**
+- [x] **Step 4: Confirm green, then mutation-check**
 
 Apply and confirm a real panic, restoring after each:
 - delete `p.validate()?;` from `try_from`
 - change `try_from = "ModelPricingRaw"` so validation is bypassed (remove the attribute entirely and restore the plain derive)
 
-- [ ] **Step 5: Confirm nothing else broke**
+- [x] **Step 5: Confirm nothing else broke**
 
 Run: `cargo test --workspace`
 **Any existing config fixture carrying a negative or non-finite price will now fail to load.** That is the intended change — but report every such test individually with its file and what it was asserting, and do NOT adjust one you cannot explain.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add -A
@@ -291,7 +312,7 @@ git commit -m "feat(kernel): reject unusable pricing at the deserialization boun
 - Modify: `crates/gateway/src/config.rs`
 - Test: same file
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[test]
@@ -315,9 +336,9 @@ fn validate_config_rejects_a_model_whose_pricing_cannot_be_compared() {
 
 Note this must be constructed **programmatically** — a negative price can no longer be deserialized after Task 2, which is the point.
 
-- [ ] **Step 2: Run it, confirm it fails**
+- [x] **Step 2: Run it, confirm it fails**
 
-- [ ] **Step 3: Add the rule**
+- [x] **Step 3: Add the rule**
 
 In `collect_validation_errors`, after the existing model rules:
 
@@ -335,7 +356,7 @@ In `collect_validation_errors`, after the existing model rules:
     }
 ```
 
-- [ ] **Step 4: Confirm green, mutation-check (delete the rule), commit**
+- [x] **Step 4: Confirm green, mutation-check (delete the rule), commit**
 
 ```bash
 git add -A
@@ -352,7 +373,7 @@ git commit -m "feat(gateway): collect_validation_errors rejects unusable pricing
 
 This is the production path: `Facade::build` calls the deliberately unchecked `Gateway::new`, and its doc states *"construction never fails on a single bad router"*. It gains a `warn` and may build with fewer models; **its signature does not change.**
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 /// AC4 — a programmatically-constructed bad price does not reach routing.
@@ -384,9 +405,9 @@ async fn a_dropped_model_never_outranks_a_priced_one() {
 }
 ```
 
-- [ ] **Step 2: Run them, confirm they fail**
+- [x] **Step 2: Run them, confirm they fail**
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In `Facade::build`, before `Gateway::new`:
 
@@ -409,13 +430,13 @@ In `Facade::build`, before `Gateway::new`:
         let gateway = Gateway::new(config, self.registry.clone(), breaker);
 ```
 
-- [ ] **Step 4: Confirm green, then mutation-check BOTH**
+- [x] **Step 4: Confirm green, then mutation-check BOTH**
 
 Restore after each, quote the panic:
 - delete the `retain` (the drop test fails)
 - replace the drop with `model.pricing = None` — i.e. the tempting repair. **`a_dropped_model_never_outranks_a_priced_one` must fail**, and that failure is the whole reason the test exists. If it passes, the test is not pinning what it claims and that is a BLOCKER.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A
@@ -430,7 +451,7 @@ git commit -m "feat(gateway): facade drops a model with uncomparable pricing (SP
 - Modify: `docs/features/routing/provider-preferences.md`, `docs/llms/configuration.md`, `docs/llms/upgrading.md`
 - Modify: the SP-ROUTE-1 plan's carry-forward entry, `docs/CHECKPOINT.md`
 
-- [ ] **Step 1: Find every surface**
+- [x] **Step 1: Find every surface**
 
 ```
 rg --no-ignore -g '!target' -g '!site/node_modules' -l 'ModelPricing|input_per_1k|pricing' docs/ README.md
@@ -438,14 +459,14 @@ rg --no-ignore -g '!target' -g '!site/node_modules' -l 'ModelPricing|input_per_1
 
 Report the full list and which you changed.
 
-- [ ] **Step 2: Document**
+- [x] **Step 2: Document**
 
 - The rejection, with **both** deliberate non-rejections stated (zero is valid; a large finite price is valid) so neither reads as an oversight.
 - That a config **file** with a bad price now fails to load — the one breaking change, belongs in `upgrading.md`.
 - That `Facade::build` drops such a model and warns, and that its signature is unchanged.
 - Update SP-ROUTE-1's carry-forward 2 from "contained" to **closed**, naming this slice.
 
-- [ ] **Step 3: Verify**
+- [x] **Step 3: Verify**
 
 Each with its REAL unpiped exit code (zsh — `${PIPESTATUS[0]}` does NOT work):
 
@@ -459,11 +480,11 @@ cargo doc --workspace --no-deps
 
 Grep the test log for `panicked at`.
 
-- [ ] **Step 4: Confirm each AC has a named passing test**
+- [x] **Step 4: Confirm each AC has a named passing test**
 
 AC1–AC8 from the spec. Name the test for each and run it individually. Any AC without a green named test is unfinished — report it.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A

@@ -132,8 +132,9 @@ selections per second at n=40.
 2. **A fixture that returns a constant cannot test a live source.** If production reads something
    mutable, at least one test needs a fixture whose answer changes.
 
-**Carry-forward from Task 8, NOT fixed here: nothing validates `ModelPricing` for finiteness or
-sign.** Both the unchecked path (`Gateway::new` / `update_config`) and the checked one
+**Carry-forward from Task 8, NOT fixed here — ✅ CLOSED by SP-ROUTE-1.1 (2026-09-18): nothing
+validates `ModelPricing` for finiteness or sign.** Both the unchecked path
+(`Gateway::new` / `update_config`) and the checked one
 (`GatewayBuilder::build` → `collect_validation_errors`) pass pricing through untouched. Confirmed
 empirically: `serde_json` rejects a literal `NaN` and `1e400`, so JSON cannot inject a non-finite
 price directly — but a finite-but-absurd value can overflow during `estimate_cost`
@@ -159,10 +160,18 @@ already-tested path); `PriceStrategy` maps one to `+inf` so an unusable price so
 treating it as free would let a broken price win the *cheapest* slot, a budget hazard rather than
 a neutral default.
 
-So the carry-forward is now **contained, not open**: the routing layer can no longer be panicked or
-mis-ordered by a bad price. Config validation rejecting non-finite and negative prices is still the
-right fix at the right layer, and still belongs to its own slice — it would turn a silently ignored
-misconfiguration into a loud one at load time, which is where an operator can act on it.
+So the carry-forward was **contained, not open** at the end of SP-ROUTE-1: the routing layer could
+no longer be panicked or mis-ordered by a bad price, but a negative price still won the cheapest
+slot, and containment at the point of use is the wrong layer for a configuration error.
+
+**✅ Now CLOSED — by its own slice, SP-ROUTE-1.1 (`docs/superpowers/plans/2026-09-18-sp-route-1-1-pricing-validation.md`).**
+`ModelPricing::validate()` rejects non-finite and negative values on `input_per_1k`,
+`output_per_1k` and `per_request`, and is called from three sites: `Deserialize` (so a config
+**file** with a bad price fails to load — the one breaking change), `collect_validation_errors`
+(the checked paths), and `Facade::build`, which **drops** the model and logs at `warn` with its
+signature unchanged. Zero and a large finite magnitude are deliberately still accepted. The
+`PriceStrategy` / `MetricStrategy` fences described above stay exactly as they are — they remain
+the last line for anything reaching the strategies by a path validation does not cover.
 
 **Task 7's Critical is the one to remember.** Reverting `strategy: Box::new(GroupedWeightedStrategy)`
 to `PriorityStrategy` — the single highest-risk line in the feature — passed 381/381. The reason is

@@ -6,7 +6,7 @@ routing call path (build a request, `gateway.execute(&req).await`, read
 `InferenceResponse`) stays source-compatible across every step below; each section
 lists only what you must touch.
 
-## 0.5.1 → next (unreleased — SP-ROUTE-1)
+## 0.5.1 → next (unreleased — SP-ROUTE-1 / SP-ROUTE-1.1)
 
 Per-request **provider routing preferences** land (`sort` / `only` / `ignore` /
 `order`, plus a price-weighted default within equal-priority groups). The call
@@ -27,6 +27,75 @@ absent field routes and serializes exactly as before.
 | Mid-stream failures | now count toward the circuit breaker, connection cooldown and model lockout | none, but a repeatedly-failing stream can now gate its endpoint |
 | A **failed** attempt | no longer contributes a latency observation (it still casts its verdict) | none — `sort: latency` stops preferring the endpoint that fails fastest |
 | Throughput | now output tokens ÷ **total attempt wall time** on both paths | none, unless you read `AttemptOutcome::duration_ms` for `StreamCompleted` — it now means the whole attempt span, not generation time |
+| `ModelPricing` (SP-ROUTE-1.1) | a non-finite or **negative** value no longer deserializes — a config **file** carrying one now fails to load | audit your config for negative prices; there is no opt-out (below) |
+
+### A config file with a bad price now fails to load — the one breaking change
+
+**This is the only change in this section that can break a deployment that
+compiles.** `ModelPricing` is now validated at the deserialization boundary:
+`input_per_1k`, `output_per_1k` and `per_request` (when present) must each be
+**finite and non-negative**.
+
+Before, this loaded and routed:
+
+```jsonc
+// before: accepted silently, and WON the cheapest slot under `sort: price`
+{
+  "models": {
+    "gpt-4o": {
+      "id": "gpt-4o",
+      "provider": "openai",
+      "capabilities": ["text_chat"],
+      "context_window": 128000,
+      "max_output_tokens": 4096,
+      "pricing": { "input_per_1k": -0.005, "output_per_1k": 0.015 }
+    }
+  }
+}
+```
+
+Now the load fails, and the error names the field and the value:
+
+```text
+input_per_1k must not be negative, got -0.005
+```
+
+Fix the number — that is the whole migration:
+
+```jsonc
+// after
+"pricing": { "input_per_1k": 0.005, "output_per_1k": 0.015 }
+```
+
+**Why it is an error rather than a warning.** A price that cannot be compared is
+not a price. A `NaN` makes the routing comparator intransitive, which Rust's
+`sort_by` *panics* on, and a negative number sorts **first** under `sort: price`
+— the cheapest slot won by a figure that is not a cost. Containing that at the
+routing layer (which SP-ROUTE-1 did) stops the panic but leaves a
+silently-mis-routed model; a load-time rejection is where an operator can act.
+
+**Two values are deliberately still accepted**, so neither looks like an
+oversight:
+
+- **`0.0`** — an explicit free price, distinct from `"pricing": null`, and the
+  two deliberately tie under `sort: price`.
+- **A large finite magnitude** such as `1e300` — any cap would be an invented
+  threshold, and a prohibitive price is a legitimate way to park a model at the
+  back of a chain.
+
+**If you assemble `ModelPricing` in code** you bypass deserialization, and the
+behaviour differs by entry point:
+
+| Entry point | Behaviour |
+|---|---|
+| `Gateway::try_new` / `try_update_config` / `GatewayBuilder::build` | `GatewayError::InvalidConfig`, listing `model '<id>' has unusable pricing: <reason>` |
+| `Facade::build` | **drops** that model, logs at `warn`; **the signature is unchanged** (still `-> Facade`, not `Result`) and construction still succeeds — it simply builds with fewer models |
+| `Gateway::new` / `update_config` | unchanged: unchecked by documented design |
+
+A chain entry still naming a dropped model skips as `ModelNotFound`, which
+surfaces in the selection diagnostics. The facade **drops** rather than nulling
+the price on purpose: `pricing: None` means *free* and free sorts **first**, so
+"repairing" a broken price would hand it the cheapest slot.
 
 ### `ResilienceConfig` is `#[non_exhaustive]` — `..Default::default()` is not the escape hatch
 

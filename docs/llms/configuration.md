@@ -50,6 +50,27 @@ ModelConfig {
 Add `pricing` to get real cost figures (`estimated_cost` / `actual_cost` on the
 response, and dollar burn-rate via the store). Without it, costs are `0.0`.
 
+> **Every `pricing` value must be finite and non-negative.** `NaN`, `±inf` and
+> any negative number on `input_per_1k`, `output_per_1k` or `per_request` are
+> rejected: a config **file** carrying one fails to load, with an error naming
+> the field and the value. A price that cannot be compared is not a price — a
+> `NaN` makes the routing comparator intransitive, and a negative number sorts
+> *first* under `sort: price`, winning the cheapest slot.
+>
+> Two values are deliberately **allowed**: an explicit `0.0` (a real free price,
+> distinct from `pricing: None`, and the two tie under `sort: price`), and a
+> large finite magnitude such as `1e300` (any cap would be an invented
+> threshold, and a prohibitive price is a legitimate way to park a model at the
+> back of a chain).
+>
+> A `ModelPricing` you assemble **in code** skips deserialization, so it is
+> caught later instead: `Gateway::try_new` / `try_update_config` /
+> `GatewayBuilder::build` report it as an `InvalidConfig` error, and
+> `Facade::build` **drops** that model and logs at `warn` (the facade still
+> builds — its signature is unchanged — and a chain entry naming the dropped
+> model then skips as `ModelNotFound`). It drops rather than nulling the price
+> because `None` means *free*, and free sorts first.
+
 ## FallbackChainConfig — ordered fallback
 
 ```rust
@@ -128,8 +149,9 @@ let config = GatewayBuilder::new()
 ```
 
 `build()` (and `Gateway::try_new`) reject: no routers, empty router URLs, a chain
-referencing an unknown model, a model whose `provider` has no router, and a model whose
-`max_output_tokens` is 0.
+referencing an unknown model, a model whose `provider` has no router, a model whose
+`max_output_tokens` is 0, and a model whose `pricing` carries a non-finite or negative
+value (`model '<id>' has unusable pricing: <reason>`).
 
 ## Load from JSON instead
 
