@@ -91,6 +91,21 @@ So, for every task below:
 This bites hardest in Tasks 7–10: a weighted strategy that returns the right *set* in the wrong
 *order* will pass any test that only checks membership.
 
+### Three traps found in Tasks 4–6 that Tasks 7–12 must not walk into
+
+1. **Never read a mean without its count.** `EndpointStats` carries three independent counters —
+   `samples` (latency), `throughput_samples`, `verdict_samples` — because `0.0` means both
+   "measured, and it is zero" and "never measured". Reliability reads `verdict_samples`, latency
+   reads `samples`, throughput reads `throughput_samples`. Using the wrong one treats a healthy
+   endpoint as totally unreliable.
+2. **A test that asserts two things are equal is green when neither works.** Task 6's byte-identity
+   test passed with all four of its builders silently discarding their arguments. If a test
+   compares a wired path against an unwired one, assert a value only the wired path can produce.
+3. **Do not trust a fixed-seed static for reproducibility.** `DEFAULT_RNG` is process-wide and
+   cargo runs tests in parallel, so the *sequence* is fixed but which test gets which draw is not.
+   Any test depending on specific draws must pass its own `SplitMix64::seeded(n)` via
+   `with_random`.
+
 ## Orientation — read before Task 1
 
 **The two-dimensional candidate space.** A candidate is a `(router, model)` pair. `router` is the provider backend (`anthropic`, `ollama`); `model` is the model id (`claude-haiku`, `gemma3:27b`). The endpoint key is `format!("{router}:{model}")` and **cannot be parsed back** — model ids contain colons. Always carry the two parts separately.
@@ -1833,7 +1848,11 @@ fn order_group(group: Vec<SelectedModel>, ctx: &StrategyCtx<'_>) -> Vec<Selected
 
     for m in group {
         let cost = m.cost_estimate.as_ref().map(|c| c.estimated).unwrap_or(0.0);
-        let endpoint = format!("{}:{}", m.router, m.model);
+        // Task 6 extracted this — do NOT re-inline the `format!`. The key is
+        // shared with the two engine dispatch sites, and a silent divergence
+        // just makes `stats()` return `None` for every candidate, which degrades
+        // to "nothing measured" with a green suite.
+        let endpoint = crate::gates::performance::endpoint_key(&m.router, &m.model);
         // `success_rate` reads 0.0 BOTH when every attempt failed and when no
         // attempt has cast a verdict yet. `verdict_samples` (Task 4) is the only
         // way to tell those apart, and the difference is not cosmetic: without
@@ -2119,7 +2138,10 @@ impl MetricStrategy {
     /// observations but no token counts would otherwise sort on a mean over
     /// nothing.
     fn value(&self, m: &SelectedModel, ctx: &StrategyCtx<'_>) -> Option<f64> {
-        let s = ctx.perf.stats(&format!("{}:{}", m.router, m.model))?;
+        // Task 6 extracted the key helper — do NOT re-inline the `format!`.
+        let s = ctx
+            .perf
+            .stats(&crate::gates::performance::endpoint_key(&m.router, &m.model))?;
         match self.metric {
             Metric::Latency => (s.samples >= self.min_samples).then_some(s.mean_latency_ms),
             // Negated so ascending sort == descending throughput.
