@@ -1308,6 +1308,7 @@ impl orchestrator_core::ModelDispatch for SelectorDispatch<'_> {
             consensus: None,
             allow_fallback: true,
             credentials: Default::default(),
+            routing: None,
         };
 
         let response = match self

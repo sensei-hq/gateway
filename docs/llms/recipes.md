@@ -22,6 +22,71 @@ A caller-pinned `model` always wins. With a `chain`, failures walk to the next
 candidate when the error is in the chain's `fallback_triggers`. The `attempts`
 field on the response is the full trail (what was tried, what failed, why).
 
+## Shape routing per request
+
+`InferenceRequest.routing` overrides the operator's authored order for one call.
+Absent ⇒ unchanged behaviour (the field is skipped on the wire entirely).
+
+```rust
+use gateway::types::request::{RoutingPreferences, SortKey, CandidateSet, CandidateRef};
+
+InferenceRequest {
+    chain: Some("chat".into()),
+    routing: Some(RoutingPreferences {
+        sort:   Some(SortKey::Price),                       // price | latency | throughput
+        ignore: Some(CandidateSet { routers: vec!["ollama".into()], models: vec![] }),
+        only:   None,
+        order:  Some(vec![CandidateRef { model: Some("claude-haiku".into()), router: None }]),
+    }),
+    ..
+}
+```
+
+Filtering runs first, then ordering: `only`/`ignore` → `sort` (or the default) →
+`order`.
+
+- **`only` is AND across non-empty axes; `ignore` is OR.** An empty list is
+  "don't care", not "match nothing" — `only: {routers: ["anthropic"]}` admits
+  every anthropic candidate. The two have no precedence over each other
+  (admission is `only_ok && !ignore_match`), but satisfying `only` does **not**
+  exempt a candidate from `ignore`. Excluding *everything* is a terminal
+  `NoCandidates`, not a retryable pause.
+- **`sort: price`** orders by estimated cost across the whole chain and
+  deliberately overrides `priority`.
+- **`sort: latency|throughput`** reorders only the candidates it has actually
+  measured, in the slots they already occupy — unmeasured candidates never move,
+  so a cold process is exactly priority order.
+- **`order` is first-matching-ref-wins.** `[{model: "charlie"}, {router: "north"}]`
+  means "charlie, then the rest of north". Candidates matching no ref follow as
+  fallbacks; `order` never drops anything. Two inert forms to know: `order: []`
+  and `order: [CandidateRef::default()]` are both no-ops, and an all-wildcard ref
+  placed first shadows every ref after it. A **router-only** ref lifts every
+  model on that router above every other priority tier — correct, but it is the
+  cross-tier reordering the default strategy will not do on its own.
+- **They filter *within* the chain that was already resolved.** A capability
+  request (no `chain`) picks one chain by **lowest chain id** before any
+  filtering runs, so `only` cannot make it go looking in a different chain — it
+  narrows the chosen one, and over-narrowing yields `NoCandidates`. Pin the
+  chain by name to combine "this chain" with "these providers".
+- **A direct `router` + `model` request is filtered too.** The gate vector runs
+  on every resolution path, so an `ignore` naming that pair excludes the one
+  candidate and the call fails with `NoCandidates`.
+
+`response.routing` explains what happened: the strategy that ran, the resulting
+order, and (for the weighted default) each candidate's cost, reliability and draw
+weight. Two readings to get right:
+
+- It is `None` for a direct router+model request, which orders nothing. That
+  is **not** "preferences were ignored" — they still filtered it (above).
+- `reliability` and `weight` are `null` for every candidate under `sort: price`,
+  `sort: latency` and `sort: throughput`, because only the weighted default
+  consults them. Read `strategy` before concluding anything about fleet health.
+
+> `execute_stream` applies the same preferences but returns `StreamEvent`s rather
+> than an `InferenceResponse`, so a streamed call has **no** routing explanation.
+
+Full reference: `docs/features/routing/provider-preferences.md`.
+
 ## Stream a chat response
 
 ```rust

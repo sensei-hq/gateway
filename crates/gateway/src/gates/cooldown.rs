@@ -1,3 +1,5 @@
+#[cfg(test)]
+use super::AttemptPhase;
 use super::{
     AdmissionGate, AttemptOutcome, CandidateView, GateVerdict, HealthRecorder, RouterHealthRead,
     SelectionCtx,
@@ -109,6 +111,14 @@ impl ConnectionCooldownSink {
 
 impl HealthRecorder for ConnectionCooldownSink {
     fn on_outcome(&self, o: &AttemptOutcome<'_>) -> Option<Instant> {
+        // A `StreamAcquired` outcome is a latency observation, not a verdict.
+        // This sink keys on `o.error`, which is always `None` at acquisition,
+        // so it was already inert to the phase-blindness bug the other two
+        // sinks had — this guard makes that explicit rather than incidental
+        // (SP-ROUTE-1 Task 5 review, Critical 3).
+        if !o.phase.is_verdict() {
+            return None;
+        }
         // Transport-level fault → cool the whole router (Network = connection failure;
         // Timeout = endpoint unreachable/too slow). Other errors do NOT cool.
         if matches!(
@@ -220,6 +230,7 @@ mod tests {
             config: &gateway_config,
             router_health: &store,
             model_lockout: &lockout,
+            preferences: None,
         };
 
         // Not cooling yet → Admit.
@@ -261,6 +272,9 @@ mod tests {
             router: "A",
             success: false,
             error: Some(&timeout_err),
+            duration_ms: 1,
+            output_tokens: None,
+            phase: AttemptPhase::Complete,
         });
         // The sink returns the `until` it just wrote — a future instant equal to
         // what the store now reports.
@@ -278,6 +292,9 @@ mod tests {
             router: "B",
             success: false,
             error: Some(&provider_err),
+            duration_ms: 1,
+            output_tokens: None,
+            phase: AttemptPhase::Complete,
         });
         assert!(returned.is_none(), "non-transport error does not cool");
         assert!(store.cooling_until("B").is_none());
@@ -287,6 +304,9 @@ mod tests {
             router: "C",
             success: true,
             error: None,
+            duration_ms: 1,
+            output_tokens: None,
+            phase: AttemptPhase::Complete,
         });
         assert!(returned.is_none(), "success does not cool");
         assert!(store.cooling_until("C").is_none());
@@ -314,12 +334,14 @@ mod tests {
     }
 
     /// At/below the cap, nothing is evicted — even an expired entry is kept.
+    /// `cap` is the EXACT current length (1), not generous headroom — a `<=`
+    /// weakened to `<` would still pass a cap of 4096 against a len of 1.
     #[test]
     fn evict_no_op_when_at_or_below_cap() {
         let s = ConnectionCooldownStore::new();
         let now = Instant::now();
         s.start("a", now - Duration::from_secs(1)); // expired but under cap → kept
-        s.evict_expired_over_cap(4096);
+        s.evict_expired_over_cap(1);
         assert!(s.cooling_until("a").is_some());
     }
 
@@ -347,6 +369,9 @@ mod tests {
             router: "new",
             success: false,
             error: Some(&timeout_err),
+            duration_ms: 1,
+            output_tokens: None,
+            phase: AttemptPhase::Complete,
         });
 
         // Expired pruned; the active cooldown and just-written one survive.
@@ -390,6 +415,9 @@ mod tests {
                 router: "R",
                 success: false,
                 error: Some(&err),
+                duration_ms: 1,
+                output_tokens: None,
+                phase: AttemptPhase::Complete,
             })
             .expect("transport fault cools");
         assert!(until >= now + base, "at least the full base cooldown");
@@ -415,6 +443,9 @@ mod tests {
                 router: "R",
                 success: false,
                 error: Some(&err),
+                duration_ms: 1,
+                output_tokens: None,
+                phase: AttemptPhase::Complete,
             })
             .expect("transport fault cools");
         let jitter = crate::resilience::deterministic_jitter("R", base, 0.5);

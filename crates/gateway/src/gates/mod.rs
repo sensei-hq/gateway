@@ -2,6 +2,7 @@ use crate::skip_reason::SkipReason;
 use crate::types::capability::Capability;
 use crate::types::config::{GatewayConfig, ModelConfig, RouterConfig};
 use crate::types::error::GatewayError;
+use crate::types::request::RoutingPreferences;
 use std::time::Instant;
 
 pub mod budget;
@@ -10,6 +11,8 @@ pub mod circuit_breaker_gate;
 pub mod context_window;
 pub mod cooldown;
 pub mod lockout;
+pub mod performance;
+pub mod routing_policy;
 
 /// Read port for endpoint health (the circuit breaker implements it in Task 4;
 /// cooldown/lockout ports arrive in later SP-0 plans).
@@ -50,6 +53,9 @@ pub struct SelectionCtx<'a> {
     pub config: &'a GatewayConfig,
     pub router_health: &'a dyn RouterHealthRead,
     pub model_lockout: &'a dyn crate::gates::lockout::ModelLockoutRead,
+    /// The request's routing preferences, read by [`routing_policy::RoutingPolicyGate`].
+    /// `None` ⇒ no filtering.
+    pub preferences: Option<&'a RoutingPreferences>,
 }
 
 pub enum GateVerdict {
@@ -60,6 +66,75 @@ pub enum GateVerdict {
 pub trait AdmissionGate: Send + Sync {
     fn name(&self) -> &'static str;
     fn evaluate(&self, cand: &CandidateView<'_>, ctx: &SelectionCtx<'_>) -> GateVerdict;
+}
+
+/// What an `AttemptOutcome` is an observation OF.
+///
+/// This exists because one streaming attempt produces TWO `AttemptOutcome`
+/// dispatches (acquisition, then completion), and naively treating both as
+/// full observations pools two unrelated time spans into one latency mean and
+/// lets a single attempt cast two reliability votes — an endpoint that fails
+/// every stream mid-way would converge on `success_rate == 0.5` forever,
+/// because the acquisition success is counted alongside the mid-stream
+/// failure. `AttemptPhase` is how `PerformanceRecorder` tells which of the
+/// two spans `duration_ms` is, and which outcome (if either) is the verdict.
+///
+/// EVERY `HealthRecorder` honours [`is_verdict`](AttemptPhase::is_verdict), not
+/// only `PerformanceRecorder` — a SP-ROUTE-1 Task 5 review finding. Letting
+/// `StreamAcquired`'s `success: true` reach `CircuitBreakerSink` /
+/// `ModelLockoutSink` made the circuit breaker structurally unable to trip on
+/// a mid-stream failure (its `record_success` reset the failure count that the
+/// failure dispatch then re-incremented, every attempt: 0 → 1 → 0 → 1) and
+/// silently halved the half-open probe budget for streaming (two
+/// `success: true` votes per attempt instead of one). `PerformanceRecorder`
+/// still needs the full three-way match (latency vs. verdict vs. neither), so
+/// it does not use this method — the other three recorders only ever need the
+/// verdict/non-verdict binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptPhase {
+    /// A complete request/response. `duration_ms` is time-to-response and the
+    /// verdict is final. Every non-streaming attempt, and every setup failure
+    /// (streaming or not — no completion dispatch follows a setup failure).
+    ///
+    /// Its `duration_ms` is a latency observation **only when `success`**. How
+    /// fast a provider rejects a request is not how fast it answers one, and
+    /// `MetricStrategy` sorts `mean_latency_ms` with no reliability filter —
+    /// so counting rejections would route `sort: latency` to whichever
+    /// endpoint fails fastest. The verdict is still cast either way.
+    Complete,
+    /// A stream was obtained. `duration_ms` is time-to-first-response — the
+    /// same quantity as `Complete`'s, hence comparable — but the verdict is
+    /// NOT final, because a completion outcome for this same attempt always
+    /// follows.
+    StreamAcquired,
+    /// A stream ended. `duration_ms` is TOTAL ATTEMPT WALL TIME — the same span
+    /// `Complete` reports — and it is used for THROUGHPUT ONLY. It contributes
+    /// no latency observation, because for a stream that span is not
+    /// time-to-first-response and pooling it with the other two phases' means
+    /// would compare unlike quantities. The verdict is final.
+    ///
+    /// Measuring the total span (rather than generation time from first byte)
+    /// is what makes `mean_tokens_per_sec` a single comparable quantity: the
+    /// SAME endpoint key is written by `execute`, whose `duration_ms` is the
+    /// whole call. Reporting generation time here made an identical real rate
+    /// read higher purely because it was served streaming.
+    StreamCompleted,
+}
+
+impl AttemptPhase {
+    /// Whether this outcome is a VERDICT on the attempt, as opposed to a
+    /// latency observation made while it is still in flight.
+    ///
+    /// `StreamAcquired` is the only phase that is not. A completion outcome
+    /// for the same attempt always follows it — or the consumer abandoned the
+    /// stream, in which case nobody knows whether it succeeded and no
+    /// recorder should guess. Every health recorder honours this, not just
+    /// `PerformanceRecorder`: letting acquisition vote made the circuit
+    /// breaker structurally unable to trip on mid-stream failure, and
+    /// silently halved the half-open probe budget for streaming.
+    pub fn is_verdict(self) -> bool {
+        !matches!(self, AttemptPhase::StreamAcquired)
+    }
 }
 
 /// A single attempt's outcome, fed to the write-side recorders. `endpoint` is the
@@ -73,6 +148,38 @@ pub struct AttemptOutcome<'a> {
     pub router: &'a str,
     pub success: bool,
     pub error: Option<&'a GatewayError>,
+    /// Wall time for this attempt/phase, in ms. Its meaning depends on `phase`
+    /// and the meanings are NOT interchangeable:
+    ///
+    /// - `Complete` — time-to-response for the whole attempt. A latency
+    ///   observation when the attempt SUCCEEDED, and a throughput input when it
+    ///   carried tokens.
+    /// - `StreamAcquired` — time-to-first-response (the same quantity as
+    ///   `Complete`'s, hence poolable with it). A latency observation.
+    /// - `StreamCompleted` — total attempt wall time, from the same start
+    ///   instant as `StreamAcquired`'s, so it spans acquisition AND generation.
+    ///   A THROUGHPUT input only, never a latency observation: for a stream
+    ///   that span is not time-to-first-response.
+    ///
+    /// The one exception is the MID-STREAM FAILURE dispatch, which reports
+    /// generation time (from first byte) rather than the total. It passes
+    /// `output_tokens: None` deliberately, so its duration reaches no mean at
+    /// all — neither latency (the phase forbids it) nor throughput (no tokens
+    /// to divide). It is carried for tracing and for future recorders, and
+    /// nothing may start deriving a rate from it without first making it the
+    /// total span too.
+    ///
+    /// `PerformanceRecorder` reads `phase` (and, for `Complete`, `success`) to
+    /// decide what this value is an observation OF, rather than pooling unlike
+    /// spans into one mean.
+    pub duration_ms: u64,
+    /// Output tokens, when the attempt produced a countable response. `None`
+    /// for a setup failure or a stream-acquisition dispatch.
+    pub output_tokens: Option<u32>,
+    /// What this outcome observes — see [`AttemptPhase`]. Read by every
+    /// `HealthRecorder` via [`AttemptPhase::is_verdict`], and additionally by
+    /// `PerformanceRecorder` for the latency/verdict/neither three-way split.
+    pub phase: AttemptPhase,
 }
 
 /// Reliable write-side reducer: updates authoritative health state from an attempt

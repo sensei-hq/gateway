@@ -92,6 +92,7 @@ fn chat_request() -> InferenceRequest {
         consensus: None,
         allow_fallback: true,
         credentials: Default::default(),
+        routing: None,
     }
 }
 
@@ -160,6 +161,7 @@ fn priced_chat_request() -> InferenceRequest {
         consensus: None,
         allow_fallback: true,
         credentials: Default::default(),
+        routing: None,
     }
 }
 
@@ -306,6 +308,7 @@ async fn chain_selection_injects_resolved_api_model_id() {
         consensus: None,
         allow_fallback: true,
         credentials: Default::default(),
+        routing: None,
     };
     gw.execute(&request).await.unwrap();
 
@@ -574,6 +577,7 @@ async fn reserved_capability_returns_unsupported_not_no_adapter() {
         consensus: None,
         allow_fallback: true,
         credentials: Default::default(),
+        routing: None,
     };
     let msg = gw.execute(&request).await.unwrap_err().to_string();
     assert!(
@@ -639,15 +643,100 @@ async fn execute_no_candidates_errors() {
         consensus: None,
         allow_fallback: true,
         credentials: Default::default(),
+        routing: None,
     };
 
     let result = gw.execute(&request).await;
     assert!(result.is_err());
     match result.unwrap_err() {
-        GatewayError::NoCandidates { capability } => {
+        GatewayError::NoCandidates { capability, .. } => {
             assert_eq!(capability, Capability::AudioTranscribe);
         }
         other => panic!("Expected NoCandidates, got: {other}"),
+    }
+}
+
+/// A caller's `routing` preferences must actually REACH selection. The two
+/// production `SelectionCriteria` sites (`execute.rs`, `stream.rs`) are the only
+/// path, and before SP-ROUTE-1 Task 10 wired them they hardcoded
+/// `preferences: None` — so the whole feature could be built and stay inert with
+/// a green suite. Un-ignored at Task 10 Step 4; it is now the regression guard
+/// that catches the entire feature going inert again.
+#[tokio::test]
+async fn a_requests_routing_preferences_reach_selection() {
+    let gw = test_gateway();
+    register_noop(&gw).await;
+
+    // `test_config_with_noop`'s only chain has exactly one candidate: router
+    // "noop", model "noop". An `only` naming a router that does not exist
+    // excludes it — and once excluded, nothing is left to try.
+    let mut request = chat_request();
+    request.routing = Some(crate::types::request::RoutingPreferences {
+        only: Some(crate::types::request::CandidateSet {
+            routers: vec!["nonexistent".to_string()],
+            models: vec![],
+        }),
+        ..Default::default()
+    });
+
+    // The BEFORE state, so the failure below is attributable. `is_err()` alone
+    // cannot tell "the `only` filter excluded the sole candidate" from any other
+    // failure on this path — including a fixture that was never able to succeed.
+    let unfiltered = gw.execute(&chat_request()).await;
+    assert!(
+        unfiltered.is_ok(),
+        "the same request without preferences must succeed, or the assertion \
+         below proves nothing about the filter: {unfiltered:?}"
+    );
+
+    match gw.execute(&request).await {
+        // Every candidate is `ExcludedByPolicy`, which is Structural — so this
+        // is terminal `NoCandidates`, NOT `AllGated`. The distinction is the
+        // point: an excluded candidate has no deadline and no human remedy, so
+        // turning this into a pausable error would park the run forever.
+        Err(err @ GatewayError::NoCandidates { .. }) => {
+            let GatewayError::NoCandidates {
+                ref capability,
+                ref skipped,
+            } = err
+            else {
+                unreachable!()
+            };
+            assert_eq!(*capability, Capability::TextChat);
+            // The whole-slice review's Minor 3: `result.skipped` held the
+            // per-candidate reasons and `execute` threw them away, so a typo'd
+            // `only: {routers: ["anthorpic"]}` — the likeliest first-use failure
+            // of the whole feature — surfaced as "no candidates available for
+            // capability 'TextChat'" and was undiagnosable. The filter must be
+            // visible in the error the caller actually receives.
+            assert_eq!(
+                skipped.len(),
+                1,
+                "the one excluded candidate must be carried: {skipped:?}"
+            );
+            assert!(
+                skipped[0].contains("noop:noop")
+                    && skipped[0].contains("excluded by request routing preferences"),
+                "the diagnostic must name the candidate AND the filter that \
+                 rejected it: {skipped:?}"
+            );
+            // Asserted on the RENDERED error too: a field nothing displays is a
+            // field an operator reading a log still cannot see.
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains("excluded by request routing preferences"),
+                "Display must surface the filter, not just the capability: {rendered}"
+            );
+        }
+        Err(other) => panic!(
+            "the only-router filter excludes every candidate structurally, so this \
+             must be NoCandidates rather than a gated/pausable error: {other}"
+        ),
+        Ok(response) => panic!(
+            "the only-router filter names a router absent from the chain, so the \
+             sole candidate must be excluded and the call must fail rather than \
+             succeed (degraded or not) against the noop adapter: {response:?}"
+        ),
     }
 }
 
@@ -674,6 +763,7 @@ async fn execute_with_direct_model() {
         consensus: None,
         allow_fallback: true,
         credentials: Default::default(),
+        routing: None,
     };
 
     let response = gw.execute(&request).await.unwrap();
@@ -707,6 +797,55 @@ impl crate::gates::HealthRecorder for CountingRecorder {
     }
 }
 
+/// A `HealthRecorder` that records every `AttemptPhase` it observed, in
+/// order. Wired in the same way as `CountingRecorder`. Exists because every
+/// `performance.rs` test hand-constructs an `AttemptOutcome` and calls
+/// `PerformanceRecorder` directly — nothing drove a REAL request or stream
+/// through the engine and asserted which phase it actually dispatched, so a
+/// call site tagging the wrong phase (e.g. `stream.rs`'s acquisition dispatch
+/// reverted to `Complete`, reinstating the very bug the phase split fixes)
+/// had nothing pinning it.
+struct PhaseRecorder(Arc<std::sync::Mutex<Vec<crate::gates::AttemptPhase>>>);
+
+impl crate::gates::HealthRecorder for PhaseRecorder {
+    fn on_outcome(&self, outcome: &crate::gates::AttemptOutcome<'_>) -> Option<std::time::Instant> {
+        self.0.lock().unwrap().push(outcome.phase);
+        None
+    }
+}
+
+/// A `HealthRecorder` that records `(phase, success, output_tokens,
+/// duration_ms)` for every dispatch. SP-ROUTE-1 Task 5 review (Important 1):
+/// the throughput test originally asserted `mean_tokens_per_sec > 0.0`, which
+/// cannot fail — `throughput_samples == 1`, checked two lines earlier, already
+/// forces `ms > 0 && t > 0` (see `PerformanceRecorder::on_outcome`), so ANY
+/// positive token count derives a positive rate. Swapping
+/// `output_tokens.output_tokens` for `.input_tokens` at the dispatch site
+/// (500 → 1000) survived the whole suite. This recorder captures the dispatched
+/// values directly, independent of the store's wall-clock arithmetic.
+///
+/// `duration_ms` is the fourth element for the same class of reason, found by
+/// the whole-slice review (Important 1): the value that DEFINES
+/// `mean_tokens_per_sec` was pinned nowhere, so swapping the completion
+/// dispatch's `stream_start.elapsed()` for `attempt_start.elapsed()` — the
+/// Critical 2 fix, and equally its reversal — left the entire suite green.
+type RecordedOutcomes =
+    Arc<std::sync::Mutex<Vec<(crate::gates::AttemptPhase, bool, Option<u32>, u64)>>>;
+
+struct OutcomeRecorder(RecordedOutcomes);
+
+impl crate::gates::HealthRecorder for OutcomeRecorder {
+    fn on_outcome(&self, outcome: &crate::gates::AttemptOutcome<'_>) -> Option<std::time::Instant> {
+        self.0.lock().unwrap().push((
+            outcome.phase,
+            outcome.success,
+            outcome.output_tokens,
+            outcome.duration_ms,
+        ));
+        None
+    }
+}
+
 #[tokio::test]
 async fn execute_fans_outcome_out_to_registered_recorders() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -722,6 +861,205 @@ async fn execute_fans_outcome_out_to_registered_recorders() {
     // One successful attempt ⇒ every registered recorder sees exactly one
     // outcome (the pre-existing breaker sink plus this counting recorder).
     assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+/// Kills the `execute.rs` success-branch phase flip: a successful
+/// non-streaming attempt must dispatch exactly one `Complete` outcome.
+#[tokio::test]
+async fn execute_tags_its_outcome_complete() {
+    let mut gw = test_gateway();
+    register_noop(&gw).await;
+    let phases = Arc::new(std::sync::Mutex::new(Vec::new()));
+    gw.recorders.push(Arc::new(PhaseRecorder(phases.clone())));
+
+    gw.execute(&chat_request()).await.unwrap();
+
+    assert_eq!(
+        *phases.lock().unwrap(),
+        vec![crate::gates::AttemptPhase::Complete],
+        "a successful non-streaming attempt must dispatch exactly one Complete outcome"
+    );
+}
+
+/// Kills the `execute.rs` error-branch phase flip: a failed non-streaming
+/// attempt must ALSO dispatch `Complete` — a setup/response failure is final,
+/// not a mid-stream observation. "noop" has no adapter registered, so the
+/// chain exhausts after this one real attempt; the overall `Err` is expected
+/// and irrelevant here — the failed attempt's tag is what's pinned.
+#[tokio::test]
+async fn execute_tags_a_failed_attempt_complete() {
+    let mut gw = test_gateway_with_chain();
+    register_failing(
+        &gw,
+        GatewayError::ProviderError {
+            adapter: "failing".into(),
+            message: "boom".into(),
+            status: Some(500),
+        },
+    )
+    .await;
+    let phases = Arc::new(std::sync::Mutex::new(Vec::new()));
+    gw.recorders.push(Arc::new(PhaseRecorder(phases.clone())));
+
+    let _ = gw.execute(&chat_request()).await;
+
+    assert_eq!(
+        *phases.lock().unwrap(),
+        vec![crate::gates::AttemptPhase::Complete],
+        "a failed non-streaming attempt must dispatch Complete, not some other phase"
+    );
+}
+
+/// Kills the `stream.rs` acquisition-dispatch phase flip back to `Complete`
+/// (literally reinstating the C2 bug this slice fixed). Must DRIVE the
+/// stream with `collect_stream`, not merely await `execute_stream` — the
+/// dispatch happens inside the `async_stream` generator body, which only runs
+/// once the stream is polled; awaiting the setup alone records zero outcomes
+/// and the test would pass vacuously.
+///
+/// SP-ROUTE-1 Task 5 review (Minor 1): this asserts ONLY `phases[0]` — the
+/// acquisition tag — even though a full successful drive now also casts a
+/// trailing `StreamCompleted` (see `completed_stream_is_tagged_stream_completed_not_complete`).
+/// Splitting the two catchers matters: a single test asserting the whole
+/// two-element vec invites a later "simplification" to `phases[0]` that
+/// would silently delete the completion-tag guard along with it.
+#[tokio::test]
+async fn stream_acquisition_is_tagged_stream_acquired_not_complete() {
+    let mut gw = test_gateway();
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamer {
+            id: "noop".to_string(),
+        }))
+        .await;
+    let phases = Arc::new(std::sync::Mutex::new(Vec::new()));
+    gw.recorders.push(Arc::new(PhaseRecorder(phases.clone())));
+
+    let _ = collect_stream(&gw, &chat_request()).await;
+
+    let recorded = phases.lock().unwrap();
+    assert_eq!(
+        recorded.first().copied(),
+        Some(crate::gates::AttemptPhase::StreamAcquired),
+        "a stream acquisition must be tagged StreamAcquired, not Complete: {recorded:?}"
+    );
+}
+
+/// SP-ROUTE-1 Task 5 review (Minor 1) — the sibling catcher this split
+/// preserves: a successfully-drained stream's completion outcome must be
+/// tagged `StreamCompleted`, never `Complete` (which would inject generation
+/// time into `mean_latency_ms` — exactly the span-pooling Task 4 fixed).
+#[tokio::test]
+async fn completed_stream_is_tagged_stream_completed_not_complete() {
+    let mut gw = test_gateway();
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamer {
+            id: "noop".to_string(),
+        }))
+        .await;
+    let phases = Arc::new(std::sync::Mutex::new(Vec::new()));
+    gw.recorders.push(Arc::new(PhaseRecorder(phases.clone())));
+
+    let _ = collect_stream(&gw, &chat_request()).await;
+
+    assert_eq!(
+        *phases.lock().unwrap(),
+        vec![
+            crate::gates::AttemptPhase::StreamAcquired,
+            crate::gates::AttemptPhase::StreamCompleted
+        ],
+        "a successfully-drained stream must cast a trailing StreamCompleted outcome, not Complete"
+    );
+}
+
+/// Kills the `stream.rs` setup-failure phase flip. Same driving requirement
+/// as above: `collect_stream` actually polls the generator body where the
+/// setup-failure dispatch lives. "B" has no adapter registered, so the walk
+/// exhausts (a terminal Error event) after "A"'s one real setup failure.
+#[tokio::test]
+async fn stream_setup_failure_is_tagged_complete() {
+    let mut gw = ab_gateway(ab_chain_config(vec![]));
+    register_stream_err(&gw, "A", || GatewayError::ProviderError {
+        adapter: "A".into(),
+        message: "boom".into(),
+        status: Some(500),
+    })
+    .await;
+    let phases = Arc::new(std::sync::Mutex::new(Vec::new()));
+    gw.recorders.push(Arc::new(PhaseRecorder(phases.clone())));
+
+    let _ = collect_stream(&gw, &chat_request()).await;
+
+    assert_eq!(
+        *phases.lock().unwrap(),
+        vec![crate::gates::AttemptPhase::Complete],
+        "a stream setup failure is final and must be tagged Complete"
+    );
+}
+
+/// SP-ROUTE-1 Task 5 review (Critical 1) — the mid-stream failure terminus
+/// has no phase-tag test at all: `AttemptPhase::StreamCompleted` → `Complete`
+/// on that dispatch survived the whole suite. `Complete` contributes a
+/// LATENCY of generation time, so a stream dying after 9s would inject
+/// 9000ms into `mean_latency_ms` — precisely the span-pooling Task 4 fixed,
+/// and what Task 9 sorts on.
+#[tokio::test]
+async fn stream_mid_failure_is_tagged_stream_completed_not_complete() {
+    let mut gw = test_gateway();
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamMidFailer {
+            id: "noop".to_string(),
+        }))
+        .await;
+    let phases = Arc::new(std::sync::Mutex::new(Vec::new()));
+    gw.recorders.push(Arc::new(PhaseRecorder(phases.clone())));
+
+    let _ = collect_stream(&gw, &chat_request()).await;
+
+    assert_eq!(
+        *phases.lock().unwrap(),
+        vec![
+            crate::gates::AttemptPhase::StreamAcquired,
+            crate::gates::AttemptPhase::StreamCompleted
+        ],
+        "a stream dying mid-way must tag its completion StreamCompleted, not Complete"
+    );
+}
+
+/// Task 4 review (Important 2): deleting `PerformanceRecorder` from
+/// `build_recorders` passed 342/342 — nothing exercised the wiring between
+/// `Gateway::record_outcome` and `Gateway::performance_stats`. This proves the
+/// whole path end-to-end on a real `Gateway`: a real outcome in, the exact
+/// units out (50 tokens / 1000ms == 50 tok/s) at the boundary a caller sees.
+#[test]
+fn record_outcome_feeds_performance_stats_through_the_real_gateway() {
+    let gw = test_gateway();
+
+    // Asserted BEFORE any outcome is recorded, so the later `expect` cannot be
+    // satisfied by some fallback/default — only a real write makes this `Some`.
+    assert!(
+        gw.performance_stats("r:m").is_none(),
+        "no attempt has been recorded yet"
+    );
+
+    gw.record_outcome(&crate::gates::AttemptOutcome {
+        endpoint: "r:m",
+        router: "r",
+        success: true,
+        error: None,
+        duration_ms: 1000,
+        output_tokens: Some(50),
+        phase: crate::gates::AttemptPhase::Complete,
+    });
+
+    let stats = gw
+        .performance_stats("r:m")
+        .expect("the recorder just wrote a live sample");
+    assert_eq!(stats.samples, 1);
+    assert!(
+        (stats.mean_tokens_per_sec - 50.0).abs() < 1e-9,
+        "50 tokens in 1000ms is 50 tok/s at the Gateway boundary, got {}",
+        stats.mean_tokens_per_sec
+    );
 }
 
 #[tokio::test]
@@ -1119,6 +1457,52 @@ async fn with_resilience_overrides_cooldown_base() {
     );
 }
 
+/// `with_resilience` rebuilds the `PerformanceStore` (M3), unlike
+/// cooldown/lockout which it reuses in place — and nothing exercised that
+/// rebuild path. Two mutations survive without this test: (a) swapping the
+/// store-rebuild above `build_recorders` so the recorders write to an
+/// ORPHANED store — `performance_stats` then returns `None` forever on any
+/// `.with_resilience(...)` gateway; (b) using the `DEFAULT_PERF_*` constants
+/// instead of the config's fields, silently ignoring operator tuning.
+#[test]
+fn with_resilience_rewires_and_applies_the_performance_store() {
+    let gw = test_gateway_with_chain().with_resilience(crate::resilience::ResilienceConfig {
+        perf_samples: 1,
+        ..Default::default()
+    });
+
+    gw.record_outcome(&crate::gates::AttemptOutcome {
+        endpoint: "r:m",
+        router: "r",
+        success: true,
+        error: None,
+        duration_ms: 100,
+        output_tokens: None,
+        phase: crate::gates::AttemptPhase::Complete,
+    });
+    let s = gw
+        .performance_stats("r:m")
+        .expect("the rebuilt recorder must write to the store the Gateway reads");
+    assert_eq!(s.samples, 1);
+
+    gw.record_outcome(&crate::gates::AttemptOutcome {
+        endpoint: "r:m",
+        router: "r",
+        success: true,
+        error: None,
+        duration_ms: 900,
+        output_tokens: None,
+        phase: crate::gates::AttemptPhase::Complete,
+    });
+    let s = gw.performance_stats("r:m").expect("still live");
+    assert_eq!(s.samples, 1, "the configured perf_samples=1 caps the ring");
+    assert!(
+        (s.mean_latency_ms - 900.0).abs() < 1e-9,
+        "the ring kept only the newest sample, got {}",
+        s.mean_latency_ms
+    );
+}
+
 #[tokio::test]
 async fn default_gateway_still_uses_30s_cooldown() {
     // The SAME setup WITHOUT `with_resilience` preserves today's behavior: the
@@ -1252,7 +1636,6 @@ async fn no_fallback_when_disabled_stops_at_primary() {
 
     let req = InferenceRequest {
         allow_fallback: false,
-        credentials: Default::default(),
         ..chat_request()
     };
     match gw.execute(&req).await.unwrap_err() {
@@ -2151,6 +2534,335 @@ impl crate::adapters::capability::ChatModel for FakeStreamFailer {
     }
 }
 
+/// Chat adapter whose `chat_stream` yields one good chunk then an error — a
+/// stream that dies AFTER the caller has committed to it. Distinct from
+/// `FakeStreamFailer`, which fails at setup and is already covered.
+struct FakeStreamMidFailer {
+    id: String,
+}
+
+impl crate::adapters::capability::Model for FakeStreamMidFailer {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::adapters::capability::ChatModel for FakeStreamMidFailer {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<crate::types::io::ChatResponse, GatewayError> {
+        Ok(crate::types::io::ChatResponse::default())
+    }
+
+    async fn chat_stream(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<
+        std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = Result<crate::types::request::StreamChunk, GatewayError>>
+                    + Send,
+            >,
+        >,
+        GatewayError,
+    > {
+        use crate::types::request::StreamChunk;
+        let chunks: Vec<Result<StreamChunk, GatewayError>> = vec![
+            Ok(StreamChunk {
+                content: "partial".to_string(),
+                finish_reason: None,
+                usage: None,
+                tool_calls: Vec::new(),
+            }),
+            Err(GatewayError::ProviderError {
+                adapter: self.id.clone(),
+                message: "connection reset mid-stream".to_string(),
+                status: Some(500),
+            }),
+        ];
+        Ok(Box::pin(futures::stream::iter(chunks)))
+    }
+}
+
+/// The two halves of a streaming attempt's wall time, used by the fixtures
+/// below. `SETUP_DELAY` elapses inside `chat_stream` (pre-first-byte: connect,
+/// queue, prompt processing), `GENERATION_DELAY` inside the stream before the
+/// terminal usage chunk. They are equal and each large enough that a dispatch
+/// measuring only ONE of them reports a doubled throughput — a 2x separation
+/// that no scheduler jitter closes.
+///
+/// Both are REAL `tokio::time::sleep`s, not mock time. The recorder dispatches
+/// time their spans with `std::time::Instant`, a real wall clock that tokio's
+/// `test-util` mock time cannot advance. A fixture whose chunks come from a
+/// synchronous `futures::stream::iter` completes in low-microseconds, so
+/// `duration_ms` truncates to 0 and `PerformanceRecorder::on_outcome`'s
+/// `ms > 0` guard (correctly) declines to invent a throughput sample at all —
+/// which is right in production and useless for an assertion about the rate.
+const SETUP_DELAY: std::time::Duration = std::time::Duration::from_millis(60);
+const GENERATION_DELAY: std::time::Duration = std::time::Duration::from_millis(60);
+/// What both paths' fixtures report as output tokens, so the only thing that
+/// can differ between them is the DURATION the rate is divided by.
+const SPLIT_DELAY_OUTPUT_TOKENS: u32 = 500;
+
+/// Non-streaming counterpart of `SplitDelayStreamer`: one `chat` call whose
+/// total wall time is `SETUP_DELAY + GENERATION_DELAY` and which returns the
+/// same `SPLIT_DELAY_OUTPUT_TOKENS`. Serving the identical work
+/// non-streaming must report the identical throughput.
+struct WholeCallDelayAdapter {
+    id: String,
+}
+
+impl crate::adapters::capability::Model for WholeCallDelayAdapter {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::adapters::capability::ChatModel for WholeCallDelayAdapter {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<crate::types::io::ChatResponse, GatewayError> {
+        tokio::time::sleep(SETUP_DELAY + GENERATION_DELAY).await;
+        Ok(crate::types::io::ChatResponse {
+            content: Some("ok".to_string()),
+            tool_calls: Vec::new(),
+            usage: Some(TokenUsage {
+                input_tokens: 1000,
+                output_tokens: SPLIT_DELAY_OUTPUT_TOKENS,
+                total_tokens: 1500,
+            }),
+            model: Some(self.id.clone()),
+            degraded: false,
+        })
+    }
+
+    async fn chat_stream(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<
+        std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = Result<crate::types::request::StreamChunk, GatewayError>>
+                    + Send,
+            >,
+        >,
+        GatewayError,
+    > {
+        Err(GatewayError::Unsupported {
+            adapter: self.id.clone(),
+            what: "streaming".to_string(),
+        })
+    }
+}
+
+/// A streaming adapter that splits its wall time either side of the first
+/// byte: `SETUP_DELAY` inside `chat_stream` (so it lands in the acquisition
+/// span, BEFORE `stream_start`), then `GENERATION_DELAY` inside the stream
+/// before the terminal usage chunk.
+///
+/// The split is the whole point. A fixture that sleeps only AFTER the stream
+/// exists makes `stream_start.elapsed()` and `attempt_start.elapsed()`
+/// indistinguishable, which is why the completion dispatch's span went
+/// unpinned through an entire slice: swapping the two left the suite green.
+struct SplitDelayStreamer {
+    id: String,
+}
+
+impl crate::adapters::capability::Model for SplitDelayStreamer {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::adapters::capability::ChatModel for SplitDelayStreamer {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<crate::types::io::ChatResponse, GatewayError> {
+        Ok(crate::types::io::ChatResponse::default())
+    }
+
+    async fn chat_stream(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<
+        std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = Result<crate::types::request::StreamChunk, GatewayError>>
+                    + Send,
+            >,
+        >,
+        GatewayError,
+    > {
+        use crate::types::request::StreamChunk;
+        // Pre-first-byte: this elapses before the engine takes `stream_start`.
+        tokio::time::sleep(SETUP_DELAY).await;
+        let stream = async_stream::stream! {
+            yield Ok(StreamChunk {
+                content: "Hello, ".to_string(),
+                finish_reason: None,
+                usage: None,
+                tool_calls: Vec::new(),
+            });
+            // Post-first-byte: the generation span.
+            tokio::time::sleep(GENERATION_DELAY).await;
+            yield Ok(StreamChunk {
+                content: String::new(),
+                finish_reason: Some("stop".to_string()),
+                usage: Some(TokenUsage {
+                    input_tokens: 1000,
+                    output_tokens: SPLIT_DELAY_OUTPUT_TOKENS,
+                    total_tokens: 1500,
+                }),
+                tool_calls: Vec::new(),
+            });
+        };
+        Ok(Box::pin(stream))
+    }
+}
+
+/// Like `FakeStreamMidFailer`, but the mid-stream error is caller-supplied.
+/// `FakeStreamMidFailer` hardcodes a `ProviderError`; the SP-ROUTE-1 Task 5
+/// review's cooldown/lockout/escalation tests need OTHER error kinds
+/// (`Timeout` to cool the router, `RateLimit` to lock the endpoint) — the
+/// same closure convention `FakeStreamErrAdapter` already uses for setup
+/// failures, applied to the mid-stream terminus instead.
+struct FakeStreamMidFailerWith {
+    id: String,
+    err: Arc<dyn Fn() -> GatewayError + Send + Sync>,
+}
+
+impl crate::adapters::capability::Model for FakeStreamMidFailerWith {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::adapters::capability::ChatModel for FakeStreamMidFailerWith {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<crate::types::io::ChatResponse, GatewayError> {
+        Ok(crate::types::io::ChatResponse::default())
+    }
+
+    async fn chat_stream(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<
+        std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = Result<crate::types::request::StreamChunk, GatewayError>>
+                    + Send,
+            >,
+        >,
+        GatewayError,
+    > {
+        use crate::types::request::StreamChunk;
+        let chunks: Vec<Result<StreamChunk, GatewayError>> = vec![
+            Ok(StreamChunk {
+                content: "partial".to_string(),
+                finish_reason: None,
+                usage: None,
+                tool_calls: Vec::new(),
+            }),
+            Err((self.err)()),
+        ];
+        Ok(Box::pin(futures::stream::iter(chunks)))
+    }
+}
+
+async fn register_stream_mid_err(
+    gw: &Gateway,
+    id: &str,
+    err: impl Fn() -> GatewayError + Send + Sync + 'static,
+) {
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamMidFailerWith {
+            id: id.to_string(),
+            err: Arc::new(err),
+        }))
+        .await;
+}
+
+/// A mid-stream failer whose one good chunk carries `usage` — a provider that
+/// reports token counts and then dies. Real (tiny) delay before the error, for
+/// the same reason `SETUP_DELAY`/`GENERATION_DELAY` are real: without it,
+/// `duration_ms` truncates to 0 and the M3 mutation (restoring a throughput
+/// sample to the failure dispatch) would be masked by the `ms > 0` guard
+/// rather than caught by the assertion.
+struct FakeStreamMidFailerWithUsage {
+    id: String,
+}
+
+impl crate::adapters::capability::Model for FakeStreamMidFailerWithUsage {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::adapters::capability::ChatModel for FakeStreamMidFailerWithUsage {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<crate::types::io::ChatResponse, GatewayError> {
+        Ok(crate::types::io::ChatResponse::default())
+    }
+
+    async fn chat_stream(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<
+        std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = Result<crate::types::request::StreamChunk, GatewayError>>
+                    + Send,
+            >,
+        >,
+        GatewayError,
+    > {
+        use crate::types::cost::TokenUsage;
+        use crate::types::request::StreamChunk;
+        let id = self.id.clone();
+        let stream = async_stream::stream! {
+            yield Ok(StreamChunk {
+                content: "partial".to_string(),
+                finish_reason: None,
+                usage: Some(TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    total_tokens: 150,
+                }),
+                tool_calls: Vec::new(),
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            yield Err(GatewayError::ProviderError {
+                adapter: id.clone(),
+                message: "connection reset mid-stream".to_string(),
+                status: Some(500),
+            });
+        };
+        Ok(Box::pin(stream))
+    }
+}
+
 async fn collect_stream(gw: &Gateway, request: &InferenceRequest) -> Vec<StreamEvent> {
     use futures::StreamExt;
     let mut stream = gw
@@ -2162,6 +2874,18 @@ async fn collect_stream(gw: &Gateway, request: &InferenceRequest) -> Vec<StreamE
         events.push(ev);
     }
     events
+}
+
+/// Drive one streaming attempt if the endpoint currently admits one, silently
+/// doing nothing if selection is gated (e.g. the breaker is already Open) —
+/// unlike `collect_stream`, which `.expect()`s a stream and panics on `Err`.
+/// Needed to drive an endpoint PAST the point its breaker opens without the
+/// test panicking on the very call that (correctly) starts failing selection.
+async fn try_drain_stream(gw: &Gateway, request: &InferenceRequest) {
+    use futures::StreamExt;
+    if let Ok(mut stream) = gw.execute_stream(request).await {
+        while stream.next().await.is_some() {}
+    }
 }
 
 #[tokio::test]
@@ -2233,6 +2957,7 @@ async fn execute_stream_yields_chunks_then_done_with_cost() {
         consensus: None,
         allow_fallback: true,
         credentials: Default::default(),
+        routing: None,
     };
 
     let events = collect_stream(&gw, &request).await;
@@ -2413,6 +3138,7 @@ async fn execute_stream_non_chat_capability_errors_up_front() {
         consensus: None,
         allow_fallback: true,
         credentials: Default::default(),
+        routing: None,
     };
 
     match gw.execute_stream(&request).await {
@@ -4126,7 +4852,7 @@ async fn all_structural_selection_stays_no_candidates() {
     let gw = ab_gateway(config);
 
     match gw.execute(&chat_request()).await.unwrap_err() {
-        GatewayError::NoCandidates { capability } => {
+        GatewayError::NoCandidates { capability, .. } => {
             assert_eq!(capability, Capability::TextChat);
         }
         other => panic!("expected NoCandidates (all-structural), got: {other}"),
@@ -4767,4 +5493,1382 @@ async fn execute_stream_gates_on_the_context_window_like_execute() {
              provider would answer 400 mid-stream, after the caller has committed"
         ),
     }
+}
+
+/// SP-ROUTE-1 Task 10 — the STREAMING half of the routing-preferences wiring,
+/// which nothing else covered.
+///
+/// `execute_stream` builds its OWN `SelectionCriteria`, so
+/// `a_requests_routing_preferences_reach_selection` — which drives `execute` —
+/// says nothing about it. Verified rather than assumed: reverting `stream.rs`
+/// alone to `preferences: None` left the entire 416-test gateway suite green, so
+/// half of SP-ROUTE-1 could have gone inert unnoticed. Filed beside
+/// `execute_stream_gates_on_the_context_window_like_execute`, which exists for
+/// exactly this reason on exactly this seam and shares its fixture.
+///
+/// BOTH halves are asserted, and the first is what makes the second mean
+/// something: unfiltered, this request streams from `small`, so a test asserting
+/// only "it streamed from `big`" could not tell a working `ignore` from a
+/// fixture that never had a choice.
+#[tokio::test]
+async fn execute_stream_honours_routing_preferences_like_execute() {
+    let gw = ab_gateway(window_chain_config(128_000, 8_192));
+    register_noop(&gw).await;
+
+    fn done_model(events: &[StreamEvent]) -> Option<String> {
+        events.iter().find_map(|e| match e {
+            StreamEvent::Done { model, .. } => Some(model.clone()),
+            _ => None,
+        })
+    }
+
+    // `small` is the priority-1 entry and holds an empty request comfortably, so
+    // it is what an unpreferenced stream comes from.
+    let plain = collect_stream(&gw, &chat_request_of_length(0)).await;
+    assert_eq!(
+        done_model(&plain),
+        Some("small".to_string()),
+        "the BEFORE state: with no preferences the priority-1 candidate serves: \
+         {plain:?}"
+    );
+
+    // `ignore` naming that candidate must demote the stream to `big`.
+    let mut request = chat_request_of_length(0);
+    request.routing = Some(crate::types::request::RoutingPreferences {
+        ignore: Some(crate::types::request::CandidateSet {
+            routers: vec![],
+            models: vec!["small".to_string()],
+        }),
+        ..Default::default()
+    });
+    let filtered = collect_stream(&gw, &request).await;
+    assert_eq!(
+        done_model(&filtered),
+        Some("big".to_string()),
+        "`ignore` must reach selection through `execute_stream` too — streaming \
+         from `small` means the caller's preferences were dropped on this path: \
+         {filtered:?}"
+    );
+}
+
+/// AC9 — a stream that fails after its first chunk must reach the health
+/// recorders as a FAILURE.
+///
+/// Before this fix the mid-stream error path returned without dispatching at
+/// all, while the acquisition dispatch had already fired — so an endpoint
+/// failing every stream halfway looked perfectly healthy.
+///
+/// `success_rate` must be 0.0, NOT 0.5. Task 4's `StreamAcquired` phase casts
+/// no verdict precisely so that one attempt yields one vote; 0.5 was the floor
+/// that made it impossible for Task 7's reliability multiplier to de-weight a
+/// totally broken endpoint.
+#[tokio::test]
+async fn a_mid_stream_failure_is_recorded_as_a_failure() {
+    let mut routers = HashMap::new();
+    routers.insert(
+        "mid".to_string(),
+        RouterConfig {
+            url: "http://localhost".to_string(),
+            api_key_env: None,
+            api_key: None,
+            enabled: true,
+            timeout_ms: None,
+            headers: HashMap::new(),
+        },
+    );
+    let mut models = HashMap::new();
+    models.insert(
+        "mid".to_string(),
+        ModelConfig {
+            id: "mid".to_string(),
+            api_model_id: None,
+            provider: "mid".to_string(),
+            family: None,
+            capabilities: vec![Capability::TextChat],
+            context_window: 4096,
+            max_output_tokens: 1024,
+            pricing: None,
+            catalog: None,
+        },
+    );
+    let config = GatewayConfig {
+        routers,
+        models,
+        chains: HashMap::new(),
+        constraints: Default::default(),
+        panels: Default::default(),
+        consensus: Default::default(),
+    };
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    let gw = Gateway::new(config, AdapterRegistry::new(), cb);
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamMidFailer {
+            id: "mid".to_string(),
+        }))
+        .await;
+
+    let request = InferenceRequest {
+        capability: Capability::TextChat,
+        model: Some("mid".to_string()),
+        router: Some("mid".to_string()),
+        chain: None,
+        payload: Payload::Chat {
+            messages: vec![Message::text(MessageRole::User, "hi")],
+            system: None,
+            max_tokens: None,
+            temperature: None,
+            tools: Vec::new(),
+        },
+        budget: None,
+        auth: None,
+        panel: None,
+        consensus: None,
+        allow_fallback: true,
+        credentials: Default::default(),
+        routing: None,
+    };
+
+    let events = collect_stream(&gw, &request).await;
+    assert!(
+        matches!(events.last(), Some(StreamEvent::Error { .. })),
+        "the fixture must actually fail mid-stream: {events:?}"
+    );
+
+    let stats = gw
+        .performance_stats("mid:mid")
+        .expect("the attempt must be recorded");
+    assert_eq!(
+        stats.verdict_samples, 1,
+        "one attempt casts exactly one verdict"
+    );
+    assert!(
+        (stats.success_rate - 0.0).abs() < 1e-9,
+        "the single verdict is a failure: {stats:?}"
+    );
+}
+
+/// The positive mirror, and the reason it exists: a test that only checks a
+/// failed stream records a failure also passes against an implementation that
+/// records EVERY stream as a failure.
+#[tokio::test]
+async fn a_completed_stream_is_recorded_as_a_success_with_its_throughput() {
+    use crate::types::config::ModelPricing;
+
+    let mut routers = HashMap::new();
+    routers.insert(
+        "priced".to_string(),
+        RouterConfig {
+            url: "http://localhost".to_string(),
+            api_key_env: None,
+            api_key: None,
+            enabled: true,
+            timeout_ms: None,
+            headers: HashMap::new(),
+        },
+    );
+    let mut models = HashMap::new();
+    models.insert(
+        "priced".to_string(),
+        ModelConfig {
+            id: "priced".to_string(),
+            api_model_id: None,
+            provider: "priced".to_string(),
+            family: None,
+            capabilities: vec![Capability::TextChat],
+            context_window: 4096,
+            max_output_tokens: 1024,
+            pricing: Some(ModelPricing {
+                input_per_1k: 0.0008,
+                output_per_1k: 0.004,
+                per_request: None,
+            }),
+            catalog: None,
+        },
+    );
+    let config = GatewayConfig {
+        routers,
+        models,
+        chains: HashMap::new(),
+        constraints: Default::default(),
+        panels: Default::default(),
+        consensus: Default::default(),
+    };
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    let mut gw = Gateway::new(config, AdapterRegistry::new(), cb);
+    gw.adapters
+        .register_chat(Arc::new(SplitDelayStreamer {
+            id: "priced".to_string(),
+        }))
+        .await;
+    let outcomes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    gw.recorders
+        .push(Arc::new(OutcomeRecorder(outcomes.clone())));
+
+    let request = InferenceRequest {
+        capability: Capability::TextChat,
+        model: Some("priced".to_string()),
+        router: Some("priced".to_string()),
+        chain: None,
+        payload: Payload::Chat {
+            messages: vec![Message::text(MessageRole::User, "hi")],
+            system: None,
+            max_tokens: None,
+            temperature: None,
+            tools: Vec::new(),
+        },
+        budget: None,
+        auth: None,
+        panel: None,
+        consensus: None,
+        allow_fallback: true,
+        credentials: Default::default(),
+        routing: None,
+    };
+
+    let events = collect_stream(&gw, &request).await;
+    assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
+
+    let stats = gw.performance_stats("priced:priced").expect("recorded");
+    assert_eq!(stats.verdict_samples, 1, "one attempt, one verdict");
+    assert!(
+        (stats.success_rate - 1.0).abs() < 1e-9,
+        "and it succeeded: {stats:?}"
+    );
+    assert_eq!(
+        stats.throughput_samples, 1,
+        "completion carries the token count — proves the wiring"
+    );
+
+    // Deterministic, wall-clock-independent pin on the exact count dispatched
+    // (Task 5 review, Important 1): `mean_tokens_per_sec > 0.0` cannot fail once
+    // `throughput_samples == 1` already forces a positive rate, so a scrambled
+    // (but still positive) token count would ship silently. 500 is the fixture's
+    // `output_tokens`; 1000 is its `input_tokens` — a wrong-field swap at the
+    // dispatch site must be visible here.
+    let recorded = outcomes.lock().unwrap();
+    let completion = recorded
+        .iter()
+        .find(|(phase, ..)| *phase == crate::gates::AttemptPhase::StreamCompleted)
+        .expect("a StreamCompleted outcome must have been dispatched");
+    assert_eq!(
+        completion.2,
+        Some(500),
+        "the completion dispatch must carry OUTPUT tokens (500), not input tokens (1000): {recorded:?}"
+    );
+
+    // ...and the same treatment for the OTHER half of the rate (whole-slice
+    // review, Important 1). `throughput_samples` and `output_tokens` pin the
+    // numerator; nothing pinned the DENOMINATOR, so swapping the span this
+    // dispatch measures — the Critical 2 fix, and equally its reversal — left
+    // the whole suite green.
+    //
+    // `SplitDelayStreamer` puts `SETUP_DELAY` BEFORE the first byte, so the two
+    // candidate spans are distinguishable: measuring from `stream_start` sees
+    // only `GENERATION_DELAY`. The completion dispatch must report TOTAL attempt
+    // wall time, which is the only quantity comparable with the `Complete`
+    // dispatch that writes the same endpoint key from `execute`.
+    let total = (SETUP_DELAY + GENERATION_DELAY).as_millis() as u64;
+    assert!(
+        completion.3 >= total,
+        "the completion dispatch must measure the TOTAL attempt span \
+         (>= {total}ms = {SETUP_DELAY:?} pre-first-byte + {GENERATION_DELAY:?} \
+         generation), not generation alone; got {}ms: {recorded:?}",
+        completion.3
+    );
+
+    // The acquisition dispatch is the control: it measures the pre-first-byte
+    // span only, and must NOT have grown to the total. Without this, a dispatch
+    // site that reported the total EVERYWHERE would satisfy the assertion above
+    // while destroying the latency signal.
+    //
+    // Compared RELATIONALLY rather than against an absolute upper bound. Both
+    // spans start at the same `attempt_start`, so `completion > acquisition`
+    // holds by construction under any scheduling delay, and fails only if the
+    // two dispatches measure the same moment — which is exactly the collapse
+    // being guarded against. An absolute `acquisition < total` would instead
+    // flake on a loaded CI runner that stretched the 60ms setup sleep past
+    // 120ms, testing the machine rather than the code.
+    let acquisition = recorded
+        .iter()
+        .find(|(phase, ..)| *phase == crate::gates::AttemptPhase::StreamAcquired)
+        .expect("a StreamAcquired outcome must have been dispatched");
+    assert!(
+        acquisition.3 >= SETUP_DELAY.as_millis() as u64,
+        "acquisition must cover the pre-first-byte span (>= {SETUP_DELAY:?}); \
+         got {}ms: {recorded:?}",
+        acquisition.3
+    );
+    assert!(
+        completion.3 > acquisition.3,
+        "acquisition must still measure time-to-first-response ALONE — if it \
+         also grew to the total span the latency signal is gone; got \
+         acquisition {}ms vs completion {}ms: {recorded:?}",
+        acquisition.3,
+        completion.3
+    );
+}
+
+// --- SP-ROUTE-1 whole-slice review, Critical 2 + Important 1: the two
+// throughput spans must be the SAME quantity ---
+
+/// Build a one-router/one-model chat config keyed on `id`, so each half of the
+/// comparison below gets its own `"{id}:{id}"` endpoint.
+fn single_endpoint_config(id: &str) -> GatewayConfig {
+    let mut routers = HashMap::new();
+    routers.insert(
+        id.to_string(),
+        RouterConfig {
+            url: "http://localhost".to_string(),
+            api_key_env: None,
+            api_key: None,
+            enabled: true,
+            timeout_ms: None,
+            headers: HashMap::new(),
+        },
+    );
+    let mut models = HashMap::new();
+    models.insert(
+        id.to_string(),
+        ModelConfig {
+            id: id.to_string(),
+            api_model_id: None,
+            provider: id.to_string(),
+            family: None,
+            capabilities: vec![Capability::TextChat],
+            context_window: 4096,
+            max_output_tokens: 1024,
+            pricing: None,
+            catalog: None,
+        },
+    );
+    GatewayConfig {
+        routers,
+        models,
+        chains: HashMap::new(),
+        constraints: Default::default(),
+        panels: Default::default(),
+        consensus: Default::default(),
+    }
+}
+
+/// Pin a request to `id`'s router+model.
+fn pinned_chat_request(id: &str) -> InferenceRequest {
+    let mut r = chat_request();
+    r.model = Some(id.to_string());
+    r.router = Some(id.to_string());
+    r
+}
+
+/// **`sort: throughput` must not pool two unlike spans.** `tokens_per_sec` is
+/// derived in `PerformanceRecorder::on_outcome` from `duration_ms` BEFORE and
+/// independently of the `phase` match, and the same `"{router}:{model}"` key is
+/// written from both entry points — so whatever span each dispatch chose to
+/// report lands in one mean. `execute` reports the WHOLE call; the end-of-stream
+/// dispatch used to report generation time alone, measured from `stream_start`.
+///
+/// Identical real work therefore reported two different rates purely because
+/// one was served streaming, and an endpoint that was faster end-to-end could
+/// lose to a slower one. This is the same defect spec §6.3 forbids for latency,
+/// never applied to throughput.
+///
+/// The fixtures do the IDENTICAL work — `SETUP_DELAY + GENERATION_DELAY` of
+/// wall time and `SPLIT_DELAY_OUTPUT_TOKENS` output tokens — differing only in
+/// which entry point serves them. The chosen fix is "both report output tokens
+/// ÷ TOTAL attempt wall time" (rather than making `Complete` contribute no
+/// throughput, which would leave `sort: throughput` measuring nothing at all
+/// for a non-streaming fleet), so the two rates must agree.
+///
+/// The tolerance is deliberately loose relative to the defect: the bug halves
+/// the streaming path's divisor, a 2x error, while the delays are large enough
+/// that scheduler jitter moves each rate by a few percent.
+#[tokio::test]
+async fn the_same_generation_rate_reports_the_same_throughput_streaming_or_not() {
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    let whole = Gateway::new(single_endpoint_config("whole"), AdapterRegistry::new(), cb);
+    whole
+        .adapters
+        .register_chat(Arc::new(WholeCallDelayAdapter {
+            id: "whole".to_string(),
+        }))
+        .await;
+
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    let split = Gateway::new(single_endpoint_config("split"), AdapterRegistry::new(), cb);
+    split
+        .adapters
+        .register_chat(Arc::new(SplitDelayStreamer {
+            id: "split".to_string(),
+        }))
+        .await;
+
+    whole
+        .execute(&pinned_chat_request("whole"))
+        .await
+        .expect("the non-streaming half must succeed");
+    let events = collect_stream(&split, &pinned_chat_request("split")).await;
+    assert!(
+        matches!(events.last(), Some(StreamEvent::Done { .. })),
+        "the streaming half must run to completion: {events:?}"
+    );
+
+    let non_streaming = whole.performance_stats("whole:whole").expect("recorded");
+    let streaming = split.performance_stats("split:split").expect("recorded");
+    assert_eq!(
+        non_streaming.throughput_samples, 1,
+        "the non-streaming path must contribute a throughput sample: {non_streaming:?}"
+    );
+    assert_eq!(
+        streaming.throughput_samples, 1,
+        "the streaming path must contribute a throughput sample: {streaming:?}"
+    );
+
+    // Bounds chosen against the DEFECT, not against a notion of precision: the
+    // bug halves the streaming path's divisor, so it lands at ratio 2.0, and
+    // anything under 1.55 separates from it cleanly. Reaching either bound
+    // honestly would take a ~65ms stall on one path and not the other.
+    let ratio = streaming.mean_tokens_per_sec / non_streaming.mean_tokens_per_sec;
+    assert!(
+        (0.65..=1.55).contains(&ratio),
+        "identical work ({SETUP_DELAY:?} setup + {GENERATION_DELAY:?} generation, \
+         {SPLIT_DELAY_OUTPUT_TOKENS} output tokens) must report the same throughput \
+         whichever entry point served it, but streaming reported \
+         {} tok/s against non-streaming's {} tok/s (ratio {ratio:.3}) — the streaming \
+         dispatch is measuring a different span",
+        streaming.mean_tokens_per_sec,
+        non_streaming.mean_tokens_per_sec,
+    );
+}
+
+// --- SP-ROUTE-1 Task 5 review fixes: one attempt casts one verdict to every
+// health recorder, not just `PerformanceRecorder` ---
+//
+// The review found that `AttemptPhase::StreamAcquired` — deliberately a
+// latency-only observation, per Task 4 — was read ONLY by
+// `PerformanceRecorder`. Every other recorder (`CircuitBreakerSink`,
+// `ModelLockoutSink`, `ConnectionCooldownSink`) treated it as a full
+// observation, so the acquisition dispatch's `success: true` reached
+// `record_success` / `store.clear()` on EVERY streaming attempt — a real
+// production defect (Critical 3 below). The tests in this section drove the
+// mutation that proved it, then pin the `AttemptPhase::is_verdict()` fix.
+
+/// A single-router/single-model ("mid"/"mid") config with NO fallback
+/// candidate — used below so the point of each test is watching ONE
+/// endpoint's health state evolve across repeated attempts, not fallback.
+fn mid_gateway_config() -> GatewayConfig {
+    let mut routers = HashMap::new();
+    routers.insert(
+        "mid".to_string(),
+        RouterConfig {
+            url: "http://localhost".to_string(),
+            api_key_env: None,
+            api_key: None,
+            enabled: true,
+            timeout_ms: None,
+            headers: HashMap::new(),
+        },
+    );
+    let mut models = HashMap::new();
+    models.insert(
+        "mid".to_string(),
+        ModelConfig {
+            id: "mid".to_string(),
+            api_model_id: None,
+            provider: "mid".to_string(),
+            family: None,
+            capabilities: vec![Capability::TextChat],
+            context_window: 4096,
+            max_output_tokens: 1024,
+            pricing: None,
+            catalog: None,
+        },
+    );
+    GatewayConfig {
+        routers,
+        models,
+        chains: HashMap::new(),
+        constraints: Default::default(),
+        panels: Default::default(),
+        consensus: Default::default(),
+    }
+}
+
+/// A chat request pinned directly at the "mid" router/model (no chain).
+fn mid_chat_request() -> InferenceRequest {
+    InferenceRequest {
+        capability: Capability::TextChat,
+        model: Some("mid".to_string()),
+        router: Some("mid".to_string()),
+        chain: None,
+        payload: Payload::Chat {
+            messages: vec![Message::text(MessageRole::User, "hi")],
+            system: None,
+            max_tokens: None,
+            temperature: None,
+            tools: Vec::new(),
+        },
+        budget: None,
+        auth: None,
+        panel: None,
+        consensus: None,
+        allow_fallback: true,
+        credentials: Default::default(),
+        routing: None,
+    }
+}
+
+/// Critical 3, primary symptom. Before the `is_verdict()` fix, the
+/// acquisition dispatch (`success: true`, phase `StreamAcquired`) reached
+/// `CircuitBreakerSink` and called `record_success`, which RESETS
+/// `Closed { failure_count }` to 0. The mid-stream failure then
+/// re-incremented it to 1. Every attempt: 0 → 1 → 0 → 1 — the breaker could
+/// never reach `threshold` no matter how many streams failed halfway.
+#[tokio::test]
+async fn repeated_mid_stream_failures_open_the_breaker() {
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+        threshold: 5,
+        ..Default::default()
+    });
+    let gw = Gateway::new(mid_gateway_config(), AdapterRegistry::new(), cb.clone());
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamMidFailer {
+            id: "mid".to_string(),
+        }))
+        .await;
+    let request = mid_chat_request();
+
+    // try_drain_stream tolerates the breaker opening partway through: once
+    // Open, selection gates the candidate and `execute_stream` returns Err
+    // before any stream — a no-op for the loop, not a panic.
+    for _ in 0..10 {
+        try_drain_stream(&gw, &request).await;
+    }
+
+    assert_eq!(
+        cb.get_state("mid:mid").name(),
+        "open",
+        "an endpoint failing every stream halfway must eventually be skipped"
+    );
+}
+
+/// Critical 3, second symptom. A successful stream dispatches TWO
+/// `success: true` outcomes (acquisition, then completion); in `HalfOpen`,
+/// `record_success` increments `success_count` on each — so
+/// `half_open_max_requests: 3` would close the breaker after two streaming
+/// attempts, not three.
+#[tokio::test]
+async fn a_streaming_success_casts_one_breaker_vote_not_two() {
+    use crate::circuit_breaker::BreakerState;
+
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+        threshold: 1,
+        timeout: std::time::Duration::from_millis(0),
+        half_open_max_requests: 3,
+    });
+    // Drive "mid:mid" into HalfOpen directly: one failure to Open, then one
+    // `can_execute` (timeout already expired) for the Open -> HalfOpen
+    // transition — mirrors `circuit_breaker.rs`'s own tests.
+    cb.can_execute("mid:mid");
+    cb.record_failure("mid:mid");
+    assert!(cb.can_execute("mid:mid"), "expired Open must admit");
+    match cb.get_state("mid:mid") {
+        BreakerState::HalfOpen { success_count } => assert_eq!(success_count, 0),
+        other => panic!(
+            "expected HalfOpen{{success_count:0}} before the attempt, got {}",
+            other.name()
+        ),
+    }
+
+    let gw = Gateway::new(mid_gateway_config(), AdapterRegistry::new(), cb.clone());
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamer {
+            id: "mid".to_string(),
+        }))
+        .await;
+
+    let _ = collect_stream(&gw, &mid_chat_request()).await;
+
+    match cb.get_state("mid:mid") {
+        BreakerState::HalfOpen { success_count } => assert_eq!(
+            success_count, 1,
+            "one successful streaming attempt must cast exactly one breaker vote"
+        ),
+        other => panic!(
+            "expected still HalfOpen{{success_count:1}}, got {}",
+            other.name()
+        ),
+    }
+}
+
+/// Critical 3, third symptom. A consumer that drops a stream after one chunk
+/// (a normal SSE client disconnect) leaves only the acquisition dispatch on
+/// the wire. That dispatch must NOT hand the breaker a free `record_success`
+/// for an attempt whose outcome nobody knows — proven by pre-seeding a
+/// NONZERO failure count and confirming an abandoned stream does not reset
+/// it. A latency sample IS still legitimately recorded (`PerformanceRecorder`
+/// treats `StreamAcquired` as a latency-only observation, unaffected by this
+/// fix).
+#[tokio::test]
+async fn an_abandoned_stream_casts_no_verdict_at_all() {
+    use crate::circuit_breaker::BreakerState;
+    use futures::StreamExt;
+
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default()); // threshold 5
+    cb.can_execute("mid:mid");
+    cb.record_failure("mid:mid");
+    cb.record_failure("mid:mid");
+    match cb.get_state("mid:mid") {
+        BreakerState::Closed { failure_count } => assert_eq!(failure_count, 2),
+        other => panic!(
+            "expected Closed{{failure_count:2}} before the attempt, got {}",
+            other.name()
+        ),
+    }
+
+    let gw = Gateway::new(mid_gateway_config(), AdapterRegistry::new(), cb.clone());
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamer {
+            id: "mid".to_string(),
+        }))
+        .await;
+
+    let mut stream = gw
+        .execute_stream(&mid_chat_request())
+        .await
+        .expect("stream should start");
+    let first = stream.next().await;
+    assert!(
+        matches!(first, Some(StreamEvent::Chunk { .. })),
+        "expected the first chunk, got {first:?}"
+    );
+    drop(stream); // abandon mid-stream — never polled again
+
+    match cb.get_state("mid:mid") {
+        BreakerState::Closed { failure_count } => assert_eq!(
+            failure_count, 2,
+            "an abandoned stream must not reset the failure count via a phantom record_success"
+        ),
+        other => panic!("the breaker must stay Closed{{2}}, got {}", other.name()),
+    }
+
+    let stats = gw
+        .performance_stats("mid:mid")
+        .expect("the acquisition latency observation IS legitimately recorded");
+    assert_eq!(
+        stats.verdict_samples, 0,
+        "nobody knows whether the abandoned stream succeeded or failed"
+    );
+    assert_eq!(
+        stats.samples, 1,
+        "the acquisition dispatch still contributes a latency sample"
+    );
+}
+
+/// Critical 2 — half of AC9 had no test at all: mutating the mid-stream
+/// dispatch's `error: Some(&e)` to `error: None` survived the whole suite
+/// (358/358). `ConnectionCooldownSink` matches on `o.error`, so a mid-stream
+/// transport fault must reach it exactly as a setup-time one already does.
+#[tokio::test]
+async fn a_mid_stream_timeout_cools_the_router() {
+    let gw = Gateway::new(
+        mid_gateway_config(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+    register_stream_mid_err(&gw, "mid", || GatewayError::Timeout {
+        adapter: "mid".to_string(),
+        model: "mid".to_string(),
+        duration_ms: 1,
+    })
+    .await;
+
+    let _ = collect_stream(&gw, &mid_chat_request()).await;
+
+    assert!(
+        gw.cooldown.cooling_until("mid").is_some(),
+        "a mid-stream Timeout must cool the router exactly like a setup-time one"
+    );
+}
+
+/// Critical 2, second half — the same gap on the lockout sink: a mid-stream
+/// 429 must lock the endpoint exactly like a setup-time one.
+#[tokio::test]
+async fn a_mid_stream_rate_limit_locks_the_endpoint() {
+    use crate::gates::lockout::{LockReason, ModelLockoutRead};
+
+    let gw = Gateway::new(
+        mid_gateway_config(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+    register_stream_mid_err(&gw, "mid", || GatewayError::RateLimit {
+        adapter: "mid".to_string(),
+        retry_after_ms: Some(2000),
+    })
+    .await;
+
+    let _ = collect_stream(&gw, &mid_chat_request()).await;
+
+    let locked = gw
+        .model_lockout
+        .locked("mid:mid")
+        .expect("a mid-stream 429 must lock the endpoint exactly like a setup-time one");
+    assert_eq!(locked.reason, LockReason::RateLimit);
+}
+
+/// Important 3 — a single mid-stream 429 now locks the endpoint, so on a
+/// single-candidate config the NEXT `execute_stream` is gated before any
+/// stream starts: `Err(AllGated { resume_after: Some(_) })`, which the
+/// orchestrator turns into a durable pause. A defensible policy, but a new
+/// user-visible escalation with no test before this — pinned here.
+#[tokio::test]
+async fn a_mid_stream_rate_limit_pauses_the_next_stream_request() {
+    let gw = Gateway::new(
+        mid_gateway_config(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+    register_stream_mid_err(&gw, "mid", || GatewayError::RateLimit {
+        adapter: "mid".to_string(),
+        retry_after_ms: Some(2000),
+    })
+    .await;
+
+    let _ = collect_stream(&gw, &mid_chat_request()).await; // locks "mid:mid"
+
+    match gw.execute_stream(&mid_chat_request()).await {
+        Err(GatewayError::AllGated { resume_after, .. }) => {
+            assert!(
+                resume_after.is_some(),
+                "a timed 429 lock must carry a resume instant, not fail outright"
+            );
+        }
+        Err(other) => panic!("expected AllGated, got: {other}"),
+        Ok(_) => {
+            panic!("expected the SECOND stream request to be paused as AllGated, not admitted")
+        }
+    }
+}
+
+/// Important 3, secondary — the OTHER practical effect of the C3 fix. Before
+/// it, the acquisition dispatch's `store.clear(o.endpoint)` in
+/// `ModelLockoutSink` (its `success: true` branch) ran on EVERY streaming
+/// attempt, wiping the escalation counter immediately before the mid-stream
+/// failure dispatch that followed in the SAME attempt — so a relock after a
+/// prior lock expired always looked like a fresh lock (escalation reset to
+/// 0) and could never escalate past the base backoff.
+#[tokio::test]
+async fn a_second_mid_stream_rate_limit_escalates_past_the_first() {
+    let gw = Gateway::new(
+        mid_gateway_config(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+    register_stream_mid_err(&gw, "mid", || GatewayError::RateLimit {
+        adapter: "mid".to_string(),
+        retry_after_ms: None, // synthetic backoff, so escalation shows up in `until`
+    })
+    .await;
+    let now = Instant::now();
+
+    // Pre-seed as though a first lock -> release cycle already happened: an
+    // EXPIRED rate-limit lock at escalation 0 — exactly what a real first
+    // mid-stream 429 leaves behind once its base cooldown elapses.
+    gw.apply_lockout(
+        "mid:mid",
+        crate::gates::lockout::LockReason::RateLimit,
+        Some(now - std::time::Duration::from_secs(1)),
+    );
+
+    let _ = collect_stream(&gw, &mid_chat_request()).await; // a genuine relock
+
+    use crate::gates::lockout::ModelLockoutRead;
+    let until = gw
+        .model_lockout
+        .locked("mid:mid")
+        .expect("relocked")
+        .until
+        .expect("timed lock");
+    let base = crate::gates::lockout::ModelLockoutPolicy::default().rate_limit_base;
+    assert!(
+        until > now + base + std::time::Duration::from_secs(30),
+        "a genuine relock must escalate strictly past the base backoff (~60s): \
+         until={until:?} now+base={:?}",
+        now + base
+    );
+}
+
+/// Minor 2 — the completion dispatch sits BEFORE `yield StreamEvent::Done` in
+/// `stream.rs`, and that ordering is load-bearing: in an `async_stream`
+/// generator, code after a `yield` runs only on the NEXT poll. A real SSE
+/// handler that stops polling once it observes the terminal `Done` event (as
+/// any sane consumer does) would never resume the generator far enough to
+/// run a dispatch placed AFTER that yield — the verdict would silently
+/// vanish. `collect_stream` drains to `None` and would not catch a
+/// regression here; this test stops exactly where a real consumer stops.
+#[tokio::test]
+async fn a_consumer_that_stops_at_done_still_sees_its_verdict_recorded() {
+    use futures::StreamExt;
+
+    let gw = Gateway::new(
+        mid_gateway_config(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamer {
+            id: "mid".to_string(),
+        }))
+        .await;
+
+    let mut stream = gw
+        .execute_stream(&mid_chat_request())
+        .await
+        .expect("stream should start");
+    loop {
+        match stream.next().await {
+            Some(StreamEvent::Done { .. }) => break,
+            Some(_) => continue,
+            None => panic!("stream ended without a terminal Done event"),
+        }
+    }
+    drop(stream); // stop exactly where a real consumer stops — no further polling
+
+    let stats = gw
+        .performance_stats("mid:mid")
+        .expect("recorded by the time Done was observed");
+    assert_eq!(
+        stats.verdict_samples, 1,
+        "the verdict must already be recorded once Done is observed, not only after the \
+         stream is fully drained to None"
+    );
+}
+
+/// Minor 3 — a mid-stream failure's dispatch must carry `output_tokens:
+/// None`, even when the provider's last good chunk reported usage. A failed
+/// attempt has no meaningful rate; contributing a throughput sample for it
+/// would let Task 9 average in a broken attempt's partial output.
+#[tokio::test]
+async fn a_mid_stream_failure_with_usage_contributes_no_throughput() {
+    let gw = Gateway::new(
+        mid_gateway_config(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamMidFailerWithUsage {
+            id: "mid".to_string(),
+        }))
+        .await;
+
+    let events = collect_stream(&gw, &mid_chat_request()).await;
+    assert!(matches!(events.last(), Some(StreamEvent::Error { .. })));
+
+    let stats = gw.performance_stats("mid:mid").expect("recorded");
+    assert_eq!(
+        stats.throughput_samples, 0,
+        "a failed attempt must not contribute a throughput sample, even though its last \
+         chunk carried usage: {stats:?}"
+    );
+}
+
+/// SP-ROUTE-1 Task 6 review — Important 1. `with_random`/`with_performance`
+/// have exactly one call site in the repo today (a unit test): production
+/// (`execute`, `execute_stream`) builds its `ModelSelectionService` via
+/// `Gateway::selection_service`, which calls `ModelSelectionService::new` and
+/// nothing else. So today every production request routes off the fixed-seed
+/// `DEFAULT_RNG`, and this asserts exactly that against the REAL production
+/// construction path — `selection_service` is the one place both `execute`
+/// and `execute_stream` build the service, extracted for this reason — not a
+/// hand-mirrored copy of it.
+///
+/// `#[ignore]`d because it is expected to fail until SP-ROUTE-1 Task 10 adds
+/// `.with_random(entropy_source)` (and, per the plan, `.with_performance`)
+/// inside `selection_service`. Un-ignoring it then turns it into the
+/// regression guard: if a future edit to `selection_service` drops the
+/// `with_random` call, this goes red again.
+#[test]
+fn production_selection_never_uses_the_fixed_seed_default() {
+    let gw = test_gateway();
+    let config = test_config_with_noop();
+    let svc = gw.selection_service(&config);
+    assert!(
+        !svc.uses_default_rng(),
+        "production must pass an entropy-seeded source via with_random; the fixed-seed \
+         DEFAULT_RNG makes every process draw the identical sequence, so weighted routing \
+         synchronises across the fleet instead of spreading"
+    );
+}
+
+/// `chat_chain`'s two endpoints, observed TWICE each: `noop` fast, `fail-model`
+/// slow. Two is deliberately one BELOW the default `min_samples` of 3, so the
+/// same fixture reads as "not measured" under the default and as "measured"
+/// under a threshold of 2 — which is the only way to observe the threshold
+/// itself rather than the observations.
+fn observe_twice(gw: &Gateway) {
+    for _ in 0..2 {
+        for (endpoint, router, duration_ms) in [
+            ("failing:fail-model", "failing", 500),
+            ("noop:noop", "noop", 10),
+        ] {
+            gw.record_outcome(&crate::gates::AttemptOutcome {
+                endpoint,
+                router,
+                success: true,
+                error: None,
+                duration_ms,
+                output_tokens: Some(10),
+                phase: crate::gates::AttemptPhase::Complete,
+            });
+        }
+    }
+}
+
+/// A `sort: latency` selection over `chat_chain`, through the real production
+/// construction path.
+fn latency_route(gw: &Gateway, config: &GatewayConfig) -> Vec<String> {
+    gw.selection_service(config)
+        .select_all(&SelectionCriteria {
+            capability: Capability::TextChat,
+            model: None,
+            router: None,
+            chain: Some("chat_chain".to_string()),
+            budget: None,
+            input_tokens: None,
+            input_tokens_pessimistic: None,
+            preferences: Some(crate::types::request::RoutingPreferences {
+                sort: Some(crate::types::request::SortKey::Latency),
+                ..Default::default()
+            }),
+        })
+        .all_candidates
+        .iter()
+        .map(|c| c.model.clone())
+        .collect()
+}
+
+/// `ResilienceConfig::min_samples` must REACH the metric sort.
+///
+/// Every step of that wiring was independently deletable with a green suite —
+/// `.with_performance(…, 0)`, dropping the `with_resilience` assignment,
+/// `DEFAULT_MIN_SAMPLES = 1` — because nothing observed the THRESHOLD, only the
+/// observations. The `→ 0` direction is the live hazard, and it is what
+/// `StrategyCtx::min_samples`'s own doc warns about: an endpoint carrying live
+/// samples of ONE counter while the counter being read sits at `0` beside a
+/// mean of `0.0`. At zero that `0.0` is trusted, so a candidate with zero
+/// LATENCY samples (a failed `Complete` casts a verdict and contributes no
+/// latency) sorts first under `sort: latency`, and a candidate with zero
+/// VERDICTS (a `StreamAcquired` with no completion yet) is weighed
+/// `reliability: Some(0.0)` and goes last under the default.
+///
+/// What zero does NOT do — and an earlier version of this comment claimed it
+/// did — is break a cold process. A never-observed endpoint never reaches a
+/// `>=` at all: `PerformanceStore::stats` returns `None` from `m.get()?` or
+/// from its `live.is_empty()` guard, and `None` is unmeasured at every
+/// threshold.
+///
+/// The fixture holds the OBSERVATIONS fixed at two and varies only the
+/// threshold, so the two halves differ in exactly the quantity under test.
+#[test]
+fn resilience_min_samples_reaches_the_metric_sort() {
+    let config = test_config_with_failing_and_noop();
+
+    let strict = test_gateway_with_chain();
+    observe_twice(&strict);
+    assert_eq!(
+        latency_route(&strict, &config),
+        vec!["fail-model", "noop"],
+        "2 observations is BELOW the default min_samples of 3, so neither \
+         candidate counts as measured and the latency sort must leave priority \
+         order alone"
+    );
+
+    let lenient = test_gateway_with_chain().with_resilience(crate::resilience::ResilienceConfig {
+        min_samples: 2,
+        ..Default::default()
+    });
+    // AFTER `with_resilience`, which REBUILDS the performance store — observing
+    // first would hand the samples to the store this call then discards.
+    observe_twice(&lenient);
+    assert_eq!(
+        latency_route(&lenient, &config),
+        vec!["noop", "fail-model"],
+        "min_samples: 2 must reach `StrategyCtx`, so the SAME two observations \
+         now count and noop's 10ms beats fail-model's 500ms despite its worse \
+         priority"
+    );
+}
+
+/// SP-ROUTE-1 Task 10 — the OTHER half of `selection_service`'s wiring, which no
+/// tripwire covered: `.with_performance`.
+///
+/// Rule 2 from Task 9's Critical: **a fixture that returns a constant cannot
+/// test a live source.** Production reads the gateway's REAL `PerformanceStore`
+/// — the one every completing attempt mutates through `record_outcome` — so this
+/// asserts the answer CHANGES: same gateway, same criteria, a different route
+/// once observations land. Every metric test in `selection.rs` and `strategy.rs`
+/// uses a fixed fixture and is structurally unable to make that claim, so
+/// `.with_performance` could be dropped from `selection_service` and all of them
+/// would stay green.
+///
+/// Both halves are asserted, and the BEFORE half is what makes the AFTER half
+/// mean anything: a test asserting only the final order would pass against a
+/// chain that was already in that order. Here the before and after orders are
+/// REVERSES of each other, so no fixed answer satisfies both.
+#[test]
+fn production_selection_reads_the_gateways_live_performance_store() {
+    let gw = test_gateway_with_chain();
+    let config = test_config_with_failing_and_noop();
+    // `chat_chain`: fail-model@failing is priority 1, noop@noop is priority 2 —
+    // so priority order and the observed-latency order below disagree.
+    let criteria = SelectionCriteria {
+        capability: Capability::TextChat,
+        model: None,
+        router: None,
+        chain: Some("chat_chain".to_string()),
+        budget: None,
+        input_tokens: None,
+        input_tokens_pessimistic: None,
+        preferences: Some(crate::types::request::RoutingPreferences {
+            sort: Some(crate::types::request::SortKey::Latency),
+            ..Default::default()
+        }),
+    };
+    let route = || -> Vec<String> {
+        gw.selection_service(&config)
+            .select_all(&criteria)
+            .all_candidates
+            .iter()
+            .map(|c| c.model.clone())
+            .collect()
+    };
+
+    assert_eq!(
+        route(),
+        vec!["fail-model", "noop"],
+        "with nothing observed a latency sort degrades to priority order (AC7) — \
+         this is the BEFORE state a live read has to move away from"
+    );
+
+    // The gateway's OWN write path: `record_outcome` fans out to the
+    // `PerformanceRecorder`, which holds a clone of the very store
+    // `selection_service` has to read. `min_samples` is 3, so three each.
+    let observe = |endpoint: &str, router: &str, duration_ms: u64| {
+        gw.record_outcome(&crate::gates::AttemptOutcome {
+            endpoint,
+            router,
+            success: true,
+            error: None,
+            duration_ms,
+            output_tokens: Some(10),
+            phase: crate::gates::AttemptPhase::Complete,
+        });
+    };
+    for _ in 0..3 {
+        observe("failing:fail-model", "failing", 500);
+        observe("noop:noop", "noop", 10);
+    }
+
+    assert_eq!(
+        route(),
+        vec!["noop", "fail-model"],
+        "`noop` is observed at 10ms against `fail-model`'s 500ms, so a latency \
+         sort must now put it first DESPITE its worse priority. Same gateway and \
+         same criteria as the assertion above — only the live store moved, which \
+         is the one thing a constant fixture cannot demonstrate"
+    );
+}
+
+// -----------------------------------------------------------------------------
+// Task 11 — AC10 at the PRODUCTION construction site.
+//
+// `reliability` and `weight` come from the performance port and from the price
+// the config carries. A bare `ModelSelectionService::new(...)` gets the NULL
+// performance port, so those two fields are the ones a bare fixture structurally
+// cannot observe — which is exactly why they are the two most worth asserting.
+// These drive `gw.selection_service(&config)` and `gw.execute(...)` instead.
+// -----------------------------------------------------------------------------
+
+/// [`test_config_with_failing_and_noop`] with PRICES attached, chosen so that
+///
+/// - the estimate is EXACTLY the configured price, independently of how large
+///   the request payload happens to be (1000 output tokens at `price` per 1k),
+///   so the inverse-square weight below is a hand-checkable number rather than
+///   an artefact of `estimate_input_tokens`; and
+/// - price order (`noop` at 1.0, then `fail-model` at 2.0) is the REVERSE of
+///   priority order (`fail-model` is 1, `noop` is 2), so a `sort: price` that
+///   silently did nothing is visible.
+fn priced_failing_and_noop() -> GatewayConfig {
+    let mut config = test_config_with_failing_and_noop();
+    for (model, price) in [("fail-model", 2.0), ("noop", 1.0)] {
+        let m = config.models.get_mut(model).expect("fixture model exists");
+        m.max_output_tokens = 1_000;
+        m.pricing = Some(ModelPricing {
+            input_per_1k: 0.0,
+            output_per_1k: price,
+            per_request: None,
+        });
+    }
+    config
+}
+
+fn priced_chain_criteria() -> SelectionCriteria {
+    SelectionCriteria {
+        capability: Capability::TextChat,
+        model: None,
+        router: None,
+        chain: Some("chat_chain".to_string()),
+        budget: None,
+        input_tokens: None,
+        input_tokens_pessimistic: None,
+        // No `sort` ⇒ the weighted default, the one strategy that produces
+        // weights at all.
+        preferences: None,
+    }
+}
+
+/// AC10, and the half a bare fixture cannot reach: the recorded `reliability`
+/// and `weight` are the values the strategy ACTUALLY used, taken from the
+/// gateway's LIVE performance store.
+///
+/// Built on `gw.selection_service(&config)` — the real production construction
+/// site — and fed through `gw.record_outcome`, the gateway's own write path, the
+/// same way `production_selection_reads_the_gateways_live_performance_store`
+/// does. A `ModelSelectionService::new(...)` built by hand holds the null
+/// performance port, so every `stats()` is `None` and `reliability` could only
+/// ever be `None`: the assertion below is one the null port CANNOT satisfy.
+///
+/// The two endpoints are asserted together on purpose. One is observed and one
+/// is not, so a single fixture pins three separate claims at once: that a
+/// measured rate reaches the trace, that an unmeasured one stays `None`, and —
+/// because the two prices differ — that reliability MULTIPLIES the price weight
+/// rather than replacing or being ignored by it.
+#[test]
+fn production_selection_records_the_weight_and_reliability_it_actually_used() {
+    let config = priced_failing_and_noop();
+    let gw = Gateway::new(
+        config.clone(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+
+    // The gateway's OWN write path. `min_samples` is 3, so exactly three
+    // verdicts — two successes and one failure — put `failing:fail-model` at a
+    // success rate of 2/3, a number no default and no null port produces.
+    let observe = |success: bool| {
+        gw.record_outcome(&crate::gates::AttemptOutcome {
+            endpoint: "failing:fail-model",
+            router: "failing",
+            success,
+            error: None,
+            duration_ms: 100,
+            output_tokens: Some(10),
+            phase: crate::gates::AttemptPhase::Complete,
+        });
+    };
+    observe(true);
+    observe(true);
+    observe(false);
+    // `noop:noop` is deliberately never observed.
+
+    let result = gw
+        .selection_service(&config)
+        .select_all(&priced_chain_criteria());
+    let decision = result
+        .decision
+        .expect("a chain resolution always records a decision");
+    let of = |endpoint: &str| {
+        decision
+            .order
+            .iter()
+            .find(|c| c.endpoint == endpoint)
+            .unwrap_or_else(|| panic!("{endpoint} must be admitted by this fixture"))
+    };
+
+    let observed = of("failing:fail-model");
+    assert_eq!(
+        observed.cost,
+        Some(2.0),
+        "1000 output tokens at 2.0 per 1k — the price the weight is derived from"
+    );
+    assert_eq!(
+        observed.reliability,
+        Some(2.0 / 3.0),
+        "two successes and one failure through the gateway's own recorder. The \
+         null performance port a hand-built service would hold cannot produce \
+         this — it can only ever produce `None`"
+    );
+    assert_eq!(
+        observed.weight,
+        Some(0.25 * (2.0 / 3.0)),
+        "`1/2² × 2/3`. Exact rather than approximate: 0.25 is a power of two, so \
+         scaling by it is lossless and this is bit-identical to what `classify` \
+         computed. A weight of 0.25 would mean reliability never reached the \
+         draw; a weight of 2/3 would mean price never did"
+    );
+
+    let unobserved = of("noop:noop");
+    assert_eq!(unobserved.cost, Some(1.0));
+    assert_eq!(
+        unobserved.reliability, None,
+        "never observed — and `None` rather than `Some(0.0)`, which is the \
+         difference between a cold endpoint and a dead one"
+    );
+    assert_eq!(
+        unobserved.weight,
+        Some(1.0),
+        "`1/1² × 1.0`: unmeasured weighs 1.0, so a cold endpoint competes on \
+         price alone rather than being starved of the traffic it needs to cast \
+         its first verdict"
+    );
+
+    assert_ne!(
+        observed.reliability, unobserved.reliability,
+        "the whole point of reading a LIVE store is that the two endpoints come \
+         back different; a constant source would make them agree"
+    );
+}
+
+/// AC10 — the decision escapes selection and reaches the caller.
+///
+/// `SelectionResult::decision` populated but never attached is a wiring point
+/// deletable with a green suite, which has been a Critical in four separate
+/// tasks of this slice. This is the test that kills that mutation: drop the
+/// attachment in `engine/execute.rs` and the `expect` below fires.
+///
+/// `sort: price` rather than the default, because the price order here is the
+/// REVERSE of priority order — so the recorded sequence cannot be mistaken for
+/// the chain's authored one, and a decision that described the wrong ordering
+/// would be visible rather than coincidentally right.
+#[tokio::test]
+async fn the_routing_decision_reaches_the_inference_response() {
+    let gw = Gateway::new(
+        priced_failing_and_noop(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+    // Only the `noop` router gets an adapter; `failing` has none, so a walk that
+    // reached it would fall through. It never does here — `noop` is cheapest, so
+    // the price sort puts it first.
+    register_noop(&gw).await;
+
+    let request = InferenceRequest {
+        chain: Some("chat_chain".to_string()),
+        routing: Some(crate::types::request::RoutingPreferences {
+            sort: Some(crate::types::request::SortKey::Price),
+            ..Default::default()
+        }),
+        ..chat_request()
+    };
+
+    let response = gw
+        .execute(&request)
+        .await
+        .expect("the noop adapter answers");
+    let decision = response
+        .routing
+        .expect("execute must attach the selection's routing decision to the response");
+
+    assert_eq!(decision.strategy, "price");
+    assert_eq!(
+        decision
+            .order
+            .iter()
+            .map(|c| c.endpoint.clone())
+            .collect::<Vec<_>>(),
+        vec!["noop:noop", "failing:fail-model"],
+        "price order (1.0 then 2.0) is the reverse of the chain's authored \
+         priority order, so this sequence can only come from the strategy that \
+         actually ran"
+    );
+    assert_eq!(
+        decision.order[0].cost,
+        Some(1.0),
+        "and the per-candidate detail travels with it, not just the order"
+    );
+}
+
+/// AC10 — the WEIGHTS reach the response, not merely the order.
+///
+/// `the_routing_decision_reaches_the_inference_response` drives `sort: price`,
+/// and `PriceStrategy` returns `OrderingReport::default()` by construction — no
+/// weights, no reliability. So that test asserts the production artefact only
+/// for `strategy`, `order` and `cost`, while
+/// `production_selection_records_the_weight_and_reliability_it_actually_used`
+/// asserts the weights but never calls `execute`. Each half of the feature was
+/// tested on a path where the other half is absent, which left the attachment
+/// free to be replaced by a re-derivation that drops the two fields a bare
+/// fixture cannot produce — verified surviving before this test existed.
+///
+/// So: the weighted DEFAULT, through `execute`, with the live store moved
+/// first. Nothing here is reachable without both the draw's own numbers and the
+/// wiring that carries them out.
+#[tokio::test]
+async fn the_response_carries_the_weights_the_draw_actually_used() {
+    let gw = Gateway::new(
+        priced_failing_and_noop(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+    // Only `noop` gets an adapter. `fail-model` leads on priority and has none,
+    // so the walk falls through to `noop` and the call succeeds — the decision
+    // still describes both candidates.
+    register_noop(&gw).await;
+
+    let observe = |success: bool| {
+        gw.record_outcome(&crate::gates::AttemptOutcome {
+            endpoint: "failing:fail-model",
+            router: "failing",
+            success,
+            error: None,
+            duration_ms: 100,
+            output_tokens: Some(10),
+            phase: crate::gates::AttemptPhase::Complete,
+        });
+    };
+    observe(true);
+    observe(true);
+    observe(false);
+    // `noop:noop` is deliberately never observed.
+
+    // No `sort`: the weighted default is the only strategy that weighs anything.
+    let request = InferenceRequest {
+        chain: Some("chat_chain".to_string()),
+        ..chat_request()
+    };
+    let response = gw
+        .execute(&request)
+        .await
+        .expect("the noop adapter answers");
+    let decision = response
+        .routing
+        .expect("execute must attach the selection's routing decision");
+
+    assert_eq!(decision.strategy, "grouped_weighted");
+    let of = |endpoint: &str| {
+        decision
+            .order
+            .iter()
+            .find(|c| c.endpoint == endpoint)
+            .unwrap_or_else(|| panic!("{endpoint} must be admitted by this fixture"))
+    };
+
+    assert_eq!(
+        of("failing:fail-model").reliability,
+        Some(2.0 / 3.0),
+        "two successes and one failure through the gateway's own recorder, \
+         carried all the way out to the caller's response"
+    );
+    assert_eq!(
+        of("failing:fail-model").weight,
+        Some(0.25 * (2.0 / 3.0)),
+        "`1/2² × 2/3` — the draw weight the ordering actually used, not a \
+         number re-derived at the attachment site"
+    );
+    assert_eq!(
+        of("noop:noop").reliability,
+        None,
+        "never observed — and `None` must survive the trip out rather than \
+         being flattened on the way"
+    );
+    assert_eq!(of("noop:noop").weight, Some(1.0), "`1/1² × 1.0`");
 }

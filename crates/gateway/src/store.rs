@@ -216,7 +216,10 @@ mod tests {
 
     use super::*;
     use crate::types::cost::CostEstimate;
-    use crate::types::trace::{Attempt, AttemptStatus, CandidateInfo, SkippedInfo, TraceStatus};
+    use crate::types::trace::{
+        Attempt, AttemptStatus, CandidateInfo, RoutedCandidate, RoutingDecision, SkippedInfo,
+        TraceStatus,
+    };
 
     fn make_call(
         session_id: Option<Uuid>,
@@ -286,6 +289,17 @@ mod tests {
                     model: "claude-sonnet".to_string(),
                 }),
                 actual_cost: None,
+                routing: Some(RoutingDecision {
+                    strategy: "grouped_weighted".to_string(),
+                    degraded: false,
+                    order: vec![RoutedCandidate {
+                        endpoint: "priority:claude-sonnet".to_string(),
+                        priority: 1,
+                        cost: Some(0.003),
+                        reliability: Some(0.75),
+                        weight: Some(0.5),
+                    }],
+                }),
                 created_at: Utc::now(),
             },
             created_at: Utc::now(),
@@ -318,6 +332,65 @@ mod tests {
         assert_eq!(deserialized.trace.request_id, trace.trace.request_id);
         assert_eq!(deserialized.trace.candidates.len(), 1);
         assert_eq!(deserialized.trace.attempts.len(), 1);
+        // SP-ROUTE-1 AC10. Asserted as a WHOLE `RoutingDecision` rather than
+        // field by field: a persisted trace whose weights survived but whose
+        // `reliability: Some(0.75)` came back as `None` would still explain the
+        // wrong routing, and the nested `Option<f64>`s are exactly the shape a
+        // serde attribute typo silently drops.
+        assert_eq!(
+            deserialized.trace.routing, trace.trace.routing,
+            "a routing decision must survive persistence intact, or the trace \
+             explains nothing once it is read back out of the store"
+        );
+        assert!(
+            deserialized.trace.routing.is_some(),
+            "and be present at all"
+        );
+    }
+
+    /// An `ExecutionTrace` written before SP-ROUTE-1 has no `routing` key at
+    /// all, and must still read back.
+    ///
+    /// Deserialized from a LITERAL pre-SP-ROUTE-1 payload rather than from a
+    /// `routing: None` struct we serialized ourselves. Round-tripping our own
+    /// output only proves `skip_serializing_if` and `default` agree with each
+    /// other; a hand-written payload is the actual historical input, and it is
+    /// what the test's name promises.
+    ///
+    /// Note what this does NOT prove: `#[serde(default)]` is not what makes it
+    /// pass. Serde routes a missing field through `missing_field`, whose
+    /// `deserialize_option` visits `none`, so an `Option<T>` already defaults
+    /// to `None` — removing the attribute keeps the whole workspace green
+    /// (verified). The attribute is belt-and-braces, and stating a false
+    /// rationale for it would be worse than omitting one: the next reader would
+    /// "discover" that an equivalent field elsewhere is unsafe without it.
+    #[test]
+    fn a_trace_persisted_without_a_routing_decision_still_deserializes() {
+        let json = r#"{
+            "id": "7ec1f6be-1ba4-4f54-9f0f-18bb7bfd3d7e",
+            "inference_call_id": null,
+            "trace": {
+                "request_id": "legacy",
+                "capability": "text_chat",
+                "status": "success",
+                "duration_ms": 1500,
+                "candidates": [],
+                "skipped": [],
+                "attempts": [],
+                "created_at": "2026-01-01T00:00:00Z"
+            },
+            "created_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let deserialized: StoredTrace =
+            serde_json::from_str(json).expect("a pre-SP-ROUTE-1 trace must still read back");
+        assert_eq!(deserialized.trace.routing, None);
+        assert_eq!(deserialized.trace.request_id, "legacy");
+
+        // And the write side: `None` is not emitted, so an OLD reader is
+        // equally unaffected by the new field.
+        let mut trace = make_trace(Some(Uuid::new_v4()));
+        trace.trace.routing = None;
+        assert!(!serde_json::to_string(&trace).unwrap().contains("routing"));
     }
 
     // 3. CallStatus serde

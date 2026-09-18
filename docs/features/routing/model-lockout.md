@@ -43,6 +43,24 @@ retrying a model that cannot currently succeed. Sits alongside the existing
 - **Classification** of limit signals: 429→`rate_limit`, 403/quota-body→`quota_exhausted`, credits→terminal; includes text-pattern detection for providers that throttle via non-standard 400/403 bodies.
 - **Bounded** map with an eviction cap (`eviction_cap`, default 4096) so lockout state cannot leak: over the cap, expired timed entries are evicted on write, while active and terminal locks are never dropped. _(Implemented in SP-0 (f).)_
 
+### What feeds it changed in SP-ROUTE-1
+
+**A mid-stream limit signal now locks the model out; stream acquisition no
+longer votes.** `execute_stream` used to fire its outcome the instant a stream
+was *obtained* and to dispatch nothing when the stream failed mid-flight, so a
+429 arriving after the first byte was reported to the lockout sink as a
+**success** and locked nothing. One attempt now casts exactly one verdict:
+acquisition contributes a latency observation only, and completion — or
+mid-stream failure — carries the verdict, classified as usual.
+
+The operator-visible consequence is worth reading twice: **a single mid-stream
+429 now locks the endpoint for `rate_limit_base`**, so on a single-candidate
+chain the *next* request returns `AllGated { resume_after: Some(t) }` rather
+than a stream. Previously it retried immediately. For an orchestrator that is a
+durable pause, not an error. Same correction, same recorder fan-out, as the
+[circuit breaker](circuit-breaker.md#streaming-a-mid-stream-failure-now-trips-the-breaker-sp-route-1)
+and [connection cooldown](connection-cooldown.md).
+
 ## Interaction with the chain
 
 A locked-out model becomes a `SkippedCandidate`; the walk continues to the next

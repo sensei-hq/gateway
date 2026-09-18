@@ -32,6 +32,19 @@ separately.
 - **Duration:** a fixed base window (`cooldown_base`, default 30s) plus optional deterministic per-router jitter (default off), distinct from the breaker's failure-count threshold. The cooldown itself does not escalate — a repeated fault just re-cools for the base window.
 - **Effect:** every `ChainEntry` whose router is cooling down becomes a `SkippedCandidate`; the walk falls over to entries on other routers.
 
+### What feeds it changed in SP-ROUTE-1
+
+**A mid-stream failure now cools the router; stream acquisition no longer
+votes.** `execute_stream` used to fire its outcome the moment a stream was
+*obtained* and dispatch nothing at all when the stream died halfway, so a
+connection fault that killed a stream mid-flight was reported to the cooldown
+sink as a **success**. One attempt now casts exactly one verdict: acquisition
+contributes a latency observation only, and completion — or mid-stream failure —
+carries the verdict. A transport fault that kills a stream therefore cools the
+router the same way one on a non-streaming call always did. Same correction, same
+recorder fan-out, as the [circuit breaker](circuit-breaker.md#streaming-a-mid-stream-failure-now-trips-the-breaker-sp-route-1)
+and [model lockout](model-lockout.md).
+
 ## Why separate from the circuit breaker
 
 The circuit breaker opens per `router:model` after N consecutive failures — so a

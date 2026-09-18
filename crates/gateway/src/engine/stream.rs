@@ -77,15 +77,14 @@ impl super::Gateway {
             budget: request.budget,
             input_tokens: Some(input_tokens),
             input_tokens_pessimistic: Some(estimate_input_tokens_pessimistic(&request.payload)),
+            // The streaming half of the same wiring as `execute.rs` — a caller's
+            // preferences must not depend on which entry point they came in
+            // through.
+            preferences: request.routing.clone(),
         };
 
         // 4. Select all candidates.
-        let svc = ModelSelectionService::new(
-            &config,
-            &self.circuit_breaker,
-            &self.cooldown,
-            &self.model_lockout,
-        );
+        let svc = self.selection_service(&config);
         let result = svc.select_all(&criteria);
 
         // No candidates? If every skip was a gate (health-lock / cooling /
@@ -99,8 +98,12 @@ impl super::Gateway {
             if let Some(gated) = super::exhaustion::all_gated_error(&result.skipped, &[]) {
                 return Err(gated);
             }
+            // Same diagnostics as `execute`'s selection-empty branch — a
+            // caller's routing filter must be as visible on the streaming
+            // entry point as on the unary one.
             return Err(GatewayError::NoCandidates {
                 capability: request.capability.clone(),
+                skipped: super::exhaustion::render_skipped(&result.skipped),
             });
         }
 
@@ -144,7 +147,11 @@ impl super::Gateway {
 
             for (idx, candidate) in candidates.iter().enumerate() {
                 let has_more = idx + 1 < total;
-                let endpoint = format!("{}:{}", candidate.router, candidate.model);
+                let endpoint = candidate.endpoint_key();
+                // Wall time for THIS candidate's setup/acquisition attempt — not
+                // the time to stream to completion (Task 5's job). No tokens
+                // exist yet at either dispatch point below, pre- or post-first-byte.
+                let attempt_start = Instant::now();
 
                 // Resolve the outbound model exactly like `execute`:
                 // caller-pinned wins, else the candidate's resolved api_model_id.
@@ -225,9 +232,23 @@ impl super::Gateway {
                 }
 
                 if let Some(mut inner) = got_stream {
-                    // A candidate produced a stream: commit to it.
-                    let _ =
-                        super::dispatch_outcome(&recorders, &endpoint, &candidate.router, true, None);
+                    // A candidate produced a stream: commit to it. Phase
+                    // `StreamAcquired` — this is a latency-only observation
+                    // (time-to-first-response), NOT the verdict: the completion
+                    // outcome for this same attempt always follows, and Task 5
+                    // is what dispatches it.
+                    let _ = super::dispatch_outcome(
+                        &recorders,
+                        &crate::gates::AttemptOutcome {
+                            endpoint: &endpoint,
+                            router: &candidate.router,
+                            success: true,
+                            error: None,
+                            duration_ms: attempt_start.elapsed().as_millis() as u64,
+                            output_tokens: None,
+                            phase: crate::gates::AttemptPhase::StreamAcquired,
+                        },
+                    );
                     let stream_start = Instant::now();
                     tracing::debug!(adapter = %candidate.router, model = %candidate.model, "streaming candidate");
                     for ev in pending_switches.drain(..) {
@@ -248,6 +269,55 @@ impl super::Gateway {
                                 }
                             }
                             Err(e) => {
+                                // A stream that dies after first byte is a FAILURE, and
+                                // the recorders have to hear about it. Before SP-ROUTE-1
+                                // this path returned silently while the acquisition
+                                // dispatch had already fired, so an endpoint failing
+                                // every stream halfway looked perfectly healthy — which
+                                // the default strategy's reliability multiplier would
+                                // then have weighted traffic toward.
+                                //
+                                // The returned deadline is discarded: the caller has
+                                // already committed to this stream and there is no
+                                // fallback left to schedule. Surfacing it on the yielded
+                                // `StreamEvent::Error` would change that event's payload
+                                // and is deliberately out of scope (spec §12).
+                                let _ = super::dispatch_outcome(
+                                    &recorders,
+                                    &crate::gates::AttemptOutcome {
+                                        endpoint: &endpoint,
+                                        router: &candidate.router,
+                                        success: false,
+                                        error: Some(&e),
+                                        // GENERATION time, not the total attempt span the
+                                        // completion dispatch below reports — and this is
+                                        // the one place the two differ. It is inert either
+                                        // way: `output_tokens: None` means it reaches no
+                                        // throughput mean, and `StreamCompleted` means it
+                                        // reaches no latency mean. It is carried for
+                                        // tracing and for the recorders that only classify
+                                        // `error`. Anything that starts deriving a RATE
+                                        // from this dispatch must switch it to
+                                        // `attempt_start` first, or it reintroduces
+                                        // exactly the unlike-spans pooling the completion
+                                        // dispatch was fixed for.
+                                        duration_ms: stream_start.elapsed().as_millis() as u64,
+                                        // Deliberately `None`, even if an earlier chunk
+                                        // carried `usage` (some providers report tokens on
+                                        // their last good chunk before dying). The attempt
+                                        // FAILED — a rate derived from a broken, partial
+                                        // attempt is not a throughput observation, and
+                                        // contributing one would let a later ranking
+                                        // average a dead attempt's output into a live rate
+                                        // (SP-ROUTE-1 Task 5 review, Minor 3).
+                                        output_tokens: None,
+                                        // The stream ENDED, badly. This is the attempt's
+                                        // one and only verdict — the acquisition dispatch
+                                        // deliberately cast none — and the phase keeps its
+                                        // duration out of the latency mean.
+                                        phase: crate::gates::AttemptPhase::StreamCompleted,
+                                    },
+                                );
                                 // Mid-stream failure: bytes already sent, so no
                                 // fallback — surface and stop.
                                 yield StreamEvent::Error {
@@ -261,6 +331,47 @@ impl super::Gateway {
                     }
 
                     let tokens = usage_acc.unwrap_or_default();
+
+                    // Throughput is only knowable here. The acquisition dispatch at the
+                    // top of this block recorded LATENCY (time until the stream started
+                    // producing); this second dispatch records the throughput rate and
+                    // this attempt's one verdict, and `AttemptPhase` is what keeps its
+                    // duration out of the latency mean.
+                    //
+                    // `attempt_start`, NOT `stream_start`: `PerformanceRecorder` derives
+                    // `tokens_per_sec` from `duration_ms` regardless of phase, and
+                    // `execute` writes the SAME `"{router}:{model}"` key with the whole
+                    // call's wall time. Reporting generation time alone here pooled two
+                    // unlike quantities into one `mean_tokens_per_sec` — the very thing
+                    // spec §6.3 forbids for latency — so an identical real rate read
+                    // higher purely because it was served streaming, and an endpoint
+                    // that was faster END TO END could lose to a slower one. Output
+                    // tokens ÷ total attempt wall time is one well-defined quantity on
+                    // both paths, and it includes queueing, which is what a caller
+                    // choosing a provider actually pays. (The alternative — making
+                    // `Complete` contribute no throughput, mirroring the latency rule —
+                    // was rejected: it leaves `sort: throughput` measuring nothing for a
+                    // non-streaming fleet, degrading it to priority order.)
+                    //
+                    // MUST run before `yield StreamEvent::Done` below, not after: in an
+                    // `async_stream` generator, code placed after a `yield` runs only on
+                    // the NEXT poll, and a real consumer that stops polling once it sees
+                    // the terminal `Done` (as any sane one does) would never resume this
+                    // generator far enough to run a dispatch placed after it — the
+                    // verdict would silently vanish (SP-ROUTE-1 Task 5 review, Minor 2).
+                    let _ = super::dispatch_outcome(
+                        &recorders,
+                        &crate::gates::AttemptOutcome {
+                            endpoint: &endpoint,
+                            router: &candidate.router,
+                            success: true,
+                            error: None,
+                            duration_ms: attempt_start.elapsed().as_millis() as u64,
+                            output_tokens: Some(tokens.output_tokens),
+                            phase: crate::gates::AttemptPhase::StreamCompleted,
+                        },
+                    );
+
                     let cost = candidate
                         .model_config
                         .pricing
@@ -317,12 +428,19 @@ impl super::Gateway {
                 // can attribute a timed resume to this attempt.
                 match &fail_error {
                     Some(err) => {
+                        // Phase `Complete`: a setup failure is final — no
+                        // completion dispatch follows it, streaming or not.
                         let written_until = super::dispatch_outcome(
                             &recorders,
-                            &endpoint,
-                            &candidate.router,
-                            false,
-                            Some(err),
+                            &crate::gates::AttemptOutcome {
+                                endpoint: &endpoint,
+                                router: &candidate.router,
+                                success: false,
+                                error: Some(err),
+                                duration_ms: attempt_start.elapsed().as_millis() as u64,
+                                output_tokens: None,
+                                phase: crate::gates::AttemptPhase::Complete,
+                            },
                         );
                         contributions
                             .push(super::exhaustion::contribution_for(err, written_until));

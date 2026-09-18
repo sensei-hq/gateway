@@ -26,7 +26,7 @@ use crate::types::trace::{Attempt, AttemptStatus};
 mod consensus;
 mod dispatch;
 mod execute;
-mod exhaustion;
+pub(crate) mod exhaustion;
 mod panel;
 mod stream;
 mod util;
@@ -74,6 +74,31 @@ pub struct Gateway {
     /// [`crate::gates::lockout::ModelLockoutSink`] in `recorders` (see
     /// [`Gateway::new`]) so a registered observer sees every lock the sink writes.
     lockout_observers: crate::gates::lockout::LockoutBroadcaster,
+    /// Rolling per-endpoint performance window: read side wired into selection
+    /// from Task 7, write side is the `PerformanceRecorder` in `recorders` —
+    /// both share this one store, exactly as `cooldown` and `model_lockout` do.
+    performance: crate::gates::performance::PerformanceStore,
+    /// Randomness for weighted routing, handed to every selection via
+    /// [`Self::selection_service`].
+    ///
+    /// **Entropy-seeded, so two workers do not make the same first choice.** The
+    /// alternative — `ModelSelectionService`'s fixed-seed `DEFAULT_RNG` — gives
+    /// every process in the fleet the identical draw sequence, so weighted
+    /// routing SYNCHRONISES rather than spreads and "load balancing" sends the
+    /// whole fleet at whichever provider won the first draw. Pinned by
+    /// `tests::production_selection_never_uses_the_fixed_seed_default`, which
+    /// asserts pointer identity against that static rather than comparing
+    /// values — two separately-seeded sources with the same seed must still
+    /// count as "not the default".
+    ///
+    /// `Arc` so the source (whose state advances through `&self`) is shared by
+    /// every request this gateway serves, rather than restarting per call.
+    rng: Arc<crate::random::SplitMix64>,
+    /// Minimum live observations before a metric sort trusts a candidate's mean
+    /// (see [`crate::resilience::ResilienceConfig::min_samples`]). Read per
+    /// request, so unlike the performance store's capacity/window this needs no
+    /// rebuild when `with_resilience` changes it.
+    resilience_min_samples: u32,
 }
 
 impl Gateway {
@@ -93,6 +118,17 @@ impl Gateway {
         // the SAME registry — so a registered observer sees every lock the
         // sink writes (§5c: the gateway announces, the caller persists).
         let lockout_observers = crate::gates::lockout::LockoutBroadcaster::new();
+        let resilience = crate::resilience::ResilienceConfig::default();
+        // Built here so the sink's write handle (in `recorders`) and this
+        // read-side field share the SAME Arc-backed store, mirroring
+        // `cooldown`/`model_lockout` above. Unlike those two, the store's OWN
+        // capacity/window is baked in at construction (no setter), so
+        // `with_resilience` must rebuild rather than reuse this store when an
+        // operator tunes `perf_samples`/`perf_window`.
+        let performance = crate::gates::performance::PerformanceStore::new(
+            resilience.perf_samples,
+            resilience.perf_window,
+        );
         // Built AFTER `model_lockout` so the sink's write handle and the gate's
         // read-side field share the SAME Arc-backed store (the gate skips what
         // the sink locked). The default config reproduces today's constants
@@ -103,7 +139,8 @@ impl Gateway {
             &cooldown,
             &model_lockout,
             &lockout_observers,
-            &crate::resilience::ResilienceConfig::default(),
+            &performance,
+            &resilience,
         );
         Self {
             config: Arc::new(RwLock::new(config)),
@@ -115,7 +152,36 @@ impl Gateway {
             cooldown,
             model_lockout,
             lockout_observers,
+            performance,
+            rng: Arc::new(crate::random::SplitMix64::from_entropy()),
+            resilience_min_samples: resilience.min_samples,
         }
+    }
+
+    /// Builds the [`ModelSelectionService`] used by BOTH `execute` and
+    /// `execute_stream` — the single construction site, so Task 9/10's
+    /// performance + entropy wiring lands in exactly one place instead of two
+    /// copies drifting apart, and so a test can inspect the service this
+    /// gateway actually builds (see
+    /// `tests::production_selection_never_uses_the_fixed_seed_default`)
+    /// without hand-mirroring the construction.
+    fn selection_service<'a>(&'a self, config: &'a GatewayConfig) -> ModelSelectionService<'a> {
+        ModelSelectionService::new(
+            config,
+            &self.circuit_breaker,
+            &self.cooldown,
+            &self.model_lockout,
+        )
+        // The READ side of the store the `PerformanceRecorder` writes. Without
+        // it selection sees the null port, and `sort: latency|throughput` would
+        // silently degrade to priority order on every request — the feature
+        // compiling and doing nothing. Pinned by
+        // `tests::production_selection_reads_the_gateways_live_performance_store`,
+        // which moves the LIVE store and requires the route to follow.
+        .with_performance(&self.performance, self.resilience_min_samples)
+        // Entropy-seeded — see the `rng` field's doc for why the fixed-seed
+        // default is a fleet-wide hazard rather than a test detail.
+        .with_random(self.rng.as_ref())
     }
 
     /// Attach a [`GatewayStore`] so each terminal call is persisted (enabling
@@ -138,23 +204,38 @@ impl Gateway {
         self
     }
 
-    /// Tune the health gates (cooldown/lockout durations, eviction cap, and
-    /// deterministic per-endpoint jitter). Builder-style; rebuilds the recorder pipeline from
-    /// `resilience` while preserving the SAME Arc-backed stores/observers/breaker,
-    /// so the read-side gates keep reading what the sinks write. Absent ⇒
+    /// Tune the health gates (cooldown/lockout durations, eviction cap,
+    /// deterministic per-endpoint jitter, and the performance window).
+    /// Builder-style; rebuilds the recorder pipeline from `resilience` while
+    /// preserving the SAME Arc-backed cooldown/lockout stores/observers/breaker,
+    /// so THEIR read-side gates keep reading what their sinks write. Absent ⇒
     /// [`ResilienceConfig::default`] (today's behavior). Construction-time only —
     /// NOT hot-swappable via `update_config` (which carries routing config, not
     /// resilience policy).
     ///
+    /// `performance` is the one store this REBUILDS rather than reuses: its
+    /// capacity/window are fixed at construction (no setter), so a tuned
+    /// `perf_samples`/`perf_window` requires a fresh, empty
+    /// `PerformanceStore` — this call therefore discards any samples recorded
+    /// before it, unlike the cooldown/lockout stores it leaves untouched.
+    ///
     /// [`ResilienceConfig::default`]: crate::resilience::ResilienceConfig::default
     pub fn with_resilience(mut self, resilience: crate::resilience::ResilienceConfig) -> Self {
+        self.performance = crate::gates::performance::PerformanceStore::new(
+            resilience.perf_samples,
+            resilience.perf_window,
+        );
         self.recorders = build_recorders(
             &self.circuit_breaker,
             &self.cooldown,
             &self.model_lockout,
             &self.lockout_observers,
+            &self.performance,
             &resilience,
         );
+        // Read per request rather than baked into a sink, so unlike the store
+        // above this is a plain replacement with no rebuild.
+        self.resilience_min_samples = resilience.min_samples;
         self
     }
 
@@ -645,15 +726,26 @@ impl Gateway {
 
     /// Dispatch one attempt's outcome to every registered recorder (reliable
     /// write-side) and return the earliest `Instant` any recorder just wrote as
-    /// this endpoint's unavailability deadline, or `None` if none did.
+    /// this endpoint's unavailability deadline, or `None` if none did. Takes
+    /// the whole [`crate::gates::AttemptOutcome`] rather than its fields
+    /// spread across separate parameters — the outcome IS the "timing/outcome
+    /// struct" a longer parameter list would otherwise need, and every field
+    /// call sites need (`phase` included) already lives there.
     pub(super) fn record_outcome(
         &self,
-        endpoint: &str,
-        router: &str,
-        success: bool,
-        error: Option<&GatewayError>,
+        outcome: &crate::gates::AttemptOutcome<'_>,
     ) -> Option<std::time::Instant> {
-        dispatch_outcome(&self.recorders, endpoint, router, success, error)
+        dispatch_outcome(&self.recorders, outcome)
+    }
+
+    /// Observed performance for an endpoint (`"{router}:{model}"`). `None` until
+    /// the endpoint has a live sample.
+    pub fn performance_stats(
+        &self,
+        endpoint: &str,
+    ) -> Option<crate::gates::performance::EndpointStats> {
+        use crate::gates::performance::EndpointPerformanceRead;
+        self.performance.stats(endpoint)
     }
 }
 
@@ -672,6 +764,7 @@ fn build_recorders(
     cooldown: &crate::gates::cooldown::ConnectionCooldownStore,
     model_lockout: &crate::gates::lockout::ModelLockoutStore,
     observers: &crate::gates::lockout::LockoutBroadcaster,
+    performance: &crate::gates::performance::PerformanceStore,
     resilience: &crate::resilience::ResilienceConfig,
 ) -> Vec<Arc<dyn crate::gates::HealthRecorder>> {
     vec![
@@ -691,6 +784,10 @@ fn build_recorders(
             resilience.eviction_cap,
             resilience.jitter_fraction,
         )),
+        Arc::new(crate::gates::performance::PerformanceRecorder::new(
+            performance.clone(),
+            resilience.eviction_cap,
+        )),
     ]
 }
 
@@ -699,18 +796,9 @@ fn build_recorders(
 /// Returns the earliest deadline any recorder just wrote (min-fanned), or `None`.
 pub(super) fn dispatch_outcome(
     recorders: &[std::sync::Arc<dyn crate::gates::HealthRecorder>],
-    endpoint: &str,
-    router: &str,
-    success: bool,
-    error: Option<&crate::types::error::GatewayError>,
+    outcome: &crate::gates::AttemptOutcome<'_>,
 ) -> Option<std::time::Instant> {
-    let o = crate::gates::AttemptOutcome {
-        endpoint,
-        router,
-        success,
-        error,
-    };
-    recorders.iter().filter_map(|r| r.on_outcome(&o)).min()
+    recorders.iter().filter_map(|r| r.on_outcome(outcome)).min()
 }
 
 #[cfg(test)]

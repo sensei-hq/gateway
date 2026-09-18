@@ -35,6 +35,7 @@ fn empty_response() -> InferenceResponse {
         estimated_cost: None,
         actual_cost: None,
         attempts: Vec::new(),
+        routing: None,
     }
 }
 
@@ -240,6 +241,7 @@ mod tests {
             consensus: None,
             allow_fallback: true,
             credentials: Default::default(),
+            routing: None,
         }
     }
 
@@ -258,6 +260,7 @@ mod tests {
             consensus: None,
             allow_fallback: true,
             credentials: Default::default(),
+            routing: None,
         }
     }
 
@@ -305,6 +308,7 @@ mod tests {
             consensus: None,
             allow_fallback: true,
             credentials: Default::default(),
+            routing: None,
         };
         assert!(to_chat_request(&ir, None).is_err());
     }
