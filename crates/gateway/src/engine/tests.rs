@@ -658,11 +658,11 @@ async fn execute_no_candidates_errors() {
 
 /// A caller's `routing` preferences must actually REACH selection. The two
 /// production `SelectionCriteria` sites (`execute.rs`, `stream.rs`) are the only
-/// path, and until SP-ROUTE-1 Task 10 wires them they hardcode `preferences: None`
-/// — so the whole feature can be built and stay inert with a green suite.
-/// Un-ignore at Task 10 Step 4.
+/// path, and before SP-ROUTE-1 Task 10 wired them they hardcoded
+/// `preferences: None` — so the whole feature could be built and stay inert with
+/// a green suite. Un-ignored at Task 10 Step 4; it is now the regression guard
+/// that catches the entire feature going inert again.
 #[tokio::test]
-#[ignore = "green at SP-ROUTE-1 Task 10 Step 4, which wires request.routing into SelectionCriteria"]
 async fn a_requests_routing_preferences_reach_selection() {
     let gw = test_gateway();
     register_noop(&gw).await;
@@ -5369,6 +5369,62 @@ async fn execute_stream_gates_on_the_context_window_like_execute() {
     }
 }
 
+/// SP-ROUTE-1 Task 10 — the STREAMING half of the routing-preferences wiring,
+/// which nothing else covered.
+///
+/// `execute_stream` builds its OWN `SelectionCriteria`, so
+/// `a_requests_routing_preferences_reach_selection` — which drives `execute` —
+/// says nothing about it. Verified rather than assumed: reverting `stream.rs`
+/// alone to `preferences: None` left the entire 416-test gateway suite green, so
+/// half of SP-ROUTE-1 could have gone inert unnoticed. Filed beside
+/// `execute_stream_gates_on_the_context_window_like_execute`, which exists for
+/// exactly this reason on exactly this seam and shares its fixture.
+///
+/// BOTH halves are asserted, and the first is what makes the second mean
+/// something: unfiltered, this request streams from `small`, so a test asserting
+/// only "it streamed from `big`" could not tell a working `ignore` from a
+/// fixture that never had a choice.
+#[tokio::test]
+async fn execute_stream_honours_routing_preferences_like_execute() {
+    let gw = ab_gateway(window_chain_config(128_000, 8_192));
+    register_noop(&gw).await;
+
+    fn done_model(events: &[StreamEvent]) -> Option<String> {
+        events.iter().find_map(|e| match e {
+            StreamEvent::Done { model, .. } => Some(model.clone()),
+            _ => None,
+        })
+    }
+
+    // `small` is the priority-1 entry and holds an empty request comfortably, so
+    // it is what an unpreferenced stream comes from.
+    let plain = collect_stream(&gw, &chat_request_of_length(0)).await;
+    assert_eq!(
+        done_model(&plain),
+        Some("small".to_string()),
+        "the BEFORE state: with no preferences the priority-1 candidate serves: \
+         {plain:?}"
+    );
+
+    // `ignore` naming that candidate must demote the stream to `big`.
+    let mut request = chat_request_of_length(0);
+    request.routing = Some(crate::types::request::RoutingPreferences {
+        ignore: Some(crate::types::request::CandidateSet {
+            routers: vec![],
+            models: vec!["small".to_string()],
+        }),
+        ..Default::default()
+    });
+    let filtered = collect_stream(&gw, &request).await;
+    assert_eq!(
+        done_model(&filtered),
+        Some("big".to_string()),
+        "`ignore` must reach selection through `execute_stream` too — streaming \
+         from `small` means the caller's preferences were dropped on this path: \
+         {filtered:?}"
+    );
+}
+
 /// AC9 — a stream that fails after its first chunk must reach the health
 /// recorders as a FAILURE.
 ///
@@ -6023,8 +6079,6 @@ async fn a_mid_stream_failure_with_usage_contributes_no_throughput() {
 /// regression guard: if a future edit to `selection_service` drops the
 /// `with_random` call, this goes red again.
 #[test]
-#[ignore = "green at SP-ROUTE-1 Task 10, which wires the gateway's entropy-seeded \
-            RandomSource into `Gateway::selection_service`"]
 fn production_selection_never_uses_the_fixed_seed_default() {
     let gw = test_gateway();
     let config = test_config_with_noop();
@@ -6034,5 +6088,85 @@ fn production_selection_never_uses_the_fixed_seed_default() {
         "production must pass an entropy-seeded source via with_random; the fixed-seed \
          DEFAULT_RNG makes every process draw the identical sequence, so weighted routing \
          synchronises across the fleet instead of spreading"
+    );
+}
+
+/// SP-ROUTE-1 Task 10 — the OTHER half of `selection_service`'s wiring, which no
+/// tripwire covered: `.with_performance`.
+///
+/// Rule 2 from Task 9's Critical: **a fixture that returns a constant cannot
+/// test a live source.** Production reads the gateway's REAL `PerformanceStore`
+/// — the one every completing attempt mutates through `record_outcome` — so this
+/// asserts the answer CHANGES: same gateway, same criteria, a different route
+/// once observations land. Every metric test in `selection.rs` and `strategy.rs`
+/// uses a fixed fixture and is structurally unable to make that claim, so
+/// `.with_performance` could be dropped from `selection_service` and all of them
+/// would stay green.
+///
+/// Both halves are asserted, and the BEFORE half is what makes the AFTER half
+/// mean anything: a test asserting only the final order would pass against a
+/// chain that was already in that order. Here the before and after orders are
+/// REVERSES of each other, so no fixed answer satisfies both.
+#[test]
+fn production_selection_reads_the_gateways_live_performance_store() {
+    let gw = test_gateway_with_chain();
+    let config = test_config_with_failing_and_noop();
+    // `chat_chain`: fail-model@failing is priority 1, noop@noop is priority 2 —
+    // so priority order and the observed-latency order below disagree.
+    let criteria = SelectionCriteria {
+        capability: Capability::TextChat,
+        model: None,
+        router: None,
+        chain: Some("chat_chain".to_string()),
+        budget: None,
+        input_tokens: None,
+        input_tokens_pessimistic: None,
+        preferences: Some(crate::types::request::RoutingPreferences {
+            sort: Some(crate::types::request::SortKey::Latency),
+            ..Default::default()
+        }),
+    };
+    let route = || -> Vec<String> {
+        gw.selection_service(&config)
+            .select_all(&criteria)
+            .all_candidates
+            .iter()
+            .map(|c| c.model.clone())
+            .collect()
+    };
+
+    assert_eq!(
+        route(),
+        vec!["fail-model", "noop"],
+        "with nothing observed a latency sort degrades to priority order (AC7) — \
+         this is the BEFORE state a live read has to move away from"
+    );
+
+    // The gateway's OWN write path: `record_outcome` fans out to the
+    // `PerformanceRecorder`, which holds a clone of the very store
+    // `selection_service` has to read. `min_samples` is 3, so three each.
+    let observe = |endpoint: &str, router: &str, duration_ms: u64| {
+        gw.record_outcome(&crate::gates::AttemptOutcome {
+            endpoint,
+            router,
+            success: true,
+            error: None,
+            duration_ms,
+            output_tokens: Some(10),
+            phase: crate::gates::AttemptPhase::Complete,
+        });
+    };
+    for _ in 0..3 {
+        observe("failing:fail-model", "failing", 500);
+        observe("noop:noop", "noop", 10);
+    }
+
+    assert_eq!(
+        route(),
+        vec!["noop", "fail-model"],
+        "`noop` is observed at 10ms against `fail-model`'s 500ms, so a latency \
+         sort must now put it first DESPITE its worse priority. Same gateway and \
+         same criteria as the assertion above — only the live store moved, which \
+         is the one thing a constant fixture cannot demonstrate"
     );
 }

@@ -104,8 +104,17 @@ pub struct ModelSelectionService<'a> {
     router_health: &'a dyn RouterHealthRead,
     /// Endpoint model-lockout read port (the model-lockout store implements it).
     model_lockout: &'a dyn crate::gates::lockout::ModelLockoutRead,
-    /// Orders admitted candidates (SP-0: priority ascending, stable).
-    strategy: Box<dyn RoutingStrategy>,
+    /// Forces [`Self::strategy_for`]'s answer, bypassing `sort` resolution.
+    ///
+    /// Test-only. There is no production field holding "the" strategy any more:
+    /// since Task 10 the strategy is resolved PER REQUEST from
+    /// `criteria.preferences.sort`, so a fixed field would be exactly the thing
+    /// that cannot express the feature. This exists so a test can install a
+    /// probe strategy that reads the `StrategyCtx` back out (see
+    /// [`tests::the_builders_install_the_ports_the_strategy_sees`]) — the one
+    /// claim no real strategy can make about itself.
+    #[cfg(test)]
+    strategy_override: Option<Box<dyn RoutingStrategy>>,
     /// Performance read port. Defaults to the null port so a caller that never
     /// wires performance behaves exactly as before this slice.
     perf: &'a dyn crate::gates::performance::EndpointPerformanceRead,
@@ -184,10 +193,42 @@ impl<'a> ModelSelectionService<'a> {
             health: circuit_breaker,
             router_health,
             model_lockout,
-            strategy: Box::new(crate::strategy::GroupedWeightedStrategy),
+            #[cfg(test)]
+            strategy_override: None,
             perf: &NO_PERF,
             rng: &DEFAULT_RNG,
             min_samples: 3,
+        }
+    }
+
+    /// The strategy for THIS request. An explicit `sort` replaces the default;
+    /// `order` (applied in [`Self::resolve_chain`]) is layered on top of
+    /// whichever ran.
+    ///
+    /// Resolved per request rather than held in a field, which is the whole of
+    /// Task 10: `sort` is a property of the CALLER's request, so a service-wide
+    /// strategy could only ever express the default. The `None` arm is what
+    /// keeps this additive — a request carrying no `sort` gets
+    /// [`crate::strategy::GroupedWeightedStrategy`], byte-identically to before
+    /// this task.
+    ///
+    /// Each arm is pinned by `tests::each_sort_value_resolves_to_its_own_strategy`
+    /// on a fixture whose price, latency, throughput and priority orders are four
+    /// mutually distinct permutations — the only shape in which an arm returning
+    /// the WRONG strategy (or falling through to the default) is observable.
+    fn strategy_for(&self, criteria: &SelectionCriteria) -> Box<dyn RoutingStrategy + '_> {
+        use crate::types::request::SortKey;
+        // Test-only, and deliberately ahead of the `sort` match: a probe
+        // strategy must see every request regardless of what it asks for.
+        #[cfg(test)]
+        if let Some(s) = &self.strategy_override {
+            return Box::new(&**s);
+        }
+        match criteria.preferences.as_ref().and_then(|p| p.sort) {
+            Some(SortKey::Price) => Box::new(crate::strategy::PriceStrategy),
+            Some(SortKey::Latency) => Box::new(crate::strategy::MetricStrategy::latency()),
+            Some(SortKey::Throughput) => Box::new(crate::strategy::MetricStrategy::throughput()),
+            None => Box::new(crate::strategy::GroupedWeightedStrategy),
         }
     }
 
@@ -421,7 +462,32 @@ impl<'a> ModelSelectionService<'a> {
             rng: self.rng,
             min_samples: self.min_samples,
         };
-        self.strategy.order(&mut all_candidates, &ctx);
+        self.strategy_for(criteria).order(&mut all_candidates, &ctx);
+
+        // `order` is layered ON TOP of whichever strategy ran. A STABLE sort by
+        // matched-ref index gives exactly the specified semantics: named
+        // candidates lead in ref order, candidates sharing a ref keep the
+        // strategy's relative order, and unmatched candidates (rank usize::MAX)
+        // follow as fallbacks in the strategy's order. `order` therefore never
+        // FILTERS — `only`/`ignore` (the `RoutingPolicyGate`) are the knobs that
+        // restrict, and they have already run by here.
+        //
+        // The rank is computed per candidate from `refs` alone — a pure, cheap
+        // function of data already in hand. Do NOT be tempted to consult a port
+        // here: Task 9 shipped a panic by reading a live store from inside a
+        // comparator (`stats()` recomputes from `Instant::now()`, so a key could
+        // change between two comparisons, and `sort_by` detects the resulting
+        // intransitivity and panics inside model selection).
+        if let Some(refs) = criteria.preferences.as_ref().and_then(|p| p.order.as_ref()) {
+            all_candidates.sort_by_key(|m| {
+                refs.iter()
+                    .position(|r| {
+                        r.router.as_deref().is_none_or(|x| x == m.router)
+                            && r.model.as_deref().is_none_or(|x| x == m.model)
+                    })
+                    .unwrap_or(usize::MAX)
+            });
+        }
 
         SelectionResult {
             selected: None, // filled by caller
@@ -2015,7 +2081,7 @@ mod tests {
         let mut svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout)
             .with_performance(&store, 11)
             .with_random(&rng);
-        svc.strategy = Box::new(std::sync::Arc::clone(&probe));
+        svc.strategy_override = Some(Box::new(std::sync::Arc::clone(&probe)));
 
         let criteria = SelectionCriteria {
             capability: Capability::TextChat,
@@ -2046,6 +2112,517 @@ mod tests {
             Some(1),
             "resolve_chain's ctx must carry the `perf` passed to `with_performance`, \
              not the null port (which would report `None`)"
+        );
+    }
+
+    // -----------------------------------------------------------------------------
+    // SP-ROUTE-1 Task 10 — per-request strategy resolution (`sort`) and the
+    // `order` re-rank, seen through the whole selection service.
+    //
+    // Every strategy test in `strategy.rs` constructs its strategy directly and
+    // calls `.order(...)`, which proves the strategy works and says NOTHING about
+    // which one a given `sort` resolves to. These go through `select_all`, the
+    // only place resolution is observable — Task 7's Critical (reverting the
+    // registered default passed the whole suite, because a test proving two
+    // strategies AGREE cannot catch a swap between them) in Task 10's clothing.
+    // -----------------------------------------------------------------------------
+
+    /// A three-model `TextChat` chain built so PRIORITY order, PRICE order,
+    /// LATENCY order and THROUGHPUT order are four MUTUALLY DISTINCT
+    /// permutations — the only shape in which a `sort` that resolves to the
+    /// wrong strategy, or silently to the default, is observable at all.
+    ///
+    /// | model   | router | priority | price | latency | tok/s |
+    /// |---------|--------|----------|-------|---------|-------|
+    /// | alpha   | north  | 1        | 3.0   | 20 ms   | 10    |
+    /// | bravo   | south  | 2        | 1.0   | 30 ms   | 50    |
+    /// | charlie | north  | 3        | 2.0   | 10 ms   | 90    |
+    ///
+    /// ⇒ default `[alpha, bravo, charlie]`, price `[bravo, charlie, alpha]`,
+    /// latency `[charlie, alpha, bravo]`, throughput `[charlie, bravo, alpha]`.
+    ///
+    /// Every priority is DISTINCT, which makes the default
+    /// (`GroupedWeightedStrategy`) exactly priority order by AC1 — so the
+    /// default's answer here is deterministic and no draw can perturb it.
+    ///
+    /// `alpha` and `charlie` share the router `north` while `bravo` sits alone on
+    /// `south`, deliberately: a router-only `CandidateRef` is then a wildcard
+    /// over TWO models that are NOT adjacent in the default order, so the
+    /// wildcard's effect cannot be mistaken for the priority sort's.
+    ///
+    /// Price is not asserted directly but comes out of `estimate_cost`: with
+    /// `input_tokens: None` the estimate is `max_output_tokens * output_per_1k /
+    /// 1000`, so at 1000 output tokens `output_per_1k` IS the dollar price.
+    fn sort_chain() -> GatewayConfig {
+        let mut routers = HashMap::new();
+        for id in ["north", "south"] {
+            routers.insert(
+                id.to_string(),
+                RouterConfig {
+                    url: "http://localhost".to_string(),
+                    api_key_env: None,
+                    api_key: None,
+                    enabled: true,
+                    timeout_ms: None,
+                    headers: HashMap::new(),
+                },
+            );
+        }
+
+        let mut models = HashMap::new();
+        let mut entries = Vec::new();
+        for (id, router, priority, price) in [
+            ("alpha", "north", 1u8, 3.0),
+            ("bravo", "south", 2, 1.0),
+            ("charlie", "north", 3, 2.0),
+        ] {
+            models.insert(
+                id.to_string(),
+                ModelConfig {
+                    id: id.to_string(),
+                    api_model_id: None,
+                    provider: router.to_string(),
+                    family: None,
+                    capabilities: vec![Capability::TextChat],
+                    context_window: 128_000,
+                    max_output_tokens: 1_000,
+                    pricing: Some(ModelPricing {
+                        input_per_1k: 0.0,
+                        output_per_1k: price,
+                        per_request: None,
+                    }),
+                    catalog: None,
+                },
+            );
+            entries.push(ChainEntry {
+                model: id.to_string(),
+                router: Some(router.to_string()),
+                api_model_id: None,
+                priority,
+            });
+        }
+
+        let mut chains = HashMap::new();
+        chains.insert(
+            "sort_chain".to_string(),
+            FallbackChainConfig {
+                id: "sort_chain".to_string(),
+                capability: Capability::TextChat,
+                models: entries,
+                fallback_triggers: vec![],
+            },
+        );
+
+        GatewayConfig {
+            routers,
+            models,
+            chains,
+            constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
+        }
+    }
+
+    /// The metrics [`sort_chain`] is designed around, keyed off the model suffix
+    /// of the `"{router}:{model}"` endpoint key so it survives the two-router
+    /// layout.
+    ///
+    /// All three counters sit ABOVE the service's `min_samples`, and each mean is
+    /// set independently of the others — a fixture that tied `throughput_samples`
+    /// to `samples` could not tell a throughput sort reading the wrong counter
+    /// from one reading the right one.
+    struct SortChainStats;
+    impl crate::gates::performance::EndpointPerformanceRead for SortChainStats {
+        fn stats(&self, endpoint: &str) -> Option<crate::gates::performance::EndpointStats> {
+            let (mean_latency_ms, mean_tokens_per_sec) = match endpoint {
+                "north:alpha" => (20.0, 10.0),
+                "south:bravo" => (30.0, 50.0),
+                "north:charlie" => (10.0, 90.0),
+                _ => return None,
+            };
+            Some(crate::gates::performance::EndpointStats {
+                samples: 9,
+                throughput_samples: 9,
+                verdict_samples: 9,
+                mean_latency_ms,
+                mean_tokens_per_sec,
+                success_rate: 1.0,
+            })
+        }
+    }
+
+    fn sort_criteria(prefs: Option<RoutingPreferences>) -> SelectionCriteria {
+        SelectionCriteria {
+            capability: Capability::TextChat,
+            model: None,
+            router: None,
+            chain: Some("sort_chain".to_string()),
+            budget: None,
+            input_tokens: None,
+            input_tokens_pessimistic: None,
+            preferences: prefs,
+        }
+    }
+
+    /// Resolve [`sort_chain`] under `prefs` and return the admitted models in
+    /// the order selection would actually try them.
+    ///
+    /// Its own seeded RNG, never `DEFAULT_RNG`: that static is process-wide and
+    /// cargo runs tests in parallel, so which draw a test receives would
+    /// otherwise depend on who else ran. (Every group here is a singleton, so no
+    /// draw can move anything — but the rule holds regardless of whether this
+    /// particular fixture is sensitive to it.)
+    fn sort_chain_order(prefs: Option<RoutingPreferences>) -> Vec<String> {
+        let config = sort_chain();
+        let cb = test_cb();
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let perf = SortChainStats;
+        let rng = crate::random::SplitMix64::seeded(1010);
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout)
+            .with_performance(&perf, 3)
+            .with_random(&rng);
+        svc.select_all(&sort_criteria(prefs))
+            .all_candidates
+            .iter()
+            .map(|c| c.model.clone())
+            .collect()
+    }
+
+    fn model_ref(model: &str) -> crate::types::request::CandidateRef {
+        crate::types::request::CandidateRef {
+            router: None,
+            model: Some(model.to_string()),
+        }
+    }
+
+    fn router_ref(router: &str) -> crate::types::request::CandidateRef {
+        crate::types::request::CandidateRef {
+            router: Some(router.to_string()),
+            model: None,
+        }
+    }
+
+    /// Each `sort` value must resolve to a DIFFERENT strategy — and the test must
+    /// be able to tell them apart.
+    ///
+    /// This is Task 7's Critical in Task 10's clothing. There, a test proving
+    /// `GroupedWeightedStrategy` and `PriorityStrategy` AGREE on a
+    /// distinct-priority chain stayed green when the registered default was
+    /// reverted. Here the equivalent risk is a `sort` arm returning the wrong
+    /// strategy — or falling through to the default — so the fixture is built so
+    /// all four answers differ, and the FULL sequence is asserted for each.
+    ///
+    /// The pairwise `assert_ne!` sweep at the end pins the fixture's own premise
+    /// rather than trusting it: if a future edit made two of these orders
+    /// coincide, the four `assert_eq!`s above would still pass while silently
+    /// losing the power to catch a swap between those two arms.
+    #[test]
+    fn each_sort_value_resolves_to_its_own_strategy() {
+        use crate::types::request::SortKey;
+        let sorted = |sort: Option<SortKey>| {
+            sort_chain_order(Some(RoutingPreferences {
+                sort,
+                ..Default::default()
+            }))
+        };
+
+        let default = sorted(None);
+        let price = sorted(Some(SortKey::Price));
+        let latency = sorted(Some(SortKey::Latency));
+        let throughput = sorted(Some(SortKey::Throughput));
+
+        assert_eq!(
+            default,
+            vec!["alpha", "bravo", "charlie"],
+            "no `sort` ⇒ the registered default (`GroupedWeightedStrategy`), which \
+             on a distinct-priority chain is exactly priority order"
+        );
+        assert_eq!(
+            price,
+            vec!["bravo", "charlie", "alpha"],
+            "`sort: price` ⇒ ascending estimated cost (1.0, 2.0, 3.0), overriding \
+             priority entirely"
+        );
+        assert_eq!(
+            latency,
+            vec!["charlie", "alpha", "bravo"],
+            "`sort: latency` ⇒ ascending mean latency (10ms, 20ms, 30ms)"
+        );
+        assert_eq!(
+            throughput,
+            vec!["charlie", "bravo", "alpha"],
+            "`sort: throughput` ⇒ DESCENDING tok/s (90, 50, 10) — note this is \
+             not the latency order, so swapping the two arms is caught here"
+        );
+
+        let all = [
+            ("default", &default),
+            ("price", &price),
+            ("latency", &latency),
+            ("throughput", &throughput),
+        ];
+        for (i, (name_a, a)) in all.iter().enumerate() {
+            for (name_b, b) in all.iter().skip(i + 1) {
+                assert_ne!(
+                    a, b,
+                    "the fixture must keep all four answers distinct or this test \
+                     loses the power to tell `{name_a}` from `{name_b}`"
+                );
+            }
+        }
+    }
+
+    /// AC6 — `order` sequences the candidates it names; unmatched candidates
+    /// follow as FALLBACKS rather than being dropped. `only` is the knob that
+    /// restricts.
+    #[test]
+    fn order_sequences_named_candidates_and_keeps_the_rest_as_fallbacks() {
+        // ONE named candidate leads, and the two it did NOT name follow in the
+        // strategy's order — all three still present.
+        assert_eq!(
+            sort_chain_order(Some(RoutingPreferences {
+                order: Some(vec![model_ref("charlie")]),
+                ..Default::default()
+            })),
+            vec!["charlie", "alpha", "bravo"],
+            "`charlie` is named and leads from LAST place; `alpha` and `bravo` are \
+             unnamed and follow as fallbacks in the strategy's order — naming one \
+             candidate must not drop the others"
+        );
+
+        // TWO named candidates lead in REF order, which here is the REVERSE of
+        // the order the strategy put them in — so this cannot pass against an
+        // implementation that merely kept the strategy's sequence for them.
+        assert_eq!(
+            sort_chain_order(Some(RoutingPreferences {
+                order: Some(vec![model_ref("charlie"), model_ref("bravo")]),
+                ..Default::default()
+            })),
+            vec!["charlie", "bravo", "alpha"],
+            "named candidates lead in the order the REFS list them (charlie then \
+             bravo), not the order the strategy produced (bravo then charlie)"
+        );
+
+        // A ref matching nothing is inert: every candidate ranks `usize::MAX`,
+        // the sort is stable, so the strategy's order survives untouched and
+        // nothing is filtered out. `order` never restricts.
+        assert_eq!(
+            sort_chain_order(Some(RoutingPreferences {
+                order: Some(vec![model_ref("ghost")]),
+                ..Default::default()
+            })),
+            vec!["alpha", "bravo", "charlie"],
+            "an `order` naming a candidate that is not in the chain must leave \
+             the selection exactly as the strategy left it — and must not drop \
+             the candidates it failed to name"
+        );
+    }
+
+    /// A ref naming only a router is a wildcard over its models.
+    #[test]
+    fn an_order_ref_with_only_a_router_is_a_wildcard_over_its_models() {
+        // `north` hosts alpha AND charlie. Both lead, keeping the strategy's
+        // relative order between them, and `charlie` jumps `bravo` — the half a
+        // single-model router could not show.
+        assert_eq!(
+            sort_chain_order(Some(RoutingPreferences {
+                order: Some(vec![router_ref("north")]),
+                ..Default::default()
+            })),
+            vec!["alpha", "charlie", "bravo"],
+            "a router-only ref matches EVERY model on that router: both of \
+             north's lead, so charlie climbs past south's bravo, and the two \
+             sharing the ref keep the strategy's order between them"
+        );
+
+        // The other router, so the assertion above cannot be satisfied by the
+        // default order with extra steps: `south` hosts only `bravo`, which must
+        // climb from the middle to the front.
+        assert_eq!(
+            sort_chain_order(Some(RoutingPreferences {
+                order: Some(vec![router_ref("south")]),
+                ..Default::default()
+            })),
+            vec!["bravo", "alpha", "charlie"],
+            "south hosts only bravo, which leads; north's two follow as \
+             fallbacks in the strategy's order"
+        );
+    }
+
+    /// Candidates SHARING one `order` ref keep the strategy's order between
+    /// them — the property that makes the re-rank a STABLE sort rather than
+    /// merely a sort.
+    ///
+    /// **Both the WIDTH and the INTERLEAVING of this fixture are load-bearing,
+    /// and each was chosen by measurement rather than taste.** The mutation this
+    /// exists to catch is `sort_by_key` → `sort_unstable_by_key`, and the
+    /// shapes that CANNOT see it are worth recording so nobody "simplifies" the
+    /// fixture back into one of them:
+    ///
+    /// - **Too narrow.** `sort_unstable_by_key` delegates to insertion sort on
+    ///   small inputs, which is stable in practice. Measured: an alternating
+    ///   fixture is preserved at n = 4…32 and only diverges from n = 40. The
+    ///   three-candidate `order` tests above are therefore all blind to it — the
+    ///   entire 415-test gateway suite passed with the unstable variant in place.
+    /// - **All ranks equal.** A ref matching EVERY candidate looks like the
+    ///   sharpest form of the claim and is in fact the weakest: pdqsort's
+    ///   equal-partition path is itself order-preserving, so an all-rank-0
+    ///   fixture is preserved at every width measured (n = 3…1000). Verified
+    ///   directly — this test was first written that way at n = 40 and passed
+    ///   under the mutation.
+    ///
+    /// What does see it is MIXED ranks interleaved through the strategy's
+    /// output: half the chain matches the ref (rank 0) and half does not
+    /// (`usize::MAX`), alternating. n = 64 sits clear of the measured n = 40
+    /// boundary rather than on it, since that threshold is a stdlib
+    /// implementation detail and may move.
+    #[test]
+    fn candidates_sharing_an_order_ref_keep_the_strategys_order() {
+        const N: u8 = 64;
+
+        let mut routers = HashMap::new();
+        for id in ["named", "other"] {
+            routers.insert(
+                id.to_string(),
+                RouterConfig {
+                    url: "http://localhost".to_string(),
+                    api_key_env: None,
+                    api_key: None,
+                    enabled: true,
+                    timeout_ms: None,
+                    headers: HashMap::new(),
+                },
+            );
+        }
+
+        // Alternating routers, so the two rank classes interleave rather than
+        // arriving already grouped — a pre-grouped input is what the stable and
+        // unstable sorts agree on.
+        let router_of = |i: u8| if i % 2 == 1 { "named" } else { "other" };
+
+        let mut models = HashMap::new();
+        let mut entries = Vec::new();
+        for i in 1..=N {
+            let id = format!("m{i:02}");
+            models.insert(
+                id.clone(),
+                ModelConfig {
+                    id: id.clone(),
+                    api_model_id: None,
+                    provider: router_of(i).to_string(),
+                    family: None,
+                    capabilities: vec![Capability::TextChat],
+                    context_window: 128_000,
+                    max_output_tokens: 1_000,
+                    pricing: None,
+                    catalog: None,
+                },
+            );
+            entries.push(ChainEntry {
+                model: id,
+                router: Some(router_of(i).to_string()),
+                api_model_id: None,
+                // DISTINCT, so the strategy's answer is deterministic priority
+                // order and the only thing that can scramble it is the re-rank.
+                priority: i,
+            });
+        }
+        let mut chains = HashMap::new();
+        chains.insert(
+            "wide_chain".to_string(),
+            FallbackChainConfig {
+                id: "wide_chain".to_string(),
+                capability: Capability::TextChat,
+                models: entries,
+                fallback_triggers: vec![],
+            },
+        );
+        let config = GatewayConfig {
+            routers,
+            models,
+            chains,
+            constraints: Default::default(),
+            panels: Default::default(),
+            consensus: Default::default(),
+        };
+
+        let cb = test_cb();
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let rng = crate::random::SplitMix64::seeded(4040);
+        let svc = ModelSelectionService::new(&config, &cb, &cooldown, &lockout).with_random(&rng);
+
+        let got: Vec<String> = svc
+            .select_all(&SelectionCriteria {
+                capability: Capability::TextChat,
+                model: None,
+                router: None,
+                chain: Some("wide_chain".to_string()),
+                budget: None,
+                input_tokens: None,
+                input_tokens_pessimistic: None,
+                preferences: Some(RoutingPreferences {
+                    order: Some(vec![router_ref("named")]),
+                    ..Default::default()
+                }),
+            })
+            .all_candidates
+            .iter()
+            .map(|c| c.model.clone())
+            .collect();
+
+        // Every `named` candidate leads, then every `other` — each class in the
+        // strategy's (priority) order, which for this chain is model-id order.
+        let expected: Vec<String> = (1..=N)
+            .filter(|i| router_of(*i) == "named")
+            .chain((1..=N).filter(|i| router_of(*i) == "other"))
+            .map(|i| format!("m{i:02}"))
+            .collect();
+        assert_eq!(
+            got, expected,
+            "the {N} candidates fall into two rank classes, and WITHIN each class \
+             the strategy's order must survive the re-rank intact"
+        );
+    }
+
+    /// `order` wins for the candidates it names; `sort` orders the unnamed tail.
+    /// Combining them is legal and composable.
+    #[test]
+    fn order_and_sort_compose_with_order_winning_for_named_candidates() {
+        use crate::types::request::SortKey;
+        let composed = sort_chain_order(Some(RoutingPreferences {
+            sort: Some(SortKey::Throughput),
+            order: Some(vec![model_ref("alpha")]),
+            ..Default::default()
+        }));
+        let sort_only = sort_chain_order(Some(RoutingPreferences {
+            sort: Some(SortKey::Throughput),
+            ..Default::default()
+        }));
+        let order_only = sort_chain_order(Some(RoutingPreferences {
+            order: Some(vec![model_ref("alpha")]),
+            ..Default::default()
+        }));
+
+        assert_eq!(
+            composed,
+            vec!["alpha", "charlie", "bravo"],
+            "`order` wins for `alpha` — the WORST candidate by throughput (10 \
+             tok/s), so it can only be leading because it was named — while \
+             `sort` still orders the unnamed tail: charlie (90) ahead of bravo \
+             (50), where priority order would have put bravo first"
+        );
+        assert_ne!(
+            composed, sort_only,
+            "if `order` were ignored the answer would collapse to the throughput \
+             sort, so these two must differ for the assertion above to mean \
+             anything"
+        );
+        assert_ne!(
+            composed, order_only,
+            "and if `sort` were ignored it would collapse to the re-ranked \
+             DEFAULT order — the tail is what tells them apart"
         );
     }
 }

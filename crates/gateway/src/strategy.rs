@@ -25,6 +25,22 @@ pub trait RoutingStrategy: Send + Sync {
     fn order(&self, admitted: &mut Vec<SelectedModel>, ctx: &StrategyCtx<'_>);
 }
 
+/// A reference to a strategy is a strategy.
+///
+/// Test-only, and it exists for one reason: since Task 10,
+/// `ModelSelectionService::strategy_for` resolves a strategy PER REQUEST and
+/// returns it owned, so the test-only `strategy_override` field cannot be
+/// handed back directly — it would have to be moved out of `&self`. This lets
+/// `strategy_for` return a BORROW of the override instead, keeping the probe
+/// mechanism (`selection::tests::the_builders_install_the_ports_the_strategy_sees`)
+/// working without widening the production surface.
+#[cfg(test)]
+impl<T: RoutingStrategy + ?Sized> RoutingStrategy for &T {
+    fn order(&self, admitted: &mut Vec<SelectedModel>, ctx: &StrategyCtx<'_>) {
+        (**self).order(admitted, ctx)
+    }
+}
+
 /// Strict ascending priority, stable. Retained as the explicit baseline every
 /// other strategy is compared against in tests.
 pub struct PriorityStrategy;
