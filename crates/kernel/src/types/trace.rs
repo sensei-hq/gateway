@@ -49,6 +49,56 @@ pub struct SkippedInfo {
     pub reason: String,
 }
 
+/// Why the candidates came out in the order they did (SP-ROUTE-1).
+///
+/// Recorded because the default strategy is a WEIGHTED DRAW: without the
+/// weights and their inputs, "why did it pick the expensive one" has no answer
+/// in a bug report, and a weighted router is otherwise unfalsifiable in
+/// production — two identical requests may legitimately route differently, so
+/// there is nothing to re-run and compare against.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RoutingDecision {
+    /// Read from `RoutingStrategy::name()` — the strategy that actually ran,
+    /// not a re-derivation from the request. One of `grouped_weighted`,
+    /// `price`, `latency`, `throughput` (or `priority` for the retained
+    /// baseline).
+    pub strategy: String,
+    /// Whether a metric sort found too few samples to reorder anything, so it
+    /// degraded to priority order.
+    ///
+    /// The single most important thing this record can say out loud: a
+    /// `sort: latency` that silently returns priority order looks, from the
+    /// outside, exactly like a `sort: latency` that was ignored.
+    pub degraded: bool,
+    /// The candidates in the order the engine will actually try them — i.e.
+    /// AFTER any `order` re-rank, not merely as the strategy left them.
+    pub order: Vec<RoutedCandidate>,
+}
+
+/// One candidate's place in a [`RoutingDecision`], and the inputs that put it
+/// there.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RoutedCandidate {
+    /// `"{router}:{model}"`.
+    pub endpoint: String,
+    pub priority: u8,
+    /// Estimated cost; `None` for an unpriced (free) candidate.
+    pub cost: Option<f64>,
+    /// Windowed success rate. `None` when unmeasured — which is NOT the same as
+    /// `Some(0.0)`, and conflating them is how a healthy fleet gets routed as
+    /// though every provider were dead. `None` also when the strategy that ran
+    /// does not consult reliability at all (every sort but the default).
+    pub reliability: Option<f64>,
+    /// The draw weight, when the weighted default ran.
+    ///
+    /// `None` when the candidate never entered a draw: no weighted strategy
+    /// ran, or it was free (an unpriced candidate, or one so cheap that
+    /// `1/cost²` overflows) and so leads its group outright. `Some(0.0)` is
+    /// distinct and meaningful — a candidate with a real weight of zero, which
+    /// can never be drawn and therefore goes last.
+    pub weight: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionTrace {
     pub request_id: String,
@@ -62,6 +112,9 @@ pub struct ExecutionTrace {
     pub estimated_cost: Option<CostEstimate>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actual_cost: Option<Cost>,
+    /// Why the candidates came out in this order (SP-ROUTE-1 AC10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<RoutingDecision>,
     pub created_at: DateTime<Utc>,
 }
 

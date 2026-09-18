@@ -131,7 +131,17 @@ impl super::Gateway {
                 )
                 .await
             {
-                StepOutcome::Done(response) => return Ok(*response),
+                StepOutcome::Done(mut response) => {
+                    // AC10 — carry the routing decision out to the caller.
+                    // `attempt_candidate` sees one candidate and cannot know why
+                    // that candidate came first, so the attachment belongs here,
+                    // where `result` is still in scope. Without this line the
+                    // whole of Task 11 is a field populated in `SelectionResult`
+                    // and read by nobody. Pinned by
+                    // `tests::the_routing_decision_reaches_the_inference_response`.
+                    response.routing = result.decision.clone();
+                    return Ok(*response);
+                }
                 StepOutcome::FallBack => continue,
                 StepOutcome::Stop => break,
             }

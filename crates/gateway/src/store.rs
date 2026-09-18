@@ -216,7 +216,10 @@ mod tests {
 
     use super::*;
     use crate::types::cost::CostEstimate;
-    use crate::types::trace::{Attempt, AttemptStatus, CandidateInfo, SkippedInfo, TraceStatus};
+    use crate::types::trace::{
+        Attempt, AttemptStatus, CandidateInfo, RoutedCandidate, RoutingDecision, SkippedInfo,
+        TraceStatus,
+    };
 
     fn make_call(
         session_id: Option<Uuid>,
@@ -286,6 +289,17 @@ mod tests {
                     model: "claude-sonnet".to_string(),
                 }),
                 actual_cost: None,
+                routing: Some(RoutingDecision {
+                    strategy: "grouped_weighted".to_string(),
+                    degraded: false,
+                    order: vec![RoutedCandidate {
+                        endpoint: "priority:claude-sonnet".to_string(),
+                        priority: 1,
+                        cost: Some(0.003),
+                        reliability: Some(0.75),
+                        weight: Some(0.5),
+                    }],
+                }),
                 created_at: Utc::now(),
             },
             created_at: Utc::now(),
@@ -318,6 +332,37 @@ mod tests {
         assert_eq!(deserialized.trace.request_id, trace.trace.request_id);
         assert_eq!(deserialized.trace.candidates.len(), 1);
         assert_eq!(deserialized.trace.attempts.len(), 1);
+        // SP-ROUTE-1 AC10. Asserted as a WHOLE `RoutingDecision` rather than
+        // field by field: a persisted trace whose weights survived but whose
+        // `reliability: Some(0.75)` came back as `None` would still explain the
+        // wrong routing, and the nested `Option<f64>`s are exactly the shape a
+        // serde attribute typo silently drops.
+        assert_eq!(
+            deserialized.trace.routing, trace.trace.routing,
+            "a routing decision must survive persistence intact, or the trace \
+             explains nothing once it is read back out of the store"
+        );
+        assert!(
+            deserialized.trace.routing.is_some(),
+            "and be present at all"
+        );
+    }
+
+    /// An `ExecutionTrace` written before SP-ROUTE-1 has no `routing` key at
+    /// all. Without `#[serde(default)]` that is a hard deserialization error,
+    /// so every historical trace in a store would become unreadable — a silent
+    /// data-loss migration hidden inside an additive-looking field.
+    #[test]
+    fn a_trace_persisted_without_a_routing_decision_still_deserializes() {
+        let mut trace = make_trace(Some(Uuid::new_v4()));
+        trace.trace.routing = None;
+        let json = serde_json::to_string(&trace).unwrap();
+        assert!(
+            !json.contains("routing"),
+            "`None` must not be written at all, so an old reader is unaffected too"
+        );
+        let deserialized: StoredTrace = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.trace.routing, None);
     }
 
     // 3. CallStatus serde

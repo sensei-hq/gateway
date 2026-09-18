@@ -6284,3 +6284,212 @@ fn production_selection_reads_the_gateways_live_performance_store() {
          is the one thing a constant fixture cannot demonstrate"
     );
 }
+
+// -----------------------------------------------------------------------------
+// Task 11 — AC10 at the PRODUCTION construction site.
+//
+// `reliability` and `weight` come from the performance port and from the price
+// the config carries. A bare `ModelSelectionService::new(...)` gets the NULL
+// performance port, so those two fields are the ones a bare fixture structurally
+// cannot observe — which is exactly why they are the two most worth asserting.
+// These drive `gw.selection_service(&config)` and `gw.execute(...)` instead.
+// -----------------------------------------------------------------------------
+
+/// [`test_config_with_failing_and_noop`] with PRICES attached, chosen so that
+///
+/// - the estimate is EXACTLY the configured price, independently of how large
+///   the request payload happens to be (1000 output tokens at `price` per 1k),
+///   so the inverse-square weight below is a hand-checkable number rather than
+///   an artefact of `estimate_input_tokens`; and
+/// - price order (`noop` at 1.0, then `fail-model` at 2.0) is the REVERSE of
+///   priority order (`fail-model` is 1, `noop` is 2), so a `sort: price` that
+///   silently did nothing is visible.
+fn priced_failing_and_noop() -> GatewayConfig {
+    let mut config = test_config_with_failing_and_noop();
+    for (model, price) in [("fail-model", 2.0), ("noop", 1.0)] {
+        let m = config.models.get_mut(model).expect("fixture model exists");
+        m.max_output_tokens = 1_000;
+        m.pricing = Some(ModelPricing {
+            input_per_1k: 0.0,
+            output_per_1k: price,
+            per_request: None,
+        });
+    }
+    config
+}
+
+fn priced_chain_criteria() -> SelectionCriteria {
+    SelectionCriteria {
+        capability: Capability::TextChat,
+        model: None,
+        router: None,
+        chain: Some("chat_chain".to_string()),
+        budget: None,
+        input_tokens: None,
+        input_tokens_pessimistic: None,
+        // No `sort` ⇒ the weighted default, the one strategy that produces
+        // weights at all.
+        preferences: None,
+    }
+}
+
+/// AC10, and the half a bare fixture cannot reach: the recorded `reliability`
+/// and `weight` are the values the strategy ACTUALLY used, taken from the
+/// gateway's LIVE performance store.
+///
+/// Built on `gw.selection_service(&config)` — the real production construction
+/// site — and fed through `gw.record_outcome`, the gateway's own write path, the
+/// same way `production_selection_reads_the_gateways_live_performance_store`
+/// does. A `ModelSelectionService::new(...)` built by hand holds the null
+/// performance port, so every `stats()` is `None` and `reliability` could only
+/// ever be `None`: the assertion below is one the null port CANNOT satisfy.
+///
+/// The two endpoints are asserted together on purpose. One is observed and one
+/// is not, so a single fixture pins three separate claims at once: that a
+/// measured rate reaches the trace, that an unmeasured one stays `None`, and —
+/// because the two prices differ — that reliability MULTIPLIES the price weight
+/// rather than replacing or being ignored by it.
+#[test]
+fn production_selection_records_the_weight_and_reliability_it_actually_used() {
+    let config = priced_failing_and_noop();
+    let gw = Gateway::new(
+        config.clone(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+
+    // The gateway's OWN write path. `min_samples` is 3, so exactly three
+    // verdicts — two successes and one failure — put `failing:fail-model` at a
+    // success rate of 2/3, a number no default and no null port produces.
+    let observe = |success: bool| {
+        gw.record_outcome(&crate::gates::AttemptOutcome {
+            endpoint: "failing:fail-model",
+            router: "failing",
+            success,
+            error: None,
+            duration_ms: 100,
+            output_tokens: Some(10),
+            phase: crate::gates::AttemptPhase::Complete,
+        });
+    };
+    observe(true);
+    observe(true);
+    observe(false);
+    // `noop:noop` is deliberately never observed.
+
+    let result = gw
+        .selection_service(&config)
+        .select_all(&priced_chain_criteria());
+    let decision = result
+        .decision
+        .expect("a chain resolution always records a decision");
+    let of = |endpoint: &str| {
+        decision
+            .order
+            .iter()
+            .find(|c| c.endpoint == endpoint)
+            .unwrap_or_else(|| panic!("{endpoint} must be admitted by this fixture"))
+    };
+
+    let observed = of("failing:fail-model");
+    assert_eq!(
+        observed.cost,
+        Some(2.0),
+        "1000 output tokens at 2.0 per 1k — the price the weight is derived from"
+    );
+    assert_eq!(
+        observed.reliability,
+        Some(2.0 / 3.0),
+        "two successes and one failure through the gateway's own recorder. The \
+         null performance port a hand-built service would hold cannot produce \
+         this — it can only ever produce `None`"
+    );
+    assert_eq!(
+        observed.weight,
+        Some(0.25 * (2.0 / 3.0)),
+        "`1/2² × 2/3`. Exact rather than approximate: 0.25 is a power of two, so \
+         scaling by it is lossless and this is bit-identical to what `classify` \
+         computed. A weight of 0.25 would mean reliability never reached the \
+         draw; a weight of 2/3 would mean price never did"
+    );
+
+    let unobserved = of("noop:noop");
+    assert_eq!(unobserved.cost, Some(1.0));
+    assert_eq!(
+        unobserved.reliability, None,
+        "never observed — and `None` rather than `Some(0.0)`, which is the \
+         difference between a cold endpoint and a dead one"
+    );
+    assert_eq!(
+        unobserved.weight,
+        Some(1.0),
+        "`1/1² × 1.0`: unmeasured weighs 1.0, so a cold endpoint competes on \
+         price alone rather than being starved of the traffic it needs to cast \
+         its first verdict"
+    );
+
+    assert_ne!(
+        observed.reliability, unobserved.reliability,
+        "the whole point of reading a LIVE store is that the two endpoints come \
+         back different; a constant source would make them agree"
+    );
+}
+
+/// AC10 — the decision escapes selection and reaches the caller.
+///
+/// `SelectionResult::decision` populated but never attached is a wiring point
+/// deletable with a green suite, which has been a Critical in four separate
+/// tasks of this slice. This is the test that kills that mutation: drop the
+/// attachment in `engine/execute.rs` and the `expect` below fires.
+///
+/// `sort: price` rather than the default, because the price order here is the
+/// REVERSE of priority order — so the recorded sequence cannot be mistaken for
+/// the chain's authored one, and a decision that described the wrong ordering
+/// would be visible rather than coincidentally right.
+#[tokio::test]
+async fn the_routing_decision_reaches_the_inference_response() {
+    let gw = Gateway::new(
+        priced_failing_and_noop(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+    // Only the `noop` router gets an adapter; `failing` has none, so a walk that
+    // reached it would fall through. It never does here — `noop` is cheapest, so
+    // the price sort puts it first.
+    register_noop(&gw).await;
+
+    let request = InferenceRequest {
+        chain: Some("chat_chain".to_string()),
+        routing: Some(crate::types::request::RoutingPreferences {
+            sort: Some(crate::types::request::SortKey::Price),
+            ..Default::default()
+        }),
+        ..chat_request()
+    };
+
+    let response = gw
+        .execute(&request)
+        .await
+        .expect("the noop adapter answers");
+    let decision = response
+        .routing
+        .expect("execute must attach the selection's routing decision to the response");
+
+    assert_eq!(decision.strategy, "price");
+    assert_eq!(
+        decision
+            .order
+            .iter()
+            .map(|c| c.endpoint.clone())
+            .collect::<Vec<_>>(),
+        vec!["noop:noop", "failing:fail-model"],
+        "price order (1.0 then 2.0) is the reverse of the chain's authored \
+         priority order, so this sequence can only come from the strategy that \
+         actually ran"
+    );
+    assert_eq!(
+        decision.order[0].cost,
+        Some(1.0),
+        "and the per-candidate detail travels with it, not just the order"
+    );
+}

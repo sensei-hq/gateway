@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use super::capability::Capability;
 use super::cost::{Cost, CostEstimate, TokenUsage};
-use super::trace::Attempt;
+use super::trace::{Attempt, RoutingDecision};
 
 // ---------------------------------------------------------------------------
 // Base64 serde helpers for audio byte fields
@@ -535,6 +535,20 @@ pub struct InferenceResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actual_cost: Option<Cost>,
     pub attempts: Vec<Attempt>,
+    /// Why the candidates were tried in the order they were (SP-ROUTE-1 AC10).
+    ///
+    /// The mirror of [`InferenceRequest::routing`]: that field is what the
+    /// caller ASKED for, this one is what the router actually did with it. `None`
+    /// when no strategy ran — a direct router+model request orders nothing.
+    ///
+    /// Carried on the response rather than only on an [`ExecutionTrace`]
+    /// because nothing in this workspace builds an `ExecutionTrace` in
+    /// production today; the response is the one artefact a caller reporting
+    /// "why did it pick the expensive one" actually has in hand.
+    ///
+    /// [`ExecutionTrace`]: super::trace::ExecutionTrace
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<RoutingDecision>,
 }
 
 #[derive(Debug, Clone)]
@@ -822,6 +836,7 @@ mod tests {
             estimated_cost: None,
             actual_cost: None,
             attempts: vec![],
+            routing: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -1142,6 +1157,7 @@ mod tests {
             estimated_cost: None,
             actual_cost: None,
             attempts: vec![],
+            routing: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -1169,6 +1185,7 @@ mod tests {
             estimated_cost: None,
             actual_cost: None,
             attempts: vec![],
+            routing: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -1268,6 +1285,7 @@ mod tests {
             estimated_cost: None,
             actual_cost: None,
             attempts: vec![],
+            routing: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -1391,6 +1409,7 @@ mod tests {
             estimated_cost: None,
             actual_cost: None,
             attempts: vec![],
+            routing: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();

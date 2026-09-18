@@ -14,6 +14,7 @@ use crate::types::config::{
 };
 use crate::types::cost::CostEstimate;
 use crate::types::request::RoutingPreferences;
+use crate::types::trace::{RoutedCandidate, RoutingDecision};
 use std::time::Instant;
 
 /// Criteria used to resolve which model(s) to try.
@@ -84,6 +85,13 @@ pub struct SelectionResult {
     pub all_candidates: Vec<SelectedModel>,
     pub skipped: Vec<SkippedCandidate>,
     pub chain: Option<FallbackChainConfig>,
+    /// Why the candidates came out in this order (SP-ROUTE-1 AC10).
+    ///
+    /// `Some` on the chain and capability paths — the ones that RUN a
+    /// [`RoutingStrategy`] — and `None` on the direct and not-found paths,
+    /// which order nothing. A direct `router` + `model` request names its one
+    /// candidate outright; there is no decision to explain.
+    pub decision: Option<RoutingDecision>,
 }
 
 /// Resolves which model(s) to use for a given request via 3-tier resolution
@@ -366,6 +374,8 @@ impl<'a> ModelSelectionService<'a> {
                 all_candidates: vec![],
                 skipped: vec![],
                 chain: None,
+                // No chain resolved ⇒ no strategy ran ⇒ nothing to explain.
+                decision: None,
             };
         }
 
@@ -384,6 +394,9 @@ impl<'a> ModelSelectionService<'a> {
                 all_candidates: vec![selected],
                 skipped: vec![],
                 chain: None,
+                // A direct request names its one candidate outright; no
+                // strategy ordered anything, so there is no decision to record.
+                decision: None,
             },
             Err(reason) => SelectionResult {
                 selected: None,
@@ -394,6 +407,7 @@ impl<'a> ModelSelectionService<'a> {
                     reason,
                 }],
                 chain: None,
+                decision: None,
             },
         }
     }
@@ -467,7 +481,14 @@ impl<'a> ModelSelectionService<'a> {
             rng: self.rng,
             min_samples: self.min_samples,
         };
-        self.strategy_for(criteria).order(&mut all_candidates, &ctx);
+        // Bound rather than called inline, because the decision below needs the
+        // NAME of the very object that produced this ordering. The alternative
+        // — a second `match` on `SortKey` at the trace site — compiles, agrees
+        // on the day it is written, and is then free to drift from
+        // `strategy_for` forever after. This way there is one `match` in the
+        // crate and the reported name is the strategy that did the work.
+        let strategy = self.strategy_for(criteria);
+        let report = strategy.order(&mut all_candidates, &ctx);
 
         // `order` is layered ON TOP of whichever strategy ran, and gives exactly
         // the specified semantics: named candidates lead in ref order,
@@ -520,11 +541,50 @@ impl<'a> ModelSelectionService<'a> {
             all_candidates = ranked.into_iter().map(|(_, _, m)| m).collect();
         }
 
+        // AC10 — record WHY the candidates came out in this order.
+        //
+        // Built HERE, after the `order` re-rank, and that placement is
+        // load-bearing: the decision must describe the sequence the engine will
+        // actually try. Built beside `strategy.order(...)` above — the obvious
+        // place — it would record the strategy's output and then be silently
+        // contradicted by the re-rank, which is a trace that lies about the one
+        // thing it exists to explain.
+        //
+        // `reliability` and `weight` are READ OUT OF `report`, never recomputed.
+        // `ctx.perf` is a live rolling window whose means are recalculated from
+        // `Instant::now()` on every call, so a second read is not guaranteed to
+        // return what the ordering used — and a trace describing an ordering
+        // that never happened fails silently, unlike the Task 9 comparator
+        // panic that came from the same live-read hazard.
+        let decision = RoutingDecision {
+            strategy: strategy.name().to_string(),
+            degraded: report.degraded,
+            order: all_candidates
+                .iter()
+                .map(|m| {
+                    let endpoint = m.endpoint_key();
+                    let weighed = report.weights.iter().find(|w| w.endpoint == endpoint);
+                    RoutedCandidate {
+                        priority: m.priority,
+                        cost: m.cost_estimate.as_ref().map(|c| c.estimated),
+                        // `None` both when the strategy weighed nothing and
+                        // when it weighed this candidate against no measurement
+                        // — see `RoutedCandidate`, which documents the
+                        // difference the `strategy` field resolves.
+                        reliability: weighed.and_then(|w| w.reliability),
+                        weight: weighed.and_then(|w| w.weight),
+                        endpoint,
+                    }
+                })
+                .collect(),
+        };
+
         SelectionResult {
             selected: None, // filled by caller
             all_candidates,
             skipped,
             chain: Some(chain.clone()),
+            decision: Some(decision),
         }
     }
 
@@ -627,6 +687,8 @@ impl<'a> ModelSelectionService<'a> {
                 all_candidates: vec![],
                 skipped: vec![],
                 chain: None,
+                // No chain matched the capability ⇒ no strategy ran.
+                decision: None,
             },
         }
     }
@@ -2064,12 +2126,17 @@ mod tests {
         perf_samples: std::sync::Mutex<Option<u32>>,
     }
     impl crate::strategy::RoutingStrategy for std::sync::Arc<ProbeStrategy> {
-        fn order(&self, admitted: &mut Vec<SelectedModel>, ctx: &crate::strategy::StrategyCtx<'_>) {
+        fn order(
+            &self,
+            admitted: &mut Vec<SelectedModel>,
+            ctx: &crate::strategy::StrategyCtx<'_>,
+        ) -> crate::strategy::OrderingReport {
             *self.draw.lock().unwrap() = Some(ctx.rng.next_u64());
             *self.min_samples.lock().unwrap() = Some(ctx.min_samples);
             *self.perf_samples.lock().unwrap() =
                 ctx.perf.stats("probe-endpoint").map(|s| s.samples);
             admitted.sort_by_key(|m| m.priority);
+            crate::strategy::OrderingReport::default()
         }
         /// Self-announcing, so a trace taken while an override is installed
         /// says so instead of impersonating the strategy it displaced.
@@ -2792,6 +2859,329 @@ mod tests {
             composed, order_only,
             "and if `sort` were ignored it would collapse to the re-ranked \
              DEFAULT order — the tail is what tells them apart"
+        );
+    }
+
+    // -----------------------------------------------------------------------------
+    // Task 11 — AC10: the routing DECISION.
+    //
+    // The default strategy is a weighted draw. Without the strategy that ran and
+    // the weights behind it, "why did it pick the expensive one" has no answer in
+    // a bug report at all, and a weighted router is unfalsifiable in production.
+    // -----------------------------------------------------------------------------
+
+    /// A per-endpoint reading over [`sort_chain`] where an endpoint ABSENT from
+    /// the slice is genuinely unmeasured (`stats` → `None`).
+    ///
+    /// That absence is the point, and it is what [`SortChainStats`] cannot
+    /// express — it answers for all three. Every counter is set to the same `n`
+    /// here because these tests vary MEASURED-vs-NOT, not which counter a sort
+    /// reads (`a_throughput_sort_ignores_an_endpoint_with_no_token_counts` in
+    /// `strategy.rs` owns that claim).
+    ///
+    /// `(endpoint, samples, mean_latency_ms, success_rate)`.
+    struct ChainReadings(&'static [(&'static str, u32, f64, f64)]);
+    impl crate::gates::performance::EndpointPerformanceRead for ChainReadings {
+        fn stats(&self, endpoint: &str) -> Option<crate::gates::performance::EndpointStats> {
+            self.0.iter().find(|(e, ..)| *e == endpoint).map(
+                |(_, samples, mean_latency_ms, success_rate)| {
+                    crate::gates::performance::EndpointStats {
+                        samples: *samples,
+                        throughput_samples: *samples,
+                        verdict_samples: *samples,
+                        mean_latency_ms: *mean_latency_ms,
+                        mean_tokens_per_sec: 0.0,
+                        success_rate: *success_rate,
+                    }
+                },
+            )
+        }
+    }
+
+    /// Resolve [`sort_chain`] under `perf` + `prefs` and hand back the WHOLE
+    /// result, so a test can compare the recorded decision against the very
+    /// candidate list it claims to describe. [`sort_chain_order`] throws that
+    /// away.
+    ///
+    /// Its own seeded source, never the process-wide `DEFAULT_RNG` — see
+    /// [`sort_chain_order`] for why.
+    fn sort_chain_select(
+        perf: &dyn crate::gates::performance::EndpointPerformanceRead,
+        prefs: Option<RoutingPreferences>,
+    ) -> SelectionResult {
+        let config = sort_chain();
+        let cb = test_cb();
+        let cooldown = crate::gates::cooldown::ConnectionCooldownStore::new();
+        let lockout = crate::gates::lockout::ModelLockoutStore::new();
+        let rng = crate::random::SplitMix64::seeded(1010);
+        ModelSelectionService::new(&config, &cb, &cooldown, &lockout)
+            .with_performance(perf, 3)
+            .with_random(&rng)
+            .select_all(&sort_criteria(prefs))
+    }
+
+    /// AC10 — the recorded strategy is the one that actually RAN.
+    ///
+    /// Read off `RoutingStrategy::name()` on the object `strategy_for` returned
+    /// and `order` was then called on, NOT re-derived from `criteria.sort` at
+    /// the trace site. That difference is not stylistic: a second `match` on
+    /// `SortKey` agrees on the day it is written and is free to drift
+    /// afterwards, and a trace naming the wrong strategy is worse than no trace
+    /// — it sends the reader of a bug report to the wrong code.
+    ///
+    /// All four arms, because an arm that silently returns the DEFAULT still
+    /// produces a perfectly valid-looking name.
+    #[test]
+    fn each_sort_value_records_the_name_of_the_strategy_that_ran() {
+        use crate::types::request::SortKey;
+        let recorded = |sort: Option<SortKey>| {
+            sort_chain_select(
+                &SortChainStats,
+                Some(RoutingPreferences {
+                    sort,
+                    ..Default::default()
+                }),
+            )
+            .decision
+            .expect("a chain resolution always runs a strategy, so it always records one")
+            .strategy
+        };
+
+        assert_eq!(recorded(None), "grouped_weighted");
+        assert_eq!(recorded(Some(SortKey::Price)), "price");
+        assert_eq!(recorded(Some(SortKey::Latency)), "latency");
+        assert_eq!(
+            recorded(Some(SortKey::Throughput)),
+            "throughput",
+            "the two metric sorts share one type, so each must report its OWN \
+             metric — a type-wide name would make `sort: latency` and \
+             `sort: throughput` indistinguishable in the trace"
+        );
+    }
+
+    /// AC10 — the recorded order IS the candidate order, element for element,
+    /// and it is recorded AFTER the `order` re-rank rather than before it.
+    ///
+    /// TWO independent anchors per case, deliberately. Element-for-element
+    /// equality on its own is the classic assertion that stays green when
+    /// neither side works: a decision built by mapping over `all_candidates` is
+    /// trivially equal to it however wrong both are. So each case also pins the
+    /// ABSOLUTE `(endpoint, priority)` sequence the strategy is specified to
+    /// produce.
+    ///
+    /// The `order` case is the structural one. `order` re-ranks AFTER the
+    /// strategy runs, so a decision built at the obvious place — right beside
+    /// the `strategy.order(...)` call — records `[alpha, bravo, charlie]` while
+    /// the engine goes on to try `[charlie, alpha, bravo]`. That trace would be
+    /// a lie about the one thing it exists to explain.
+    #[test]
+    fn the_recorded_order_is_the_candidate_order_element_for_element() {
+        use crate::types::request::SortKey;
+        let case = |label: &str, prefs: RoutingPreferences, expected: Vec<(&str, u8)>| {
+            let result = sort_chain_select(&SortChainStats, Some(prefs));
+            let actual: Vec<(String, u8)> = result
+                .all_candidates
+                .iter()
+                .map(|m| (m.endpoint_key(), m.priority))
+                .collect();
+            let expected: Vec<(String, u8)> = expected
+                .into_iter()
+                .map(|(e, p)| (e.to_string(), p))
+                .collect();
+            assert_eq!(
+                actual, expected,
+                "{label}: fixture premise — this is the order the engine will \
+                 actually try, and the decision has to match THIS"
+            );
+
+            let recorded: Vec<(String, u8)> = result
+                .decision
+                .as_ref()
+                .expect("a chain resolution always records a decision")
+                .order
+                .iter()
+                .map(|c| (c.endpoint.clone(), c.priority))
+                .collect();
+            assert_eq!(
+                recorded, expected,
+                "{label}: the recorded order must be the candidate order, \
+                 element for element"
+            );
+        };
+
+        case(
+            "default",
+            RoutingPreferences::default(),
+            vec![("north:alpha", 1), ("south:bravo", 2), ("north:charlie", 3)],
+        );
+        case(
+            "price",
+            RoutingPreferences {
+                sort: Some(SortKey::Price),
+                ..Default::default()
+            },
+            vec![("south:bravo", 2), ("north:charlie", 3), ("north:alpha", 1)],
+        );
+        case(
+            "latency",
+            RoutingPreferences {
+                sort: Some(SortKey::Latency),
+                ..Default::default()
+            },
+            vec![("north:charlie", 3), ("north:alpha", 1), ("south:bravo", 2)],
+        );
+        case(
+            "order re-rank",
+            RoutingPreferences {
+                order: Some(vec![model_ref("charlie")]),
+                ..Default::default()
+            },
+            vec![("north:charlie", 3), ("north:alpha", 1), ("south:bravo", 2)],
+        );
+    }
+
+    /// `reliability: None` (never measured) and `Some(0.0)` (measured, and
+    /// every verdict failed) are DIFFERENT facts and the trace must not flatten
+    /// them.
+    ///
+    /// Flattening is not a cosmetic loss. A reader of a trace where every
+    /// candidate reports `0.0` cannot tell a cold process from a dead fleet,
+    /// which is precisely the confusion `verdict_samples` was added to
+    /// `EndpointStats` to end — and it would be re-introduced one layer up, in
+    /// the artefact the operator actually reads.
+    ///
+    /// The `assert_ne!` is the load-bearing one: two `assert_eq!`s could both be
+    /// satisfied by a constant if the fixture were weaker, and this states the
+    /// claim (they DIFFER) directly.
+    #[test]
+    fn an_unmeasured_candidates_reliability_is_none_not_a_measured_zero() {
+        // `north:alpha` has 9 verdicts and failed every one of them; the other
+        // two endpoints have no reading at all.
+        let perf = ChainReadings(&[("north:alpha", 9, 0.0, 0.0)]);
+        let result = sort_chain_select(&perf, None);
+        let decision = result
+            .decision
+            .expect("a chain resolution always records a decision");
+        let of = |endpoint: &str| {
+            decision
+                .order
+                .iter()
+                .find(|c| c.endpoint == endpoint)
+                .unwrap_or_else(|| panic!("{endpoint} must be admitted by this fixture"))
+        };
+
+        assert_eq!(
+            of("north:alpha").reliability,
+            Some(0.0),
+            "9 verdicts is past `min_samples` 3 and every one failed, so this is \
+             MEASURED at zero — a fact about the endpoint"
+        );
+        assert_eq!(
+            of("south:bravo").reliability,
+            None,
+            "never observed, so there is no success rate to report — `None`, \
+             which is a fact about the OBSERVATION, not about the endpoint"
+        );
+        assert_ne!(
+            of("north:alpha").reliability,
+            of("south:bravo").reliability,
+            "measured-and-dead must not read identically to never-measured"
+        );
+
+        // And the weights those two facts produced, which is how the difference
+        // reaches the routing itself rather than only the trace.
+        assert_eq!(
+            of("north:alpha").weight,
+            Some(0.0),
+            "reliability 0.0 multiplies the price weight to zero: drawable never, \
+             so last in its group"
+        );
+        assert_eq!(
+            of("south:bravo").weight,
+            Some(1.0),
+            "unmeasured weighs 1.0, so at a price of 1.0 the draw weight is \
+             `1/1² × 1.0`. A `None`→`0.0` flattening here would make this 0.0 \
+             and strand a healthy endpoint"
+        );
+    }
+
+    /// `degraded` is true exactly when a metric sort could not express an
+    /// ordering for want of samples, so the result is priority order.
+    ///
+    /// Both directions, and the `< 2` boundary in both — a ONE-measured sort
+    /// writes that candidate back into its own slot and moves nothing, so it is
+    /// degraded just as surely as a zero-measured one, while a TWO-measured
+    /// sort is not degraded even if the pair happened to already agree.
+    /// The claim is about the INFORMATION the sort had.
+    #[test]
+    fn a_metric_sort_records_whether_it_degraded_for_want_of_samples() {
+        use crate::types::request::SortKey;
+        let degraded = |perf: &dyn crate::gates::performance::EndpointPerformanceRead,
+                        sort: Option<SortKey>| {
+            sort_chain_select(
+                perf,
+                Some(RoutingPreferences {
+                    sort,
+                    ..Default::default()
+                }),
+            )
+            .decision
+            .expect("a chain resolution always records a decision")
+            .degraded
+        };
+        let cold = crate::gates::performance::NoPerformance;
+
+        assert!(
+            degraded(&cold, Some(SortKey::Latency)),
+            "a cold store measures nothing, so the latency sort reorders nothing \
+             and the caller silently receives priority order — the single most \
+             important thing for a trace to say out loud"
+        );
+        assert!(
+            degraded(
+                &ChainReadings(&[("north:charlie", 9, 10.0, 1.0)]),
+                Some(SortKey::Latency)
+            ),
+            "ONE measured candidate of three is written back into its own slot, \
+             so the output is priority order too — `< 2`, not `== 0`"
+        );
+
+        let two = ChainReadings(&[("north:alpha", 9, 30.0, 1.0), ("south:bravo", 9, 20.0, 1.0)]);
+        assert!(
+            !degraded(&two, Some(SortKey::Latency)),
+            "TWO measured candidates give the sort a preference it can express"
+        );
+        // ...and here it DID express one, so the line above is not merely a
+        // claim about a sort that had nothing to do.
+        assert_eq!(
+            sort_chain_select(
+                &two,
+                Some(RoutingPreferences {
+                    sort: Some(SortKey::Latency),
+                    ..Default::default()
+                })
+            )
+            .all_candidates
+            .iter()
+            .map(|m| m.model.clone())
+            .collect::<Vec<_>>(),
+            vec!["bravo", "alpha", "charlie"],
+            "bravo (20ms) overtakes alpha (30ms) despite the worse priority, \
+             while the unmeasured charlie holds its index"
+        );
+
+        assert!(
+            !degraded(&SortChainStats, Some(SortKey::Latency)),
+            "all three measured is a complete metric sort"
+        );
+        assert!(
+            !degraded(&cold, None),
+            "the weighted default consults no SAMPLE COUNT, so it cannot degrade \
+             for want of them however cold the store is"
+        );
+        assert!(
+            !degraded(&cold, Some(SortKey::Price)),
+            "nor can a price sort, which reads config and never the store"
         );
     }
 }

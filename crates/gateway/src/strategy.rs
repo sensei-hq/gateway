@@ -20,9 +20,82 @@ pub struct StrategyCtx<'a> {
     pub min_samples: u32,
 }
 
+/// What one [`RoutingStrategy::order`] call did, beyond permuting the
+/// candidates — the input to the trace's `RoutingDecision` (SP-ROUTE-1 AC10).
+///
+/// **Returned BY `order` rather than read back off the strategy afterwards, and
+/// that is the whole design.** The trace has to report the weight and the
+/// reliability the ordering ACTUALLY used, and the two other shapes both fail
+/// that requirement:
+///
+/// - **Recomputing them at the trace site** is a second derivation of the same
+///   numbers from a LIVE port. `PerformanceStore::stats` recomputes its means
+///   from `Instant::now()` on every call, so an attempt completing between the
+///   sort and the trace makes the trace describe an ordering that never
+///   happened. That is the same live-read hazard that panicked model selection
+///   in Task 9, in a shape that fails silently instead of loudly.
+/// - **Stashing them on the strategy for a later `explain(&self)`** needs
+///   interior mutability (`order` takes `&self`, and strategies are
+///   `Send + Sync`) and introduces temporal coupling: called before `order`, or
+///   after a second `order`, it returns something stale with no way to tell.
+///
+/// A return value has neither problem. It cannot exist without the call that
+/// produced the ordering, and it cannot outlive it.
+#[derive(Debug, Default, PartialEq)]
+pub struct OrderingReport {
+    /// A metric sort had fewer than two MEASURED candidates, so it could not
+    /// express any ordering preference and the result is exactly priority
+    /// order.
+    ///
+    /// `< 2`, not `== 0`: with a single measured candidate the sort writes that
+    /// candidate back into the slot it already occupied and nothing moves, so
+    /// the output is priority order just as surely as with none. Conversely two
+    /// measured candidates that happen to already agree are NOT degraded — the
+    /// sort would have reordered them had they disagreed. The claim is about
+    /// the INFORMATION the sort had, not about whether the permutation changed.
+    ///
+    /// Always `false` for a strategy that consults no sample counts
+    /// ([`PriorityStrategy`], [`PriceStrategy`], [`GroupedWeightedStrategy`]):
+    /// they cannot degrade for want of something they never read.
+    pub degraded: bool,
+    /// One entry per candidate the strategy WEIGHED. Empty for a strategy that
+    /// weighs nothing, which is every strategy but the default.
+    ///
+    /// Keyed by endpoint rather than positional, because the caller re-ranks
+    /// the candidates after `order` returns (the `order` routing preference),
+    /// so a position is not a stable join.
+    pub weights: Vec<CandidateWeight>,
+}
+
+/// The draw inputs one candidate was weighed with, exactly as the strategy used
+/// them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CandidateWeight {
+    /// `"{router}:{model}"`.
+    pub endpoint: String,
+    /// The MEASURED windowed success rate, or `None` when the endpoint carried
+    /// fewer than [`StrategyCtx::min_samples`] verdicts.
+    ///
+    /// `None` is emphatically not `0.0`: an unmeasured candidate is WEIGHED as
+    /// healthy (`1.0`), so recording `0.0` here would both misreport the input
+    /// and contradict the weight recorded beside it.
+    pub reliability: Option<f64>,
+    /// The draw weight, or `None` when the candidate never entered the draw —
+    /// the free bucket, where `1/cost²` is undefined or overflows and the
+    /// candidate leads its group outright.
+    ///
+    /// `Some(0.0)` is a different and meaningful answer: a real weight of zero,
+    /// which can never be drawn and therefore goes last.
+    pub weight: Option<f64>,
+}
+
 /// Orders admitted candidates. The single ordering seam.
 pub trait RoutingStrategy: Send + Sync {
-    fn order(&self, admitted: &mut Vec<SelectedModel>, ctx: &StrategyCtx<'_>);
+    /// Order `admitted` in place, and report what was used to do it.
+    ///
+    /// See [`OrderingReport`] for why the explanation is this call's RETURN
+    /// VALUE rather than a second method on the strategy.
+    fn order(&self, admitted: &mut Vec<SelectedModel>, ctx: &StrategyCtx<'_>) -> OrderingReport;
 
     /// A stable identifier for the strategy that actually ran, for the trace.
     ///
@@ -57,7 +130,7 @@ pub trait RoutingStrategy: Send + Sync {
 /// preserve if this impl is ever widened.
 #[cfg(test)]
 impl<T: RoutingStrategy + ?Sized> RoutingStrategy for &T {
-    fn order(&self, admitted: &mut Vec<SelectedModel>, ctx: &StrategyCtx<'_>) {
+    fn order(&self, admitted: &mut Vec<SelectedModel>, ctx: &StrategyCtx<'_>) -> OrderingReport {
         (**self).order(admitted, ctx)
     }
     /// Forwarded, NOT reported as a wrapper name — an override must announce
@@ -71,8 +144,11 @@ impl<T: RoutingStrategy + ?Sized> RoutingStrategy for &T {
 /// other strategy is compared against in tests.
 pub struct PriorityStrategy;
 impl RoutingStrategy for PriorityStrategy {
-    fn order(&self, admitted: &mut Vec<SelectedModel>, _ctx: &StrategyCtx<'_>) {
+    fn order(&self, admitted: &mut Vec<SelectedModel>, _ctx: &StrategyCtx<'_>) -> OrderingReport {
         admitted.sort_by_key(|m| m.priority); // stable; identical to resolve_chain's sort today
+        // Reads no port and weighs nothing, so there is nothing to explain
+        // beyond the authored priorities the caller already has.
+        OrderingReport::default()
     }
     fn name(&self) -> &'static str {
         "priority"
@@ -90,6 +166,7 @@ impl RoutingStrategy for PriorityStrategy {
 /// and this is exactly `PriorityStrategy` — which is why it is safe as a default.
 pub struct GroupedWeightedStrategy;
 
+#[derive(Clone, Copy)]
 enum Weight {
     /// Costs nothing, or so little that `1/cost²` overflows — indistinguishable
     /// at that price. Always ahead of anything priced.
@@ -97,6 +174,19 @@ enum Weight {
     Draw(f64),
     /// Weight zero — unreachable by a draw, so it goes last.
     Zero,
+}
+
+impl Weight {
+    /// How this classification reads in a [`CandidateWeight`]: the draw weight
+    /// when there is one, and `None` for the free bucket, which bypasses the
+    /// draw entirely rather than entering it with some particular number.
+    fn recorded(self) -> Option<f64> {
+        match self {
+            Weight::Free => None,
+            Weight::Draw(w) => Some(w),
+            Weight::Zero => Some(0.0),
+        }
+    }
 }
 
 fn classify(cost: f64, reliability: f64) -> Weight {
@@ -116,13 +206,16 @@ fn classify(cost: f64, reliability: f64) -> Weight {
 }
 
 impl RoutingStrategy for GroupedWeightedStrategy {
-    fn order(&self, admitted: &mut Vec<SelectedModel>, ctx: &StrategyCtx<'_>) {
+    fn order(&self, admitted: &mut Vec<SelectedModel>, ctx: &StrategyCtx<'_>) -> OrderingReport {
         // Stable, so equal priorities end up adjacent IN CHAIN ORDER — the input
         // order the free/zero buckets below preserve.
         admitted.sort_by_key(|m| m.priority);
 
         let mut rest = std::mem::take(admitted);
         let mut out = Vec::with_capacity(rest.len());
+        // Accumulated ACROSS groups, so the report covers every candidate and
+        // not merely the last group's.
+        let mut weights = Vec::with_capacity(rest.len());
         while !rest.is_empty() {
             let p = rest[0].priority;
             let split = rest
@@ -130,22 +223,43 @@ impl RoutingStrategy for GroupedWeightedStrategy {
                 .position(|m| m.priority != p)
                 .unwrap_or(rest.len());
             let group: Vec<SelectedModel> = rest.drain(..split).collect();
-            out.extend(order_group(group, ctx));
+            out.extend(order_group(group, ctx, &mut weights));
         }
         *admitted = out;
+        OrderingReport {
+            // Weighs every candidate it is given, whatever the store holds, so
+            // there is no sample count it could fall short of.
+            degraded: false,
+            weights,
+        }
     }
     fn name(&self) -> &'static str {
         "grouped_weighted"
     }
 }
 
-fn order_group(group: Vec<SelectedModel>, ctx: &StrategyCtx<'_>) -> Vec<SelectedModel> {
+/// Orders one equal-priority group, appending one [`CandidateWeight`] per
+/// candidate to `weights` as it goes.
+///
+/// The recording happens HERE, beside the classification, rather than being
+/// re-derived by the caller afterwards — see [`OrderingReport`]. `ctx.perf` is a
+/// live window, so a second read would not be guaranteed to return what this
+/// one did.
+fn order_group(
+    group: Vec<SelectedModel>,
+    ctx: &StrategyCtx<'_>,
+    weights: &mut Vec<CandidateWeight>,
+) -> Vec<SelectedModel> {
     let mut free = Vec::new();
     let mut zero = Vec::new();
     let mut pool: Vec<(f64, SelectedModel)> = Vec::new();
 
     for m in group {
         let cost = m.cost_estimate.as_ref().map(|c| c.estimated).unwrap_or(0.0);
+        // Bound once and reused for both the port lookup and the record, so the
+        // recorded endpoint is by construction the key the reading was taken
+        // under — and so a selection does not allocate the same string twice.
+        let endpoint = m.endpoint_key();
         // `success_rate` reads 0.0 BOTH when every attempt failed and when no
         // attempt has cast a verdict yet. `verdict_samples` is the only way to
         // tell those apart, and the difference is not cosmetic: without the
@@ -160,13 +274,25 @@ fn order_group(group: Vec<SelectedModel>, ctx: &StrategyCtx<'_>) -> Vec<Selected
         // healthy endpoint. Below the threshold a candidate weighs 1.0: the same
         // "unmeasured is healthy" rule, applied consistently rather than only at
         // exactly zero samples.
-        let reliability = ctx
+        //
+        // Split into MEASURED and the value actually used, rather than collapsed
+        // by `unwrap_or` in one expression: the trace needs to say which of the
+        // two it is (`None` vs `Some(0.0)`) and the draw needs the number. One
+        // read of the port serves both, so the recorded reliability cannot
+        // disagree with the one the weight was computed from.
+        let measured = ctx
             .perf
-            .stats(&m.endpoint_key())
+            .stats(&endpoint)
             .filter(|s| s.verdict_samples >= ctx.min_samples)
-            .map(|s| s.success_rate)
-            .unwrap_or(1.0);
-        match classify(cost, reliability) {
+            .map(|s| s.success_rate);
+        let reliability = measured.unwrap_or(1.0);
+        let classified = classify(cost, reliability);
+        weights.push(CandidateWeight {
+            endpoint,
+            reliability: measured,
+            weight: classified.recorded(),
+        });
+        match classified {
             Weight::Free => free.push(m),
             Weight::Zero => zero.push(m),
             Weight::Draw(w) => pool.push((w, m)),
@@ -248,13 +374,16 @@ fn price_key(m: &SelectedModel) -> f64 {
 }
 
 impl RoutingStrategy for PriceStrategy {
-    fn order(&self, admitted: &mut Vec<SelectedModel>, _ctx: &StrategyCtx<'_>) {
+    fn order(&self, admitted: &mut Vec<SelectedModel>, _ctx: &StrategyCtx<'_>) -> OrderingReport {
         admitted.sort_by(|a, b| {
             price_key(a)
                 .partial_cmp(&price_key(b))
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.priority.cmp(&b.priority))
         });
+        // Sorts on the price the trace already carries per candidate, and reads
+        // no port — so it has no weight and no sample count to report.
+        OrderingReport::default()
     }
     fn name(&self) -> &'static str {
         "price"
@@ -324,7 +453,7 @@ impl MetricStrategy {
 }
 
 impl RoutingStrategy for MetricStrategy {
-    fn order(&self, admitted: &mut Vec<SelectedModel>, ctx: &StrategyCtx<'_>) {
+    fn order(&self, admitted: &mut Vec<SelectedModel>, ctx: &StrategyCtx<'_>) -> OrderingReport {
         // The baseline every unmeasured candidate keeps.
         admitted.sort_by_key(|m| m.priority);
 
@@ -351,6 +480,14 @@ impl RoutingStrategy for MetricStrategy {
                 subset.push((v, m.clone()));
             }
         }
+        // Computed from the snapshot, BEFORE the sort consumes it. Fewer than
+        // two measured candidates leaves the output identical to the priority
+        // order established above — with one, the loop below writes that
+        // candidate back into the slot it already held — so the caller asked
+        // for a metric sort and is silently receiving priority order. That is
+        // the fact the trace exists to surface; see `OrderingReport::degraded`
+        // for why the boundary is `< 2` rather than `== 0`.
+        let degraded = !admitted.is_empty() && subset.len() < 2;
         // STABLE, and that is load-bearing: candidates whose readings are equal
         // fall back to the authored priority order established above, which is
         // what makes a partial set of observations a monotone interpolation
@@ -360,6 +497,12 @@ impl RoutingStrategy for MetricStrategy {
         debug_assert_eq!(slots.len(), subset.len());
         for (&slot, (_, m)) in slots.iter().zip(subset) {
             admitted[slot] = m;
+        }
+        OrderingReport {
+            degraded,
+            // Sorts on an observed mean and never on a draw, so there is no
+            // weight to report.
+            weights: Vec::new(),
         }
     }
     /// A property of the VALUE, not the type — the two metric sorts share

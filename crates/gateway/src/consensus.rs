@@ -107,6 +107,7 @@ mod tests {
             estimated_cost: None,
             actual_cost: None,
             attempts: Vec::new(),
+            routing: None,
         }
     }
 
