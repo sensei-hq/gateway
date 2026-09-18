@@ -11,6 +11,10 @@ pub const DEFAULT_EVICTION_CAP: usize = 4096;
 pub const DEFAULT_PERF_SAMPLES: usize = 64;
 /// How long a performance sample stays live.
 pub const DEFAULT_PERF_WINDOW: Duration = Duration::from_secs(300);
+/// Minimum live observations before a metric sort trusts a candidate's mean.
+/// Matches the value `ModelSelectionService::new` installs, so wiring this
+/// through `Gateway` changes nothing by default.
+pub const DEFAULT_MIN_SAMPLES: u32 = 3;
 
 /// Operator-tunable resilience policy applied at construction via
 /// `Gateway::with_resilience` (Task 2). `Default` reproduces the pre-(f)
@@ -35,6 +39,19 @@ pub struct ResilienceConfig {
     /// How long a performance sample stays live (Task 4). Same rebuild caveat
     /// as `perf_samples`.
     pub perf_window: Duration,
+    /// The minimum count of live observations a metric sort requires before it
+    /// trusts a candidate's mean as "measured" rather than leaving it in
+    /// priority order (SP-ROUTE-1). Reaches the strategies as
+    /// [`crate::strategy::StrategyCtx::min_samples`], whose doc carries the
+    /// hazard: each metric has its OWN counter on `EndpointStats`, and this
+    /// threshold must be compared against the one belonging to the metric being
+    /// sorted on.
+    ///
+    /// A COUNT, unlike `perf_samples` (a retention capacity) and `perf_window`
+    /// (a retention age) — those two decide what stays in the window, this one
+    /// decides how much of it is enough to act on. Unlike them it needs no
+    /// rebuild: it is read per request, so `with_resilience` simply replaces it.
+    pub min_samples: u32,
 }
 
 impl Default for ResilienceConfig {
@@ -46,6 +63,7 @@ impl Default for ResilienceConfig {
             jitter_fraction: 0.0,
             perf_samples: DEFAULT_PERF_SAMPLES,
             perf_window: DEFAULT_PERF_WINDOW,
+            min_samples: DEFAULT_MIN_SAMPLES,
         }
     }
 }

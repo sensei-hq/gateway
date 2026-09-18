@@ -56,7 +56,12 @@ impl super::Gateway {
             budget: request.budget,
             input_tokens: Some(input_tokens),
             input_tokens_pessimistic: Some(input_tokens_pessimistic),
-            preferences: None,
+            // One of the TWO sites (with `stream.rs`) where a caller's routing
+            // preferences enter selection. `None` here made the whole of
+            // SP-ROUTE-1 inert with a green suite — `only`/`ignore` never
+            // reached the `RoutingPolicyGate` and no `sort` selected anything.
+            // Pinned by `tests::a_requests_routing_preferences_reach_selection`.
+            preferences: request.routing.clone(),
         };
 
         // 3. Select all candidates

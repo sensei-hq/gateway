@@ -77,7 +77,10 @@ impl super::Gateway {
             budget: request.budget,
             input_tokens: Some(input_tokens),
             input_tokens_pessimistic: Some(estimate_input_tokens_pessimistic(&request.payload)),
-            preferences: None,
+            // The streaming half of the same wiring as `execute.rs` — a caller's
+            // preferences must not depend on which entry point they came in
+            // through.
+            preferences: request.routing.clone(),
         };
 
         // 4. Select all candidates.

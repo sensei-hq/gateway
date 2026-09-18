@@ -78,6 +78,27 @@ pub struct Gateway {
     /// from Task 7, write side is the `PerformanceRecorder` in `recorders` —
     /// both share this one store, exactly as `cooldown` and `model_lockout` do.
     performance: crate::gates::performance::PerformanceStore,
+    /// Randomness for weighted routing, handed to every selection via
+    /// [`Self::selection_service`].
+    ///
+    /// **Entropy-seeded, so two workers do not make the same first choice.** The
+    /// alternative — `ModelSelectionService`'s fixed-seed `DEFAULT_RNG` — gives
+    /// every process in the fleet the identical draw sequence, so weighted
+    /// routing SYNCHRONISES rather than spreads and "load balancing" sends the
+    /// whole fleet at whichever provider won the first draw. Pinned by
+    /// `tests::production_selection_never_uses_the_fixed_seed_default`, which
+    /// asserts pointer identity against that static rather than comparing
+    /// values — two separately-seeded sources with the same seed must still
+    /// count as "not the default".
+    ///
+    /// `Arc` so the source (whose state advances through `&self`) is shared by
+    /// every request this gateway serves, rather than restarting per call.
+    rng: Arc<crate::random::SplitMix64>,
+    /// Minimum live observations before a metric sort trusts a candidate's mean
+    /// (see [`crate::resilience::ResilienceConfig::min_samples`]). Read per
+    /// request, so unlike the performance store's capacity/window this needs no
+    /// rebuild when `with_resilience` changes it.
+    resilience_min_samples: u32,
 }
 
 impl Gateway {
@@ -132,6 +153,8 @@ impl Gateway {
             model_lockout,
             lockout_observers,
             performance,
+            rng: Arc::new(crate::random::SplitMix64::from_entropy()),
+            resilience_min_samples: resilience.min_samples,
         }
     }
 
@@ -149,6 +172,16 @@ impl Gateway {
             &self.cooldown,
             &self.model_lockout,
         )
+        // The READ side of the store the `PerformanceRecorder` writes. Without
+        // it selection sees the null port, and `sort: latency|throughput` would
+        // silently degrade to priority order on every request — the feature
+        // compiling and doing nothing. Pinned by
+        // `tests::production_selection_reads_the_gateways_live_performance_store`,
+        // which moves the LIVE store and requires the route to follow.
+        .with_performance(&self.performance, self.resilience_min_samples)
+        // Entropy-seeded — see the `rng` field's doc for why the fixed-seed
+        // default is a fleet-wide hazard rather than a test detail.
+        .with_random(self.rng.as_ref())
     }
 
     /// Attach a [`GatewayStore`] so each terminal call is persisted (enabling
@@ -200,6 +233,9 @@ impl Gateway {
             &self.performance,
             &resilience,
         );
+        // Read per request rather than baked into a sink, so unlike the store
+        // above this is a plain replacement with no rebuild.
+        self.resilience_min_samples = resilience.min_samples;
         self
     }
 
