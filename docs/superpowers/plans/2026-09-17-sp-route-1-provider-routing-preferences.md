@@ -25,7 +25,21 @@
 | 7 | `c7ad5aa` · `4ed2247` · `cf02fba` | ✅ done; review found the **registered default itself** was untested |
 | 8 | `201450b` | ✅ done; surfaced a pre-existing config-validation gap — see below |
 | 9 | `662e22c` · `4f58000` | ✅ done; review found a **live-store read inside the sort comparator** that panicked selection |
-| 10–12 | — | pending |
+| 10 | `d6576b8` · `57b41c7` | ✅ done — **the feature is live**; both planted tripwires confirmed red-before / green-after |
+| 11–12 | — | pending |
+
+**Doc debt for Task 12, none of which has a doc surface today:**
+- `order`'s **first-matching-ref-wins** rule. `RoutingPreferences.order`'s doc says only
+  "candidates matching no entry follow as fallbacks" and never states it.
+- A **router-only ref lifts every model on that router across priority tiers** — caller-explicit
+  and correct, but it is precisely the cross-group reordering `GroupedWeightedStrategy` refuses to
+  do on its own, so it deserves saying out loud.
+- `order: Some(vec![])` and `order: Some(vec![CandidateRef::default()])` are both **inert**; a
+  default ref appearing first shadows every later ref.
+- The new **`min_samples`** knob on `ResilienceConfig`.
+- **Two breaking public-API changes** landed in `57b41c7`: `#[non_exhaustive]` on
+  `ResilienceConfig`, and `RoutingStrategy::name()` as a required (deliberately un-defaulted)
+  method. Both right for a pre-1.0 crate; downstream implementors need a one-line edit.
 
 **Task 9's Critical is the most serious defect the slice found, and it is a lesson about fixtures.**
 `MetricStrategy` called `value()` — which reads the shared `PerformanceStore` — from *inside*
@@ -2268,12 +2282,12 @@ In `crates/gateway/src/resilience.rs`, add to `ResilienceConfig`:
 
 and to `Default`: `min_samples: 3,`. Extend `default_matches_todays_hardcoded_behavior` with `assert_eq!(r.min_samples, 3);`.
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p sensei-gateway metric_sort latency_sort throughput_sort unmeasured min_samples -- --nocapture`
 Expected: PASS, 5 tests.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/gateway/src
@@ -2288,7 +2302,7 @@ git commit -m "feat(gateway): MetricStrategy for sort=latency|throughput (SP-ROU
 - Modify: `crates/gateway/src/selection.rs`, `crates/gateway/src/engine/execute.rs`, `crates/gateway/src/engine/stream.rs`
 - Test: `crates/gateway/src/selection.rs`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
     /// AC6 — `order` sequences the candidates it names; unmatched candidates
@@ -2360,12 +2374,12 @@ git commit -m "feat(gateway): MetricStrategy for sort=latency|throughput (SP-ROU
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p sensei-gateway order_sequences an_order_ref_with_only -- --nocapture`
 Expected: FAIL — the assertion, with `gemma3:27b` still leading.
 
-- [ ] **Step 3: Resolve the strategy per request and apply `order`**
+- [x] **Step 3: Resolve the strategy per request and apply `order`**
 
 In `crates/gateway/src/selection.rs`, remove the `strategy` field from the struct and its initialisation, and add:
 
@@ -2414,7 +2428,7 @@ In `resolve_chain`, replace the ordering block with:
         }
 ```
 
-- [ ] **Step 4: Wire the engine's ports through**
+- [x] **Step 4: Wire the engine's ports through**
 
 In `crates/gateway/src/engine/execute.rs`, add `preferences: request.routing.clone(),` to the `SelectionCriteria` literal, and extend the service construction:
 
@@ -2442,7 +2456,7 @@ Add the two `Gateway` fields this needs:
 
 initialised in `Gateway::new` as `rng: Arc::new(crate::random::SplitMix64::from_entropy())` and `resilience_min_samples: crate::resilience::ResilienceConfig::default().min_samples`, and updated in `with_resilience` from the passed config.
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p sensei-gateway order_sequences an_order_ref_with_only -- --nocapture`
 Expected: PASS, 2 tests.
@@ -2450,7 +2464,7 @@ Expected: PASS, 2 tests.
 Run: `cargo test --workspace 2>&1 | tail -5`
 Expected: all green.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/gateway/src
@@ -2460,6 +2474,19 @@ git commit -m "feat(gateway): explicit order + per-request strategy resolution (
 ---
 
 ## Task 11: Observability
+
+> **Three corrections from Task 10's review — read before writing any of this.**
+>
+> 1. **Do not add a `strategy_name` match.** `RoutingStrategy::name()` is a required trait method
+>    now; read the name off the strategy that ran. See the superseded block below.
+> 2. **The planned tests build a bare `ModelSelectionService::new(...)` with no ports**, so
+>    `reliability` and `weight` would come from the null performance port and the fixed-seed
+>    `DEFAULT_RNG` — the two trace fields most worth asserting are the ones that fixture
+>    structurally *cannot* observe. Drive at least one test through `gw.selection_service(&config)`,
+>    the way `production_selection_reads_the_gateways_live_performance_store` does.
+> 3. **`degraded` is computed from `min_samples`**, whose end-to-end wiring was untested until
+>    `57b41c7`. It is pinned now by `resilience_min_samples_reaches_the_metric_sort`; build on that
+>    rather than re-deriving the threshold.
 
 **Files:**
 - Modify: `crates/gateway/src/selection.rs`, `crates/kernel/src/types/trace.rs`, `crates/gateway/src/engine/execute.rs`
@@ -2568,15 +2595,21 @@ pub struct RoutedCandidate {
 In `crates/gateway/src/selection.rs`, add `pub decision: Option<RoutingDecision>` to `SelectionResult`, populate it in `resolve_chain` after ordering, and set `decision: None` in the other `SelectionResult` literals (direct/not-found paths). Name the strategy from the same match `strategy_for` uses so the two cannot drift:
 
 ```rust
-        fn strategy_name(prefs: Option<&RoutingPreferences>) -> &'static str {
-            use crate::types::request::SortKey;
-            match prefs.and_then(|p| p.sort) {
-                Some(SortKey::Price) => "price",
-                Some(SortKey::Latency) => "latency",
-                Some(SortKey::Throughput) => "throughput",
-                None => "grouped_weighted",
-            }
-        }
+// SUPERSEDED — do NOT add a second match on `SortKey`. An earlier draft of this
+// plan put one here and claimed "so the two cannot drift", which was exactly
+// backwards: two matches on the same enum in different files IS the drift
+// hazard. Task 10's review caught it before it was written.
+//
+// `RoutingStrategy::name()` is a REQUIRED trait method as of Task 10, so read
+// the name off the strategy that actually ran:
+//
+//     let strategy = self.strategy_for(criteria);
+//     strategy.order(&mut all_candidates, &ctx);
+//     let name = strategy.name();     // "grouped_weighted" | "price" | "latency" | "throughput"
+//
+// One match, impossible to drift, and it makes the reported name provably the
+// strategy that produced the order rather than a parallel re-derivation of it.
+// `MetricStrategy` reports per-VALUE, since both metric sorts share one type.
 ```
 
 In `crates/gateway/src/engine/execute.rs`, attach `result.decision` to the `ExecutionTrace` built for the call.
