@@ -24,7 +24,31 @@
 | 6 | `5fedd29` · `a252457` | ✅ done; review found all four seam wiring points were deletable with a green suite |
 | 7 | `c7ad5aa` · `4ed2247` · `cf02fba` | ✅ done; review found the **registered default itself** was untested |
 | 8 | `201450b` | ✅ done; surfaced a pre-existing config-validation gap — see below |
-| 9–12 | — | pending |
+| 9 | `662e22c` · `4f58000` | ✅ done; review found a **live-store read inside the sort comparator** that panicked selection |
+| 10–12 | — | pending |
+
+**Task 9's Critical is the most serious defect the slice found, and it is a lesson about fixtures.**
+`MetricStrategy` called `value()` — which reads the shared `PerformanceStore` — from *inside*
+`sort_by`'s comparator. `stats()` recomputes its means from `Instant::now()` over a ring that
+`PerformanceRecorder::on_outcome` mutates from every concurrently completing attempt, so a
+candidate's key could change between two comparisons. That makes the comparator intransitive, and
+Rust's `sort_by` **panics** on that — inside model selection, the component whose whole purpose is
+surviving provider failure. Measured against the real store with four writer threads: **89 panics
+in 719 selections at 40 candidates, and zero at 12**, because the total-order check only runs once
+the input outgrows insertion sort.
+
+**No test in the suite could have caught it.** All three fixtures return a constant per endpoint, so
+the entire failure class — a reading that *changes* — was invisible. It took a reviewer building a
+writer thread against the real store.
+
+Fix: snapshot each candidate's reading once, before any comparison, then sort the snapshot. Also
+drops the cost from 144 `stats()` calls per 12-candidate selection to 12, and measured 7.5× more
+selections per second at n=40.
+
+**Two rules for Tasks 10–12 that follow from it:**
+1. **Never call a port from inside a comparator.** Read once into a snapshot, then sort.
+2. **A fixture that returns a constant cannot test a live source.** If production reads something
+   mutable, at least one test needs a fixture whose answer changes.
 
 **Carry-forward from Task 8, NOT fixed here: nothing validates `ModelPricing` for finiteness or
 sign.** Both the unchecked path (`Gateway::new` / `update_config`) and the checked one
@@ -2070,7 +2094,7 @@ git commit -m "feat(gateway): PriceStrategy for sort=price (SP-ROUTE-1 Task 8, A
 - Modify: `crates/gateway/src/strategy.rs`, `crates/gateway/src/resilience.rs`
 - Test: `crates/gateway/src/strategy.rs`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
     struct FixedStats(&'static [(&'static str, u32, f64, f64)]);
@@ -2153,12 +2177,12 @@ git commit -m "feat(gateway): PriceStrategy for sort=price (SP-ROUTE-1 Task 8, A
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p sensei-gateway metric_sort latency_sort throughput_sort unmeasured min_samples -- --nocapture`
 Expected: FAIL — `cannot find type 'MetricStrategy'`.
 
-- [ ] **Step 3: Write the strategy**
+- [x] **Step 3: Write the strategy**
 
 ```rust
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2230,7 +2254,7 @@ impl RoutingStrategy for MetricStrategy {
 }
 ```
 
-- [ ] **Step 4: Add the tunable**
+- [x] **Step 4: Add the tunable**
 
 In `crates/gateway/src/resilience.rs`, add to `ResilienceConfig`:
 
