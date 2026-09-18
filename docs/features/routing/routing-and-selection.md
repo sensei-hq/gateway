@@ -234,6 +234,12 @@ minimum     = input_cost                 // output assumed unused
 `max_output_tokens` from the model config, i.e. the estimate assumes the full
 output budget is spent.
 
+Since SP-ROUTE-1.1 the inputs to that formula are validated rather than trusted:
+every `ModelPricing` value must be finite and non-negative, so a config file
+carrying a bad price fails to load and `Facade::build` drops a model carrying
+one assembled in code. An explicit `0.0` and a large finite magnitude such as
+`1e300` both stay valid — see [provider routing preferences §4](provider-preferences.md#pricing-is-validated-before-it-can-be-sorted).
+
 ### Chain resolution (`resolve_chain`)
 
 Entries are cloned and walked in `ChainEntry.priority` order (ascending; the

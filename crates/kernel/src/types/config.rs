@@ -44,11 +44,38 @@ impl std::fmt::Debug for RouterConfig {
     }
 }
 
+/// What a model costs: USD per 1,000 input / output tokens, plus an optional
+/// flat per-request fee. Attached to a model as [`ModelConfig::pricing`]; absent
+/// (`None`) means **free**, which sorts FIRST under `sort: price`.
+///
+/// # Validated at the boundary (SP-ROUTE-1.1)
+///
+/// Every field must be **finite and non-negative** — see
+/// [`validate`](ModelPricing::validate) for the rule and the reasoning.
+/// `Deserialize` enforces it, so a config **file** carrying a bad price fails to
+/// load with an error naming the field and the value; it cannot reach routing by
+/// any path. `Serialize` is untouched, so a valid pricing round-trips unchanged.
+///
+/// Two values are deliberately **accepted**, stated here so neither reads as an
+/// oversight: an explicit **zero** (a real price, distinct from `None`, and the
+/// two deliberately tie under `sort: price`) and a **large finite** magnitude
+/// such as `1e300` (any cap would be an invented threshold, and a prohibitive
+/// price is a legitimate way to park a model at the back of a chain).
+///
+/// A price assembled **in code** bypasses `Deserialize`. The gateway's
+/// `collect_validation_errors` catches it on the checked paths
+/// (`try_new` / `try_update_config` / `GatewayBuilder`), and `Facade::build` —
+/// the production path — **drops** the model and logs at `warn`. It drops rather
+/// than nulling the price because `None` means *free* and free sorts **first**,
+/// so "repairing" a broken price would hand it the cheapest slot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(try_from = "ModelPricingRaw")]
 pub struct ModelPricing {
+    /// USD per 1,000 input tokens. Finite and `>= 0`.
     pub input_per_1k: f64,
+    /// USD per 1,000 output tokens. Finite and `>= 0`.
     pub output_per_1k: f64,
+    /// Optional flat USD fee per request. Finite and `>= 0` when `Some`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub per_request: Option<f64>,
 }

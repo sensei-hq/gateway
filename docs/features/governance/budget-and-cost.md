@@ -59,6 +59,37 @@ pub struct ModelPricing {
 - A model with `pricing: None` is treated as **free**: cost estimation yields no
   estimate and the budget check is skipped for it (see §5).
 
+### 2.1 Every value must be finite and non-negative (SP-ROUTE-1.1)
+
+`ModelPricing::validate()` rejects `NaN`, `±inf` and any negative value on all
+three fields. The reason is comparison, not arithmetic: a `NaN` estimate makes
+the routing comparator intransitive and Rust's `sort_by` **panics** on that,
+and a negative rate produces a negative estimate, which `sort: price` puts
+**first** — the cheapest slot won by a figure that is not a cost. (The free test
+in the default strategy is `cost <= 0.0`, not `== 0.0`, so a negative estimate
+outranks even a genuinely free candidate.)
+
+Enforced at three sites, all calling that one function:
+
+- **`Deserialize`** — a config **file** with a bad price fails to load, with an
+  error naming the field and the value (`input_per_1k must not be negative, got
+  -0.001`). This is the only breaking change of the slice.
+- **`collect_validation_errors`** — `GatewayBuilder::build` / `Gateway::try_new`
+  / `try_update_config` report `model '<id>' has unusable pricing: <reason>`.
+- **`Facade::build`** — the production path **drops** the model and logs at
+  `warn`; its signature is unchanged and construction still succeeds. A chain
+  entry naming a dropped model then skips as `ModelNotFound`. It drops rather
+  than setting `pricing = None` precisely because of the bullet above: `None`
+  means free, and free sorts first.
+
+**Two deliberate non-rejections**, so neither reads as an oversight: an explicit
+`0.0` stays valid (it is a real price, distinct from `None`, and the two tie
+under `sort: price`), and a large finite magnitude such as `1e300` stays valid
+(any cap would be an invented threshold, and a prohibitive price is a legitimate
+way to park a model at the back of a chain). A `1e300` rate can still overflow
+inside `estimate_cost` — that non-finite *result* is fenced by the routing
+strategies, which is a different guard from this one.
+
 ---
 
 ## 3. `estimate_cost`, `filter_by_budget`, `AffordableModel` / `BudgetFilterResult`

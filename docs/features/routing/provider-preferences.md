@@ -190,16 +190,56 @@ gate's reading). A non-finite estimate sorts **last**, not first: an unusable
 price is not a price, and treating it as free would let a broken figure win the
 cheapest slot.
 
-> **"Free" includes a NEGATIVE estimate, and `sort: price` puts one first.**
-> The default's free test is `cost <= 0.0`, not `cost == 0.0`, and `price_key`
-> passes a negative estimate straight through as a finite number, so it sorts
-> ahead of every genuinely free candidate. This is reachable because **nothing
-> validates `ModelPricing` for sign or finiteness** — neither `Gateway::new` /
-> `update_config` nor `GatewayBuilder::build` — so a negative per-1k price in
-> config is accepted silently and wins the cheapest slot outright. That
-> validation is a carry-forward from this slice, not something the routing
-> layer papers over; routing is fenced against a *panic* from a non-finite
-> price, not against a wrong one.
+> **"Free" includes a NEGATIVE estimate, and `sort: price` would put one
+> first.** The default's free test is `cost <= 0.0`, not `cost == 0.0`, and
+> `price_key` passes a negative estimate straight through as a finite number, so
+> it would sort ahead of every genuinely free candidate. Routing is fenced
+> against a *panic* from a non-finite price, not against a wrong one — so the
+> fix belongs one layer up, and **SP-ROUTE-1.1 put it there**: `ModelPricing` is
+> now rejected at the boundary for a non-finite or negative value, so a config
+> file carrying one fails to load and `Facade::build` drops a model carrying one
+> assembled in code. See
+> [Pricing is validated before it can be sorted](#pricing-is-validated-before-it-can-be-sorted)
+> just below. The `+inf` fence above stays as the last line for anything
+> reaching the strategies by a path validation does not cover.
+
+### Pricing is validated before it can be sorted
+
+Since **SP-ROUTE-1.1** a `ModelPricing` whose values cannot be **compared** is
+rejected rather than sorted. The rule is one function,
+`ModelPricing::validate()` in `crates/kernel/src/types/config.rs`, called from
+three places:
+
+| Site | Behaviour |
+|---|---|
+| `Deserialize for ModelPricing` | **Hard error.** A config **file** with a bad price fails to load, and the message names the field and the value. Covers every path, checked or unchecked. |
+| `Facade::build` | **Drops the model**, logs at `warn`. The signature is unchanged — `build` still returns `Facade`, not `Result`, and simply builds with fewer models. |
+| `collect_validation_errors` | Adds `model '<id>' has unusable pricing: <reason>` for the checked paths (`try_new` / `try_update_config` / `GatewayBuilder`). |
+
+**Invalid:** `NaN`, `+inf`, `-inf`, and any **negative** value, on
+`input_per_1k`, `output_per_1k`, or `per_request` when `Some`.
+
+**Two values are deliberately valid, and this is a decision rather than an
+oversight:**
+
+- **Zero.** `Some(0.0)` is an *explicit* price, distinct from `pricing: None`,
+  and the two deliberately tie under `sort: price` — pinned by
+  `price_sort_puts_an_unpriced_candidate_first_in_both_input_orders` and
+  `unpriced_ties_with_an_explicit_zero_price` in `strategy.rs`. Rejecting zero
+  would break shipped, tested behaviour.
+- **A large finite magnitude.** `1e300` loads. Any cap would be an invented
+  threshold; the overflow it can cause is already fenced by the non-finite
+  guards described above; and a deliberately prohibitive price is a legitimate
+  way to park a model at the back of a chain.
+
+**Why `Facade::build` drops the model rather than nulling its price.** The
+tempting repair is `pricing = None` — carry on without the bad number. That is
+the hazard, not the fix: `None` means **free**, `price_key` maps it to `0.0`,
+and free sorts **first**, so "cleaning" a broken price hands it the cheapest
+slot. It is the same reasoning that made a non-finite `PriceStrategy` key map to
+`+inf` rather than to `0.0`. A chain entry still naming a dropped model skips as
+`SkipReason::ModelNotFound`, which is `Structural` and appears in the selection
+diagnostics — traceable, and unable to silently win anything.
 
 ### `sort: latency` / `sort: throughput`
 

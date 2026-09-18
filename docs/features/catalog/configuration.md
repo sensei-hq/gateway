@@ -106,9 +106,38 @@ Describes one model and what it can do.
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `input_per_1k` | `f64` | USD per 1K input tokens. |
-| `output_per_1k` | `f64` | USD per 1K output tokens. |
-| `per_request` | `Option<f64>` | Flat per-request surcharge, if any. Omitted from JSON when `None`. |
+| `input_per_1k` | `f64` | USD per 1K input tokens. Must be **finite and non-negative**. |
+| `output_per_1k` | `f64` | USD per 1K output tokens. Must be **finite and non-negative**. |
+| `per_request` | `Option<f64>` | Flat per-request surcharge, if any. Must be **finite and non-negative** when `Some`. Omitted from JSON when `None`. |
+
+#### Validation (SP-ROUTE-1.1)
+
+One rule — `ModelPricing::validate()` in `crates/kernel/src/types/config.rs` —
+called from three sites. It rejects `NaN`, `±inf` and any negative value,
+because such a number cannot be used to **compare** candidates: a `NaN` makes
+the routing comparator intransitive (`sort_by` panics on that) and a negative
+value sorts *first* under `sort: price`, taking the cheapest slot with a figure
+that is not a cost.
+
+| Site | Behaviour |
+| --- | --- |
+| `Deserialize for ModelPricing` (`#[serde(try_from)]`) | Hard error naming the field and the value, e.g. `input_per_1k must not be negative, got -0.001`. A config **file** carrying a bad price does not load, on any path. Only `Deserialize` is affected — `Serialize` still derives, so a valid pricing serializes exactly as before and round-trips unchanged. |
+| `Facade::build` | Drops the model, logs at `warn`. `build`'s signature is unchanged (still `-> Facade`); it may simply build with fewer models, and a chain entry naming a dropped model skips as `ModelNotFound`. |
+| `collect_validation_errors` | Rule 7 above, for `GatewayBuilder::build` / `Gateway::try_new` / `try_update_config`. |
+
+**Deliberately accepted, not oversights.** An explicit `0.0` is a real price,
+distinct from `pricing: None`, and the two tie under `sort: price`; a large
+finite magnitude such as `1e300` also loads, because any cap would be an
+invented threshold and a prohibitive price is a legitimate way to park a model
+at the back of a chain.
+
+**Why the facade drops rather than nulls.** `pricing: None` means *free* and
+free sorts **first**, so "repairing" a bad price by nulling it would hand it the
+cheapest slot — the opposite of the intent.
+
+Note the knock-on for the catalog: `cost_band` is derived from `pricing` when
+`catalog.cost_band` is absent, so a model dropped by the facade contributes no
+derived band either — it is not in the config at all.
 
 ## Fallback chains
 
@@ -153,7 +182,12 @@ validates before producing a `GatewayConfig`:
   4. every model's `provider` must have a corresponding router;
   5. every model's `max_output_tokens` must be non-zero — a model that can emit no
      output cannot serve a chat call, and the SP-DATA-5 budget clamp would otherwise
-     send it `max_tokens: Some(0)` on every budgeted request.
+     send it `max_tokens: Some(0)` on every budgeted request;
+  6. every model's `context_window` must be non-zero — since SP-7a the
+     `ContextWindowGate` skips such a model for every request carrying any input;
+  7. every model's `pricing`, when present, must be **comparable** — see
+     [`ModelPricing`](#modelpricing). The error reads
+     `model '<id>' has unusable pricing: <reason>`.
 - `build() -> Result<GatewayConfig, Vec<String>>` returns `Err` with the full
   error list if validation fails.
 - `from_config(GatewayConfig)` reconstitutes a builder from an existing config
