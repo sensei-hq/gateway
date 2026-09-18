@@ -55,6 +55,23 @@ pub struct ResilienceConfig {
     /// threshold must be compared against the one belonging to the metric being
     /// sorted on.
     ///
+    /// Defaults to [`DEFAULT_MIN_SAMPLES`] (3) — the smallest count at which a
+    /// mean is not simply the last observation. The cost of getting it wrong is
+    /// bounded in both directions: too low and the sort reacts to noise, too
+    /// high and it degrades to priority order, which is the documented fallback
+    /// anyway.
+    ///
+    /// **Do NOT set it to `0`.** Every counter comparison is `>=`, so at zero an
+    /// endpoint with no observations at all passes: `s.samples >= 0` always
+    /// holds, so a never-measured endpoint reports `mean_latency_ms == 0.0` and
+    /// sorts FIRST — winning every latency race it has never run — and
+    /// `verdict_samples >= 0` always holds, so its `success_rate == 0.0` becomes
+    /// a TRUSTED reliability of zero. "A cold process weighs every candidate 0.0
+    /// and a healthy fleet routes as though every provider were dead" stops
+    /// being a comment about a bug that was fixed and becomes an
+    /// operator-reachable configuration. Pinned by
+    /// `engine::tests::resilience_min_samples_reaches_the_metric_sort`.
+    ///
     /// A COUNT, unlike `perf_samples` (a retention capacity) and `perf_window`
     /// (a retention age) — those two decide what stays in the window, this one
     /// decides how much of it is enough to act on. Unlike them it needs no

@@ -12,7 +12,12 @@ use gateway::types::cost::{Cost, CostEstimate, TokenUsage};
 use gateway::types::error::GatewayError;
 use gateway::types::io::{ChatRequest, ChatResponse, EmbedRequest, EmbedResponse};
 use gateway::types::request::{Message, MessageRole, StreamChunk};
-use gateway::types::trace::Attempt;
+// SP-ROUTE-1's request surface, reached the same way `Message`/`StreamChunk`
+// are — through `types::request`, NOT through a new crate-root re-export.
+// `docs/llms/recipes.md` documents exactly these paths, so a rename that broke
+// them would otherwise only be caught by a reader.
+use gateway::types::request::{CandidateRef, CandidateSet, RoutingPreferences, SortKey};
+use gateway::types::trace::{Attempt, RoutedCandidate, RoutingDecision};
 use gateway::{Capability, InferenceRequest, InferenceResponse};
 
 #[cfg(feature = "cloud")]

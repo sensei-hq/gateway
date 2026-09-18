@@ -145,6 +145,14 @@ per-request `TenantKeyCache`; the gateway itself stays credential-store-agnostic
 ## 8. Advanced routing (all opt-in)
 
 - **Fallback chains** — named, priority-ordered model lists with per-error triggers.
+- **Per-request routing preferences** — `InferenceRequest.routing` carries `sort`
+  (`price`/`latency`/`throughput`), `only`/`ignore` allow- and deny-lists over
+  separate `routers`/`models` axes, and an explicit `order`. Absent ⇒ unchanged
+  behaviour. `response.routing` explains what the router did. Note: entries that
+  share a `priority` are load-balanced (weighted by `(1/cost²) × reliability`), so
+  give them distinct priorities unless you want a pool; and `execute_stream`
+  applies preferences but returns no explanation. See
+  `docs/features/routing/provider-preferences.md`.
 - **Circuit breaker** — per `router:model` open/half-open/closed with cooldown probes.
 - **Budget** — skip candidates over a cost cap pre-flight; record real per-call spend.
 - **Consensus / panels** — `execute_panel` fans a prompt across family-distinct models

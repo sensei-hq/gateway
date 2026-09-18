@@ -30,9 +30,9 @@ Sources:
    `Arc<RwLock<...>>`. If `routers`, `models`, **and** `chains` are all empty,
    it returns `GatewayError::NotConfigured`.
 2. **Build `SelectionCriteria`.** The request's `capability`, `model`, `router`,
-   `chain`, and `budget` are copied across. `input_tokens` is filled from a
-   rough `estimate_input_tokens` heuristic (≈ 1 token per 4 characters of
-   payload text; STT is always `0`).
+   `chain`, `budget`, and `routing` (as `preferences`) are copied across.
+   `input_tokens` is filled from a rough `estimate_input_tokens` heuristic
+   (≈ 1 token per 4 characters of payload text; STT is always `0`).
 3. **Resolve candidates.** A `ModelSelectionService` is built over the config
    and the shared `CircuitBreakerManager`, and `select_all` produces an ordered
    `Vec<SelectedModel>`. If it is empty, `execute` returns
@@ -114,8 +114,17 @@ pub struct SelectionCriteria {
     pub chain: Option<String>,
     pub budget: Option<f64>,
     pub input_tokens: Option<u32>,
+    pub input_tokens_pessimistic: Option<u32>,
+    /// Per-request routing preferences (SP-ROUTE-1). `None` ⇒ default routing.
+    pub preferences: Option<RoutingPreferences>,
 }
 ```
+
+`preferences` is copied from `InferenceRequest.routing` at the two production
+construction sites (`engine/execute.rs`, `engine/stream.rs`). It drives two
+things: the `RoutingPolicyGate` (`only`/`ignore`) and the strategy resolved for
+this request (`sort`, then the `order` re-rank). See
+[provider routing preferences](provider-preferences.md).
 
 The public entry points are `select` and `select_all`. Both call
 `resolve_candidates`, then set `selected = all_candidates.first().cloned()`.
@@ -130,12 +139,17 @@ pub struct SelectionResult {
     pub all_candidates: Vec<SelectedModel>,
     pub skipped: Vec<SkippedCandidate>,
     pub chain: Option<FallbackChainConfig>,
+    /// Why the candidates came out in this order (SP-ROUTE-1).
+    pub decision: Option<RoutingDecision>,
 }
 ```
 
 `all_candidates` holds every model that passed validation (in try order);
 `skipped` holds every rejected candidate with a human-readable `reason`;
-`chain` is `Some` only when a chain drove resolution (tiers 2/3).
+`chain` is `Some` only when a chain drove resolution (tiers 2/3); `decision`
+is `Some` on the chain and capability paths — the ones that actually run a
+`RoutingStrategy` — and `None` on the direct and not-found paths, which order
+nothing. The engine copies it onto `InferenceResponse::routing`.
 
 ### Three-tier resolution
 
@@ -164,19 +178,43 @@ not as a chain.
 ### Per-candidate validation pipeline
 
 Each candidate passes the same ordered gauntlet; the first failing check
-appends a `SkippedCandidate` and drops the candidate:
+appends a `SkippedCandidate` and drops the candidate. Structural resolution
+(router/model lookup) happens per path, then the shared admission pipeline runs
+the registered `AdmissionGate`s in order:
 
-1. **Router exists** in `config.routers` — else `"router not found"`.
-2. **Router enabled** — else `"router disabled"`.
-3. **Model exists** in `config.models` — else `"model not found"`.
-4. **Model supports the capability** (`model_config.capabilities.contains(&criteria.capability)`) — else `"does not support {capability:?}"`.
-5. **Circuit breaker closed** for `"{router}:{model}"` — else `"circuit breaker open"`.
-6. **Within budget** — if both `criteria.budget` and a `CostEstimate` exist and
-   `estimated > budget`, else `"over budget (estimated .., budget ..)"`.
+1. **Router exists** in `config.routers` — else `"router not found"`. *(structural)*
+2. **Router enabled** — else `"router disabled"`. *(structural)*
+3. **Model exists** in `config.models` — else `"model not found"`. *(structural)*
+4. **`RoutingPolicyGate`** — the request's own `only`/`ignore` preferences must
+   not exclude this candidate, else `ExcludedByPolicy`.
+5. **`CapabilityGate`** — the model supports `criteria.capability`.
+6. **`ConnectionCooldownGate`** — the router is not in a transport-fault cooldown.
+7. **`CircuitBreakerGate`** — the breaker for `"{router}:{model}"` is not open.
+8. **`ModelLockoutGate`** — the model is not locked out for this reason class.
+9. **`BudgetGate`** — the `CostEstimate` is within `criteria.budget`.
+10. **`ContextWindowGate`** — the prompt fits the model's serving window.
+
+**Gate order decides which reason a multiply-gated candidate reports**, because
+`admit` returns the *first* skip. `RoutingPolicyGate` is deliberately first: the
+caller's own instruction is the most specific explanation available, and
+`ExcludedByPolicy` is `Structural`, so an excluded candidate never donates a
+breaker deadline to `AllGated.resume_after`. `ContextWindowGate` is deliberately
+last for the mirror reason — see the comments in `ModelSelectionService::new`,
+which is the one place these are registered.
 
 In `resolve_direct` (tier 1) the pipeline runs once and any failure returns an
 empty result (with the skip recorded). In `resolve_chain` a failure `continue`s
 to the next entry, so later entries can still be selected.
+
+### Ordering the admitted candidates
+
+Admitted candidates are then ordered by a `RoutingStrategy`, resolved **per
+request** from `InferenceRequest.routing.sort`, and re-ranked by `routing.order`
+if one was supplied. With no preferences the default is
+`GroupedWeightedStrategy`, which is a no-op on any chain whose admitted
+candidates have distinct priorities. Full rules, the determinism claim, and the
+`min_samples` knob live in
+[provider routing preferences](provider-preferences.md).
 
 ### Cost estimation
 
@@ -196,7 +234,9 @@ output budget is spent.
 
 ### Chain resolution (`resolve_chain`)
 
-Entries are cloned and sorted by `ChainEntry.priority` (ascending), then walked:
+Entries are cloned and walked in `ChainEntry.priority` order (ascending; the
+strategy establishes it — see [Ordering the admitted
+candidates](#ordering-the-admitted-candidates)):
 
 - The model is looked up first; a missing model is skipped as
   `"model not found"` (its router is reported as the entry's `router` or
@@ -349,6 +389,17 @@ Behaviours worth flagging when reading the source:
 - **Adapter-not-found always continues**, unlike a provider error which only
   continues when a fallback trigger matches.
 - **Pinned models bypass `api_model_id` translation** (see the caveat above).
+- **Selection is deterministic only while priorities are distinct.** Since
+  SP-ROUTE-1 the default strategy load-balances *within* an equal-priority
+  group, so a chain that ties two entries may route two fresh requests
+  differently. Every chain in this repo has distinct priorities and is
+  unaffected; the two ways to reach a tie unintentionally (a chain past 254
+  entries, and unvalidated hand-authored priorities) are documented in
+  [provider routing preferences §8](provider-preferences.md#8-determinism).
+- **A direct (tier-1) request has no `RoutingDecision`.** It names its one
+  candidate outright, so `SelectionResult.decision` and
+  `InferenceResponse::routing` are both `None`. Ordering nothing is not the same
+  as ordering by default.
 
 ## Scenarios
 

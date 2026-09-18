@@ -27,7 +27,7 @@ traces its claims to source, with a **Notes** section for quirks.
 ### Gateway (existing core + Phase-1 enhancements)
 | Module | Status | Covers |
 |---|---|---|
-| [routing](routing/README.md) | Partial | selection · fallback chains · circuit breaker · **+ connection cooldown · model lockout · quota demote-to-tier** (SP-0) |
+| [routing](routing/README.md) | Partial | selection · fallback chains · circuit breaker · **+ connection cooldown · model lockout · quota demote-to-tier** (SP-0) · **+ per-request provider preferences** (SP-ROUTE-1) |
 | [catalog](catalog/README.md) | Partial | model registry · configuration · **+ free-tier catalog · tiers & chains · catalog refresh · config versioning** (SP-CAT) |
 | [inference](inference/README.md) | Implemented | providers · capabilities & adapters · streaming · tool-calling |
 | [governance](governance/README.md) | Partial | budget & cost · subscription quota · **+ usage metering · expiration tracking · predicted lockout** |

@@ -16,6 +16,7 @@ unavailable candidates (circuit breaker + connection cooldown + model lockout).
 | Feature | Status | Source | Notes |
 |---|---|---|---|
 | [Routing & selection](routing-and-selection.md) | Implemented | `crates/gateway/src/selection.rs` | 3 routing modes; `api_model_id` resolution |
+| [Provider routing preferences](provider-preferences.md) | Implemented (SP-ROUTE-1) | `crates/gateway/src/strategy.rs`, `crates/gateway/src/gates/routing_policy.rs` | per-request `sort` / `only` / `ignore` / `order`; price-weighted default within equal-priority groups; `InferenceResponse::routing` |
 | [Fallback chains](fallback-chains.md) | Implemented | `crates/gateway/src/engine.rs` | priority walk; `FallbackTrigger` continue-vs-break |
 | [Circuit breaker](circuit-breaker.md) | Implemented | `crates/gateway/src/circuit_breaker.rs` | per-`router:model`; in-memory |
 | [Connection cooldown](connection-cooldown.md) | Implemented (Phase 1 · SP-0) | `crates/gateway/src/gates/cooldown.rs` | router-level skip on connection faults |
@@ -25,7 +26,8 @@ unavailable candidates (circuit breaker + connection cooldown + model lockout).
 
 ## Notes
 
-- The three health gates (breaker / cooldown / lockout) are distinct granularities of the same idea — skip a candidate that cannot currently succeed — and run in the shared admission-gate / health-recorder pipeline.
+- The three health gates (breaker / cooldown / lockout) are distinct granularities of the same idea — skip a candidate that cannot currently succeed — and run in the shared admission-gate / health-recorder pipeline. SP-ROUTE-1 adds a fourth, the `RoutingPolicyGate`, registered **first** so a caller's own `only`/`ignore` exclusion is the reason reported for a multiply-gated candidate — and, being `Structural`, never contributes a deadline to `AllGated.resume_after`.
+- **Ordering is a seam, not a sort.** Since SP-ROUTE-1 the candidate order comes from a `RoutingStrategy` resolved **per request** (`selection.rs::strategy_for`), not from a bare `sort_by_key(priority)`. The default is price-weighted within equal-priority groups and is a no-op on any chain whose priorities are distinct — see [provider routing preferences](provider-preferences.md) for the determinism claim and the two ways a tie can arise unintentionally.
 - SP-0 touches the same hot path as issue #39 (engine.rs/selection.rs refactor); sequence together.
 - Gate state is in-memory/per-process today; a future seam can persist it for multi-instance sharing.
 - **SP-0 (health gates) is complete.** The gates are operator-tunable via `ResilienceConfig` / `Gateway::with_resilience` (cooldown/lockout durations, a bounded eviction cap, deterministic per-endpoint jitter); defaults reproduce the prior hardcoded behavior exactly. Deferred beyond SP-0 (planned, NOT implemented): a calendar-clock exact quota reset boundary (the fixed ~1h default is a self-correcting approximation), an opaque `EndpointKey` (the `router:model` string key is used throughout), and open `.with_gate` / `.with_recorder` composition hooks (added when an external consumer needs a custom gate/recorder).

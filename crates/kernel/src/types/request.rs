@@ -374,42 +374,142 @@ fn default_true() -> bool {
 /// Per-request provider-routing preferences (SP-ROUTE-1).
 ///
 /// Every knob is optional; an entirely absent `RoutingPreferences` means "use
-/// the default". From SP-ROUTE-1 Task 7 that default is price-weighted,
-/// uptime-aware selection within equal-priority groups (a no-op on any chain
-/// whose priorities are distinct); until then it is strict `priority` order
-/// (see `gateway::strategy::PriorityStrategy`).
+/// the default" — price-weighted, uptime-aware selection within equal-priority
+/// groups (`gateway::strategy::GroupedWeightedStrategy`), which is a no-op on
+/// any chain whose admitted candidates have distinct priorities.
+///
+/// # Order of operations
+///
+/// Filtering first, then ordering:
+///
+/// ```text
+/// only / ignore  →  sort (or the weighted default)  →  order
+/// ```
+///
+/// [`only`](Self::only) and [`ignore`](Self::ignore) have **no precedence
+/// relative to each other** — both are pure predicates over a single candidate,
+/// so admission is the commutative conjunction `only_ok && !ignore_match`. What
+/// is true, and what the tests pin, is that satisfying `only` does not exempt a
+/// candidate from `ignore`.
+///
+/// [`order`](Self::order) and [`sort`](Self::sort) genuinely *are*
+/// sequence-dependent: `order` wins for the candidates it names, and `sort` (or
+/// the default weighting) orders the unnamed tail that follows them. Combining
+/// them is legal and composable, not an error.
+///
+/// # Determinism
+///
+/// With distinct chain priorities routing is deterministic and identical to
+/// prior releases. Give two chain entries the **same** priority and they become
+/// a load-balanced pool: two *fresh* runs may pick different models. Orchestrator
+/// resume is unaffected (a completed model call replays from its journal memo and
+/// never re-enters selection). See
+/// `docs/features/routing/provider-preferences.md` for the two ways a tie can
+/// arise unintentionally.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct RoutingPreferences {
-    /// Replace the default ordering with a deterministic sort.
+    /// Replace the default weighted ordering with a deterministic sort.
+    /// See [`SortKey`] — `Price` overrides `priority` outright, while the two
+    /// metric sorts move only the candidates they have measured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort: Option<SortKey>,
-    /// Allowlist. AND across non-empty axes (see `CandidateSet`).
+    /// Allowlist. AND across non-empty axes (see [`CandidateSet`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub only: Option<CandidateSet>,
-    /// Denylist. OR across non-empty axes.
+    /// Denylist. OR across non-empty axes (see [`CandidateSet`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignore: Option<CandidateSet>,
-    /// Explicit try-order. Candidates matching no entry follow as fallbacks.
+    /// Explicit try-order, layered on top of whichever strategy ran. A stable
+    /// re-rank by matched-ref index — it never FILTERS; `only`/`ignore` are the
+    /// knobs that restrict.
+    ///
+    /// **First matching ref wins.** A candidate takes the rank of the FIRST
+    /// [`CandidateRef`] it matches, not the last, so
+    /// `[{model: "charlie"}, {router: "north"}]` reads *"charlie, then the rest
+    /// of north"*: charlie matches both refs, takes rank 0, and keeps its lead
+    /// over the other north candidates at rank 1. Candidates matching no entry
+    /// rank last and follow as fallbacks.
+    ///
+    /// **Two inert forms**, neither an error:
+    ///
+    /// - `Some(vec![])` — no ref to match, so every candidate ranks last and the
+    ///   strategy's order survives intact.
+    /// - `Some(vec![CandidateRef::default()])` — an all-wildcard ref matches
+    ///   *every* candidate, so all of them tie at rank 0 and the strategy's
+    ///   relative order is preserved.
+    ///
+    /// The second carries a trap: **a default (all-wildcard) ref placed first
+    /// shadows every later ref**, because first-match-wins hands every candidate
+    /// rank 0 before any subsequent ref is consulted.
+    /// `[CandidateRef::default(), CandidateRef { model: Some("charlie"), .. }]`
+    /// does not promote charlie.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order: Option<Vec<CandidateRef>>,
 }
 
+/// Which deterministic ordering replaces the weighted default
+/// ([`RoutingPreferences::sort`]).
+///
+/// `Price` and the two metric sorts behave differently on purpose, and the
+/// difference is worth knowing before reading a `RoutingDecision`:
+///
+/// - `Price` sorts **every** candidate and therefore **overrides the operator's
+///   authored `priority` entirely**. That is what an explicit sort means — load
+///   balancing switches off and the router tries candidates strictly in the
+///   named order.
+/// - `Latency` / `Throughput` sort only the **measured subset**, within the
+///   indices that subset already occupies. Unmeasured candidates never move, so
+///   a cold process returns exactly priority order and a partially-observed
+///   chain is a monotone interpolation between the two. "Measured" means at
+///   least `ResilienceConfig::min_samples` live observations *of that metric*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SortKey {
-    /// Ascending — cheapest candidate first.
+    /// Ascending estimated cost across the whole chain, free first, ties broken
+    /// by authored priority. Overrides `priority`. An unpriced model is free; a
+    /// non-finite estimate sorts LAST, not first — an unusable price is not a
+    /// price, and treating it as free would let a broken figure win the cheapest
+    /// slot.
     Price,
-    /// Ascending — fastest (lowest-latency) candidate first.
+    /// Ascending — fastest (lowest mean latency) measured candidate first.
     Latency,
-    /// Descending — highest-throughput candidate first.
+    /// Descending — highest mean tokens/sec measured candidate first.
     Throughput,
 }
 
-/// A set of candidates named on either axis. The two axes are SEPARATE because
-/// the endpoint key `"{router}:{model}"` cannot be parsed back — model ids
-/// contain colons (`"ollama:gemma3:27b"`).
+/// A set of candidates named on either axis, used by both
+/// [`RoutingPreferences::only`] and [`RoutingPreferences::ignore`].
 ///
-/// An EMPTY list is "don't care" on that axis.
+/// The two axes are SEPARATE because the endpoint key `"{router}:{model}"`
+/// cannot be parsed back — model ids contain colons (`"ollama:gemma3:27b"`).
+/// There is therefore no flat `provider:model` selector namespace; name the two
+/// parts separately.
+///
+/// **An EMPTY list is "don't care" on that axis — not "match nothing".**
+/// `only: {routers: ["anthropic"]}` admits every anthropic candidate whatever
+/// its model.
+///
+/// # The two knobs read this type differently
+///
+/// - **`only` is AND across non-empty axes.** A candidate is admitted iff it
+///   satisfies *every* non-empty list.
+/// - **`ignore` is OR across non-empty axes.** A candidate is excluded iff it is
+///   named on *any* axis.
+///
+/// The asymmetry is deliberate — it is how an operator says these aloud. "Only
+/// these routers and only these models" is a conjunction; "ignore this router
+/// and that model" is a disjunction. An AND-ed `ignore` would exclude only the
+/// single named *pair*, which nobody means.
+///
+/// | preference | candidate | admitted? |
+/// |---|---|---|
+/// | `only: {routers: [anthropic], models: [claude-haiku]}` | `anthropic:claude-haiku` | yes |
+/// | same | `anthropic:claude-opus` | no — the model axis binds |
+/// | same | `bedrock:claude-haiku` | no — the router axis binds |
+/// | `only: {routers: [anthropic]}` | `anthropic:anything` | yes — empty axis is don't-care |
+/// | `ignore: {routers: [ollama], models: [claude-opus]}` | `ollama:gemma3:27b` | no — router match |
+/// | same | `anthropic:claude-opus` | no — model match |
+/// | same | `anthropic:claude-haiku` | yes — neither axis matched |
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct CandidateSet {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -418,8 +518,22 @@ pub struct CandidateSet {
     pub models: Vec<String>,
 }
 
-/// One position in an explicit sequence. An ABSENT field is a wildcard, so
-/// `{router: "anthropic"}` means "every anthropic candidate, here".
+/// One position in an explicit sequence ([`RoutingPreferences::order`]).
+///
+/// A ref matches a candidate iff every **present** field equals the candidate's;
+/// an ABSENT field is a wildcard. So `{router: "anthropic"}` means "every
+/// anthropic candidate, here", and `CandidateRef::default()` (both fields
+/// absent) matches everything.
+///
+/// **A router-only ref lifts every model on that router across priority tiers.**
+/// `order: [{router: "anthropic"}]` puts *all* anthropic candidates ahead of
+/// everything else regardless of their authored `priority`. That is correct and
+/// caller-explicit — but it is precisely the cross-group reordering
+/// `GroupedWeightedStrategy` refuses to do on its own, which only ever reorders
+/// WITHIN a priority group. Reach for it deliberately.
+///
+/// See [`RoutingPreferences::order`] for first-match-wins and the two inert
+/// forms.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct CandidateRef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -545,6 +659,12 @@ pub struct InferenceResponse {
     /// because nothing in this workspace builds an `ExecutionTrace` in
     /// production today; the response is the one artefact a caller reporting
     /// "why did it pick the expensive one" actually has in hand.
+    ///
+    /// **Not available on the streaming path.** `Gateway::execute_stream`
+    /// selects with the full preferences — `only`/`ignore` filtering and every
+    /// ordering knob apply — but returns a stream of `StreamEvent`s rather than
+    /// an `InferenceResponse`, so a streamed request has no explanation to read.
+    /// A known gap, not an oversight.
     ///
     /// `default` is belt-and-braces — serde already resolves a missing
     /// `Option<T>` field to `None`.

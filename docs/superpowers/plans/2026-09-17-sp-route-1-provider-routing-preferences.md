@@ -27,7 +27,7 @@
 | 9 | `662e22c` · `4f58000` | ✅ done; review found a **live-store read inside the sort comparator** that panicked selection |
 | 10 | `d6576b8` · `57b41c7` | ✅ done — **the feature is live**; both planted tripwires confirmed red-before / green-after |
 | 11 | `a9c8652` · `b7ff616` | ✅ done; found that **AC10 named a destination nothing fills** |
-| 12 | — | pending — docs + final verification + whole-slice review |
+| 12 | *(this commit)* | ✅ done — docs + final verification; **whole-slice review is a separate step, still pending** |
 
 **Task 11 found a spec defect of mine.** AC10 said the decision goes on `ExecutionTrace`. Nothing in
 the workspace builds one in production — it is constructed only in a `store.rs` test helper, and
@@ -2686,13 +2686,43 @@ git commit -m "feat(gateway): record the routing decision on the trace (SP-ROUTE
 - Modify: `docs/features/` (routing docs), `README.md` if it documents request fields
 - Modify: `docs/CHECKPOINT.md`
 
-- [ ] **Step 1: Find every doc surface that describes routing or request fields**
+- [x] **Step 1: Find every doc surface that describes routing or request fields**
 
 Run: `rg --no-ignore -g '!target' -g '!site/node_modules' -l 'allow_fallback|fallback chain|priority' docs/ README.md`
 
 Update each hit that enumerates request fields or describes selection order.
 
-- [ ] **Step 2: Document the tied-chain consequence loudly**
+**Done.** The sweep returned 79 files; the ones that actually enumerate request
+fields or describe selection order are nine, and all nine changed:
+
+| Surface | Change |
+|---|---|
+| `docs/features/routing/provider-preferences.md` | **NEW** — the canonical feature doc (one file per feature is this directory's convention) |
+| `docs/features/routing/README.md` | status row + the `RoutingPolicyGate` / ordering-seam notes |
+| `docs/features/routing/routing-and-selection.md` | stale `SelectionCriteria` (missing `preferences` *and* `input_tokens_pessimistic`), `SelectionResult.decision`, the 10-gate pipeline with the order rationale, the ordering seam, two new "surprises" |
+| `docs/features/routing/fallback-chains.md` | the priority walk is now the *default* order; the `priority` row now says a tie is a pool |
+| `docs/features/observability/tracing-and-attempts.md` | a `RoutingDecision` section + BOTH gaps (streaming, `ExecutionTrace` forward-provision) |
+| `docs/features/README.md` | routing row |
+| `docs/llms/configuration.md` | tie warning on `ChainEntry.priority` + a `min_samples` section carrying the `0` hazard |
+| `docs/llms/recipes.md` | a "Shape routing per request" recipe covering every rule |
+| `docs/llms/upgrading.md` | a newest-first `0.5.1 → next` section with both breaking API changes and the mid-stream behaviour change |
+| `docs/skills/using-gateway/SKILL.md` | §8 "Advanced routing" bullet |
+| `README.md` | the `gateway` crate one-liner |
+
+The remaining 68 hits match on an unrelated `priority`/`routing` (orchestrator
+scheduler priorities, plan files, design specs for other slices) and were left
+alone.
+
+Also closed the T10 carry-forward "new kernel types not re-exported; decide in
+T11/T12": **decision — no crate-root re-export.** `RoutingPreferences` /
+`SortKey` / `CandidateSet` / `CandidateRef` are reached through
+`gateway::types::request`, exactly as `Message` / `MessageRole` / `StreamChunk`
+already are, and `RoutingDecision` / `RoutedCandidate` through
+`gateway::types::trace` beside `Attempt`. `tests/reexport_paths.rs` now pins all
+six, because `recipes.md` documents those literal paths and a rename would
+otherwise only be caught by a reader.
+
+- [x] **Step 2: Document the tied-chain consequence loudly**
 
 In the routing feature doc, add:
 
@@ -2709,7 +2739,18 @@ journal memo and never re-enters selection), but two independent runs of the
 same graph may now diverge. That is the feature; author ties deliberately.
 ```
 
-- [ ] **Step 3: Run the full verification**
+**Done**, as `provider-preferences.md` §8, and it says more than the draft
+above. The draft's "which is every chain `assemble()` produces" is the claim
+the Task 7 review already refuted, so §8 carries the narrower true version plus
+**both** ways a tie arises unintentionally: `assemble()`'s
+`u8::try_from(pos + 1).unwrap_or(u8::MAX)` **saturates** (a 300-entry chain has
+46 entries tied at 255), and `GatewayBuilder::add_chain` / `Deserialize` pass
+`priority` through with no validation at all. Mirrored as a warning on
+`ChainEntry.priority` in `docs/llms/configuration.md` and on the `priority` row
+in `fallback-chains.md`, and as a `# Determinism` section on
+`RoutingPreferences`'s rustdoc.
+
+- [x] **Step 3: Run the full verification**
 
 ```bash
 cargo fmt --all
@@ -2725,33 +2766,35 @@ Confirm no test was silently skipped:
 Run: `cargo test --workspace 2>&1 | grep -E "test result" | awk -F'[;.]' '{print}'`
 Expected: `failed` is 0 on every line.
 
-- [ ] **Step 4: Verify each acceptance criterion has a passing test**
+- [x] **Step 4: Verify each acceptance criterion has a passing test**
 
-| AC | Test |
-|---|---|
-| AC1 | `distinct_priorities_select_identically_to_priority_order_on_every_seed` |
-| AC2 | `a_tied_group_is_weighted_by_inverse_square_price` |
-| AC3 | `a_free_candidate_leads_its_group_on_every_seed`, `a_zero_reliability_candidate_goes_last_but_is_never_dropped` |
-| AC4 | `only_is_and_across_non_empty_axes`, `ignore_is_or_across_non_empty_axes`, `ignore_subtracts_from_only` |
-| AC5 | `a_policy_exclusion_is_reported_ahead_of_an_open_breaker`, `excluding_every_candidate_is_terminal_not_pausable` |
-| AC6 | `order_sequences_named_candidates_and_keeps_the_rest_as_fallbacks` |
-| AC7 | `a_metric_sort_with_no_observations_is_priority_order`, `an_unmeasured_candidate_holds_its_index` |
-| AC8 | `price_sort_overrides_priority_across_the_whole_chain` |
-| AC9 | `a_mid_stream_failure_is_recorded_as_a_failure` |
-| AC10 | `a_selection_records_the_strategy_and_the_weights_behind_it` |
-| AC11 | Step 3 |
+Every test below was run **individually** (`--exact`) and passed, 1/0 each.
+Two names in the draft table were wrong and are corrected here — the plan was
+written before the tests were, and both were renamed during their task:
 
-Run each named test individually and confirm it passes. Any AC without a green test is unfinished work, not a rounding error.
+| AC | Test (module path) | Individually |
+|---|---|---|
+| AC1 | `strategy::tests::distinct_priorities_select_identically_to_priority_order_on_every_seed` | ✅ |
+| AC2 | `strategy::tests::a_tied_group_is_weighted_by_inverse_square_price` | ✅ |
+| AC3 | `strategy::tests::a_free_candidate_leads_its_group_on_every_seed`, `strategy::tests::a_zero_reliability_candidate_goes_last_but_is_never_dropped` | ✅ ✅ |
+| AC4 | `gates::routing_policy::tests::only_is_and_across_non_empty_axes`, `…::ignore_is_or_across_non_empty_axes`, `…::ignore_excludes_even_when_only_admits` *(was `ignore_subtracts_from_only` — renamed in Task 3 because §4.2's "ignore is applied AFTER only" was itself wrong: the two are commutative predicates, and the surviving claim is that `only` does not exempt from `ignore`)* | ✅ ✅ ✅ |
+| AC5 | `selection::tests::a_policy_exclusion_is_reported_ahead_of_an_open_breaker`, `selection::tests::excluding_every_candidate_is_terminal_not_pausable` | ✅ ✅ |
+| AC6 | `selection::tests::order_sequences_named_candidates_and_keeps_the_rest_as_fallbacks` | ✅ |
+| AC7 | `strategy::tests::a_metric_sort_with_no_observations_is_priority_order`, `strategy::tests::an_unmeasured_candidate_holds_its_index` | ✅ ✅ |
+| AC8 | `strategy::tests::price_sort_overrides_priority_across_the_whole_chain` | ✅ |
+| AC9 | `engine::tests::a_mid_stream_failure_is_recorded_as_a_failure` | ✅ |
+| AC10 | `engine::tests::the_routing_decision_reaches_the_inference_response`, `engine::tests::the_response_carries_the_weights_the_draw_actually_used`, `engine::tests::production_selection_records_the_weight_and_reliability_it_actually_used` *(the draft's single `a_selection_records_the_strategy_and_the_weights_behind_it` was never written; Task 11 split it into three because each half was otherwise testable on a path where the other was absent)* | ✅ ✅ ✅ |
+| AC11 | Step 3 | ✅ |
 
-- [ ] **Step 5: Update the checkpoint**
+- [x] **Step 5: Update the checkpoint**
 
 Overwrite `docs/CHECKPOINT.md` (one current entry, under 40 lines) with the slice state, then run `/sensei:checkpoint`.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
-git add docs
-git commit -m "docs: SP-ROUTE-1 routing preferences + tied-chain determinism note (Task 12)"
+git add -A
+git commit -m "docs: SP-ROUTE-1 user-facing documentation and final verification (Task 12)"
 ```
 
 - [ ] **Step 7: Whole-slice review**
