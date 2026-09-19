@@ -44,12 +44,98 @@ impl std::fmt::Debug for RouterConfig {
     }
 }
 
+/// What a model costs: USD per 1,000 input / output tokens, plus an optional
+/// flat per-request fee. Attached to a model as [`ModelConfig::pricing`]; absent
+/// (`None`) means **free**, which sorts FIRST under `sort: price`.
+///
+/// # Validated at the boundary (SP-ROUTE-1.1)
+///
+/// Every field must be **finite and non-negative** — see
+/// [`validate`](ModelPricing::validate) for the rule and the reasoning.
+/// `Deserialize` enforces it, so a config **file** carrying a bad price fails to
+/// load with an error naming the field and the value; it cannot reach routing by
+/// any path. `Serialize` is untouched, so a valid pricing round-trips unchanged.
+///
+/// Two values are deliberately **accepted**, stated here so neither reads as an
+/// oversight: an explicit **zero** (a real price, distinct from `None`, and the
+/// two deliberately tie under `sort: price`) and a **large finite** magnitude
+/// such as `1e300` (any cap would be an invented threshold, and a prohibitive
+/// price is a legitimate way to park a model at the back of a chain).
+///
+/// A price assembled **in code** bypasses `Deserialize`. The gateway's
+/// `collect_validation_errors` catches it on the checked paths
+/// (`try_new` / `try_update_config` / `GatewayBuilder`), and `Facade::build` —
+/// the production path — **drops** the model and logs at `warn`. It drops rather
+/// than nulling the price because `None` means *free* and free sorts **first**,
+/// so "repairing" a broken price would hand it the cheapest slot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "ModelPricingRaw")]
 pub struct ModelPricing {
+    /// USD per 1,000 input tokens. Finite and `>= 0`.
     pub input_per_1k: f64,
+    /// USD per 1,000 output tokens. Finite and `>= 0`.
     pub output_per_1k: f64,
+    /// Optional flat USD fee per request. Finite and `>= 0` when `Some`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub per_request: Option<f64>,
+}
+
+/// Deserialization shadow for [`ModelPricing`], so [`ModelPricing::validate`]
+/// runs at the boundary. A price that cannot be compared must not load at all:
+/// a `NaN` makes the routing comparator intransitive and a negative price wins
+/// the cheapest slot under `sort: price`.
+#[derive(Deserialize)]
+struct ModelPricingRaw {
+    input_per_1k: f64,
+    output_per_1k: f64,
+    #[serde(default)]
+    per_request: Option<f64>,
+}
+
+impl TryFrom<ModelPricingRaw> for ModelPricing {
+    type Error = String;
+    fn try_from(raw: ModelPricingRaw) -> Result<Self, Self::Error> {
+        let p = ModelPricing {
+            input_per_1k: raw.input_per_1k,
+            output_per_1k: raw.output_per_1k,
+            per_request: raw.per_request,
+        };
+        p.validate()?;
+        Ok(p)
+    }
+}
+
+impl ModelPricing {
+    /// `Err(reason)` when this pricing cannot be used to COMPARE candidates.
+    ///
+    /// Rejects non-finite and negative values. A `NaN` makes the routing
+    /// comparator intransitive — `sort_by` panics on that — and a negative
+    /// price sorts FIRST under `sort: price`, winning the cheapest slot with a
+    /// number that is not a price.
+    ///
+    /// **Zero is valid**: `Some(0.0)` is an explicit zero, distinct from
+    /// `pricing: None`, and the two deliberately tie.
+    ///
+    /// **A large finite value is valid**: any magnitude threshold would be
+    /// invented, the routing layer already fences the overflow it can cause,
+    /// and a prohibitive price is a legitimate way to park a model last.
+    pub fn validate(&self) -> Result<(), String> {
+        let check = |name: &str, v: f64| -> Result<(), String> {
+            if !v.is_finite() {
+                return Err(format!("{name} must be a finite number, got {v}"));
+            }
+            if v < 0.0 {
+                return Err(format!("{name} must not be negative, got {v}"));
+            }
+            Ok(())
+        };
+        check("input_per_1k", self.input_per_1k)?;
+        check("output_per_1k", self.output_per_1k)?;
+        if let Some(per_request) = self.per_request {
+            check("per_request", per_request)?;
+        }
+        Ok(())
+    }
 }
 
 /// Optional catalog metadata for a model: free-tier terms plus attribute tags
@@ -717,5 +803,128 @@ mod tests {
         assert_eq!(pro.quota[0].unit, MeterUnit::Requests);
         assert_eq!(pro.quota[1].window, Window::Week);
         assert_eq!(pro.per_capability[&Capability::ImageGenerate][0].limit, 50);
+    }
+
+    fn pricing(input: f64, output: f64, per_request: Option<f64>) -> ModelPricing {
+        ModelPricing {
+            input_per_1k: input,
+            output_per_1k: output,
+            per_request,
+        }
+    }
+
+    #[test]
+    fn pricing_validate_rejects_negative_and_non_finite_but_accepts_zero() {
+        let ok = |p: ModelPricing| assert!(p.validate().is_ok(), "{p:?} must be valid");
+        let bad = |p: ModelPricing, needle: &str| {
+            let e = p.validate().expect_err("must be rejected");
+            assert!(
+                e.contains(needle),
+                "the error must name the offending field and value; got {e:?}"
+            );
+        };
+
+        // Zero is an EXPLICIT price, distinct from `pricing: None`, and SP-ROUTE-1
+        // Task 8 pinned that the two tie under `sort: price`. Rejecting it would
+        // break shipped, tested behaviour.
+        ok(pricing(0.0, 0.0, None));
+        ok(pricing(0.0008, 0.004, Some(0.0)));
+        // Deliberately accepted — see the spec. Any magnitude threshold is invented,
+        // and a prohibitive price is a legitimate way to park a model last.
+        ok(pricing(1e300, 1e300, Some(1e300)));
+
+        bad(pricing(-0.001, 0.004, None), "input_per_1k");
+        bad(pricing(0.001, -0.004, None), "output_per_1k");
+        bad(pricing(0.001, 0.004, Some(-1.0)), "per_request");
+        bad(pricing(f64::NAN, 0.004, None), "input_per_1k");
+        bad(pricing(0.001, f64::INFINITY, None), "output_per_1k");
+        bad(
+            pricing(0.001, 0.004, Some(f64::NEG_INFINITY)),
+            "per_request",
+        );
+    }
+
+    #[test]
+    fn a_negative_price_fails_to_deserialize_and_the_error_names_the_field() {
+        let err = serde_json::from_str::<ModelPricing>(
+            r#"{"input_per_1k": -0.001, "output_per_1k": 0.004}"#,
+        )
+        .expect_err("a negative price must not load");
+        let msg = err.to_string();
+        assert!(msg.contains("input_per_1k"), "must name the field: {msg}");
+        assert!(msg.contains("-0.001"), "must name the value: {msg}");
+    }
+
+    /// An explicit zero and a large finite price both still load. These are the two
+    /// non-rejections the spec makes deliberately; pinning them stops either
+    /// drifting into a silent threshold.
+    #[test]
+    fn an_explicit_zero_and_a_large_finite_price_still_deserialize() {
+        let zero: ModelPricing =
+            serde_json::from_str(r#"{"input_per_1k": 0.0, "output_per_1k": 0.0}"#).unwrap();
+        assert_eq!(zero.input_per_1k, 0.0);
+
+        let big: ModelPricing =
+            serde_json::from_str(r#"{"input_per_1k": 1e300, "output_per_1k": 1e300}"#).unwrap();
+        assert_eq!(big.input_per_1k, 1e300);
+    }
+
+    /// `serde_json` already refuses a literal `NaN` and an out-of-range `1e400`.
+    /// Pinned so a future format change (or a hand-rolled visitor) cannot quietly
+    /// start accepting them.
+    #[test]
+    fn a_non_finite_literal_is_refused_by_the_format_itself() {
+        assert!(
+            serde_json::from_str::<ModelPricing>(
+                r#"{"input_per_1k": NaN, "output_per_1k": 0.004}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<ModelPricing>(
+                r#"{"input_per_1k": 1e400, "output_per_1k": 0.004}"#
+            )
+            .is_err()
+        );
+    }
+
+    /// A format that CAN express a non-finite value must still be rejected by our
+    /// rule rather than relying on the format.
+    ///
+    /// This does NOT round-trip through `Deserialize` — `serde_json` cannot
+    /// represent an infinity (see `a_non_finite_literal_is_refused_by_the_format_itself`
+    /// for what it does with a literal that reads as one), and no other
+    /// serde-format dev-dependency exists in this workspace that carries
+    /// `f64::INFINITY` faithfully through a round trip, so adding one is out of
+    /// scope for this slice (no new dependencies). This instead pins the rule
+    /// the `TryFrom` seam delegates to directly, so the seam's correctness rests
+    /// on `pricing_validate_rejects_negative_and_non_finite_but_accepts_zero`
+    /// plus the `try_from`-deletion mutation check, not on this test alone.
+    #[test]
+    fn a_non_finite_value_is_rejected_by_our_own_rule() {
+        let bad = ModelPricing {
+            input_per_1k: f64::INFINITY,
+            output_per_1k: 0.004,
+            per_request: None,
+        };
+        assert!(
+            bad.validate().is_err(),
+            "the rule, not the format, must reject an infinity"
+        );
+    }
+
+    /// Serialization is UNCHANGED — a valid pricing round-trips byte-identically.
+    #[test]
+    fn a_valid_pricing_round_trips_unchanged() {
+        let p = ModelPricing {
+            input_per_1k: 0.0008,
+            output_per_1k: 0.004,
+            per_request: Some(0.01),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: ModelPricing = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.input_per_1k, p.input_per_1k);
+        assert_eq!(back.output_per_1k, p.output_per_1k);
+        assert_eq!(back.per_request, p.per_request);
     }
 }
