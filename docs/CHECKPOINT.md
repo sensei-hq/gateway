@@ -1,29 +1,32 @@
 # Checkpoint
 
-**SP-ROUTE-1 — 12/12 TASKS + THE WHOLE-SLICE REVIEW DONE, on `develop`.**
-Suite **1909 passed / 0 failed / 60 ignored**, real exit 0, zero `panicked at`.
-Clippy (Homebrew 1.97.1 + rustup stable 1.98.1), `fmt --check`,
-`cargo test -p sensei-gateway --features local --locked` (439/0), and
+**SP-ROUTE-1.1 — 5/5 TASKS DONE, on `develop`.** Pricing that cannot be compared
+is now rejected at the boundary. Suite **1918 passed / 0 failed / 60 ignored**,
+real exit 0, zero `panicked at`. Clippy (Homebrew 1.97.1 + rustup stable 1.98.1),
+`fmt --check`, `cargo test -p sensei-gateway --features local --locked`, and
 `cargo doc --workspace --no-deps` all clean, all real exit 0.
-Spec: `docs/superpowers/specs/2026-09-17-sp-route-1-provider-routing-preferences-design.md`
-Plan: `docs/superpowers/plans/2026-09-17-sp-route-1-provider-routing-preferences.md`
-(Progress table + "Whole-slice adversarial review" — **read those first**).
+Spec: `docs/superpowers/specs/2026-09-18-sp-route-1-1-pricing-validation-design.md`
+Plan: `docs/superpowers/plans/2026-09-18-sp-route-1-1-pricing-validation.md`
+(Progress table — **read it first**).
 
 ## Done
 
-T1–T12 (request types → `RoutingDecision` on `InferenceResponse` → docs), each
-reviewed. **Whole-slice review complete in two rounds:** `0c26c8c` behavioural
-(a failed attempt no longer casts a latency observation; throughput is now
-output tokens ÷ TOTAL attempt wall time on both paths; `NoCandidates` gained
-`skipped`; the `--features local` CI step runs `cargo test`, not `cargo check`)
-and this commit, documentation (3 Critical / 6 Important / 10 Minor).
+T1 `ModelPricing::validate` (`4d52044`) · T2 the `#[serde(try_from)]` boundary
+(`1170aab`, AC1–AC3/AC7) · T3 `collect_validation_errors` Rule 7 (`3a091a6`,
+AC6) · T4 `Facade::build` drops-and-warns (`cb5fbbf`, AC4–AC5) · T5 docs +
+verification (this commit, AC8).
 
-The two Criticals worth carrying: `#[non_exhaustive]` forbids
-`..Default::default()` too, so the documented way to set `min_samples` did not
-compile for any consumer — now guarded from OUTSIDE the crate by a
-`reexport_paths.rs` test and a `resilience.rs` doctest; and the `min_samples: 0`
-hazard named a mechanism the code lacks (`stats()` returns `None` first, so a
-cold process is fine — the real hazard is a live ring with a zeroed counter).
+One rule, three call sites. **The breaking change:** a config **file** carrying
+a non-finite or negative price now fails to load, with an error naming the field
+and the value. Two non-rejections are deliberate and pinned: an explicit `0.0`
+(a real price, ties with `None`) and a large finite `1e300`. `Facade::build`
+**drops** such a model rather than nulling its price — `None` means free and
+free sorts first, so the tempting repair hands a broken price the cheapest slot.
+AC5 is the test that fails when the feature is implemented the *wrong* way.
+
+This **closes SP-ROUTE-1 carry-forward 4** ("nothing validates `ModelPricing`"),
+which was contained at the routing layer and is now fixed at the config layer.
+The `PriceStrategy` / `MetricStrategy` non-finite fences stay as the last line.
 
 ## Next
 
@@ -33,18 +36,16 @@ land.
 
 ## Carry-forwards — deliberate, not forgotten
 
-1. **Streaming carries no `RoutingDecision`** — `execute_stream` applies every
-   preference but returns `StreamEvent`s, so there is nowhere to put it.
+1. **Streaming carries no `RoutingDecision`** (`execute_stream` returns
+   `StreamEvent`s, nowhere to put it).
 2. **`ExecutionTrace::routing` is forward provision** — nothing builds an
-   `ExecutionTrace` in production; the response is the delivered surface.
+   `ExecutionTrace` in production.
 3. `InferenceCall` store write in `stream.rs` sits **after** `yield Done`, so an
    SSE consumer that breaks on `Done` is never metered. Metering, not routing.
-4. Nothing validates `ModelPricing` for finiteness or sign. **Contained** (both
-   strategies fence non-finite keys), but a NEGATIVE price is accepted and sorts
-   FIRST under `sort: price`. The loud load-time rejection belongs at the config
-   layer — now documented as a hazard rather than left implicit.
-5. **Consensus legs drop the caller's `routing`** (`routing: None` hardcoded),
-   while a panel inherits it. Consistent with `budget`/`auth`; documented, not
-   changed.
+4. **Consensus legs drop the caller's `routing`** while a panel inherits it.
+   Consistent with `budget`/`auth`; documented, not changed.
+5. **No magnitude cap on pricing, by design** (SP-ROUTE-1.1 §2/§6): `1e300` can
+   still overflow inside `estimate_cost`, and that non-finite *result* stays
+   fenced by the strategies. Any cap would be an invented threshold.
 
 Open questions: none. Known-broken: nothing.

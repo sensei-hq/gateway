@@ -117,6 +117,31 @@ pub(crate) fn collect_validation_errors(
         }
     }
 
+    // Rule 7: A model's pricing must be COMPARABLE.
+    //
+    // Same rule as the deserialization boundary — [`ModelPricing::validate`] — CALLED
+    // rather than restated. SP-ROUTE-1 shipped a defect where a second derivation of one
+    // value drifted from the first, so the rule lives in exactly one place and every site
+    // asks it.
+    //
+    // A `NaN` makes the routing comparator intransitive (`sort_by` panics on that) and a
+    // negative price sorts FIRST under `sort: price`, winning the cheapest slot with a
+    // number that is not a price. Zero stays valid — it is an explicit price that
+    // deliberately ties with `pricing: None` — and so does a large finite value.
+    //
+    // The boundary already refuses such a price in a config FILE, so this rule fires only
+    // on a `GatewayConfig` assembled in code. Same CHECKED-path caveat as Rules 5 and 6:
+    // `Gateway::new` and `update_config` validate nothing by documented design. The
+    // production path is `Facade::build`, which drops the model instead (SP-ROUTE-1.1
+    // Task 4).
+    for (model_id, model) in models {
+        if let Some(pricing) = &model.pricing
+            && let Err(reason) = pricing.validate()
+        {
+            errors.push(format!("model '{model_id}' has unusable pricing: {reason}"));
+        }
+    }
+
     errors
 }
 
@@ -223,7 +248,7 @@ mod tests {
     use super::*;
     use crate::types::capability::Capability;
     use crate::types::config::{
-        ChainEntry, FallbackChainConfig, FallbackTrigger, ModelConfig, RouterConfig,
+        ChainEntry, FallbackChainConfig, FallbackTrigger, ModelConfig, ModelPricing, RouterConfig,
     };
     use std::collections::HashMap;
 
@@ -458,6 +483,61 @@ mod tests {
                 .any(|e| e.contains("gemma3:27b") && e.contains("context_window")),
             "the error must name the model and the field: {errors:?}"
         );
+    }
+
+    /// A model's pricing must be COMPARABLE on the checked paths too.
+    ///
+    /// SP-ROUTE-1.1 Task 2 already refuses such a price at the deserialization
+    /// boundary, so a config FILE can no longer carry one. A `GatewayConfig`
+    /// assembled in code still can — which is why the bad price here is planted
+    /// PROGRAMMATICALLY, after `build()`. That is the point of the rule: the
+    /// checked entry points (`GatewayBuilder::build`, `Gateway::try_new`,
+    /// `try_update_config`) must report the same problem the boundary does,
+    /// by CALLING `ModelPricing::validate` rather than restating it.
+    ///
+    /// The green half of this test is load-bearing too: an explicit `Some(0.0)`
+    /// is a valid price (it deliberately ties with `pricing: None` under
+    /// `sort: price`), so a rule that swept up every `Some(_)` would be caught
+    /// here rather than in production.
+    #[test]
+    fn validate_config_rejects_a_model_whose_pricing_cannot_be_compared() {
+        let mut well_priced = gemma_model();
+        well_priced.id = "well-priced".to_string();
+        well_priced.pricing = Some(ModelPricing {
+            input_per_1k: 0.0008,
+            output_per_1k: 0.004,
+            per_request: Some(0.0),
+        });
+
+        let mut config = GatewayBuilder::new()
+            .add_router("ollama", ollama_router())
+            .add_model(gemma_model())
+            .add_model(well_priced)
+            .build()
+            .expect("comparable pricing — including an explicit zero — must still build");
+        assert!(
+            validate_config(&config).is_ok(),
+            "a config whose prices are all comparable must pass"
+        );
+
+        config.models.get_mut("gemma3:27b").unwrap().pricing = Some(ModelPricing {
+            input_per_1k: -0.001,
+            output_per_1k: 0.004,
+            per_request: None,
+        });
+
+        match validate_config(&config) {
+            Err(GatewayError::InvalidConfig(msg)) => {
+                assert!(msg.contains("gemma3:27b"), "must name the model: {msg}");
+                assert!(msg.contains("input_per_1k"), "must name the field: {msg}");
+                assert!(msg.contains("-0.001"), "must name the value: {msg}");
+                assert!(
+                    !msg.contains("well-priced"),
+                    "must not blame the comparable model: {msg}"
+                );
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
     }
 
     #[test]
