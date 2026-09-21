@@ -1,6 +1,6 @@
 [package]
 name = "sensei-orchestrator-core"
-version = "0.1.0"
+version = "0.6.0"
 edition = "2024"
 description = "Zero-I/O core types for the sensei orchestrator: graph, effect, and journal vocabulary"
 license = "MIT"
