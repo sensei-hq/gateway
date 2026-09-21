@@ -88,20 +88,36 @@ deliberately **not** here. It is a different file, a different question (propaga
 request-building), and arguably not a defect at all: consensus legs already drop `budget` and
 `auth`, so the exclusion is consistent and may be intended.
 
-## 4. The testing problem this slice must solve first
+## 4. The fixture this needs already exists — an earlier draft of this section was wrong
 
-**Every streaming test in the suite drains to `None`.** `collect_stream` loops
-`while let Some(ev) = stream.next().await`, so no existing test behaves like a real SSE consumer,
-and none of them can observe §2.1 at all. A fix verified only against `collect_stream` proves
-nothing.
+**Correction.** This section originally claimed every streaming test drains to `None` via
+`collect_stream`, and that the slice's first job was building a consumer that stops at `Done`.
+That is false, and the check that caught it took two minutes.
 
-So this slice needs a consumer fixture that **stops polling at `Done`** — takes events until it
-sees the terminal one, then drops the stream. That fixture is what makes §2.1's test real, and it
-is the first thing to build.
+`engine/tests.rs:6309` — `a_consumer_that_stops_at_done_still_sees_its_verdict_recorded`, added by
+SP-ROUTE-1 Task 5's own review as Minor 2 — does exactly that:
 
-This is the same lesson SP-ROUTE-1 learned twice: a fixture that does not behave like production
-cannot test production. There, every performance fixture returned a constant and could not see a
-live-store read inside a comparator.
+```rust
+loop {
+    match stream.next().await {
+        Some(StreamEvent::Done { .. }) => break,
+        Some(_) => continue,
+        None => panic!("stream ended without a terminal Done event"),
+    }
+}
+drop(stream); // stop exactly where a real consumer stops — no further polling
+```
+
+Its doc comment carries the same reasoning this spec opens with, and it is what pins the
+performance dispatch's position today.
+
+**So the slice is smaller than drafted.** The pattern is proven and in the file; §2.1 reuses it
+against the metering row instead of the verdict. What remains true is the underlying point —
+`collect_stream` cannot see this class of defect, so **AC1 must not be written against it**.
+
+It is still the case that this fixture is the *only* one of its kind: every other streaming test
+drains fully, which is why §2.1 survived Task 5's review even though the sibling defect beside it
+did not.
 
 ## 5. Acceptance criteria
 
