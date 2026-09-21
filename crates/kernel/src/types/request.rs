@@ -754,6 +754,13 @@ pub enum StreamEvent {
         model: String,
         tokens: TokenUsage,
         cost: f64,
+        /// Why these candidates came out in this order — the same
+        /// [`RoutingDecision`] `execute` puts on [`InferenceResponse::routing`].
+        /// `None` when no strategy ordered anything (a tier-1 direct request).
+        ///
+        /// [`RoutingDecision`]: crate::types::trace::RoutingDecision
+        /// [`InferenceResponse::routing`]: InferenceResponse::routing
+        routing: Option<crate::types::trace::RoutingDecision>,
     },
     Error {
         code: String,
@@ -1761,6 +1768,7 @@ mod tests {
             model: "m".to_string(),
             tokens: TokenUsage::default(),
             cost: 0.01,
+            routing: None,
         };
         match event {
             StreamEvent::Done { model, cost, .. } => {

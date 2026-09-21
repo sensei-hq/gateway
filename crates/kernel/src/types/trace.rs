@@ -57,18 +57,16 @@ pub struct SkippedInfo {
 /// production — two identical requests may legitimately route differently, so
 /// there is nothing to re-run and compare against.
 ///
-/// Delivered on [`InferenceResponse::routing`], which is the artefact a caller
-/// actually holds. Two gaps to know before going looking for it:
+/// Delivered on the two artefacts a caller actually holds: on
+/// [`InferenceResponse::routing`] for a unary call, and — since SP-ROUTE-1.2 —
+/// on [`StreamEvent::Done`] for a streamed one, which is the same decision
+/// value rather than a second derivation of it. One gap remains before going
+/// looking for it:
 ///
-/// - **The streaming path carries none.** `Gateway::execute_stream` selects with
-///   the full preferences — filtering and ordering both apply — but returns a
-///   stream of `StreamEvent`s rather than an `InferenceResponse`, so it has
-///   nowhere to put the explanation. A streamed request routes correctly and
-///   cannot currently report why. Recorded as a known gap rather than papered
-///   over.
 /// - **[`ExecutionTrace::routing`] is forward provision.** See that field.
 ///
 /// [`InferenceResponse::routing`]: super::request::InferenceResponse::routing
+/// [`StreamEvent::Done`]: super::request::StreamEvent#variant.Done
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RoutingDecision {
     /// Read from `RoutingStrategy::name()` — the strategy that actually ran,
