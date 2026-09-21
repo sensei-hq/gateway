@@ -2976,6 +2976,7 @@ async fn execute_stream_yields_chunks_then_done_with_cost() {
             model,
             tokens,
             cost,
+            ..
         } => {
             assert_eq!(model, "priced");
             assert_eq!(tokens.input_tokens, 1000);
@@ -5939,6 +5940,172 @@ async fn the_same_generation_rate_reports_the_same_throughput_streaming_or_not()
     );
 }
 
+/// A [`crate::store::GatewayStore`] that keeps every row it is handed, so a
+/// test can assert on a persisted FIELD.
+///
+/// `InMemoryStore` cannot serve this: no `GatewayStore` READ exposes
+/// `duration_ms` at all. `get_inference_calls_by_session` — the only read that
+/// returns whole rows — filters on a `session_id` that neither entry point ever
+/// populates, and every other read is a dollar/token aggregate.
+///
+/// The reads are `unimplemented!()` rather than empty so a future test that
+/// leans on one fails loudly instead of silently asserting over nothing.
+#[derive(Default)]
+struct RecordingStore {
+    calls: std::sync::Mutex<Vec<crate::store::InferenceCall>>,
+}
+
+impl RecordingStore {
+    /// The rows persisted for `adapter`, in insertion order.
+    fn calls_for(&self, adapter: &str) -> Vec<crate::store::InferenceCall> {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.adapter == adapter)
+            .cloned()
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::store::GatewayStore for RecordingStore {
+    async fn insert_inference_call(
+        &self,
+        call: &crate::store::InferenceCall,
+    ) -> Result<Uuid, GatewayError> {
+        self.calls.lock().unwrap().push(call.clone());
+        Ok(call.id)
+    }
+
+    async fn get_inference_calls_by_session(
+        &self,
+        _session_id: Uuid,
+    ) -> Result<Vec<crate::store::InferenceCall>, GatewayError> {
+        unimplemented!("RecordingStore records writes; read the rows with `calls_for`")
+    }
+
+    async fn get_spend_since(&self, _since: chrono::DateTime<Utc>) -> Result<f64, GatewayError> {
+        unimplemented!("RecordingStore records writes; read the rows with `calls_for`")
+    }
+
+    async fn get_spend_by_model_since(
+        &self,
+        _since: chrono::DateTime<Utc>,
+    ) -> Result<Vec<(String, f64)>, GatewayError> {
+        unimplemented!("RecordingStore records writes; read the rows with `calls_for`")
+    }
+
+    async fn get_usage_since(
+        &self,
+        _subject_id: Uuid,
+        _since: chrono::DateTime<Utc>,
+    ) -> Result<crate::store::UsageTotals, GatewayError> {
+        unimplemented!("RecordingStore records writes; read the rows with `calls_for`")
+    }
+
+    async fn insert_execution_trace(
+        &self,
+        _trace: &crate::store::StoredTrace,
+    ) -> Result<Uuid, GatewayError> {
+        unimplemented!("RecordingStore records inference calls only")
+    }
+
+    async fn get_execution_trace(
+        &self,
+        _id: Uuid,
+    ) -> Result<Option<crate::store::StoredTrace>, GatewayError> {
+        unimplemented!("RecordingStore records inference calls only")
+    }
+
+    async fn get_traces_by_call(
+        &self,
+        _inference_call_id: Uuid,
+    ) -> Result<Vec<crate::store::StoredTrace>, GatewayError> {
+        unimplemented!("RecordingStore records inference calls only")
+    }
+}
+
+/// SP-ROUTE-1.2 AC3 — the same unlike-spans argument as the test above, on the
+/// PERSISTED column rather than the dispatch. `InferenceCall.duration_ms` was
+/// written from `stream_start` (generation time alone) while `execute` writes
+/// the same column with the whole attempt's wall time, so `inference_calls`
+/// mixed two quantities under one name and any analytics over it was wrong with
+/// nothing surfacing the fact. The completion dispatch directly above this row's
+/// construction had already been moved to `attempt_start` for exactly this
+/// reason; the metering row was simply never brought along.
+///
+/// `SplitDelayStreamer` is what makes it visible: `SETUP_DELAY` elapses BEFORE
+/// the first byte, so a row measured from `stream_start` sees `GENERATION_DELAY`
+/// alone — half the span, a 2x separation no scheduler jitter closes.
+///
+/// Both assertions are RELATIONAL against the fixture's own known delays, never
+/// an absolute millisecond ceiling: a stalled runner can only stretch these
+/// spans UPWARD, and both bounds are lower bounds, so a loaded machine cannot
+/// turn either red. (A streaming-vs-unary RATIO was considered for the parity
+/// half and rejected — it fails whenever one path alone is stalled, which tests
+/// the machine rather than the code.)
+#[tokio::test]
+async fn a_streamed_calls_persisted_duration_includes_acquisition() {
+    let store = Arc::new(RecordingStore::default());
+
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    let split = Gateway::new(single_endpoint_config("split"), AdapterRegistry::new(), cb)
+        .with_store(store.clone());
+    split
+        .adapters
+        .register_chat(Arc::new(SplitDelayStreamer {
+            id: "split".to_string(),
+        }))
+        .await;
+
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    let whole = Gateway::new(single_endpoint_config("whole"), AdapterRegistry::new(), cb)
+        .with_store(store.clone());
+    whole
+        .adapters
+        .register_chat(Arc::new(WholeCallDelayAdapter {
+            id: "whole".to_string(),
+        }))
+        .await;
+
+    let events = collect_stream(&split, &pinned_chat_request("split")).await;
+    assert!(
+        matches!(events.last(), Some(StreamEvent::Done { .. })),
+        "the streaming half must run to completion: {events:?}"
+    );
+    whole
+        .execute(&pinned_chat_request("whole"))
+        .await
+        .expect("the non-streaming half must succeed");
+
+    let total = (SETUP_DELAY + GENERATION_DELAY).as_millis() as u64;
+
+    let streamed = store.calls_for("split");
+    assert_eq!(streamed.len(), 1, "one streamed call, one metering row");
+    assert!(
+        streamed[0].duration_ms >= total,
+        "the persisted duration must cover the TOTAL attempt span \
+         (>= {total}ms = {SETUP_DELAY:?} pre-first-byte + {GENERATION_DELAY:?} generation), \
+         not generation alone; got {}ms",
+        streamed[0].duration_ms
+    );
+
+    // The parity half of AC3: `execute` writes this same column, and the row it
+    // writes for the IDENTICAL work must clear the same bar. Both are then the
+    // one quantity — output over total attempt wall time — that an analytics
+    // query over `inference_calls` can pool.
+    let unary = store.calls_for("whole");
+    assert_eq!(unary.len(), 1, "one unary call, one metering row");
+    assert!(
+        unary[0].duration_ms >= total,
+        "`execute` records the whole attempt's wall time in the same column \
+         (>= {total}ms); got {}ms — if this ever stops holding, the streaming \
+         row above is matching a quantity that moved",
+        unary[0].duration_ms
+    );
+}
+
 // --- SP-ROUTE-1 Task 5 review fixes: one attempt casts one verdict to every
 // health recorder, not just `PerformanceRecorder` ---
 //
@@ -6340,6 +6507,73 @@ async fn a_consumer_that_stops_at_done_still_sees_its_verdict_recorded() {
         stats.verdict_samples, 1,
         "the verdict must already be recorded once Done is observed, not only after the \
          stream is fully drained to None"
+    );
+}
+
+/// SP-ROUTE-1.2 AC1 — the same trap as the test above, one concern over: a
+/// consumer that stops polling at `Done` must still be BILLED.
+/// `insert_inference_call` sat AFTER the `yield`, so a streamed request was
+/// metered only when its caller happened to over-poll, while a non-streaming
+/// request is always metered. This is billing data.
+///
+/// Deliberately NOT written against `collect_stream`: that drains to `None` and
+/// passes whether the write is above or below the yield, which is exactly how
+/// this survived the review that caught the sibling dispatch beside it.
+///
+/// Asserts through `get_usage_since`, not `get_inference_calls_by_session`: the
+/// streaming path writes `session_id: None`, so the session-keyed read can
+/// never return this row. `get_usage_since` is the only `InMemoryStore` read
+/// that yields an exact ROW COUNT (`requests`) — the two spend reads are dollar
+/// aggregates that read 0.0 on this unpriced config and could not tell one row
+/// from none.
+#[tokio::test]
+async fn a_consumer_that_stops_at_done_is_still_metered() {
+    use crate::store::GatewayStore;
+    use futures::StreamExt;
+
+    let store = Arc::new(InMemoryStore::default());
+    let gw = Gateway::new(
+        mid_gateway_config(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    )
+    .with_store(store.clone());
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamer {
+            id: "mid".to_string(),
+        }))
+        .await;
+
+    // The subject is what carries the row into `get_usage_since`: the streaming
+    // path populates `InferenceCall::subject_id` from `request.auth`.
+    let subject = Uuid::new_v4();
+    let mut request = mid_chat_request();
+    request.auth = Some(AuthContext {
+        subject_id: subject,
+        tier: None,
+    });
+
+    let mut stream = gw
+        .execute_stream(&request)
+        .await
+        .expect("stream should start");
+    loop {
+        match stream.next().await {
+            Some(StreamEvent::Done { .. }) => break,
+            Some(_) => continue,
+            None => panic!("stream ended without a terminal Done event"),
+        }
+    }
+    drop(stream); // stop exactly where a real consumer stops — no further polling
+
+    let usage = store
+        .get_usage_since(subject, Utc::now() - chrono::Duration::hours(1))
+        .await
+        .expect("the in-memory store never errors");
+    assert_eq!(
+        usage.requests, 1,
+        "the metering row must exist once Done is observed, not only after the stream is \
+         fully drained to None — otherwise a normal SSE consumer is never billed: {usage:?}"
     );
 }
 
@@ -6871,4 +7105,551 @@ async fn the_response_carries_the_weights_the_draw_actually_used() {
          being flattened on the way"
     );
     assert_eq!(of("noop:noop").weight, Some(1.0), "`1/1² × 1.0`");
+}
+
+/// The `RoutingDecision` carried on a collected stream's terminal `Done`.
+///
+/// Panics rather than returning an `Option<Option<_>>` when the stream did not
+/// end in a `Done` at all: a stream that ended in an `Error` would otherwise
+/// read as "no decision", which is a different claim entirely.
+fn done_routing(events: &[StreamEvent]) -> Option<crate::types::trace::RoutingDecision> {
+    match events.last() {
+        Some(StreamEvent::Done { routing, .. }) => routing.clone(),
+        other => panic!("expected a terminal Done event, got {other:?}"),
+    }
+}
+
+/// AC4 — a streaming caller can ask why its provider was chosen.
+///
+/// Preferences already APPLY on this path: `execute_stream` builds the same
+/// `SelectionCriteria` as `execute`, so filtering and ordering both work
+/// identically. Only the EXPLANATION was missing — the stream yields
+/// `StreamEvent`s rather than an `InferenceResponse`, so the `RoutingDecision`
+/// had nowhere to ride until it joined `model`, `tokens` and `cost` on the
+/// terminal `Done`.
+///
+/// `sort: price` rather than the default, for the same reason
+/// `the_routing_decision_reaches_the_inference_response` uses it: the price
+/// order here is the REVERSE of the chain's authored priority order, so the
+/// recorded sequence cannot be mistaken for the chain as written.
+#[tokio::test]
+async fn a_streamed_request_carries_its_routing_decision() {
+    let gw = Gateway::new(
+        priced_failing_and_noop(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+    // Only `noop` gets an adapter — and it is also the cheapest, so the price
+    // sort puts it first and the walk never needs `failing`.
+    register_noop(&gw).await;
+
+    let request = InferenceRequest {
+        chain: Some("chat_chain".to_string()),
+        routing: Some(crate::types::request::RoutingPreferences {
+            sort: Some(crate::types::request::SortKey::Price),
+            ..Default::default()
+        }),
+        ..chat_request()
+    };
+
+    let events = collect_stream(&gw, &request).await;
+    let decision = done_routing(&events)
+        .expect("execute_stream must carry the selection's routing decision on `Done`");
+
+    assert_eq!(decision.strategy, "price");
+    assert_eq!(
+        decision
+            .order
+            .iter()
+            .map(|c| c.endpoint.clone())
+            .collect::<Vec<_>>(),
+        vec!["noop:noop", "failing:fail-model"],
+        "price order (1.0 then 2.0) is the reverse of the chain's authored \
+         priority order, so this sequence can only come from the strategy that \
+         actually ran"
+    );
+}
+
+/// AC5 — and it is the decision the selection PRODUCED, not a re-derivation at
+/// the attachment site.
+///
+/// SP-ROUTE-1 Task 11 shipped exactly that defect on the unary path, and it
+/// survived the whole suite: a decision rebuilt where the artefact is assembled
+/// reproduces `strategy` and `order` perfectly, because both are derivable from
+/// the candidate list already in scope there. What it cannot reproduce is
+/// `reliability` and `weight` — those are the draw's own numbers, read from a
+/// LIVE performance window inside `order_group`, and the code that records them
+/// says outright that a second read is not guaranteed to return what the first
+/// one did.
+///
+/// So: the weighted DEFAULT, with the gateway's own recorder moved first, and
+/// the streamed decision compared WHOLE against what `execute` reports for the
+/// same request and chain — per-candidate cost, reliability and weight
+/// included. Then the numbers themselves, so that two matching empties cannot
+/// pass for agreement.
+///
+/// Not flaky despite the draw being random: `chat_chain`'s two entries carry
+/// DISTINCT priorities, and `GroupedWeightedStrategy` only ever reorders WITHIN
+/// a priority group — so every group here is a singleton, the order is priority
+/// order on both paths, and the randomness has nothing to act on.
+#[tokio::test]
+async fn the_streamed_decision_matches_what_execute_reports() {
+    let gw = Gateway::new(
+        priced_failing_and_noop(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+    // `fail-model` leads on priority and has no adapter, so BOTH paths fall
+    // through to `noop` — while the decision still describes both candidates.
+    register_noop(&gw).await;
+
+    // The gateway's OWN write path. `min_samples` is 3, so exactly three
+    // verdicts — two successes and one failure — put `failing:fail-model` at a
+    // success rate of 2/3, a number no default and no hand-built fixture
+    // produces.
+    let observe = |success: bool| {
+        gw.record_outcome(&crate::gates::AttemptOutcome {
+            endpoint: "failing:fail-model",
+            router: "failing",
+            success,
+            error: None,
+            duration_ms: 100,
+            output_tokens: Some(10),
+            phase: crate::gates::AttemptPhase::Complete,
+        });
+    };
+    observe(true);
+    observe(true);
+    observe(false);
+    // `noop:noop` is deliberately never observed here. The two calls below each
+    // cast exactly ONE verdict on it, which stays below `min_samples`, so it
+    // reads unmeasured for both selections and the act of measuring cannot
+    // drift the two decisions apart. `failing:fail-model` takes the no-adapter
+    // arm, which dispatches no outcome at all, so its 2/3 is untouched.
+
+    // No `sort`: the weighted default is the only strategy that weighs anything.
+    let request = InferenceRequest {
+        chain: Some("chat_chain".to_string()),
+        ..chat_request()
+    };
+
+    let unary = gw
+        .execute(&request)
+        .await
+        .expect("the noop adapter answers")
+        .routing
+        .expect("execute attaches the selection's routing decision");
+    let events = collect_stream(&gw, &request).await;
+    let streamed = done_routing(&events)
+        .expect("execute_stream must carry the selection's routing decision on `Done`");
+
+    assert_eq!(
+        streamed, unary,
+        "the streamed decision must equal the one `execute` reports for the \
+         same request and chain — strategy, degradation, and every candidate's \
+         cost, reliability and weight"
+    );
+
+    // ...and it is a REAL decision rather than two matching blanks: every
+    // number below exists only inside the draw that actually ran.
+    assert_eq!(streamed.strategy, "grouped_weighted");
+    let of = |endpoint: &str| {
+        streamed
+            .order
+            .iter()
+            .find(|c| c.endpoint == endpoint)
+            .unwrap_or_else(|| panic!("{endpoint} must be admitted by this fixture"))
+    };
+    assert_eq!(
+        of("failing:fail-model").reliability,
+        Some(2.0 / 3.0),
+        "two successes and one failure through the gateway's own recorder, \
+         carried all the way out to the STREAMING caller. A decision rebuilt at \
+         the attachment site has no window to read and could only say `None`"
+    );
+    assert_eq!(
+        of("failing:fail-model").weight,
+        Some(0.25 * (2.0 / 3.0)),
+        "`1/2² × 2/3` — the draw weight the ordering actually used, not a \
+         number re-derived at the attachment site"
+    );
+    assert_eq!(
+        of("noop:noop").reliability,
+        None,
+        "never observed above `min_samples` — and `None` must survive the trip \
+         out rather than being flattened on the way"
+    );
+    assert_eq!(of("noop:noop").weight, Some(1.0), "`1/1² × 1.0`");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// SP-ROUTE-1.2 whole-slice review — C2, C1, I1, M1
+// ───────────────────────────────────────────────────────────────────────────
+
+/// A store whose `insert_inference_call` stalls. Models the failure mode that
+/// actually bites a metering write — a saturated connection pool or an
+/// unreachable database — which is LATENCY, not an `Err`. A store that returns
+/// an error promptly was already handled; one that never answers was not.
+struct StalledStore {
+    stall: std::time::Duration,
+}
+
+#[async_trait::async_trait]
+impl crate::store::GatewayStore for StalledStore {
+    async fn insert_inference_call(
+        &self,
+        call: &crate::store::InferenceCall,
+    ) -> Result<Uuid, GatewayError> {
+        tokio::time::sleep(self.stall).await;
+        Ok(call.id)
+    }
+
+    async fn get_inference_calls_by_session(
+        &self,
+        _session_id: Uuid,
+    ) -> Result<Vec<crate::store::InferenceCall>, GatewayError> {
+        unimplemented!("StalledStore exists to stall a write")
+    }
+
+    async fn get_spend_since(&self, _since: chrono::DateTime<Utc>) -> Result<f64, GatewayError> {
+        unimplemented!("StalledStore exists to stall a write")
+    }
+
+    async fn get_spend_by_model_since(
+        &self,
+        _since: chrono::DateTime<Utc>,
+    ) -> Result<Vec<(String, f64)>, GatewayError> {
+        unimplemented!("StalledStore exists to stall a write")
+    }
+
+    async fn get_usage_since(
+        &self,
+        _subject_id: Uuid,
+        _since: chrono::DateTime<Utc>,
+    ) -> Result<crate::store::UsageTotals, GatewayError> {
+        unimplemented!("StalledStore exists to stall a write")
+    }
+
+    async fn insert_execution_trace(
+        &self,
+        _trace: &crate::store::StoredTrace,
+    ) -> Result<Uuid, GatewayError> {
+        unimplemented!("StalledStore exists to stall a write")
+    }
+
+    async fn get_execution_trace(
+        &self,
+        _id: Uuid,
+    ) -> Result<Option<crate::store::StoredTrace>, GatewayError> {
+        unimplemented!("StalledStore exists to stall a write")
+    }
+
+    async fn get_traces_by_call(
+        &self,
+        _inference_call_id: Uuid,
+    ) -> Result<Vec<crate::store::StoredTrace>, GatewayError> {
+        unimplemented!("StalledStore exists to stall a write")
+    }
+}
+
+/// Setup-failing adapter that burns a known span BEFORE failing, so a timer
+/// that wrongly spans the whole walk is separable from one scoped to the
+/// winning candidate. `FakeStreamFailer` fails instantly and cannot tell the
+/// two apart.
+struct SlowSetupFailer {
+    id: String,
+}
+
+impl crate::adapters::capability::Model for SlowSetupFailer {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::adapters::capability::ChatModel for SlowSetupFailer {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<crate::types::io::ChatResponse, GatewayError> {
+        tokio::time::sleep(FAILED_CANDIDATE_SPAN).await;
+        Err(GatewayError::ProviderError {
+            adapter: self.id.clone(),
+            message: "slow setup failure".to_string(),
+            status: Some(500),
+        })
+    }
+
+    async fn chat_stream(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<
+        std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = Result<crate::types::request::StreamChunk, GatewayError>>
+                    + Send,
+            >,
+        >,
+        GatewayError,
+    > {
+        tokio::time::sleep(FAILED_CANDIDATE_SPAN).await;
+        Err(GatewayError::ProviderError {
+            adapter: self.id.clone(),
+            message: "slow setup failure".to_string(),
+            status: Some(500),
+        })
+    }
+}
+
+/// The span the FIRST, failing candidate burns in `the_persisted_duration_excludes_a_failed_candidates_span`.
+const FAILED_CANDIDATE_SPAN: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// C2 — the terminal `Done` must not be hostage to the metering write.
+///
+/// Task 1 moved `insert_inference_call` ABOVE the `yield` so a consumer that
+/// stops at `Done` is still billed (AC1). That is correct and stays. What it
+/// introduced is a head-of-line block the comment beside it mis-justified as
+/// "the same price the dispatch above already charges": `dispatch_outcome` is a
+/// SYNCHRONOUS fold over in-memory recorders and awaits nothing, while
+/// `insert_inference_call` is an `async` call into a consumer-supplied store
+/// with no timeout anywhere in this crate. A stalled pool therefore delayed —
+/// or with a per-event consumer timeout, destroyed — the terminal event, which
+/// carries the tokens, the cost and the routing decision. "Delivered but
+/// unbilled" became "not delivered and unbilled".
+///
+/// Runs on a PAUSED clock, so it costs no wall time and measures the virtual
+/// span the generator actually waited. Under the pre-fix code the assertion
+/// reads the full `STALL`.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_store_does_not_hold_the_terminal_event() {
+    use futures::StreamExt;
+
+    const STALL: std::time::Duration = std::time::Duration::from_secs(30);
+
+    let gw = Gateway::new(
+        mid_gateway_config(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    )
+    .with_store(Arc::new(StalledStore { stall: STALL }));
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamer {
+            id: "mid".to_string(),
+        }))
+        .await;
+
+    let started = tokio::time::Instant::now();
+    let mut stream = gw
+        .execute_stream(&mid_chat_request())
+        .await
+        .expect("stream should start");
+    loop {
+        match stream.next().await {
+            Some(StreamEvent::Done { .. }) => break,
+            Some(_) => continue,
+            None => panic!("stream ended without a terminal Done event"),
+        }
+    }
+    let waited = started.elapsed();
+
+    assert!(
+        waited < STALL,
+        "the terminal Done must not wait on a stalled metering write: waited {waited:?} \
+         of the store's {STALL:?} stall. Metering is best-effort, and that has to be \
+         true of LATENCY as well as of success."
+    );
+}
+
+/// C1 — a stream that dies mid-generation must still be metered.
+///
+/// Task 1 fixed the SUCCESS path only. The mid-stream `Err` arm returns without
+/// any `insert_inference_call`, so real generated tokens — reported by the
+/// provider on its last good chunk, and billed by it — were recorded nowhere.
+/// `execute` writes a `CallStatus::Failed` row for the analogous exhaustion
+/// (`execute.rs`, "observability + request counting"), so this was a live
+/// unary-vs-streamed parity break, not a design choice.
+///
+/// Drained with `collect_stream` deliberately: the absence is STRUCTURAL, not a
+/// polling artefact, and draining to `None` proves that — this row is missing
+/// even for a consumer that over-polls.
+#[tokio::test]
+async fn a_stream_that_dies_mid_generation_is_still_metered() {
+    let store = Arc::new(RecordingStore::default());
+    let gw = Gateway::new(
+        mid_gateway_config(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    )
+    .with_store(store.clone());
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamMidFailerWithUsage {
+            id: "mid".to_string(),
+        }))
+        .await;
+
+    let events = collect_stream(&gw, &mid_chat_request()).await;
+    assert!(
+        matches!(events.last(), Some(StreamEvent::Error { .. })),
+        "the fixture must die mid-stream: {events:?}"
+    );
+
+    let rows = store.calls_for("mid");
+    assert_eq!(
+        rows.len(),
+        1,
+        "a failed stream is recorded exactly as `execute` records a failed call"
+    );
+    assert_eq!(rows[0].status, CallStatus::Failed);
+    assert!(
+        rows[0].error_type.is_some(),
+        "the failure must be classified on the row, not left null"
+    );
+    assert_eq!(
+        rows[0].output_tokens,
+        Some(50),
+        "the tokens the provider reported before dying are the tokens it BILLS; \
+         the row is accounting, not a health observation (the recorder dispatch \
+         deliberately sends None here, for a different reason)"
+    );
+}
+
+/// C1, second `return` site — chain exhaustion is the other unmetered failure.
+///
+/// Every candidate failing at setup yields a terminal `Error` and returns with
+/// no row, while `execute`'s exhaustion branch writes one attributed to the
+/// last attempted candidate. Same defect, different arm; a fix to the
+/// mid-stream arm alone would leave this one open.
+#[tokio::test]
+async fn a_stream_that_exhausts_its_chain_is_still_metered() {
+    let store = Arc::new(RecordingStore::default());
+    let gw = Gateway::new(
+        mid_gateway_config(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    )
+    .with_store(store.clone());
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamFailer {
+            id: "mid".to_string(),
+            status: 500,
+        }))
+        .await;
+
+    let events = collect_stream(&gw, &mid_chat_request()).await;
+    assert!(
+        matches!(events.last(), Some(StreamEvent::Error { .. })),
+        "the single candidate must fail at setup: {events:?}"
+    );
+
+    let rows = store.calls_for("mid");
+    assert_eq!(
+        rows.len(),
+        1,
+        "an exhausted stream is recorded, as `execute` records an exhausted call"
+    );
+    assert_eq!(rows[0].status, CallStatus::Failed);
+    assert_eq!(
+        rows[0].output_tokens, None,
+        "field-for-field parity with `execute`'s failed row, which writes \
+         `tokens: None`. `Some(0)` was the tempting value and is wrong: a setup \
+         failure does not prove the provider generated nothing, only that we \
+         never saw a usage report. `None` is 'unknown', which is what this is."
+    );
+    assert_eq!(
+        rows[0].cost_usd, 0.0,
+        "no usage was reported, so there is nothing to cost — as `execute` does"
+    );
+}
+
+/// I1 — AC3's parity claim, on the only branch where the two paths can diverge.
+///
+/// `a_streamed_calls_persisted_duration_includes_acquisition` uses a
+/// single-candidate, first-candidate-success fixture and asserts two LOWER
+/// bounds. AC3's actual requirement is stronger — the same quantity `execute`
+/// records, which is the WINNING CANDIDATE's span, not the request's — and a
+/// lower bound cannot tell those apart on a fixture that never falls back.
+///
+/// Both timers are re-bound per candidate today, so this passes. It is the
+/// mutation it kills that earns it: hoisting `attempt_start` above the
+/// `for (idx, candidate)` loop is a plausible one-line edit that leaves all 442
+/// shipped tests green while making the streamed row absorb the failed
+/// candidate's 250ms against the unary row's ~0ms — reintroducing precisely the
+/// "two quantities under one name" mixing AC3 exists to end.
+#[tokio::test]
+async fn the_persisted_duration_excludes_a_failed_candidates_span() {
+    let store = Arc::new(RecordingStore::default());
+    let gw = Gateway::new(
+        test_config_with_failing_and_noop(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    )
+    .with_store(store.clone());
+    register_noop(&gw).await;
+    gw.adapters
+        .register_chat(Arc::new(SlowSetupFailer {
+            id: "failing".to_string(),
+        }))
+        .await;
+
+    let request = InferenceRequest {
+        chain: Some("chat_chain".to_string()),
+        ..chat_request()
+    };
+
+    // BOTH entry points, against one store, so the comparison is like-for-like.
+    let events = collect_stream(&gw, &request).await;
+    assert!(
+        matches!(events.last(), Some(StreamEvent::Done { .. })),
+        "the second candidate must win: {events:?}"
+    );
+    gw.execute(&request)
+        .await
+        .expect("the unary half must fall back and succeed");
+
+    let rows = store.calls_for("noop");
+    assert_eq!(rows.len(), 2, "one streamed row and one unary row");
+    for r in &rows {
+        assert!(
+            r.duration_ms < FAILED_CANDIDATE_SPAN.as_millis() as u64,
+            "the winner's row must not absorb the failed candidate's {FAILED_CANDIDATE_SPAN:?}; \
+             got {}ms",
+            r.duration_ms
+        );
+        assert_eq!(
+            r.fallback_sequence, 1,
+            "the winner is the second candidate on both paths"
+        );
+    }
+}
+
+/// M1 — `Done.routing`'s documented `None` case, pinned.
+///
+/// The rustdoc says "`None` when no strategy ordered anything (a tier-1 direct
+/// request)". That was true but unasserted, so
+/// `routing: decision.or_else(|| Some(RoutingDecision::default()))` — a
+/// plausible "helpful" edit that would make every direct request report a
+/// fabricated empty decision — passed the whole suite. A `Some` here is a claim
+/// that a strategy ran, and on this path none did.
+#[tokio::test]
+async fn a_direct_streamed_request_carries_no_routing_decision() {
+    let gw = Gateway::new(
+        mid_gateway_config(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamer {
+            id: "mid".to_string(),
+        }))
+        .await;
+
+    // `mid_chat_request` names router AND model: one candidate, nothing ordered.
+    let events = collect_stream(&gw, &mid_chat_request()).await;
+    assert!(
+        done_routing(&events).is_none(),
+        "a direct router+model request orders nothing, so there is no decision \
+         to report — reporting an empty one would claim a strategy ran"
+    );
 }

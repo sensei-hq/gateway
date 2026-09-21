@@ -82,8 +82,10 @@ weight. Two readings to get right:
   `sort: latency` and `sort: throughput`, because only the weighted default
   consults them. Read `strategy` before concluding anything about fleet health.
 
-> `execute_stream` applies the same preferences but returns `StreamEvent`s rather
-> than an `InferenceResponse`, so a streamed call has **no** routing explanation.
+> `execute_stream` applies the same preferences and reports the same explanation:
+> the terminal `StreamEvent::Done` carries `routing: Option<RoutingDecision>`,
+> the very decision the selection produced. Read it exactly as you read
+> `response.routing`, including the two readings above.
 
 Full reference: `docs/features/routing/provider-preferences.md`.
 
@@ -99,8 +101,13 @@ while let Some(ev) = stream.next().await {
         StreamEvent::Chunk { content }        => print!("{content}"),
         StreamEvent::ProviderSwitch { reason, to_model, .. } =>
             eprintln!("[fell back to {to_model}: {reason}]"),
-        StreamEvent::Done { model, tokens, cost } =>
-            eprintln!("\n[{model}: {} tok, ${cost:.4}]", tokens.total_tokens),
+        StreamEvent::Done { model, tokens, cost, routing } => {
+            eprintln!("\n[{model}: {} tok, ${cost:.4}]", tokens.total_tokens);
+            if let Some(d) = routing {                 // why this provider won
+                eprintln!("[routed by {}: {:?}]", d.strategy,
+                          d.order.iter().map(|c| &c.endpoint).collect::<Vec<_>>());
+            }
+        }
         StreamEvent::Error { code, message }  => eprintln!("[error {code}: {message}]"),
     }
 }
@@ -108,6 +115,14 @@ while let Some(ev) = stream.next().await {
 
 Fallback is **pre-first-byte only**: once bytes flow, a mid-stream error is terminal
 (`Error`), not a switch.
+
+`Done.routing` is the same `RoutingDecision` `execute` puts on
+`InferenceResponse::routing` — `None` when no strategy ordered anything (a direct
+router+model request). A streamed call is also **always metered**, success or
+failure: the `InferenceCall` row is written before the terminal event is
+yielded — `Done` or `Error` alike — so breaking out of this loop on the terminal
+event, as above, does not skip your billing row. That write is bounded at 2s, so
+a stalled store drops the row rather than stalling your stream.
 
 ## Read cost + token usage
 

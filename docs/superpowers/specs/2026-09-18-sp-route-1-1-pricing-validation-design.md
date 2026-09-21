@@ -5,7 +5,8 @@ module: kernel + gateway
 slice: SP-ROUTE-1.1
 status: draft
 date: 2026-09-18
-closes: SP-ROUTE-1 carry-forward 2
+closes: SP-ROUTE-1 carry-forward 4 (nothing validates ModelPricing) — was mis-numbered "2" here;
+  corrected against the ledger in the SP-ROUTE-1 plan
 ---
 
 # SP-ROUTE-1.1 — reject unusable model pricing at the boundary
