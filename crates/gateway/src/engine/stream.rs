@@ -396,7 +396,14 @@ impl super::Gateway {
                         output_tokens: Some(tokens.output_tokens),
                         cost_usd: cost,
                         cost_estimated: None, // §D LN-4: embedded-plane estimate population deferred
-                        duration_ms: stream_start.elapsed().as_millis() as u64,
+                        // `attempt_start`, NOT `stream_start` — the same parity
+                        // the completion dispatch above already restored, on the
+                        // PERSISTED column. `execute` writes this very column
+                        // with the whole attempt's wall time, so reporting
+                        // generation time alone here left `inference_calls`
+                        // mixing two quantities under one name, with nothing to
+                        // tell an analytics query which one a row carries.
+                        duration_ms: attempt_start.elapsed().as_millis() as u64,
                         status: CallStatus::Success,
                         error_type: None,
                         fallback_sequence: idx as u8,
