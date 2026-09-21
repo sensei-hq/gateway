@@ -230,12 +230,15 @@ Notes and caveats:
   re-read a live performance port and could disagree with the order the walk
   was actually handed — the hazard SP-ROUTE-1 Task 9 hit and Task 11 shipped
   once before it was caught.
-- **`Done` is emitted before the metering row is durable-attempted, but after
-  the health verdict and the `InferenceCall` write are issued.** Both sit above
-  the `yield` on purpose: in an `async_stream` generator, code after a `yield`
-  runs only on the next poll, and a consumer that stops at the terminal event
-  never provides one. See `persistence-store.md` for what that means for
-  billing.
+- **Every terminal event — `Done` *and* `Error` — is yielded only after this
+  attempt's health verdict and its `InferenceCall` row have been issued.** Both
+  sit above the `yield` on purpose: in an `async_stream` generator, code after a
+  `yield` runs only on the next poll, and a consumer that stops at the terminal
+  event never provides one. The two are not the same kind of work, though — the
+  verdict dispatch is a synchronous in-memory fold, while the metering write is
+  an `async` call into a consumer-supplied store, so only the latter runs under
+  a wall-clock budget (2s) to keep the terminal event from being held open by a
+  stalled database. See `persistence-store.md`.
 - `StreamChunk` (the type adapters actually stream) is the per-token unit:
   `content: String`, `finish_reason: Option<String>`, `usage: Option<TokenUsage>`,
   and `tool_calls: Vec<ToolCall>` (assembled tool calls arrive on the terminal

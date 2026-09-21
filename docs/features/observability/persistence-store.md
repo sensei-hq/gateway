@@ -68,15 +68,39 @@ One accounting record per model invocation.
 | `fallback_sequence` | `u8` | Position in the fallback walk (0 = first candidate). |
 | `recorded_at` | `DateTime<Utc>` | When the call was recorded (the field spend queries filter on). |
 
-#### Two things to know about streamed rows (SP-ROUTE-1.2)
+#### Three things to know about streamed rows (SP-ROUTE-1.2)
 
-**A streamed call is always metered.** The `insert_inference_call` write used to
-sit *after* the terminal `StreamEvent::Done` was yielded, and in an
-`async_stream` generator, code after a `yield` runs only on the **next poll** —
+**A streamed call is metered whether it succeeds or fails.** Two separate gaps
+closed here, and they had different causes.
+
+*Successes* were lost to **event ordering**: the `insert_inference_call` write
+sat *after* the terminal `StreamEvent::Done` was yielded, and in an
+`async_stream` generator code after a `yield` runs only on the **next poll** —
 so a consumer that stopped at the terminal event (the normal SSE shape) produced
-**no row at all**. A non-streaming call was always metered. The write now
-precedes the `yield`, so both paths bill alike. Expect more rows, and a higher
-streamed-traffic total, than before the upgrade; nothing is back-filled.
+**no row at all**. The write now precedes the `yield`.
+
+*Failures* were lost to **absence**: neither streaming failure path wrote a row
+at all, for any consumer, however thoroughly it polled. A stream that died
+mid-generation — after the provider had generated and reported real tokens — and
+a stream whose every candidate failed at setup both recorded nothing, while
+`execute` wrote a `CallStatus::Failed` row for the analogous exhaustion. Unary
+one row, streamed zero, same adapter. Both streaming paths now write one, before
+their terminal `StreamEvent::Error`, mirroring `execute` field-for-field:
+
+| Outcome | Row | `output_tokens` | `cost_usd` |
+|---|---|---|---|
+| Stream completes | `Success` | reported usage | costed from usage |
+| Stream dies mid-generation | `Failed` | usage reported before the death | costed from that usage |
+| Every candidate fails at setup | `Failed` | `None` — unknown, as `execute` writes | `0.0` |
+
+The middle row is the one that differs from `execute`, and only because
+`execute` has no partial-success concept: those tokens were generated and the
+provider bills for them, so discarding them would knowingly under-count spend.
+The last row uses `None` rather than `Some(0)` deliberately — a setup failure
+does not prove the provider generated nothing, only that no usage was reported.
+
+Expect more rows than before the upgrade, across successes *and* failures, and a
+higher streamed-traffic total. Nothing is back-filled.
 
 **`duration_ms` changed meaning for streamed rows, once.** It used to be
 measured from the moment the stream was obtained — generation time only — while
@@ -87,10 +111,23 @@ still carry the old quantity and cannot be repaired (the acquisition span of a
 past call was never recorded anywhere), so **analytics spanning the upgrade sees
 a one-time upward step**. Annotate the date; see `docs/llms/upgrading.md`.
 
-Metering is **best-effort on both paths**: a store error is logged at `warn` and
-never surfaces to the caller, so a failing store degrades your billing record
-rather than your inference. Do not treat an absent row as proof a call did not
-happen.
+**Metering is best-effort in latency as well as in success — the streaming write
+is time-bounded.** On both paths a store *error* is logged at `warn` and never
+surfaces to the caller. On the streaming path the write also runs under a
+**2-second ceiling**, because it now sits *ahead* of the terminal event: without
+a bound, a saturated connection pool or an unreachable database would hold the
+terminal event open, and a consumer with a per-event timeout would receive the
+full content and then **no terminal event at all** — losing the tokens, the cost
+and the routing decision, and cancelling the in-flight write so no row landed
+either. Exceeding the ceiling drops the row and logs loudly.
+
+There is no knob to raise it: it is a liveness guarantee, not a tuning
+parameter, and raising it would reintroduce the block it prevents.
+
+**So do not treat an absent row as proof a call did not happen.** If you
+reconcile against a provider invoice, a persistent shortfall on streamed traffic
+means your store is too slow to meet the ceiling — check your logs for the
+budget warning rather than assuming the calls were not made.
 
 ### `StoredTrace`
 

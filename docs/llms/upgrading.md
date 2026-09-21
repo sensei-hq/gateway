@@ -206,18 +206,42 @@ happened to over-poll; a non-streaming request always was.
 The write now precedes the `yield`, exactly as the health-verdict dispatch
 beside it already did.
 
-**What to expect after upgrading:** more rows in `inference_calls`, and a
-spend/usage total for streamed traffic that is higher than the pre-upgrade
-figure — because the pre-upgrade figure was missing calls that really happened.
-If you reconcile gateway metering against a provider invoice, the post-upgrade
-numbers are the ones that should agree. Nothing is back-filled: rows that were
-never written cannot be recovered.
+**Streamed failures are now metered too**, which was a second and separate gap:
+neither streaming failure path wrote a row at all — not for any consumer,
+however thoroughly it polled — while `execute` wrote a `CallStatus::Failed` row
+for the analogous exhaustion. A stream that died mid-generation after the
+provider had generated real tokens, and a stream whose every candidate failed at
+setup, both recorded nothing. Both now write one `Failed` row ahead of their
+terminal `StreamEvent::Error`, mirroring `execute`. The mid-generation row
+carries the usage the provider reported before dying, because those tokens are
+billed; the setup-exhaustion row carries `output_tokens: None`, exactly as
+`execute` does.
 
-Metering stays **best-effort** — a store error is logged at `warn` and never
-surfaces to the caller — so the terminal `Done` is not gated on your store
-succeeding, only on it being *attempted*. It does now mean the terminal event
-waits on that write; that is the same price the dispatch above it already
-charged.
+**What to expect after upgrading:** more rows in `inference_calls` — across
+successes *and* failures — and a spend/usage total for streamed traffic higher
+than the pre-upgrade figure, because the pre-upgrade figure was missing calls
+that really happened. Anything that counts requests by counting rows will step
+up. Nothing is back-filled: rows that were never written cannot be recovered.
+
+If you reconcile gateway metering against a provider invoice, the post-upgrade
+numbers are the ones that can agree — with one caveat you should read before
+trusting a reconciliation, below.
+
+**Metering is best-effort in latency as well as in success, and the streaming
+write is now time-bounded.** A store error is logged at `warn` and never
+surfaces to the caller. Because the write sits *ahead* of the terminal event, it
+also runs under a **2-second ceiling**: without one, a saturated pool or an
+unreachable database would hold the terminal event open indefinitely, and a
+consumer with an ordinary per-event timeout would get the full content and then
+**no terminal event** — losing the tokens, the cost and the new routing
+decision, and cancelling the in-flight write so no row landed either. That would
+turn "delivered but unbilled" into "not delivered and unbilled". Exceeding the
+ceiling drops the row and logs loudly; there is no knob to raise it, because it
+is a liveness guarantee rather than a tuning parameter.
+
+**So an absent row is not proof a call did not happen.** A persistent shortfall
+on streamed traffic means your store is too slow to meet the ceiling — grep your
+logs for the budget warning before concluding the calls were not made.
 
 ### The `duration_ms` discontinuity, accepted deliberately (SP-ROUTE-1.2)
 
