@@ -1,6 +1,6 @@
 [package]
 name = "sensei-torii"
-version = "0.1.0"
+version = "0.6.0"
 edition = "2024"
 description = "torii: the operator control plane for the sensei orchestrator"
 license = "MIT"
