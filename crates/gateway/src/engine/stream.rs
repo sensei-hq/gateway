@@ -132,6 +132,23 @@ impl super::Gateway {
             .as_ref()
             .map(|c| c.fallback_triggers.clone())
             .unwrap_or_default();
+        // The explanation for the order the walk below is about to follow,
+        // moved out for the `'static` generator like the pieces above it and
+        // attached to the terminal `Done`. `execute` puts this very value on
+        // `InferenceResponse::routing`; a streaming caller had nowhere to read
+        // it from, so a streamed request routed correctly and could not say
+        // why.
+        //
+        // MOVED, never rebuilt at the attachment site. The generator has
+        // `candidates` in scope and could reconstruct something that looks
+        // right — SP-ROUTE-1 Task 11 shipped exactly that on the unary path and
+        // it survived the whole suite — but `reliability` and `weight` are read
+        // from a LIVE performance window inside the strategy, and
+        // `strategy::order_group` says outright that a second read is not
+        // guaranteed to return what the first one did. A rebuilt decision is a
+        // plausible story about the routing rather than a record of it. Pinned
+        // by `tests::the_streamed_decision_matches_what_execute_reports`.
+        let decision = result.decision;
         let adapters = self.adapters.clone();
         let recorders = self.recorders.clone();
         let store = self.store.clone();
@@ -432,6 +449,7 @@ impl super::Gateway {
                         model: candidate.model.clone(),
                         tokens,
                         cost,
+                        routing: decision,
                     };
                     return;
                 }

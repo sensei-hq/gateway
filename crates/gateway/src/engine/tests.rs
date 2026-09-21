@@ -2976,6 +2976,7 @@ async fn execute_stream_yields_chunks_then_done_with_cost() {
             model,
             tokens,
             cost,
+            ..
         } => {
             assert_eq!(model, "priced");
             assert_eq!(tokens.input_tokens, 1000);
@@ -7102,6 +7103,181 @@ async fn the_response_carries_the_weights_the_draw_actually_used() {
         None,
         "never observed — and `None` must survive the trip out rather than \
          being flattened on the way"
+    );
+    assert_eq!(of("noop:noop").weight, Some(1.0), "`1/1² × 1.0`");
+}
+
+/// The `RoutingDecision` carried on a collected stream's terminal `Done`.
+///
+/// Panics rather than returning an `Option<Option<_>>` when the stream did not
+/// end in a `Done` at all: a stream that ended in an `Error` would otherwise
+/// read as "no decision", which is a different claim entirely.
+fn done_routing(events: &[StreamEvent]) -> Option<crate::types::trace::RoutingDecision> {
+    match events.last() {
+        Some(StreamEvent::Done { routing, .. }) => routing.clone(),
+        other => panic!("expected a terminal Done event, got {other:?}"),
+    }
+}
+
+/// AC4 — a streaming caller can ask why its provider was chosen.
+///
+/// Preferences already APPLY on this path: `execute_stream` builds the same
+/// `SelectionCriteria` as `execute`, so filtering and ordering both work
+/// identically. Only the EXPLANATION was missing — the stream yields
+/// `StreamEvent`s rather than an `InferenceResponse`, so the `RoutingDecision`
+/// had nowhere to ride until it joined `model`, `tokens` and `cost` on the
+/// terminal `Done`.
+///
+/// `sort: price` rather than the default, for the same reason
+/// `the_routing_decision_reaches_the_inference_response` uses it: the price
+/// order here is the REVERSE of the chain's authored priority order, so the
+/// recorded sequence cannot be mistaken for the chain as written.
+#[tokio::test]
+async fn a_streamed_request_carries_its_routing_decision() {
+    let gw = Gateway::new(
+        priced_failing_and_noop(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+    // Only `noop` gets an adapter — and it is also the cheapest, so the price
+    // sort puts it first and the walk never needs `failing`.
+    register_noop(&gw).await;
+
+    let request = InferenceRequest {
+        chain: Some("chat_chain".to_string()),
+        routing: Some(crate::types::request::RoutingPreferences {
+            sort: Some(crate::types::request::SortKey::Price),
+            ..Default::default()
+        }),
+        ..chat_request()
+    };
+
+    let events = collect_stream(&gw, &request).await;
+    let decision = done_routing(&events)
+        .expect("execute_stream must carry the selection's routing decision on `Done`");
+
+    assert_eq!(decision.strategy, "price");
+    assert_eq!(
+        decision
+            .order
+            .iter()
+            .map(|c| c.endpoint.clone())
+            .collect::<Vec<_>>(),
+        vec!["noop:noop", "failing:fail-model"],
+        "price order (1.0 then 2.0) is the reverse of the chain's authored \
+         priority order, so this sequence can only come from the strategy that \
+         actually ran"
+    );
+}
+
+/// AC5 — and it is the decision the selection PRODUCED, not a re-derivation at
+/// the attachment site.
+///
+/// SP-ROUTE-1 Task 11 shipped exactly that defect on the unary path, and it
+/// survived the whole suite: a decision rebuilt where the artefact is assembled
+/// reproduces `strategy` and `order` perfectly, because both are derivable from
+/// the candidate list already in scope there. What it cannot reproduce is
+/// `reliability` and `weight` — those are the draw's own numbers, read from a
+/// LIVE performance window inside `order_group`, and the code that records them
+/// says outright that a second read is not guaranteed to return what the first
+/// one did.
+///
+/// So: the weighted DEFAULT, with the gateway's own recorder moved first, and
+/// the streamed decision compared WHOLE against what `execute` reports for the
+/// same request and chain — per-candidate cost, reliability and weight
+/// included. Then the numbers themselves, so that two matching empties cannot
+/// pass for agreement.
+///
+/// Not flaky despite the draw being random: `chat_chain`'s two entries carry
+/// DISTINCT priorities, and `GroupedWeightedStrategy` only ever reorders WITHIN
+/// a priority group — so every group here is a singleton, the order is priority
+/// order on both paths, and the randomness has nothing to act on.
+#[tokio::test]
+async fn the_streamed_decision_matches_what_execute_reports() {
+    let gw = Gateway::new(
+        priced_failing_and_noop(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+    // `fail-model` leads on priority and has no adapter, so BOTH paths fall
+    // through to `noop` — while the decision still describes both candidates.
+    register_noop(&gw).await;
+
+    // The gateway's OWN write path. `min_samples` is 3, so exactly three
+    // verdicts — two successes and one failure — put `failing:fail-model` at a
+    // success rate of 2/3, a number no default and no hand-built fixture
+    // produces.
+    let observe = |success: bool| {
+        gw.record_outcome(&crate::gates::AttemptOutcome {
+            endpoint: "failing:fail-model",
+            router: "failing",
+            success,
+            error: None,
+            duration_ms: 100,
+            output_tokens: Some(10),
+            phase: crate::gates::AttemptPhase::Complete,
+        });
+    };
+    observe(true);
+    observe(true);
+    observe(false);
+    // `noop:noop` is deliberately never observed here. The two calls below each
+    // cast exactly ONE verdict on it, which stays below `min_samples`, so it
+    // reads unmeasured for both selections and the act of measuring cannot
+    // drift the two decisions apart. `failing:fail-model` takes the no-adapter
+    // arm, which dispatches no outcome at all, so its 2/3 is untouched.
+
+    // No `sort`: the weighted default is the only strategy that weighs anything.
+    let request = InferenceRequest {
+        chain: Some("chat_chain".to_string()),
+        ..chat_request()
+    };
+
+    let unary = gw
+        .execute(&request)
+        .await
+        .expect("the noop adapter answers")
+        .routing
+        .expect("execute attaches the selection's routing decision");
+    let events = collect_stream(&gw, &request).await;
+    let streamed = done_routing(&events)
+        .expect("execute_stream must carry the selection's routing decision on `Done`");
+
+    assert_eq!(
+        streamed, unary,
+        "the streamed decision must equal the one `execute` reports for the \
+         same request and chain — strategy, degradation, and every candidate's \
+         cost, reliability and weight"
+    );
+
+    // ...and it is a REAL decision rather than two matching blanks: every
+    // number below exists only inside the draw that actually ran.
+    assert_eq!(streamed.strategy, "grouped_weighted");
+    let of = |endpoint: &str| {
+        streamed
+            .order
+            .iter()
+            .find(|c| c.endpoint == endpoint)
+            .unwrap_or_else(|| panic!("{endpoint} must be admitted by this fixture"))
+    };
+    assert_eq!(
+        of("failing:fail-model").reliability,
+        Some(2.0 / 3.0),
+        "two successes and one failure through the gateway's own recorder, \
+         carried all the way out to the STREAMING caller. A decision rebuilt at \
+         the attachment site has no window to read and could only say `None`"
+    );
+    assert_eq!(
+        of("failing:fail-model").weight,
+        Some(0.25 * (2.0 / 3.0)),
+        "`1/2² × 2/3` — the draw weight the ordering actually used, not a \
+         number re-derived at the attachment site"
+    );
+    assert_eq!(
+        of("noop:noop").reliability,
+        None,
+        "never observed above `min_samples` — and `None` must survive the trip \
+         out rather than being flattened on the way"
     );
     assert_eq!(of("noop:noop").weight, Some(1.0), "`1/1² × 1.0`");
 }
