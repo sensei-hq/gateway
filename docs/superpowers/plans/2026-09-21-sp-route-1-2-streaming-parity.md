@@ -139,7 +139,11 @@ git commit -m "fix(gateway): meter a streamed call before yielding Done (SP-ROUT
 
 `InferenceCall.duration_ms` uses `stream_start.elapsed()` — generation time only. `execute` writes the same column with the whole call's wall time, so `inference_calls` mixes two quantities under one name.
 
-Use a fixture with a distinguishable pre-first-byte delay (`FakeStreamerWithRealDelay` exists — check its shape) and assert the persisted `duration_ms` **includes** the acquisition span:
+Use a fixture with a distinguishable pre-first-byte delay. **`FakeStreamerWithRealDelay` does NOT exist — that name in an earlier draft was wrong.** The real one is `SplitDelayStreamer` (`tests.rs:2675`): it sleeps `SETUP_DELAY` (60ms) *inside* `chat_stream` — pre-first-byte — and `GENERATION_DELAY` (60ms) inside the stream, which is exactly the split this needs.
+
+Also: **no `GatewayStore` read exposes `duration_ms`**, so reading it back needs a test-local recording store. Give its unused reads `unimplemented!()` so a future test leaning on one fails loudly rather than silently taking a default.
+
+Assert the persisted `duration_ms` **includes** the acquisition span:
 
 ```rust
 /// The persisted duration must be the same quantity `execute` records — total
