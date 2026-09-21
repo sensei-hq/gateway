@@ -13,7 +13,7 @@ structured `Attempt`. On success the full ordered list of attempts is attached
 to the response so callers can see the entire fallback walk that led to the
 answer. This doc describes the `Attempt` record, how the engine builds one per
 candidate, what survives to the caller on success versus total failure, and the
-(currently unwired) `StreamEvent` streaming trace surface.
+`StreamEvent` streaming trace surface `execute_stream` emits.
 
 Source: `crates/gateway/src/types/trace.rs`,
 `crates/gateway/src/engine.rs`,
@@ -180,12 +180,15 @@ it where it stands.
 `routing` is `None` when no strategy ran: a direct router+model request names its
 one candidate and orders nothing.
 
-Two gaps worth knowing before you go looking:
+**The streaming path reports it too** (SP-ROUTE-1.2). `execute_stream` returns
+`StreamEvent`s rather than an `InferenceResponse`, so the decision rides the
+terminal event: `StreamEvent::Done { .., routing: Option<RoutingDecision> }`,
+carrying the decision the selection produced rather than one re-derived at the
+yield site. Read it exactly as you read `InferenceResponse::routing`, `None`
+condition included.
 
-- **The streaming path carries no decision.** `execute_stream` applies the full
-  preferences — filtering and ordering both work — but returns a stream of
-  `StreamEvent`s rather than an `InferenceResponse`, so it has nowhere to put the
-  explanation.
+One gap worth knowing before you go looking:
+
 - **`ExecutionTrace::routing` is forward provision only.** The field exists and
   round-trips through serde, but nothing in this workspace builds an
   `ExecutionTrace` in production (see above — every field of that struct is
@@ -202,33 +205,43 @@ pub enum StreamEvent {
     Chunk        { content: String },
     ProviderSwitch { from_adapter: String, from_model: String,
                      to_adapter: String, to_model: String, reason: String },
-    Done         { model: String, tokens: TokenUsage, cost: f64 },
-    Error        { code: String, message: String },
+    Done         { model: String, tokens: TokenUsage, cost: f64,
+                   routing: Option<RoutingDecision> },
+    Error        { code: String, message: String,
+                   resume_after: Option<DateTime<Utc>> },
 }
 ```
 
-| Variant | Fields | Intended meaning |
+| Variant | Fields | Meaning |
 | --- | --- | --- |
 | `Chunk` | `content` | An incremental slice of generated text. |
-| `ProviderSwitch` | `from_adapter`, `from_model`, `to_adapter`, `to_model`, `reason` | A mid-stream fallback: the stream moved from one endpoint to another; the streaming analogue of a `fallback_triggered` `Attempt`. |
-| `Done` | `model`, `tokens`, `cost` | Terminal success event carrying the final model, `TokenUsage`, and total `cost` — the streaming counterpart to a `Success` attempt's `tokens` + `cost`. |
-| `Error` | `code`, `message` | Terminal error event. |
+| `ProviderSwitch` | `from_adapter`, `from_model`, `to_adapter`, `to_model`, `reason` | A mid-stream fallback: the stream moved from one endpoint to another; the streaming analogue of a `fallback_triggered` `Attempt`. Fallback is **pre-first-byte only** — once bytes flow, a failure is terminal. |
+| `Done` | `model`, `tokens`, `cost`, `routing` | Terminal success event carrying the final model, `TokenUsage`, total `cost`, and the `RoutingDecision` — the streaming counterpart to a `Success` attempt's `tokens` + `cost` *and* to `InferenceResponse::routing`. |
+| `Error` | `code`, `message`, `resume_after` | Terminal error event. `resume_after` is `Some` only for a timed all-gated exhaustion, mirroring `GatewayError::AllGated`. |
 
 Notes and caveats:
 
 - Unlike `Attempt`, `StreamEvent` derives only `Debug, Clone` — **no
-  `Serialize`/`Deserialize`**. It is not a wire type as written.
-- **It is currently unwired.** Across the crate `StreamEvent` is referenced only
-  by its own unit test (`stream_event_variants`); it has no producer and no
-  consumer, and it is not re-exported from `lib.rs`. `Gateway` has no streaming
-  `execute`; the only streaming entry point is the adapter trait's `stream()`,
-  which yields `StreamChunk` (not `StreamEvent`).
+  `Serialize`/`Deserialize`**. It is not a wire type as written, so a streaming
+  trace that has to cross a process boundary needs a projection of your own.
+- **`Done.routing` is moved, not recomputed.** `execute_stream` pulls the
+  decision off its `SelectionResult` alongside the other owned pieces and
+  attaches it to the terminal event. Re-deriving it at the yield site would
+  re-read a live performance port and could disagree with the order the walk
+  was actually handed — the hazard SP-ROUTE-1 Task 9 hit and Task 11 shipped
+  once before it was caught.
+- **`Done` is emitted before the metering row is durable-attempted, but after
+  the health verdict and the `InferenceCall` write are issued.** Both sit above
+  the `yield` on purpose: in an `async_stream` generator, code after a `yield`
+  runs only on the next poll, and a consumer that stops at the terminal event
+  never provides one. See `persistence-store.md` for what that means for
+  billing.
 - `StreamChunk` (the type adapters actually stream) is the per-token unit:
   `content: String`, `finish_reason: Option<String>`, `usage: Option<TokenUsage>`,
   and `tool_calls: Vec<ToolCall>` (assembled tool calls arrive on the terminal
-  chunk). It, too, is a plain `Debug, Clone` struct with no serde. Treat
-  `StreamEvent` as a forward-looking design for a gateway-level streaming trace
-  that the engine does not yet emit.
+  chunk). It, too, is a plain `Debug, Clone` struct with no serde. `StreamEvent`
+  is the **gateway-level** event the engine assembles from those chunks;
+  `StreamChunk` is the **adapter-level** unit underneath it.
 
 ## Scenarios
 

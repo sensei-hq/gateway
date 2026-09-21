@@ -62,11 +62,35 @@ One accounting record per model invocation.
 | `input_tokens` | `Option<u32>` | Input tokens (may be unknown). |
 | `output_tokens` | `Option<u32>` | Output tokens (may be unknown). |
 | `cost_usd` | `f64` | Cost of the call in USD. |
-| `duration_ms` | `u64` | Wall-clock duration. |
+| `duration_ms` | `u64` | Wall-clock duration of the **whole attempt** — from just before adapter dispatch to the point the result is complete. Identical in meaning on both paths: for a streamed call it covers acquisition *and* generation, not generation alone (see below). |
 | `status` | `CallStatus` | Success or failure. |
 | `error_type` | `Option<String>` | Error classification when failed. |
 | `fallback_sequence` | `u8` | Position in the fallback walk (0 = first candidate). |
 | `recorded_at` | `DateTime<Utc>` | When the call was recorded (the field spend queries filter on). |
+
+#### Two things to know about streamed rows (SP-ROUTE-1.2)
+
+**A streamed call is always metered.** The `insert_inference_call` write used to
+sit *after* the terminal `StreamEvent::Done` was yielded, and in an
+`async_stream` generator, code after a `yield` runs only on the **next poll** —
+so a consumer that stopped at the terminal event (the normal SSE shape) produced
+**no row at all**. A non-streaming call was always metered. The write now
+precedes the `yield`, so both paths bill alike. Expect more rows, and a higher
+streamed-traffic total, than before the upgrade; nothing is back-filled.
+
+**`duration_ms` changed meaning for streamed rows, once.** It used to be
+measured from the moment the stream was obtained — generation time only — while
+`execute` wrote the same column with the whole attempt's wall time, so this
+table mixed two quantities under one name with nothing in the row to say which.
+Both paths now record the total attempt span. Rows written before that change
+still carry the old quantity and cannot be repaired (the acquisition span of a
+past call was never recorded anywhere), so **analytics spanning the upgrade sees
+a one-time upward step**. Annotate the date; see `docs/llms/upgrading.md`.
+
+Metering is **best-effort on both paths**: a store error is logged at `warn` and
+never surfaces to the caller, so a failing store degrades your billing record
+rather than your inference. Do not treat an absent row as proof a call did not
+happen.
 
 ### `StoredTrace`
 

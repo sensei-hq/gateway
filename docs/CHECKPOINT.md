@@ -1,51 +1,47 @@
 # Checkpoint
 
-**SP-ROUTE-1.1 — 5/5 TASKS DONE, on `develop`.** Pricing that cannot be compared
-is now rejected at the boundary. Suite **1918 passed / 0 failed / 60 ignored**,
-real exit 0, zero `panicked at`. Clippy (Homebrew 1.97.1 + rustup stable 1.98.1),
-`fmt --check`, `cargo test -p sensei-gateway --features local --locked`, and
-`cargo doc --workspace --no-deps` all clean, all real exit 0.
-Spec: `docs/superpowers/specs/2026-09-18-sp-route-1-1-pricing-validation-design.md`
-Plan: `docs/superpowers/plans/2026-09-18-sp-route-1-1-pricing-validation.md`
+**SP-ROUTE-1.2 — 4/4 TASKS DONE, on `develop`.** The streaming path now has the
+metering and explanation the unary path already had. Suite **1922 passed / 0
+failed / 60 ignored**, real exit 0, zero `panicked at`. Clippy (Homebrew 0.1.97 +
+rustup stable 0.1.98), `fmt --all --check`, `cargo test -p sensei-gateway
+--features local --locked`, `cargo doc --workspace --no-deps` — all clean, all
+real exit 0, zero unresolved doc links.
+Plan: `docs/superpowers/plans/2026-09-21-sp-route-1-2-streaming-parity.md`
 (Progress table — **read it first**).
 
 ## Done
 
-T1 `ModelPricing::validate` (`4d52044`) · T2 the `#[serde(try_from)]` boundary
-(`1170aab`, AC1–AC3/AC7) · T3 `collect_validation_errors` Rule 7 (`3a091a6`,
-AC6) · T4 `Facade::build` drops-and-warns (`cb5fbbf`, AC4–AC5) · T5 docs +
-verification (this commit, AC8).
+T1 metering above the `yield` (`2fb6b86`, AC1–AC2/AC6) · T2 `attempt_start` on
+the persisted row (`ab4e6ee`, AC3) · T3 `StreamEvent::Done.routing` (`7e89dc3`,
+AC4–AC5) · T4 docs + verification (this commit, AC7).
 
-One rule, three call sites. **The breaking change:** a config **file** carrying
-a non-finite or negative price now fails to load, with an error naming the field
-and the value. Two non-rejections are deliberate and pinned: an explicit `0.0`
-(a real price, ties with `None`) and a large finite `1e300`. `Facade::build`
-**drops** such a model rather than nulling its price — `None` means free and
-free sorts first, so the tempting repair hands a broken price the cheapest slot.
-AC5 is the test that fails when the feature is implemented the *wrong* way.
+Three fixes in one function, `Gateway::execute_stream`. **The billing one is the
+one to remember:** `insert_inference_call` sat *after* `yield Done`, and in an
+`async_stream` generator code after a `yield` runs only on the next poll — so a
+consumer that stops at the terminal event (the normal SSE shape) was **never
+metered**. The persisted `duration_ms` now means total attempt span on both
+paths — a **deliberate one-time discontinuity** in `inference_calls`, documented
+in `upgrading.md`, not back-filled. `Done` carries the decision the selection
+*produced*, not a re-derivation.
 
-This **closes SP-ROUTE-1 carry-forward 4** ("nothing validates `ModelPricing`"),
-which was contained at the routing layer and is now fixed at the config layer.
-The `PriceStrategy` / `MetricStrategy` non-finite fences stay as the last line.
+AC2/AC6 re-measured in Task 4, not inherited: under the reverted mutation exactly
+**1 of 442** gateway tests fails (AC1's), while every `collect_stream` test stays
+green — including one that asserts a metering row and still finds it.
 
 ## Next
 
-**Merge `origin/main` into `develop`, then open the develop→main PR.** `main`'s
-ruleset is strict — without main's merge commits the PR sits BEHIND and cannot
-land.
+**Whole-slice review over the three-commit diff** (`2fb6b86..7e89dc3` + docs) —
+this plan has no review step, unlike SP-ROUTE-1's Task 12. Then merge
+`origin/main` into `develop` and open the develop→main PR (`main`'s ruleset is
+strict: without main's merge commits the PR sits BEHIND and cannot land).
 
-## Carry-forwards — deliberate, not forgotten
+## Carry-forwards
 
-1. **Streaming carries no `RoutingDecision`** (`execute_stream` returns
-   `StreamEvent`s, nowhere to put it).
-2. **`ExecutionTrace::routing` is forward provision** — nothing builds an
-   `ExecutionTrace` in production.
-3. `InferenceCall` store write in `stream.rs` sits **after** `yield Done`, so an
-   SSE consumer that breaks on `Done` is never metered. Metering, not routing.
-4. **Consensus legs drop the caller's `routing`** while a panel inherits it.
-   Consistent with `budget`/`auth`; documented, not changed.
-5. **No magnitude cap on pricing, by design** (SP-ROUTE-1.1 §2/§6): `1e300` can
-   still overflow inside `estimate_cost`, and that non-finite *result* stays
-   fenced by the strategies. Any cap would be an invented threshold.
+Canonical ledger now in the SP-ROUTE-1 plan (§"Carry-forward ledger"), added this
+slice because three surfaces had each invented their own numbering. **1** and
+**3** closed here; **4** by SP-ROUTE-1.1. Still open: **2** `ExecutionTrace::routing`
+is forward provision (nothing builds one in production) and **5** consensus legs
+drop the caller's `routing` while a panel inherits it (consistent with
+`budget`/`auth`; documented, not changed).
 
 Open questions: none. Known-broken: nothing.

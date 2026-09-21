@@ -150,8 +150,9 @@ per-request `TenantKeyCache`; the gateway itself stays credential-store-agnostic
   separate `routers`/`models` axes, and an explicit `order`. Absent ⇒ unchanged
   behaviour. `response.routing` explains what the router did. Note: entries that
   share a `priority` are load-balanced (weighted by `(1/cost²) × reliability`), so
-  give them distinct priorities unless you want a pool; and `execute_stream`
-  applies preferences but returns no explanation. See
+  give them distinct priorities unless you want a pool. `execute_stream` applies
+  preferences **and** explains them — the terminal `StreamEvent::Done` carries
+  `routing: Option<RoutingDecision>` — and always writes its metering row. See
   `docs/features/routing/provider-preferences.md`.
 - **Circuit breaker** — per `router:model` open/half-open/closed with cooldown probes.
 - **Budget** — skip candidates over a cost cap pre-flight; record real per-call spend.

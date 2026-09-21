@@ -5,16 +5,18 @@ module: gateway
 slice: SP-ROUTE-1.2
 status: draft
 date: 2026-09-19
-closes: SP-ROUTE-1 carry-forwards 3, 4, 5
+closes: SP-ROUTE-1 carry-forwards 1 (streaming decision) and 3 (metering after yield), plus the
+  unnumbered persisted-duration mismatch. NOT 5 (consensus legs) — see §3.
 ---
 
 # SP-ROUTE-1.2 — streaming parity for metering and explanation
 
 ## 1. Why this exists
 
-Three SP-ROUTE-1 carry-forwards are the same defect wearing three hats: **the streaming path was
-built before the metering and observability concerns existed, and never caught up.** All three
-live in one function, `Gateway::execute_stream`.
+Three streaming defects left by SP-ROUTE-1 — two on its carry-forward ledger (1 and 3), one
+never numbered — are the same defect wearing three hats: **the streaming path was built before
+the metering and observability concerns existed, and never caught up.** All three live in one
+function, `Gateway::execute_stream`.
 
 The shape is unusually clear, because the fix for a *sibling* concern is already in the file with
 its reasoning written out — and the three open items sit directly beneath it, unfixed.
@@ -83,8 +85,8 @@ span a duration measures — and the third's fix lands in the same terminal-even
 one moves. Splitting them means three sets of streaming fixtures and three review passes over the
 same forty lines.
 
-The remaining SP-ROUTE-1 carry-forward — consensus legs dropping routing preferences — is
-deliberately **not** here. It is a different file, a different question (propagation through
+The remaining *routing-preferences* carry-forward — **5**, consensus legs dropping routing
+preferences — is deliberately **not** here. It is a different file, a different question (propagation through
 request-building), and arguably not a defect at all: consensus legs already drop `budget` and
 `auth`, so the exclusion is consistent and may be intended.
 
