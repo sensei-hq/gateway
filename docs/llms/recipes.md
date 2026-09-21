@@ -118,9 +118,11 @@ Fallback is **pre-first-byte only**: once bytes flow, a mid-stream error is term
 
 `Done.routing` is the same `RoutingDecision` `execute` puts on
 `InferenceResponse::routing` — `None` when no strategy ordered anything (a direct
-router+model request). A streamed call is also **always metered**: the
-`InferenceCall` row is written before `Done` is yielded, so breaking out of this
-loop on the terminal event — as above — does not skip your billing row.
+router+model request). A streamed call is also **always metered**, success or
+failure: the `InferenceCall` row is written before the terminal event is
+yielded — `Done` or `Error` alike — so breaking out of this loop on the terminal
+event, as above, does not skip your billing row. That write is bounded at 2s, so
+a stalled store drops the row rather than stalling your stream.
 
 ## Read cost + token usage
 

@@ -7281,3 +7281,375 @@ async fn the_streamed_decision_matches_what_execute_reports() {
     );
     assert_eq!(of("noop:noop").weight, Some(1.0), "`1/1² × 1.0`");
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// SP-ROUTE-1.2 whole-slice review — C2, C1, I1, M1
+// ───────────────────────────────────────────────────────────────────────────
+
+/// A store whose `insert_inference_call` stalls. Models the failure mode that
+/// actually bites a metering write — a saturated connection pool or an
+/// unreachable database — which is LATENCY, not an `Err`. A store that returns
+/// an error promptly was already handled; one that never answers was not.
+struct StalledStore {
+    stall: std::time::Duration,
+}
+
+#[async_trait::async_trait]
+impl crate::store::GatewayStore for StalledStore {
+    async fn insert_inference_call(
+        &self,
+        call: &crate::store::InferenceCall,
+    ) -> Result<Uuid, GatewayError> {
+        tokio::time::sleep(self.stall).await;
+        Ok(call.id)
+    }
+
+    async fn get_inference_calls_by_session(
+        &self,
+        _session_id: Uuid,
+    ) -> Result<Vec<crate::store::InferenceCall>, GatewayError> {
+        unimplemented!("StalledStore exists to stall a write")
+    }
+
+    async fn get_spend_since(&self, _since: chrono::DateTime<Utc>) -> Result<f64, GatewayError> {
+        unimplemented!("StalledStore exists to stall a write")
+    }
+
+    async fn get_spend_by_model_since(
+        &self,
+        _since: chrono::DateTime<Utc>,
+    ) -> Result<Vec<(String, f64)>, GatewayError> {
+        unimplemented!("StalledStore exists to stall a write")
+    }
+
+    async fn get_usage_since(
+        &self,
+        _subject_id: Uuid,
+        _since: chrono::DateTime<Utc>,
+    ) -> Result<crate::store::UsageTotals, GatewayError> {
+        unimplemented!("StalledStore exists to stall a write")
+    }
+
+    async fn insert_execution_trace(
+        &self,
+        _trace: &crate::store::StoredTrace,
+    ) -> Result<Uuid, GatewayError> {
+        unimplemented!("StalledStore exists to stall a write")
+    }
+
+    async fn get_execution_trace(
+        &self,
+        _id: Uuid,
+    ) -> Result<Option<crate::store::StoredTrace>, GatewayError> {
+        unimplemented!("StalledStore exists to stall a write")
+    }
+
+    async fn get_traces_by_call(
+        &self,
+        _inference_call_id: Uuid,
+    ) -> Result<Vec<crate::store::StoredTrace>, GatewayError> {
+        unimplemented!("StalledStore exists to stall a write")
+    }
+}
+
+/// Setup-failing adapter that burns a known span BEFORE failing, so a timer
+/// that wrongly spans the whole walk is separable from one scoped to the
+/// winning candidate. `FakeStreamFailer` fails instantly and cannot tell the
+/// two apart.
+struct SlowSetupFailer {
+    id: String,
+}
+
+impl crate::adapters::capability::Model for SlowSetupFailer {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::adapters::capability::ChatModel for SlowSetupFailer {
+    async fn chat(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<crate::types::io::ChatResponse, GatewayError> {
+        tokio::time::sleep(FAILED_CANDIDATE_SPAN).await;
+        Err(GatewayError::ProviderError {
+            adapter: self.id.clone(),
+            message: "slow setup failure".to_string(),
+            status: Some(500),
+        })
+    }
+
+    async fn chat_stream(
+        &self,
+        _cfg: &RouterConfig,
+        _req: &crate::types::io::ChatRequest,
+    ) -> Result<
+        std::pin::Pin<
+            Box<
+                dyn futures::Stream<Item = Result<crate::types::request::StreamChunk, GatewayError>>
+                    + Send,
+            >,
+        >,
+        GatewayError,
+    > {
+        tokio::time::sleep(FAILED_CANDIDATE_SPAN).await;
+        Err(GatewayError::ProviderError {
+            adapter: self.id.clone(),
+            message: "slow setup failure".to_string(),
+            status: Some(500),
+        })
+    }
+}
+
+/// The span the FIRST, failing candidate burns in `the_persisted_duration_excludes_a_failed_candidates_span`.
+const FAILED_CANDIDATE_SPAN: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// C2 — the terminal `Done` must not be hostage to the metering write.
+///
+/// Task 1 moved `insert_inference_call` ABOVE the `yield` so a consumer that
+/// stops at `Done` is still billed (AC1). That is correct and stays. What it
+/// introduced is a head-of-line block the comment beside it mis-justified as
+/// "the same price the dispatch above already charges": `dispatch_outcome` is a
+/// SYNCHRONOUS fold over in-memory recorders and awaits nothing, while
+/// `insert_inference_call` is an `async` call into a consumer-supplied store
+/// with no timeout anywhere in this crate. A stalled pool therefore delayed —
+/// or with a per-event consumer timeout, destroyed — the terminal event, which
+/// carries the tokens, the cost and the routing decision. "Delivered but
+/// unbilled" became "not delivered and unbilled".
+///
+/// Runs on a PAUSED clock, so it costs no wall time and measures the virtual
+/// span the generator actually waited. Under the pre-fix code the assertion
+/// reads the full `STALL`.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_store_does_not_hold_the_terminal_event() {
+    use futures::StreamExt;
+
+    const STALL: std::time::Duration = std::time::Duration::from_secs(30);
+
+    let gw = Gateway::new(
+        mid_gateway_config(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    )
+    .with_store(Arc::new(StalledStore { stall: STALL }));
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamer {
+            id: "mid".to_string(),
+        }))
+        .await;
+
+    let started = tokio::time::Instant::now();
+    let mut stream = gw
+        .execute_stream(&mid_chat_request())
+        .await
+        .expect("stream should start");
+    loop {
+        match stream.next().await {
+            Some(StreamEvent::Done { .. }) => break,
+            Some(_) => continue,
+            None => panic!("stream ended without a terminal Done event"),
+        }
+    }
+    let waited = started.elapsed();
+
+    assert!(
+        waited < STALL,
+        "the terminal Done must not wait on a stalled metering write: waited {waited:?} \
+         of the store's {STALL:?} stall. Metering is best-effort, and that has to be \
+         true of LATENCY as well as of success."
+    );
+}
+
+/// C1 — a stream that dies mid-generation must still be metered.
+///
+/// Task 1 fixed the SUCCESS path only. The mid-stream `Err` arm returns without
+/// any `insert_inference_call`, so real generated tokens — reported by the
+/// provider on its last good chunk, and billed by it — were recorded nowhere.
+/// `execute` writes a `CallStatus::Failed` row for the analogous exhaustion
+/// (`execute.rs`, "observability + request counting"), so this was a live
+/// unary-vs-streamed parity break, not a design choice.
+///
+/// Drained with `collect_stream` deliberately: the absence is STRUCTURAL, not a
+/// polling artefact, and draining to `None` proves that — this row is missing
+/// even for a consumer that over-polls.
+#[tokio::test]
+async fn a_stream_that_dies_mid_generation_is_still_metered() {
+    let store = Arc::new(RecordingStore::default());
+    let gw = Gateway::new(
+        mid_gateway_config(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    )
+    .with_store(store.clone());
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamMidFailerWithUsage {
+            id: "mid".to_string(),
+        }))
+        .await;
+
+    let events = collect_stream(&gw, &mid_chat_request()).await;
+    assert!(
+        matches!(events.last(), Some(StreamEvent::Error { .. })),
+        "the fixture must die mid-stream: {events:?}"
+    );
+
+    let rows = store.calls_for("mid");
+    assert_eq!(
+        rows.len(),
+        1,
+        "a failed stream is recorded exactly as `execute` records a failed call"
+    );
+    assert_eq!(rows[0].status, CallStatus::Failed);
+    assert!(
+        rows[0].error_type.is_some(),
+        "the failure must be classified on the row, not left null"
+    );
+    assert_eq!(
+        rows[0].output_tokens,
+        Some(50),
+        "the tokens the provider reported before dying are the tokens it BILLS; \
+         the row is accounting, not a health observation (the recorder dispatch \
+         deliberately sends None here, for a different reason)"
+    );
+}
+
+/// C1, second `return` site — chain exhaustion is the other unmetered failure.
+///
+/// Every candidate failing at setup yields a terminal `Error` and returns with
+/// no row, while `execute`'s exhaustion branch writes one attributed to the
+/// last attempted candidate. Same defect, different arm; a fix to the
+/// mid-stream arm alone would leave this one open.
+#[tokio::test]
+async fn a_stream_that_exhausts_its_chain_is_still_metered() {
+    let store = Arc::new(RecordingStore::default());
+    let gw = Gateway::new(
+        mid_gateway_config(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    )
+    .with_store(store.clone());
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamFailer {
+            id: "mid".to_string(),
+            status: 500,
+        }))
+        .await;
+
+    let events = collect_stream(&gw, &mid_chat_request()).await;
+    assert!(
+        matches!(events.last(), Some(StreamEvent::Error { .. })),
+        "the single candidate must fail at setup: {events:?}"
+    );
+
+    let rows = store.calls_for("mid");
+    assert_eq!(
+        rows.len(),
+        1,
+        "an exhausted stream is recorded, as `execute` records an exhausted call"
+    );
+    assert_eq!(rows[0].status, CallStatus::Failed);
+    assert_eq!(
+        rows[0].output_tokens, None,
+        "field-for-field parity with `execute`'s failed row, which writes \
+         `tokens: None`. `Some(0)` was the tempting value and is wrong: a setup \
+         failure does not prove the provider generated nothing, only that we \
+         never saw a usage report. `None` is 'unknown', which is what this is."
+    );
+    assert_eq!(
+        rows[0].cost_usd, 0.0,
+        "no usage was reported, so there is nothing to cost — as `execute` does"
+    );
+}
+
+/// I1 — AC3's parity claim, on the only branch where the two paths can diverge.
+///
+/// `a_streamed_calls_persisted_duration_includes_acquisition` uses a
+/// single-candidate, first-candidate-success fixture and asserts two LOWER
+/// bounds. AC3's actual requirement is stronger — the same quantity `execute`
+/// records, which is the WINNING CANDIDATE's span, not the request's — and a
+/// lower bound cannot tell those apart on a fixture that never falls back.
+///
+/// Both timers are re-bound per candidate today, so this passes. It is the
+/// mutation it kills that earns it: hoisting `attempt_start` above the
+/// `for (idx, candidate)` loop is a plausible one-line edit that leaves all 442
+/// shipped tests green while making the streamed row absorb the failed
+/// candidate's 250ms against the unary row's ~0ms — reintroducing precisely the
+/// "two quantities under one name" mixing AC3 exists to end.
+#[tokio::test]
+async fn the_persisted_duration_excludes_a_failed_candidates_span() {
+    let store = Arc::new(RecordingStore::default());
+    let gw = Gateway::new(
+        test_config_with_failing_and_noop(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    )
+    .with_store(store.clone());
+    register_noop(&gw).await;
+    gw.adapters
+        .register_chat(Arc::new(SlowSetupFailer {
+            id: "failing".to_string(),
+        }))
+        .await;
+
+    let request = InferenceRequest {
+        chain: Some("chat_chain".to_string()),
+        ..chat_request()
+    };
+
+    // BOTH entry points, against one store, so the comparison is like-for-like.
+    let events = collect_stream(&gw, &request).await;
+    assert!(
+        matches!(events.last(), Some(StreamEvent::Done { .. })),
+        "the second candidate must win: {events:?}"
+    );
+    gw.execute(&request)
+        .await
+        .expect("the unary half must fall back and succeed");
+
+    let rows = store.calls_for("noop");
+    assert_eq!(rows.len(), 2, "one streamed row and one unary row");
+    for r in &rows {
+        assert!(
+            r.duration_ms < FAILED_CANDIDATE_SPAN.as_millis() as u64,
+            "the winner's row must not absorb the failed candidate's {FAILED_CANDIDATE_SPAN:?}; \
+             got {}ms",
+            r.duration_ms
+        );
+        assert_eq!(
+            r.fallback_sequence, 1,
+            "the winner is the second candidate on both paths"
+        );
+    }
+}
+
+/// M1 — `Done.routing`'s documented `None` case, pinned.
+///
+/// The rustdoc says "`None` when no strategy ordered anything (a tier-1 direct
+/// request)". That was true but unasserted, so
+/// `routing: decision.or_else(|| Some(RoutingDecision::default()))` — a
+/// plausible "helpful" edit that would make every direct request report a
+/// fabricated empty decision — passed the whole suite. A `Some` here is a claim
+/// that a strategy ran, and on this path none did.
+#[tokio::test]
+async fn a_direct_streamed_request_carries_no_routing_decision() {
+    let gw = Gateway::new(
+        mid_gateway_config(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamer {
+            id: "mid".to_string(),
+        }))
+        .await;
+
+    // `mid_chat_request` names router AND model: one candidate, nothing ordered.
+    let events = collect_stream(&gw, &mid_chat_request()).await;
+    assert!(
+        done_routing(&events).is_none(),
+        "a direct router+model request orders nothing, so there is no decision \
+         to report — reporting an empty one would claim a strategy ran"
+    );
+}

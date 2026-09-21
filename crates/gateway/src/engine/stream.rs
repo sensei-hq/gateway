@@ -335,6 +335,70 @@ impl super::Gateway {
                                         phase: crate::gates::AttemptPhase::StreamCompleted,
                                     },
                                 );
+                                // METER THE FAILURE. `execute` writes a
+                                // `CallStatus::Failed` row for its analogous
+                                // exhaustion ("observability + request
+                                // counting"); this arm wrote nothing at all, so
+                                // a stream that died after generating real
+                                // tokens was recorded NOWHERE — unary 1 row,
+                                // streamed 0, same adapter. Task 1 fixed only
+                                // the success path; this is the same defect on
+                                // the failure path (whole-slice review C1).
+                                //
+                                // Before the `yield`, for the same
+                                // stops-polling reason as the success path, and
+                                // under the same bounded budget.
+                                //
+                                // `usage_acc` IS carried here, unlike the
+                                // recorder dispatch above which deliberately
+                                // sends `output_tokens: None`. The two answer
+                                // different questions: a rate derived from a
+                                // broken attempt is not a throughput
+                                // observation, but the tokens a provider
+                                // reported on its last good chunk are tokens it
+                                // BILLS. This row is accounting.
+                                let failed_call = store.as_ref().map(|_| InferenceCall {
+                                    id: Uuid::new_v4(),
+                                    session_id: None,
+                                    project_id: None,
+                                    capability: request.capability.clone(),
+                                    chain_id: request.chain.clone(),
+                                    adapter: candidate.router.clone(),
+                                    model: candidate.model.clone(),
+                                    api_model_id: Some(candidate.api_model_id.clone()),
+                                    input_tokens: usage_acc.as_ref().map(|u| u.input_tokens),
+                                    output_tokens: usage_acc.as_ref().map(|u| u.output_tokens),
+                                    // Costed from the usage that WAS reported,
+                                    // where `execute` writes 0.0 — not a
+                                    // divergence in policy but in information:
+                                    // `execute` has no partial-success concept
+                                    // and never holds usage for a failed call.
+                                    // Discarding it here would knowingly
+                                    // under-count spend on tokens we know were
+                                    // generated.
+                                    cost_usd: usage_acc
+                                        .as_ref()
+                                        .zip(candidate.model_config.pricing.as_ref())
+                                        .map(|(u, p)| {
+                                            Cost::from_usage(u, p.input_per_1k, p.output_per_1k)
+                                                .total_cost
+                                        })
+                                        .unwrap_or(0.0),
+                                    cost_estimated: None,
+                                    // The TOTAL attempt span, as AC3 requires of
+                                    // every persisted row on both paths. (The
+                                    // dispatch above uses `stream_start` for a
+                                    // documented reason that applies to health
+                                    // observations, not to this column.)
+                                    duration_ms: attempt_start.elapsed().as_millis() as u64,
+                                    status: CallStatus::Failed,
+                                    error_type: Some(e.to_string()),
+                                    fallback_sequence: idx as u8,
+                                    recorded_at: Utc::now(),
+                                    subject_id: request.auth.as_ref().map(|a| a.subject_id),
+                                    tier: request.auth.as_ref().and_then(|a| a.tier.clone()),
+                                });
+                                record_call_bounded(&store, failed_call).await;
                                 // Mid-stream failure: bytes already sent, so no
                                 // fallback — surface and stop.
                                 yield StreamEvent::Error {
@@ -435,16 +499,22 @@ impl super::Gateway {
                     // verdict once (SP-ROUTE-1 Task 5 review, Minor 2); here it
                     // cost the BILLING ROW — a streamed request was metered only
                     // when its caller happened to over-poll, while a
-                    // non-streaming one always is. The price paid for it is that
-                    // the terminal event now waits on the store write, which is
-                    // the same price the dispatch above already charges and is
-                    // worth paying for billing data.
-                    if let Some(store) = &store
-                        && let Some(call) = call
-                        && let Err(e) = store.insert_inference_call(&call).await
-                    {
-                        tracing::warn!(error = %e, "failed to record streaming call (metering is best-effort)");
-                    }
+                    // non-streaming one always is.
+                    //
+                    // BOUNDED, and the dispatch above is NOT the precedent for
+                    // paying this price unbounded (the whole-slice review's C2
+                    // corrected that claim). `dispatch_outcome` is a synchronous
+                    // fold over in-memory recorders — it awaits nothing and
+                    // charges no I/O. This is an `async` call into a store the
+                    // CONSUMER supplies, so putting it ahead of the yield makes
+                    // the terminal event wait on somebody else's database. A
+                    // stalled pool would then delay `Done` indefinitely, and a
+                    // consumer with a per-event timeout would get the full
+                    // content and no `Done` at all — losing the tokens, the cost
+                    // and the routing decision, and cancelling the in-flight
+                    // write so no row lands either. "Delivered but unbilled"
+                    // must not become "not delivered and unbilled".
+                    record_call_bounded(&store, call).await;
                     yield StreamEvent::Done {
                         model: candidate.model.clone(),
                         tokens,
@@ -507,6 +577,44 @@ impl super::Gateway {
                     continue;
                 }
 
+                // METER THE EXHAUSTION — the second unmetered failure (C1).
+                // `execute`'s exhaustion branch writes a `CallStatus::Failed`
+                // row attributed to the LAST attempted candidate; this path
+                // wrote none, so an all-candidates-failed stream produced no
+                // record of the request at all. Built here, before the yields
+                // below consume `fail_message`, and recorded ahead of the
+                // terminal event for the same stops-polling reason as the
+                // success path.
+                //
+                // Field-for-field parity with `execute`'s failed row, including
+                // `tokens: None` / `cost: None`: nothing was generated and the
+                // provider reported no usage, so "unknown" is the honest value.
+                // `Some(0)` would claim knowledge a setup failure does not give
+                // us — the request may have been processed and billed before
+                // the stream could be established.
+                let exhausted_call = store.as_ref().map(|_| InferenceCall {
+                    id: Uuid::new_v4(),
+                    session_id: None,
+                    project_id: None,
+                    capability: request.capability.clone(),
+                    chain_id: request.chain.clone(),
+                    adapter: candidate.router.clone(),
+                    model: candidate.model.clone(),
+                    api_model_id: Some(candidate.api_model_id.clone()),
+                    input_tokens: None,
+                    output_tokens: None,
+                    cost_usd: 0.0,
+                    cost_estimated: None,
+                    duration_ms: attempt_start.elapsed().as_millis() as u64,
+                    status: CallStatus::Failed,
+                    error_type: Some(fail_message.clone()),
+                    fallback_sequence: idx as u8,
+                    recorded_at: Utc::now(),
+                    subject_id: request.auth.as_ref().map(|a| a.subject_id),
+                    tier: request.auth.as_ref().and_then(|a| a.tier.clone()),
+                });
+                record_call_bounded(&store, exhausted_call).await;
+
                 // No further candidates to try (or a non-fallback stop): flush
                 // the switch history, then a terminal Error.
                 for ev in pending_switches.drain(..) {
@@ -546,5 +654,42 @@ impl super::Gateway {
         };
 
         Ok(Box::pin(stream))
+    }
+}
+
+/// Wall-clock ceiling on a single streaming metering write.
+///
+/// Generous for a healthy store and short enough that a sick one cannot hold a
+/// stream open. There is no configuration knob on purpose: this is not a tuning
+/// parameter but a liveness guarantee, and a deployment that could raise it
+/// would reintroduce exactly the head-of-line block it exists to prevent.
+const METERING_WRITE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Persist one metering row, bounded by [`METERING_WRITE_BUDGET`].
+///
+/// Metering on the streaming path is best-effort, and after the whole-slice
+/// review that is true of **latency** as well as of success. The row is written
+/// ahead of the terminal event so a consumer that stops polling at `Done` is
+/// still billed (AC1); the budget is what stops that ordering from making the
+/// terminal event hostage to a consumer-supplied store. Exceeding it drops the
+/// row and logs loudly — losing a billing row is bad, losing the caller's
+/// tokens, cost and routing decision is worse, and a stream that never
+/// terminates is worst.
+///
+/// `None` store or `None` call is a no-op, which keeps every store-less
+/// configuration byte-identical.
+async fn record_call_bounded(store: &Option<Arc<dyn GatewayStore>>, call: Option<InferenceCall>) {
+    let (Some(store), Some(call)) = (store, call) else {
+        return;
+    };
+    match tokio::time::timeout(METERING_WRITE_BUDGET, store.insert_inference_call(&call)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "failed to record streaming call (metering is best-effort)")
+        }
+        Err(_) => tracing::warn!(
+            budget = ?METERING_WRITE_BUDGET,
+            "metering write exceeded its budget; dropping the row to release the terminal event"
+        ),
     }
 }

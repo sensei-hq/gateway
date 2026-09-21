@@ -19,7 +19,91 @@
 | 1 — a streamed request is always metered | `2fb6b86` | ✅ done (AC1–AC2, AC6); the write moved above the `yield`, mutation confirmed red at `requests == 0` |
 | 2 — the persisted duration means the same thing | `ab4e6ee` · `f40d8f8` (plan correction) | ✅ done (AC3); `attempt_start` on the store row, both assertions relational against the fixture's own delays |
 | 3 — `Done` carries the routing decision | `7e89dc3` | ✅ done (AC4–AC5); `result.decision` moved onto the event, not re-derived; both mutations confirmed red |
-| 4 — docs + final verification | *(this commit)* | ✅ done (AC7) |
+| 4 — docs + final verification | `4aee074` | ✅ done (AC7) |
+| **Whole-slice review** | *(this commit)* | ✅ **COMPLETE** — 2 Critical, 1 Important, 1 Minor, all fixed red-first; see below |
+
+### Whole-slice adversarial review — complete
+
+The review found that **Task 1 had fixed one third of the metering defect and
+the docs claimed all of it**, and that the fix itself introduced a liveness
+regression. Both Criticals were reproduced with probes before anything was
+changed, and every fix was driven red-first.
+
+**C2 — the terminal event became hostage to an unbounded store write.** Task 1's
+comment justified putting `insert_inference_call` ahead of the `yield` as "the
+same price the dispatch above already charges". That was **false, and I wrote
+it**: `dispatch_outcome` is a *synchronous* fold over in-memory recorders and
+awaits nothing, while `insert_inference_call` is an `async` call into a
+consumer-supplied store with no timeout anywhere in the crate. Measured: a 400ms
+store delayed `Done` by 403ms, and a consumer with an ordinary 100ms per-event
+timeout received the full content and then **no terminal event at all** — no
+tokens, no cost, none of Task 3's routing — with the in-flight write cancelled
+so no row landed either. Task 1 had converted *delivered but unbilled* into *not
+delivered and unbilled*, and an unreachable database meant a stream that never
+terminates. Fixed with a 2s `METERING_WRITE_BUDGET` and a `record_call_bounded`
+helper; the false comment is corrected at the source and in `upgrading.md`.
+
+**C1 — streamed failures were never metered, and Task 4's docs said they were.**
+Task 1 fixed the success path only. Both failure `return` sites — the mid-stream
+`Err` arm and setup exhaustion — returned without any write, so a stream that
+died after generating real tokens recorded **nothing**, even when fully drained
+with `collect_stream`. The absence was structural, not a polling artefact.
+Meanwhile `execute` writes a `CallStatus::Failed` row for the analogous
+exhaustion: unary one row, streamed zero, same adapter. Both sites now write
+one, ahead of their terminal `Error`, under the same budget.
+
+**This is the finding to remember, and it is about the docs, not the code.**
+Task 4 asserted "a streamed call is always metered… both paths bill alike" and
+told operators that post-upgrade numbers "should agree" with a provider invoice
+— advice to trust a reconciliation that still under-counted every stream that
+died after first byte. A doc written from the *intent* of a fix rather than from
+its *reach* is worse than no doc: it converts a known gap into a false
+assurance. The prose was not corrected to match the code; the code was finished
+so the prose became true.
+
+**I1 — AC3's parity claim was unguarded on the only divergent branch.**
+`a_streamed_calls_persisted_duration_includes_acquisition` uses a
+single-candidate, first-candidate-success fixture and asserts two lower bounds,
+but AC3 requires the *winning candidate's* span, not the request's — and a lower
+bound cannot separate those without a fallback. Behaviour was already correct;
+hoisting `attempt_start` above the candidate loop is a one-line edit that left
+all 442 shipped tests green while making the streamed row read 252ms against the
+unary row's ~0ms. Now pinned by
+`the_persisted_duration_excludes_a_failed_candidates_span`.
+
+**M1 — `Done.routing`'s documented `None` case was unasserted**, so a
+"helpful" `decision.or_else(|| Some(…))` would have made every direct request
+report a fabricated empty decision. Pinned by
+`a_direct_streamed_request_carries_no_routing_decision`.
+
+**Independently confirmed by the reviewer:** my Task 4 AC2 measurement (exactly
+1 of 442) reproduces, and Task 3's move-without-clone is compiler-enforced —
+deleting the `return;` yields `E0382: value moved here, in previous iteration of
+loop`.
+
+**Five mutations, five real panics** (`stream.rs` restored byte-identical after,
+verified by `diff` against a pre-mutation backup rather than `git checkout`,
+which would have reverted the uncommitted fix):
+
+| Mutation | Test that went red | Panic |
+|---|---|---|
+| Remove the timeout | `a_stalled_store_does_not_hold_the_terminal_event` | `waited 30s of the store's 30s stall` |
+| Delete the mid-stream write | `a_stream_that_dies_mid_generation_is_still_metered` | `left: 0, right: 1` |
+| Delete the exhaustion write | `a_stream_that_exhausts_its_chain_is_still_metered` | `left: 0, right: 1` |
+| Hoist `attempt_start` | `the_persisted_duration_excludes_a_failed_candidates_span` | `must not absorb the failed candidate's 250ms; got 252ms` |
+| Fabricate an empty decision | `a_direct_streamed_request_carries_no_routing_decision` | `is_none()` assertion |
+
+**One decision the review's suggested fix got wrong, and I changed.** It
+specified `output_tokens: usage_acc.map(…)` for *both* failure sites. At setup
+exhaustion there is no `usage_acc` and the honest value is not `Some(0)` either:
+checking `execute.rs` showed it writes `tokens: None, cost: None` for a failed
+attempt, and a setup failure does not prove the provider generated nothing —
+only that no usage was reported. That site now mirrors `execute` field-for-field
+with `None`. The mid-stream site *does* carry its usage and costs it, diverging
+from `execute` only because `execute` has no partial-success concept and never
+holds usage for a failed call; discarding tokens the provider bills for would
+knowingly under-count spend. The first draft of the test asserted `Some(0)` and
+was corrected to `None` once `execute.rs` was actually read.
 
 **Final state:** suite **1922 passed / 0 failed / 60 ignored**, real exit 0, zero
 `panicked at`. Clippy clean under **both** toolchains (Homebrew 0.1.97 and rustup
@@ -66,14 +150,20 @@ decision on `Done` is the one the *selection* produced — same strategy, same c
 order as `execute` reports for the same request and chain — rather than merely
 non-`None`.
 
-### One process gap, named rather than left implicit
+### The process gap this slice closed by hitting it
 
-This plan has **no whole-slice review step**. SP-ROUTE-1's Task 12 ended with one
-(`Step 7: Whole-slice review`, run before the develop→main PR); SP-ROUTE-1.2's Task 4
-ends at the commit. The slice is small and every task carried its own mutation check,
-but per the SP-6 lesson — *review must not be a workflow's last phase* — a whole-slice
-pass over the three-commit diff is still owed before this batches into the
-develop→main PR. Recorded here so it is a decision rather than an omission.
+This plan shipped with **no whole-slice review step** — SP-ROUTE-1's Task 12 had one,
+Task 4 here ended at the commit. That gap was flagged in Task 4 rather than left
+implicit, and the review was then run. It found two Criticals in ~120 lines of
+already-"verified" code, one of them a regression introduced by the fix itself and one
+a false claim in the verification commit's own documentation.
+
+**The lesson is the SP-6 one, earned again: per-task mutation checks do not compose
+into slice-level correctness.** Every task here was individually red-first, mutation-
+checked, and green. The defects lived in what no single task owned — Task 1's fix
+measured against Task 1's test, with no one asking what it cost the *other* terminal
+event or what it left undone on the *other* return path. A slice-level pass is not a
+formality after per-task rigour; it is the only phase that sees the seams.
 
 ---
 
