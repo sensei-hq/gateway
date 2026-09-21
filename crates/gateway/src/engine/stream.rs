@@ -381,9 +381,8 @@ impl super::Gateway {
                         })
                         .unwrap_or(0.0);
 
-                    // Build the record before `tokens` moves into the event; insert
-                    // it after yielding `Done` so the terminal event isn't delayed
-                    // by the store write. Best-effort: a store error never surfaces.
+                    // Built before `tokens` moves into the event below.
+                    // Best-effort: a store error never surfaces.
                     let call = store.as_ref().map(|_| InferenceCall {
                         id: Uuid::new_v4(),
                         session_id: None,
@@ -405,17 +404,28 @@ impl super::Gateway {
                         subject_id: request.auth.as_ref().map(|a| a.subject_id),
                         tier: request.auth.as_ref().and_then(|a| a.tier.clone()),
                     });
-                    yield StreamEvent::Done {
-                        model: candidate.model.clone(),
-                        tokens,
-                        cost,
-                    };
+                    // Before the `yield`, for the reason spelled out above the
+                    // completion dispatch: a consumer that stops polling at the
+                    // terminal `Done` never resumes this generator, so anything
+                    // placed after the yield silently never runs. That cost the
+                    // verdict once (SP-ROUTE-1 Task 5 review, Minor 2); here it
+                    // cost the BILLING ROW — a streamed request was metered only
+                    // when its caller happened to over-poll, while a
+                    // non-streaming one always is. The price paid for it is that
+                    // the terminal event now waits on the store write, which is
+                    // the same price the dispatch above already charges and is
+                    // worth paying for billing data.
                     if let Some(store) = &store
                         && let Some(call) = call
                         && let Err(e) = store.insert_inference_call(&call).await
                     {
                         tracing::warn!(error = %e, "failed to record streaming call (metering is best-effort)");
                     }
+                    yield StreamEvent::Done {
+                        model: candidate.model.clone(),
+                        tokens,
+                        cost,
+                    };
                     return;
                 }
 

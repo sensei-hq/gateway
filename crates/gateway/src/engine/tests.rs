@@ -6343,6 +6343,73 @@ async fn a_consumer_that_stops_at_done_still_sees_its_verdict_recorded() {
     );
 }
 
+/// SP-ROUTE-1.2 AC1 — the same trap as the test above, one concern over: a
+/// consumer that stops polling at `Done` must still be BILLED.
+/// `insert_inference_call` sat AFTER the `yield`, so a streamed request was
+/// metered only when its caller happened to over-poll, while a non-streaming
+/// request is always metered. This is billing data.
+///
+/// Deliberately NOT written against `collect_stream`: that drains to `None` and
+/// passes whether the write is above or below the yield, which is exactly how
+/// this survived the review that caught the sibling dispatch beside it.
+///
+/// Asserts through `get_usage_since`, not `get_inference_calls_by_session`: the
+/// streaming path writes `session_id: None`, so the session-keyed read can
+/// never return this row. `get_usage_since` is the only `InMemoryStore` read
+/// that yields an exact ROW COUNT (`requests`) — the two spend reads are dollar
+/// aggregates that read 0.0 on this unpriced config and could not tell one row
+/// from none.
+#[tokio::test]
+async fn a_consumer_that_stops_at_done_is_still_metered() {
+    use crate::store::GatewayStore;
+    use futures::StreamExt;
+
+    let store = Arc::new(InMemoryStore::default());
+    let gw = Gateway::new(
+        mid_gateway_config(),
+        AdapterRegistry::new(),
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    )
+    .with_store(store.clone());
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamer {
+            id: "mid".to_string(),
+        }))
+        .await;
+
+    // The subject is what carries the row into `get_usage_since`: the streaming
+    // path populates `InferenceCall::subject_id` from `request.auth`.
+    let subject = Uuid::new_v4();
+    let mut request = mid_chat_request();
+    request.auth = Some(AuthContext {
+        subject_id: subject,
+        tier: None,
+    });
+
+    let mut stream = gw
+        .execute_stream(&request)
+        .await
+        .expect("stream should start");
+    loop {
+        match stream.next().await {
+            Some(StreamEvent::Done { .. }) => break,
+            Some(_) => continue,
+            None => panic!("stream ended without a terminal Done event"),
+        }
+    }
+    drop(stream); // stop exactly where a real consumer stops — no further polling
+
+    let usage = store
+        .get_usage_since(subject, Utc::now() - chrono::Duration::hours(1))
+        .await
+        .expect("the in-memory store never errors");
+    assert_eq!(
+        usage.requests, 1,
+        "the metering row must exist once Done is observed, not only after the stream is \
+         fully drained to None — otherwise a normal SSE consumer is never billed: {usage:?}"
+    );
+}
+
 /// Minor 3 — a mid-stream failure's dispatch must carry `output_tokens:
 /// None`, even when the provider's last good chunk reported usage. A failed
 /// attempt has no meaningful rate; contributing a throughput sample for it
