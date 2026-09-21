@@ -5939,6 +5939,172 @@ async fn the_same_generation_rate_reports_the_same_throughput_streaming_or_not()
     );
 }
 
+/// A [`crate::store::GatewayStore`] that keeps every row it is handed, so a
+/// test can assert on a persisted FIELD.
+///
+/// `InMemoryStore` cannot serve this: no `GatewayStore` READ exposes
+/// `duration_ms` at all. `get_inference_calls_by_session` — the only read that
+/// returns whole rows — filters on a `session_id` that neither entry point ever
+/// populates, and every other read is a dollar/token aggregate.
+///
+/// The reads are `unimplemented!()` rather than empty so a future test that
+/// leans on one fails loudly instead of silently asserting over nothing.
+#[derive(Default)]
+struct RecordingStore {
+    calls: std::sync::Mutex<Vec<crate::store::InferenceCall>>,
+}
+
+impl RecordingStore {
+    /// The rows persisted for `adapter`, in insertion order.
+    fn calls_for(&self, adapter: &str) -> Vec<crate::store::InferenceCall> {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.adapter == adapter)
+            .cloned()
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::store::GatewayStore for RecordingStore {
+    async fn insert_inference_call(
+        &self,
+        call: &crate::store::InferenceCall,
+    ) -> Result<Uuid, GatewayError> {
+        self.calls.lock().unwrap().push(call.clone());
+        Ok(call.id)
+    }
+
+    async fn get_inference_calls_by_session(
+        &self,
+        _session_id: Uuid,
+    ) -> Result<Vec<crate::store::InferenceCall>, GatewayError> {
+        unimplemented!("RecordingStore records writes; read the rows with `calls_for`")
+    }
+
+    async fn get_spend_since(&self, _since: chrono::DateTime<Utc>) -> Result<f64, GatewayError> {
+        unimplemented!("RecordingStore records writes; read the rows with `calls_for`")
+    }
+
+    async fn get_spend_by_model_since(
+        &self,
+        _since: chrono::DateTime<Utc>,
+    ) -> Result<Vec<(String, f64)>, GatewayError> {
+        unimplemented!("RecordingStore records writes; read the rows with `calls_for`")
+    }
+
+    async fn get_usage_since(
+        &self,
+        _subject_id: Uuid,
+        _since: chrono::DateTime<Utc>,
+    ) -> Result<crate::store::UsageTotals, GatewayError> {
+        unimplemented!("RecordingStore records writes; read the rows with `calls_for`")
+    }
+
+    async fn insert_execution_trace(
+        &self,
+        _trace: &crate::store::StoredTrace,
+    ) -> Result<Uuid, GatewayError> {
+        unimplemented!("RecordingStore records inference calls only")
+    }
+
+    async fn get_execution_trace(
+        &self,
+        _id: Uuid,
+    ) -> Result<Option<crate::store::StoredTrace>, GatewayError> {
+        unimplemented!("RecordingStore records inference calls only")
+    }
+
+    async fn get_traces_by_call(
+        &self,
+        _inference_call_id: Uuid,
+    ) -> Result<Vec<crate::store::StoredTrace>, GatewayError> {
+        unimplemented!("RecordingStore records inference calls only")
+    }
+}
+
+/// SP-ROUTE-1.2 AC3 — the same unlike-spans argument as the test above, on the
+/// PERSISTED column rather than the dispatch. `InferenceCall.duration_ms` was
+/// written from `stream_start` (generation time alone) while `execute` writes
+/// the same column with the whole attempt's wall time, so `inference_calls`
+/// mixed two quantities under one name and any analytics over it was wrong with
+/// nothing surfacing the fact. The completion dispatch directly above this row's
+/// construction had already been moved to `attempt_start` for exactly this
+/// reason; the metering row was simply never brought along.
+///
+/// `SplitDelayStreamer` is what makes it visible: `SETUP_DELAY` elapses BEFORE
+/// the first byte, so a row measured from `stream_start` sees `GENERATION_DELAY`
+/// alone — half the span, a 2x separation no scheduler jitter closes.
+///
+/// Both assertions are RELATIONAL against the fixture's own known delays, never
+/// an absolute millisecond ceiling: a stalled runner can only stretch these
+/// spans UPWARD, and both bounds are lower bounds, so a loaded machine cannot
+/// turn either red. (A streaming-vs-unary RATIO was considered for the parity
+/// half and rejected — it fails whenever one path alone is stalled, which tests
+/// the machine rather than the code.)
+#[tokio::test]
+async fn a_streamed_calls_persisted_duration_includes_acquisition() {
+    let store = Arc::new(RecordingStore::default());
+
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    let split = Gateway::new(single_endpoint_config("split"), AdapterRegistry::new(), cb)
+        .with_store(store.clone());
+    split
+        .adapters
+        .register_chat(Arc::new(SplitDelayStreamer {
+            id: "split".to_string(),
+        }))
+        .await;
+
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    let whole = Gateway::new(single_endpoint_config("whole"), AdapterRegistry::new(), cb)
+        .with_store(store.clone());
+    whole
+        .adapters
+        .register_chat(Arc::new(WholeCallDelayAdapter {
+            id: "whole".to_string(),
+        }))
+        .await;
+
+    let events = collect_stream(&split, &pinned_chat_request("split")).await;
+    assert!(
+        matches!(events.last(), Some(StreamEvent::Done { .. })),
+        "the streaming half must run to completion: {events:?}"
+    );
+    whole
+        .execute(&pinned_chat_request("whole"))
+        .await
+        .expect("the non-streaming half must succeed");
+
+    let total = (SETUP_DELAY + GENERATION_DELAY).as_millis() as u64;
+
+    let streamed = store.calls_for("split");
+    assert_eq!(streamed.len(), 1, "one streamed call, one metering row");
+    assert!(
+        streamed[0].duration_ms >= total,
+        "the persisted duration must cover the TOTAL attempt span \
+         (>= {total}ms = {SETUP_DELAY:?} pre-first-byte + {GENERATION_DELAY:?} generation), \
+         not generation alone; got {}ms",
+        streamed[0].duration_ms
+    );
+
+    // The parity half of AC3: `execute` writes this same column, and the row it
+    // writes for the IDENTICAL work must clear the same bar. Both are then the
+    // one quantity — output over total attempt wall time — that an analytics
+    // query over `inference_calls` can pool.
+    let unary = store.calls_for("whole");
+    assert_eq!(unary.len(), 1, "one unary call, one metering row");
+    assert!(
+        unary[0].duration_ms >= total,
+        "`execute` records the whole attempt's wall time in the same column \
+         (>= {total}ms); got {}ms — if this ever stops holding, the streaming \
+         row above is matching a quantity that moved",
+        unary[0].duration_ms
+    );
+}
+
 // --- SP-ROUTE-1 Task 5 review fixes: one attempt casts one verdict to every
 // health recorder, not just `PerformanceRecorder` ---
 //
