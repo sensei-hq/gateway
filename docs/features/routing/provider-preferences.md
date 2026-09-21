@@ -505,13 +505,23 @@ pub struct RoutedCandidate {
   orders nothing. That is not "preferences were ignored": `only`/`ignore` still
   filtered it (§2), it just had one candidate and nothing to order.
 
-### Two known gaps
+### The streaming path reports the same decision
 
-- **The streaming path carries no routing decision.** `execute_stream` selects
-  with the full preferences — filtering and ordering both apply — but it returns
-  a `Stream` of `StreamEvent`s rather than an `InferenceResponse`, so there is
-  nowhere to put the explanation. A streamed request routes correctly and cannot
-  currently report *why*.
+`execute_stream` selects with the full preferences — filtering and ordering both
+apply — and since **SP-ROUTE-1.2** it reports the explanation too, on the
+terminal event:
+
+```rust
+StreamEvent::Done { model, tokens, cost, routing: Option<RoutingDecision> }
+```
+
+It is the decision the selection **produced**, moved onto the event, not one
+re-derived where the event is built. Every reading above applies unchanged,
+`None` condition included. Before SP-ROUTE-1.2 a streamed request routed
+correctly and could not report *why*; that gap is closed.
+
+### One known gap
+
 - **`ExecutionTrace::routing` is forward provision only.** The field exists and
   round-trips, but **nothing in this workspace builds an `ExecutionTrace` in
   production** — the type is constructed in one test helper, and

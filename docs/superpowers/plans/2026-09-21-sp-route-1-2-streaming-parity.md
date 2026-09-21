@@ -12,6 +12,71 @@
 
 ---
 
+## Progress
+
+| Task | Commits | State |
+|---|---|---|
+| 1 — a streamed request is always metered | `2fb6b86` | ✅ done (AC1–AC2, AC6); the write moved above the `yield`, mutation confirmed red at `requests == 0` |
+| 2 — the persisted duration means the same thing | `ab4e6ee` · `f40d8f8` (plan correction) | ✅ done (AC3); `attempt_start` on the store row, both assertions relational against the fixture's own delays |
+| 3 — `Done` carries the routing decision | `7e89dc3` | ✅ done (AC4–AC5); `result.decision` moved onto the event, not re-derived; both mutations confirmed red |
+| 4 — docs + final verification | *(this commit)* | ✅ done (AC7) |
+
+**Final state:** suite **1922 passed / 0 failed / 60 ignored**, real exit 0, zero
+`panicked at`. Clippy clean under **both** toolchains (Homebrew 0.1.97 and rustup
+stable 0.1.98), `fmt --all --check` clean, `cargo test -p sensei-gateway --features
+local --locked` green, `cargo doc --workspace --no-deps` clean with zero unresolved
+links. Closes SP-ROUTE-1 carry-forwards **1** and **3**, plus the unnumbered
+persisted-duration mismatch. **5** (consensus legs) and **2** (`ExecutionTrace`
+forward provision) remain open by design — see the ledger in the SP-ROUTE-1 plan.
+
+### The two things this slice proves that a green suite does not
+
+**AC1 is the one that must not be waved through.** It is the only test here that
+`collect_stream` cannot substitute for: written against `collect_stream` it passes
+whether the write is above or below the `yield`, which is not a hypothetical — it is
+how this exact defect survived the SP-ROUTE-1 Task 5 review that caught the sibling
+dispatch defect fifteen lines away.
+
+Re-measured in Task 4 against the finished slice, not carried over from Task 1's
+smaller suite. Moving the write back below the `yield` and running
+`cargo test -p sensei-gateway --lib`:
+
+```text
+test result: FAILED. 441 passed; 1 failed; 0 ignored
+    engine::tests::a_consumer_that_stops_at_done_is_still_metered
+assertion `left == right` failed: the metering row must exist once Done is observed…
+  left: 0
+ right: 1
+```
+
+**Exactly 1 of 442 fails, and it is this one** (Task 1 measured 1 of 439; the suite
+has since gained the three tests Tasks 2–3 added). That is AC2. **AC6 is the same run
+read the other way:** every `collect_stream`-based streaming test stays green under
+that mutation — `execute_stream_yields_chunks_then_done_with_cost`,
+`a_consumer_that_stops_at_done_still_sees_its_verdict_recorded`, and most pointedly
+`a_streamed_calls_persisted_duration_includes_acquisition`, which *asserts a metering
+row exists* and still finds one, because draining to `None` over-polls the generator
+and runs the write anyway. A `collect_stream` fixture cannot see this defect. The
+source file was restored byte-identical afterwards (`git diff crates/` empty).
+
+**AC5 is second.** SP-ROUTE-1 Task 11 shipped a re-derivation at an attachment site
+that survived its whole suite until a reviewer mutated it. The same shape was
+available here, so `the_streamed_decision_matches_what_execute_reports` asserts the
+decision on `Done` is the one the *selection* produced — same strategy, same candidate
+order as `execute` reports for the same request and chain — rather than merely
+non-`None`.
+
+### One process gap, named rather than left implicit
+
+This plan has **no whole-slice review step**. SP-ROUTE-1's Task 12 ended with one
+(`Step 7: Whole-slice review`, run before the develop→main PR); SP-ROUTE-1.2's Task 4
+ends at the commit. The slice is small and every task carried its own mutation check,
+but per the SP-6 lesson — *review must not be a workflow's last phase* — a whole-slice
+pass over the three-commit diff is still owed before this batches into the
+develop→main PR. Recorded here so it is a decision rather than an omission.
+
+---
+
 ## Orientation — read before Task 1
 
 **Baseline: 1918 passed, 0 failed, 60 ignored, real exit 0.** Repo root `/Users/Jerry/Developer/gateway`.
@@ -63,7 +128,7 @@ No new files, no new dependencies.
 
 **Files:** Modify `crates/gateway/src/engine/stream.rs`; test in `crates/gateway/src/engine/tests.rs`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Model it on `a_consumer_that_stops_at_done_still_sees_its_verdict_recorded`, but assert the **store** rather than the perf stats. You need a `Gateway` with an `InMemoryStore` wired — find how via `rg -n 'with_store|InMemoryStore' crates/gateway/src`.
 
@@ -97,11 +162,11 @@ async fn a_consumer_that_stops_at_done_is_still_metered() {
 
 If `get_inference_calls_by_session` needs a session id the request does not carry, use whichever `GatewayStore` read the in-memory impl exposes — check `crates/gateway/src/store.rs`. **Report which you used and why.**
 
-- [ ] **Step 2: Run it, confirm it fails, read the actual failure**
+- [x] **Step 2: Run it, confirm it fails, read the actual failure**
 
 Expect `calls.len() == 0`. Quote it.
 
-- [ ] **Step 3: Move the write above the yield**
+- [x] **Step 3: Move the write above the yield**
 
 In `stream.rs`, relocate the `if let Some(store) = &store && let Some(call) = call && let Err(e) = store.insert_inference_call(&call).await { … }` block to **before** `yield StreamEvent::Done { … }`.
 
@@ -118,11 +183,11 @@ Add a comment pointing at the existing one rather than restating it:
 
 **Watch the borrow:** `tokens` is moved into the yielded `Done`. The `InferenceCall` is already built before the yield (into `call`), so this should be a clean move — but if the borrow checker objects, hoist what you need rather than cloning blindly, and say what you did.
 
-- [ ] **Step 4: Confirm green, then mutation-check**
+- [x] **Step 4: Confirm green, then mutation-check**
 
 Move the write back below the yield. `a_consumer_that_stops_at_done_is_still_metered` **must** fail. Quote the panic. Also confirm an existing `collect_stream`-based metering test still passes under that mutation — that contrast is the point of AC2.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A
@@ -135,7 +200,7 @@ git commit -m "fix(gateway): meter a streamed call before yielding Done (SP-ROUT
 
 **Files:** Modify `crates/gateway/src/engine/stream.rs`; test in `crates/gateway/src/engine/tests.rs`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `InferenceCall.duration_ms` uses `stream_start.elapsed()` — generation time only. `execute` writes the same column with the whole call's wall time, so `inference_calls` mixes two quantities under one name.
 
@@ -158,13 +223,13 @@ async fn a_streamed_calls_persisted_duration_includes_acquisition() { /* … */ 
 
 Make the assertion **relational**, not an absolute bound — a loaded CI runner must not flake it. Compare against the known pre-first-byte delay rather than a fixed millisecond ceiling.
 
-- [ ] **Step 2: Run it, confirm it fails**
+- [x] **Step 2: Run it, confirm it fails**
 
-- [ ] **Step 3: Change `stream_start.elapsed()` to `attempt_start.elapsed()`** on the `InferenceCall`, with a comment naming the parity it restores.
+- [x] **Step 3: Change `stream_start.elapsed()` to `attempt_start.elapsed()`** on the `InferenceCall`, with a comment naming the parity it restores.
 
-- [ ] **Step 4: Confirm green, mutation-check (revert to `stream_start`), quote the panic**
+- [x] **Step 4: Confirm green, mutation-check (revert to `stream_start`), quote the panic**
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A
@@ -182,7 +247,7 @@ git commit -m "fix(gateway): persist the total attempt span for streamed calls (
 - `crates/kernel/src/types/request.rs:1760` — a `Done` literal; add the field
 - `crates/gateway/src/engine/stream.rs:408` — the production site, which is the change itself
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 /// AC4 — a streaming caller can ask why its provider was chosen. Preferences
@@ -199,9 +264,9 @@ async fn the_streamed_decision_matches_what_execute_reports() { /* … */ }
 
 AC5 is the one that matters: SP-ROUTE-1 Task 11 shipped a re-derivation at the attachment site that survived its whole suite, so "it is the one selection produced" needs asserting, not assuming.
 
-- [ ] **Step 2: Run them, confirm they fail**
+- [x] **Step 2: Run them, confirm they fail**
 
-- [ ] **Step 3: Add the field and thread it**
+- [x] **Step 3: Add the field and thread it**
 
 In `crates/kernel/src/types/request.rs`, add to `StreamEvent::Done`:
 
@@ -220,16 +285,16 @@ In `stream.rs`, pull the decision out beside the other owned pieces **before** t
 
 then move it into the generator and attach it on the `Done` yield. **Do not re-derive it** — that is the Task 11 defect.
 
-- [ ] **Step 4: Fix the two break sites**, then confirm green
+- [x] **Step 4: Fix the two break sites**, then confirm green
 
-- [ ] **Step 5: Mutation-check**
+- [x] **Step 5: Mutation-check**
 
 - Attach a freshly-built `RoutingDecision` instead of `decision` — AC5 must fail.
 - Attach `None` — AC4 must fail.
 
 Quote both panics.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add -A
@@ -242,7 +307,7 @@ git commit -m "feat(gateway): carry the routing decision on StreamEvent::Done (S
 
 **Files:** `docs/llms/upgrading.md`, `docs/features/observability/tracing-and-attempts.md`, `docs/features/routing/provider-preferences.md`, the SP-ROUTE-1 plan's carry-forwards, `docs/CHECKPOINT.md`
 
-- [ ] **Step 1: Find every surface**
+- [x] **Step 1: Find every surface**
 
 ```
 rg --no-ignore -g '!target' -g '!site/node_modules' -l 'StreamEvent|execute_stream|streaming' docs/ README.md
@@ -250,14 +315,63 @@ rg --no-ignore -g '!target' -g '!site/node_modules' -l 'StreamEvent|execute_stre
 
 Report the full list and which you changed.
 
-- [ ] **Step 2: Document**
+**Done.** The sweep (widened with `|duration_ms`) returned **58 files of the 180 markdown
+files under `docs/`**. Most match on an unrelated "streaming" in another slice's plan or
+spec, or on an `AttemptOutcome::duration_ms` that this slice does not touch. **Seven
+user-facing surfaces carried a claim this slice falsifies, and all seven changed:**
+
+| Surface | Change |
+|---|---|
+| `docs/llms/upgrading.md` | three new table rows + three new subsections: the `Done` migration (E0027/E0063), the always-metered billing fix, the `duration_ms` discontinuity |
+| `docs/llms/recipes.md` | the "no routing explanation when streaming" note **inverted**; the `match` sample destructured `Done { model, tokens, cost }` **exhaustively** and no longer compiled — now reads `routing` |
+| `docs/features/observability/tracing-and-attempts.md` | gap bullet → "the streaming path reports it too"; the `StreamEvent` enum block, variant table, and lead-in sentence refreshed |
+| `docs/features/observability/persistence-store.md` | `duration_ms` row now states the span it measures; a new subsection on always-metered + the discontinuity + best-effort |
+| `docs/features/routing/provider-preferences.md` | "Two known gaps" → "One known gap", with the streaming decision documented as delivered |
+| `docs/skills/using-gateway/SKILL.md` | §8's "`execute_stream` applies preferences but returns no explanation" corrected |
+| `docs/CHECKPOINT.md` | rewritten for this slice |
+
+Plus four slice-record surfaces: the SP-ROUTE-1 plan (carry-forward ledger), this plan,
+and the SP-ROUTE-1.1 / SP-ROUTE-1.2 spec frontmatter (mis-numbered `closes:` lines).
+
+**Two surfaces checked and deliberately left alone.** `site/src/lib/content/docs/` is
+generated **and gitignored** (`site/.gitignore:5` — `/src/lib/content`), so `docs/llms/`
+is the source of truth. `site/src/lib/data.ts` **is** committed and published, and was
+read: its streaming copy is "Stream tokens as they arrive, read an attempt-by-attempt
+trace, and plug in your own GatewayStore" — marketing prose carrying no field list and no
+claim about a routing explanation, so nothing in it is falsified. `README.md` matched
+none of the four terms at all.
+
+**Three surfaces state the old behaviour and were kept as written**, because they are
+historical records of what a past slice knew:
+`docs/reviews/2026-07-17-production-readiness-review.md`,
+`docs/superpowers/plans/2026-08-07-sp0-e-resume-after-allgated.md`, and SP-ROUTE-1's own
+Task 12 doc-surface table (which says it documented "BOTH gaps"). Rewriting those would
+falsify the record rather than correct it.
+
+- [x] **Step 2: Document**
 
 - **`StreamEvent::Done` gained a field** — a public enum change; exhaustive matches break. `upgrading.md`.
 - **The `duration_ms` discontinuity** — pre-slice streamed rows carry generation-only durations, post-slice rows carry total. Analytics spanning the boundary sees a step change. This is deliberate: it ends an ongoing wrongness at the cost of a one-time one. `upgrading.md`.
 - **Streaming now carries a `RoutingDecision`** — update the observability doc, which currently states the absence as a known gap.
 - Close SP-ROUTE-1 carry-forwards **3, 4 and 5** in `docs/superpowers/plans/2026-09-17-sp-route-1-provider-routing-preferences.md`, naming this slice. One remains: consensus legs.
 
-- [ ] **Step 3: Verify**
+> **The numbers in that last bullet are wrong, and finding out why was part of Task 4.**
+> There is no list on which "3, 4, 5" are this slice's three items. The only enumerated
+> list SP-ROUTE-1 ever produced is the one in `76a3e2a`'s `docs/CHECKPOINT.md`, and on it
+> this slice closes **1** (streaming carries no `RoutingDecision`) and **3** (the metering
+> row after `yield Done`). **4** was already closed by SP-ROUTE-1.1. **5** *is* the
+> consensus item the same bullet says must stay open — so taken literally the instruction
+> contradicts itself. The third thing this slice fixes, the persisted `duration_ms` span,
+> was never numbered at all.
+>
+> Resolved by intent, not by invention: the three streaming defects named in spec §2 are
+> unambiguous, and consensus legs stay open. The fix is upstream of the numbering — the
+> SP-ROUTE-1 plan now carries a **canonical carry-forward ledger** with all five items and
+> their states, and both mis-numbered `closes:` frontmatter lines (SP-ROUTE-1.1's "2",
+> SP-ROUTE-1.2's "3, 4, 5") now cite by name. **A cross-slice reference by bare ordinal
+> needs one canonical list, or it quietly means something different in every file.**
+
+- [x] **Step 3: Verify**
 
 Each with its REAL unpiped exit code:
 
@@ -271,11 +385,45 @@ cargo doc --workspace --no-deps
 
 Grep the test log for `panicked at`; report the count and `cargo doc`'s unresolved-link count.
 
-- [ ] **Step 4: Confirm each AC has a named passing test**
+- [x] **Step 4: Confirm each AC has a named passing test**
 
 AC1–AC7 from the spec. Name the test for each, run it individually, confirm it passes. Any AC without a green named test is unfinished — report it.
 
-- [ ] **Step 5: Commit**
+**Done.** Every named test was run **individually** (`--exact`) and passed 1/0, real
+exit 0. All live in `crates/gateway/src/engine/tests.rs`.
+
+| AC | Test (module path) | Individually |
+|---|---|---|
+| AC1 | `engine::tests::a_consumer_that_stops_at_done_is_still_metered` | ✅ 1/0 |
+| AC2 | *(mutation, not a test — see below)* | ✅ 1 of 442 red |
+| AC3 | `engine::tests::a_streamed_calls_persisted_duration_includes_acquisition` | ✅ 1/0 |
+| AC4 | `engine::tests::a_streamed_request_carries_its_routing_decision` | ✅ 1/0 |
+| AC5 | `engine::tests::the_streamed_decision_matches_what_execute_reports` | ✅ 1/0 |
+| AC6 | `engine::tests::execute_stream_yields_chunks_then_done_with_cost` *(and the whole `collect_stream` cohort — see below)* | ✅ 1/0 |
+| AC7 | Step 3 | ✅ |
+
+**AC2 and AC6 are contrast claims, not standalone tests**, so both were *established*
+rather than asserted — and re-established in Task 4 against the finished slice rather
+than inherited from Task 1's smaller suite. One mutation run proves both: move the
+`insert_inference_call` block back below `yield StreamEvent::Done` and run
+`cargo test -p sensei-gateway --lib`.
+
+- **AC2** — exactly one test goes red, and it is AC1's: `441 passed; 1 failed`, panicking
+  at `tests.rs:6573` with `left: 0, right: 1` on `UsageTotals { requests: 0, … }`. The
+  fixture has teeth.
+- **AC6** — the other 441 stay green, including every `collect_stream`-based streaming
+  test. The sharpest of them is `a_streamed_calls_persisted_duration_includes_acquisition`:
+  it *asserts a metering row exists* (`streamed.len() == 1`) and still finds one under the
+  mutation, because draining to `None` over-polls the generator and runs the write anyway.
+  That is the whole reason AC1 could not be written against `collect_stream`, demonstrated
+  rather than argued. `execute_stream_yields_chunks_then_done_with_cost` is named in the
+  table as the AC6 representative — it is the one existing streaming test Task 3 had to
+  touch at all, and only to add `..` to a pattern; its assertions are unchanged.
+
+The source file was restored byte-identical after the mutation (`git diff crates/` empty,
+verified before committing).
+
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A

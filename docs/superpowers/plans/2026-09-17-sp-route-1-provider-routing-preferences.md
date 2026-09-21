@@ -28,7 +28,39 @@
 | 10 | `d6576b8` · `57b41c7` | ✅ done — **the feature is live**; both planted tripwires confirmed red-before / green-after |
 | 11 | `a9c8652` · `b7ff616` | ✅ done; found that **AC10 named a destination nothing fills** |
 | 12 | `172b77f` | ✅ done — docs + final verification |
-| **Whole-slice review** | `0c26c8c` (behaviour) · *(this commit)* (docs) | ✅ **COMPLETE** — see below |
+| **Whole-slice review** | `0c26c8c` (behaviour) · `76a3e2a` (docs) | ✅ **COMPLETE** — see below |
+
+### Carry-forward ledger — the canonical numbering
+
+The numbered list SP-ROUTE-1 ended with (`76a3e2a`'s `docs/CHECKPOINT.md`), with
+what has since closed it. **Use these numbers**; two later surfaces invented their own
+(see the note below), and this table is the one to trust.
+
+| # | Carry-forward | State |
+|---|---|---|
+| 1 | **Streaming carries no `RoutingDecision`** — `execute_stream` applies every preference but returns `StreamEvent`s, so there was nowhere to put it | ✅ **CLOSED by SP-ROUTE-1.2** (AC4–AC5) — `StreamEvent::Done.routing`, carrying the decision the selection produced, not a re-derivation |
+| 2 | **`ExecutionTrace::routing` is forward provision** — nothing builds an `ExecutionTrace` in production; the response is the delivered surface | ⬜ **OPEN.** Untouched by 1.1 and 1.2. Closing it means finding a production writer for `ExecutionTrace`, which is a different question from routing |
+| 3 | **`InferenceCall` store write sits after `yield Done`** — an SSE consumer that breaks on the terminal event is never metered | ✅ **CLOSED by SP-ROUTE-1.2** (AC1–AC2) — the write moved above the `yield`; a streamed request is now always billed |
+| 4 | **Nothing validates `ModelPricing`** for finiteness or sign — contained at the routing layer, but a negative price sorted first under `sort: price` | ✅ **CLOSED by SP-ROUTE-1.1** — `ModelPricing::validate()` at the deserialization boundary |
+| 5 | **Consensus legs drop the caller's `routing`** (`routing: None` hardcoded) while a panel inherits it | ⬜ **OPEN, and deliberately so.** Consistent with `budget`/`auth`, which consensus legs already drop; §11 of `provider-preferences.md` documents the asymmetry. SP-ROUTE-1.2 §3 excluded it on purpose: different file, different question (propagation through request-building), and arguably not a defect |
+
+Two items outside the numbering, recorded so they are not mistaken for gaps:
+
+- The **persisted `InferenceCall::duration_ms`** span mismatch (streamed rows measured
+  generation only) was never numbered — it was found by SP-ROUTE-1.2 while fixing #3, in
+  the same forty lines. ✅ Closed by SP-ROUTE-1.2 (AC3). See the Task 5 note below.
+- **No magnitude cap on pricing** (`1e300` can still overflow inside `estimate_cost`, and
+  the non-finite *result* stays fenced by the strategies) is a **design decision** from
+  SP-ROUTE-1.1 §2/§6, not an open item. Any cap would be an invented threshold.
+
+> **The numbering drifted, and this is the correction.** `2026-09-18-…-pricing-validation-design.md`
+> says `closes: SP-ROUTE-1 carry-forward 2` and `2026-09-19-…-streaming-parity-design.md` says
+> `closes: SP-ROUTE-1 carry-forwards 3, 4, 5` — neither matches the list above, and the second
+> would read as closing the consensus item, which is explicitly still open. Both frontmatter lines
+> were written against an ad-hoc count of "the things this slice touches" rather than against the
+> ledger. The lesson generalises: **a cross-slice reference by bare ordinal needs one canonical
+> list, or it silently means something different in every file that cites it.** Cite by name here,
+> not by number alone.
 
 ### Whole-slice adversarial review — complete
 
@@ -206,10 +238,32 @@ Fix: `AttemptPhase::is_verdict()` — false only for `StreamAcquired` — is now
 `HealthRecorder`, not just `PerformanceRecorder`. Task 4 applied "one attempt, one verdict" too
 narrowly.
 
-**Carry-forward, deliberately NOT fixed here:** the pre-existing `InferenceCall` store write in
-`stream.rs` sits *after* `yield StreamEvent::Done`, so a real SSE consumer that breaks on `Done`
-never polls again and the metering row is never written. Same exposure the completion dispatch
-avoids by sitting before the yield. That is metering, not routing, and belongs to its own slice.
+**Carry-forward from Task 5, NOT fixed here — ✅ CLOSED by SP-ROUTE-1.2 (2026-09-21):** the
+pre-existing `InferenceCall` store write in `stream.rs` sits *after* `yield StreamEvent::Done`, so
+a real SSE consumer that breaks on `Done` never polls again and the metering row is never written.
+Same exposure the completion dispatch avoids by sitting before the yield. That is metering, not
+routing, and belongs to its own slice.
+
+**✅ Now CLOSED — by `docs/superpowers/plans/2026-09-21-sp-route-1-2-streaming-parity.md`
+(carry-forward 3, AC1–AC2).** The write moved above the `yield`, so a streamed request is billed
+on the same terms a non-streaming one always was. Pinned by
+`engine::tests::a_consumer_that_stops_at_done_is_still_metered`, which stops polling at `Done` and
+drops the stream — deliberately **not** written against `collect_stream`, because draining to
+`None` passes whether the write is above or below the yield. That is exactly how this survived
+Task 5's review while the sibling dispatch defect beside it was caught. Moving the write back
+below the `yield` turns that test red with `requests == 0`; every `collect_stream`-based streaming
+test stays green under the same mutation, which is the contrast the fixture exists to provide.
+
+**A fourth streaming defect the review did not enumerate, also closed by SP-ROUTE-1.2:** the
+Task 4 / whole-slice work moved `AttemptOutcome::duration_ms` for `StreamCompleted` to
+`attempt_start`, but the **persisted** `InferenceCall::duration_ms` fifteen lines below it kept
+using `stream_start`. So the dispatch and the store row disagreed, and `inference_calls` mixed
+generation-only (streamed) with whole-call (unary) durations under one column name. Now
+`attempt_start` on both. Pinned by
+`engine::tests::a_streamed_calls_persisted_duration_includes_acquisition`. This one was never on
+the numbered carry-forward list — worth noting, because the list was assembled from the review's
+findings rather than from a sweep of the file, and the defect sat in the same forty lines as two
+that were.
 
 **Task 4 changed the design, and Tasks 5 / 7 / 9 inherit it.** The review found that
 `mean_latency_ms` pooled two unrelated time spans (full request wall time from `execute`, stream
