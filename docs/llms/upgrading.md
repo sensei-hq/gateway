@@ -6,7 +6,7 @@ routing call path (build a request, `gateway.execute(&req).await`, read
 `InferenceResponse`) stays source-compatible across every step below; each section
 lists only what you must touch.
 
-## 0.5.1 → next (unreleased — SP-ROUTE-1 / SP-ROUTE-1.1)
+## 0.5.1 → next (unreleased — SP-ROUTE-1 / SP-ROUTE-1.1 / SP-ROUTE-1.2)
 
 Per-request **provider routing preferences** land (`sort` / `only` / `ignore` /
 `order`, plus a price-weighted default within equal-priority groups). The call
@@ -28,6 +28,9 @@ absent field routes and serializes exactly as before.
 | A **failed** attempt | no longer contributes a latency observation (it still casts its verdict) | none — `sort: latency` stops preferring the endpoint that fails fastest |
 | Throughput | now output tokens ÷ **total attempt wall time** on both paths | none, unless you read `AttemptOutcome::duration_ms` for `StreamCompleted` — it now means the whole attempt span, not generation time |
 | `ModelPricing` (SP-ROUTE-1.1) | a non-finite or **negative** value no longer deserializes — a config **file** carrying one now fails to load | audit your config for negative prices; there is no opt-out (below) |
+| `StreamEvent::Done` (SP-ROUTE-1.2) | new field `routing: Option<RoutingDecision>` | add `..` to an exhaustive destructuring, `routing: None` to a literal (below) |
+| A **streamed** request (SP-ROUTE-1.2) | is now always metered — the `InferenceCall` write moved above `yield Done` | none in your code; expect **more** `inference_calls` rows than before (below) |
+| `InferenceCall::duration_ms` for a **streamed** call (SP-ROUTE-1.2) | now the **total attempt span**, not generation time alone | none to compile; analytics spanning the upgrade sees a one-time step change (below) |
 
 ### A config file with a bad price now fails to load — the one breaking change
 
@@ -142,12 +145,131 @@ drifts — and a default would reintroduce the same failure one step along, with
 new strategy silently tracing as whatever the default said. All of these breaks
 are right for a pre-1.0 crate.
 
-The last row is the one to read twice. A single mid-stream 429 now locks the
-endpoint for the rate-limit base duration, so on a single-candidate chain the
-*next* request returns `AllGated { resume_after: Some(t) }` rather than a
-stream — previously it retried immediately. This was a correctness fix: the
-streaming path reported a stream that died halfway as a **success** to every
-health recorder.
+The **"Mid-stream failures"** row is the one to read twice. A single mid-stream
+429 now locks the endpoint for the rate-limit base duration, so on a
+single-candidate chain the *next* request returns
+`AllGated { resume_after: Some(t) }` rather than a stream — previously it
+retried immediately. This was a correctness fix: the streaming path reported a
+stream that died halfway as a **success** to every health recorder.
+
+### `StreamEvent::Done` gained a field (SP-ROUTE-1.2)
+
+`Done` now carries the routing explanation, so a streaming caller can ask the
+same question a non-streaming one already could:
+
+```rust
+// before
+Done { model: String, tokens: TokenUsage, cost: f64 }
+
+// after
+Done { model: String, tokens: TokenUsage, cost: f64,
+       routing: Option<RoutingDecision> }
+```
+
+This is a public enum change, so it breaks two shapes and only two:
+
+- **An exhaustive destructuring** — `StreamEvent::Done { model, tokens, cost }`
+  is now `E0027` (pattern does not mention field `routing`). Add `..`:
+
+  ```rust
+  StreamEvent::Done { model, tokens, cost, .. } => …
+  ```
+
+  A pattern that already ends in `..` — `Done { .. }`, `Done { model, .. }` —
+  needs nothing.
+- **A `Done` literal** you construct yourself (a test double, a re-emitting
+  proxy) is now `E0063`. Add `routing: None`, which is what the variant means
+  when no strategy ordered anything.
+
+Both were measured across this workspace rather than estimated: of every
+`StreamEvent::Done` site, exactly one destructuring and one literal needed an
+edit. Expect the same ratio in yours — most matches already end in `..`.
+
+`routing` is the decision the selection **actually produced**, moved onto the
+event, not re-derived at the yield site. It is `None` under exactly the same
+condition as `InferenceResponse::routing`: a direct router+model request names
+its one candidate and orders nothing. See
+`docs/features/routing/provider-preferences.md` for how to read a
+`RoutingDecision` — in particular that a `null` `reliability` means "unmeasured
+*or* not consulted by this strategy", never `0.0`.
+
+### A streamed request is now always metered (SP-ROUTE-1.2)
+
+This is a **billing-correctness fix**, not a code move. The `InferenceCall`
+write in the streaming path sat *after* `yield StreamEvent::Done`, and in an
+`async_stream` generator, code after a `yield` runs only on the **next poll**.
+A consumer that stops polling when it sees the terminal event — which is the
+normal shape for an SSE handler — never resumed the generator, so **no metering
+row was ever written**. A streamed request was billed only if its caller
+happened to over-poll; a non-streaming request always was.
+
+The write now precedes the `yield`, exactly as the health-verdict dispatch
+beside it already did.
+
+**Streamed failures are now metered too**, which was a second and separate gap:
+neither streaming failure path wrote a row at all — not for any consumer,
+however thoroughly it polled — while `execute` wrote a `CallStatus::Failed` row
+for the analogous exhaustion. A stream that died mid-generation after the
+provider had generated real tokens, and a stream whose every candidate failed at
+setup, both recorded nothing. Both now write one `Failed` row ahead of their
+terminal `StreamEvent::Error`, mirroring `execute`. The mid-generation row
+carries the usage the provider reported before dying, because those tokens are
+billed; the setup-exhaustion row carries `output_tokens: None`, exactly as
+`execute` does.
+
+**What to expect after upgrading:** more rows in `inference_calls` — across
+successes *and* failures — and a spend/usage total for streamed traffic higher
+than the pre-upgrade figure, because the pre-upgrade figure was missing calls
+that really happened. Anything that counts requests by counting rows will step
+up. Nothing is back-filled: rows that were never written cannot be recovered.
+
+If you reconcile gateway metering against a provider invoice, the post-upgrade
+numbers are the ones that can agree — with one caveat you should read before
+trusting a reconciliation, below.
+
+**Metering is best-effort in latency as well as in success, and the streaming
+write is now time-bounded.** A store error is logged at `warn` and never
+surfaces to the caller. Because the write sits *ahead* of the terminal event, it
+also runs under a **2-second ceiling**: without one, a saturated pool or an
+unreachable database would hold the terminal event open indefinitely, and a
+consumer with an ordinary per-event timeout would get the full content and then
+**no terminal event** — losing the tokens, the cost and the new routing
+decision, and cancelling the in-flight write so no row landed either. That would
+turn "delivered but unbilled" into "not delivered and unbilled". Exceeding the
+ceiling drops the row and logs loudly; there is no knob to raise it, because it
+is a liveness guarantee rather than a tuning parameter.
+
+**So an absent row is not proof a call did not happen.** A persistent shortfall
+on streamed traffic means your store is too slow to meet the ceiling — grep your
+logs for the budget warning before concluding the calls were not made.
+
+### The `duration_ms` discontinuity, accepted deliberately (SP-ROUTE-1.2)
+
+`InferenceCall::duration_ms` for a **streamed** call was measured from the
+moment the stream was obtained — generation time only, excluding acquisition —
+while `execute` wrote the same column with the whole attempt's wall time. The
+`inference_calls` table therefore mixed two different quantities under one name,
+with nothing in a row to say which one it carried. Both paths now record the
+**total attempt span**.
+
+**The cost of the fix, stated plainly:** streamed rows written *before* this
+change carry generation-only durations; streamed rows written *after* carry the
+total. Any analytics that spans the upgrade — a p95 latency chart, a
+duration-weighted cost model, an SLO computed over `inference_calls` — will see
+a **step change** at the boundary, upward, by roughly the acquisition time of
+your providers.
+
+**This is deliberate.** It ends an ongoing wrongness at the cost of a one-time
+one. Leaving it means every future row stays incomparable with every `execute`
+row beside it, forever; taking it means one discontinuity at a known date. The
+column is analytics data, not a fence or an idempotency key, so a step change
+degrades a chart rather than breaking a mechanism.
+
+**It is not back-filled, and cannot be.** The acquisition span of a call that
+already happened was never recorded anywhere, so there is no value to migrate
+from — a backfill could only invent one. If you chart this column, annotate your
+upgrade date and compare like with like on either side of it. Non-streamed rows
+are unaffected: `execute` already recorded the total span and still does.
 
 See `docs/features/routing/provider-preferences.md` for the full surface.
 

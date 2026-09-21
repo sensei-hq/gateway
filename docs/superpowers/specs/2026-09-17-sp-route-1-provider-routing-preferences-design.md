@@ -552,6 +552,14 @@ delivery.
 rather than a response, so it has nowhere to put a decision. A streaming caller cannot currently
 see why its provider was chosen. Recorded as a gap rather than papered over.
 
+> **⚠️ SUPERSEDED — stale present tense.** The paragraph above describes SP-ROUTE-1 as
+> shipped and is kept as the record of what this slice decided. It is **no longer true**:
+> **SP-ROUTE-1.2** (2026-09-21) put the decision on the terminal event,
+> `StreamEvent::Done { .., routing: Option<RoutingDecision> }` — the decision the selection
+> produced, not a re-derivation. The "nowhere to put it" premise was the gap; the terminal
+> event was the place. This closed carry-forward **1**; see the ledger in
+> `docs/superpowers/plans/2026-09-17-sp-route-1-provider-routing-preferences.md`.
+
 Without this, "why did it pick the expensive one" has no answer.
 
 ## 10. Acceptance criteria

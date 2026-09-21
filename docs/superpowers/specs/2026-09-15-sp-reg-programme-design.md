@@ -26,7 +26,7 @@ is recorded so it can be re-opened deliberately rather than by accident.
 | slice | what | blocked on |
 |---|---|---|
 | **SP-REG-2** | Discovery tools, composed per-run from the pinned registry | code: nothing. **Done gate: the tool SPECS** — see §3 |
-| **SP-REG-3** | Designating which planner wins | nothing |
+| **SP-REG-3** | Designating which planner wins | ✅ **SHIPPED** — PR #66 (`e6658d6`, 2026-09-16) |
 | **SP-REG-4** | `config init` + embedded defaults + the shipped content | **TWO: the content list, AND the un-designed `dispatch()` restructure (§6)** |
 | **SP-REG-5** | Cross-check agent chain ids against the gateway config at push | ✅ **SHIPPED** — PR #65 (`15688a5`) |
 
@@ -160,7 +160,43 @@ deliberate trade, and the doc comment must say so.
 3. `agent_input_hash` is byte-identical for a run whose agent declares none of them.
 4. An agent that does NOT declare a discovery tool still cannot call it (s1 gate unchanged).
 
-## 4. SP-REG-3 — designating the planner
+## 4. SP-REG-3 — designating the planner ✅ SHIPPED (PR #66)
+
+> **⚠️ This section is written in the present tense about a world that no longer exists.**
+> SP-REG-3 shipped on 2026-09-16 (`e86ced1`, merged `e6658d6`). This document was edited *after*
+> that merge — `570dc7b`, the commit that corrected "42 of 58" to "34" — and left every design
+> paragraph below describing the pre-implementation baseline. On 2026-09-19 that cost a slice
+> start: the table above still said "blocked on: nothing", and the work was recommended and
+> scoped before a claims check caught it.
+>
+> **What is now FALSE about HEAD** (all were true at `15688a5`, the baseline):
+> - *"the winner is `candidates.first()` over a name sort"* — `planner_candidates`
+>   (`executor/mod.rs:1442`) now sorts on the composite key
+>   `(!x.default_planner, x.name)`. The alphabetical accident was removed by this slice.
+> - *"nothing can supply it"* — still true of `RulePlannerSelector.default`, but irrelevant:
+>   **the shipped design designates by ORDERING, not via that field**, which remains dead in
+>   production (`boot.rs:477` passes `None`).
+> - *"34 literals"* — the current figure is **35**, and the number that actually predicts the
+>   churn is the exemption rule the replacement text dropped: of 56 `AgentDefinition` literal
+>   sites, **21 use a `..rest` pattern** and take a new field for free. The passage also names
+>   two regex false-positive classes; there are **three** (`impl AgentDefinition {` at
+>   `registry.rs:1010`).
+>
+> **Two rules the done gate below never covered, both shipped and tested:**
+> 1. `default_planner: true` on an agent whose `area != "planning"` is a loud `RegistryLoad`
+>    (`registry.rs:518`), because `planner_candidates` filters on area *before* reading the
+>    marker — so an out-of-area marker would designate nothing, silently.
+> 2. `#[serde(default)]` on the field (`registry.rs:75`) is **load-bearing, not cosmetic**.
+>    `PostgresConfigSource::read_all` collects into `Result<_, _>`, so a single pre-SP-REG-3
+>    `config_agents` row lacking the key would fail the whole `RegistryConfig` and brick torii
+>    boot plus every scheduler wake. Pinned by
+>    `a_pre_sp_reg_3_agent_row_without_default_planner_still_deserializes`.
+>
+> **One imprecision:** the at-most-one-marked guard is in `Registry::validate`
+> (`registry.rs:675`), not `from_config` — `from_config` calls it. That matters because
+> `Registry::default().with_agent(…)` bypasses `from_config` entirely and *can* hold two marked
+> agents; the `name` tie-break in the sort key is what keeps that case deterministic rather than
+> `HashMap`-ordered. Do not remove it.
 
 With two `area: planning` agents the winner is `candidates.first()` over a name sort — alphabetical
 accident. `RulePlannerSelector` already has the mechanism (`default: Option<AgentRef>`, preferred
