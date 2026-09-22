@@ -150,7 +150,15 @@ bump: ## Bump version, commit, tag, push (v=patch|minor|major|<version>)
 	@# The SvelteKit site (site/package.json) tracks the same version. Anchored to
 	@# the indented top-level "version" key so nested dep versions are untouched.
 	@sed -i '' -E "s/^([[:space:]]*\"version\"): \"[^\"]*\"/\1: \"$(_v)\"/" site/package.json
-	@git add crates/*/Cargo.toml site/package.json
+	@# Cargo.lock records every WORKSPACE MEMBER's version, so the sed above makes
+	@# it stale. CI builds with `--locked`, which refuses to update it — v0.6.0
+	@# shipped a tag whose lockfile said 0.5.1 while every manifest said 0.6.0, and
+	@# both required checks failed in under 70s. Refresh it here rather than relying
+	@# on the pre-commit hook's clippy run, which touches it only as a side effect
+	@# and does so AFTER `git add`, leaving the change unstaged.
+	@cargo metadata --format-version 1 --offline >/dev/null 2>&1 \
+	  || cargo metadata --format-version 1 >/dev/null
+	@git add crates/*/Cargo.toml site/package.json Cargo.lock
 	@git commit -m "chore: bump to v$(_v)"
 	@git tag -a "v$(_v)" -m "gateway v$(_v)"
 	@git push origin HEAD
