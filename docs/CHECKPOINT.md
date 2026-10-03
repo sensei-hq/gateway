@@ -21,8 +21,7 @@ protected). develop head: `ce10413`.
 
 ## Next
 
-1. `gh pr checks 228 -R sensei-hq/sensei` — sensei CI was pending at hand-off.
-2. Human review/merge of gateway #74 and sensei #228.
+1. Human review/merge of gateway #74 (18/18 green) and sensei #228 (9/9 green).
 
 ## Open questions
 
