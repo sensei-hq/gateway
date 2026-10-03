@@ -3,7 +3,7 @@
 //! (`decode_step` / `stream_tokens`). Split out of `super` for readability;
 //! shares the adapter's private `Inner` state.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use kernel::types::error::GatewayError;
 use kernel::types::request::StreamChunk;
@@ -123,18 +123,12 @@ fn decode_step(
     let token = state.sampler.sample(state.ctx, state.batch.n_tokens() - 1);
     state.sampler.accept(token);
 
-    if model.is_eog_token(token) {
+    let vocab = model.vocab();
+    if vocab.is_eog(token) {
         return Ok(StreamStep::EndOfGeneration);
     }
 
-    let bytes = model
-        .token_to_piece_bytes(token, 32, false, None)
-        .map_err(|e| {
-            emit_err(
-                tx,
-                stream_error(adapter_id, format!("token_to_piece_bytes: {e}")),
-            )
-        })?;
+    let bytes = vocab.token_to_piece(token, false, None);
     state.buf.extend_from_slice(&bytes);
 
     // Ship the longest newly-valid UTF-8 prefix beyond `emitted`.
