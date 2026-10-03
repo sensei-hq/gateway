@@ -33,6 +33,11 @@ use gateway::resilience::ResilienceConfig;
 use gateway::adapters::{
     anthropic::AnthropicAdapter, bedrock::BedrockAdapter, openai::OpenAIAdapter,
 };
+// SP-DEC-1: the System One adapter + Ollama's probe vocabulary, reachable by a
+// consumer that depends only on `sensei-gateway`.
+#[cfg(feature = "cloud")]
+#[allow(unused_imports)]
+use gateway::adapters::systemone::{DecisionModelStatus, SystemOneAdapter};
 
 // Model-registry vocabulary via the facade (no direct `kernel` dependency needed).
 use gateway::registry::{ModelEntry, ModelFormat, ModelResolver, ModelSource, ResolveError};
