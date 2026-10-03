@@ -33,7 +33,9 @@ The simplest local path needs **no `local-providers` / `local-engine` at all**: 
 Ollama yourself and point an `ollama` router at it. The `ollama` adapter speaks the
 OpenAI-compatible API, so it behaves like any cloud router — just over
 `http://localhost:11434`. Configure it like any other router (see `configuration.md`);
-models you've `ollama pull`ed are available for chat + embed. Use this when Ollama is
+models you've `ollama pull`ed are available for chat + embed, and decision models
+(e.g. `nimble`) for System One decisions on Ollama ≥ 0.35 — see
+[recipes § decision](recipes.md#ask-a-decision-system-one). Use this when Ollama is
 already running on the box and you don't want to link native engines.
 
 ## Embedded Ollama models

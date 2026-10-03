@@ -104,6 +104,8 @@ trait ChatModel: Model {
 #[async_trait] trait TtsModel:   Model { async fn speak(&self, cfg, req: &TtsRequest)        -> Result<TtsResponse,   GatewayError>; }
 #[async_trait] trait ImageModel: Model { async fn generate_image(&self, cfg, req: &ImageRequest) -> Result<ImageResponse, GatewayError>; }
 #[async_trait] trait VideoModel: Model { async fn generate_video(&self, cfg, req: &VideoRequest) -> Result<VideoResponse, GatewayError>; }
+// Added after this design landed (SP-DEC-1, gh#72) — a seventh payload-backed capability:
+#[async_trait] trait DecisionModel: Model { async fn decide(&self, cfg, req: &DecisionRequest) -> Result<DecisionResponse, GatewayError>; }
 ```
 
 An adapter implements only what it supports:
@@ -114,7 +116,8 @@ impl EmbedModel for OpenAiAdapter { … }
 impl ImageModel for OpenAiAdapter { … }   // openai also does STT/TTS → SttModel + TtsModel
 // grok:        ChatModel + SttModel + TtsModel
 // together:    ChatModel + ImageModel
-// ollama:      ChatModel + EmbedModel
+// ollama:      ChatModel + EmbedModel (+ DecisionModel since SP-DEC-1)
+// systemone:   DecisionModel only        (SP-DEC-1; registered as `openrouter` / `typesafe`)
 // huggingface: ChatModel + EmbedModel   (added in the HF-B spec)
 ```
 
@@ -136,6 +139,7 @@ completion path).
 | `AudioGenerate`   | `Tts`             | `TtsModel`   | `TtsRequest`  | `TtsResponse`  | `audio` |
 | `ImageGenerate`   | `ImageGenerate`   | `ImageModel` | `ImageRequest`| `ImageResponse`| `images` |
 | `VideoGenerate`   | `VideoGenerate`   | `VideoModel` | `VideoRequest`| `VideoResponse`| `videos` |
+| `Decision` *(SP-DEC-1)* | `Decision`  | `DecisionModel` | `DecisionRequest` | `DecisionResponse` | `decisions`, `usage` |
 
 ### 3.3 Typed request/response (decision 4b)
 
@@ -161,6 +165,10 @@ struct ImageResponse { images: Vec<ImageResult> }
 
 struct VideoRequest  { model: Option<String>, prompt: String, duration_secs: Option<u32>, resolution: Option<String> }
 struct VideoResponse { videos: Vec<VideoResult> }
+
+// SP-DEC-1 (gh#72):
+struct DecisionRequest  { model: Option<String>, state: DecisionContent, questions: DecisionQuestions, images: Vec<String>, keep_alive: Option<serde_json::Value> }
+struct DecisionResponse { answers: DecisionAnswers, usage: Option<TokenUsage>, model: Option<String>, degraded: bool }
 ```
 
 Cross-cutting fields (`estimated_cost`, `actual_cost`, `attempts`, `success`)
@@ -190,6 +198,7 @@ struct AdapterRegistry {
     tts:   HashMap<String, Arc<dyn TtsModel>>,
     image: HashMap<String, Arc<dyn ImageModel>>,
     video: HashMap<String, Arc<dyn VideoModel>>,
+    decision: HashMap<String, Arc<dyn DecisionModel>>, // SP-DEC-1
 }
 
 impl AdapterRegistry {

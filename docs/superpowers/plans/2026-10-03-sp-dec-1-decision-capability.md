@@ -53,3 +53,12 @@ Downstream (sensei, after v0.7.0): `model_capability` gains `decision`, seed dec
 
 | # | Commit | Notes |
 |---|---|---|
+| T1–T2 | `e21ade4` | types+trait+registry in one commit (a test that cannot compile without the type cannot be committed red under the clippy hook — SP-ROUTE-1 T1 precedent); validate_decision 4/4 mutations caught |
+| T3 | `49c9000` red → `8f80053` | 7 engine tests; 8/8 mutations caught (criteria counting initially survived — test tightened) |
+| T4 | `04c9e2e` red → `7bcd6a0` | 9 wiremock + 1 live (Ollama 0.35.0 + nimble, passes); 8/8 mutations caught |
+| T5 | red → `50cafb9` | facade: openrouter (chat + decision), typesafe |
+| T6 | docs commit + re-export fix | docs sync found `systemone` missing from `gateway::adapters` re-exports — fixed, pinned by `reexport_paths`; upgrading.md 0.6.x → 0.7.0 |
+| T7 | — | whole-slice review, then v0.7.0 |
+
+Carry-forwards: Cloudflare Workers AI (`clef`, different image shape, truncates); Liquid (non-standard path);
+emulating decisions over logprobs on chat endpoints; sensei seed + `map_capability` (needs sensei#202).

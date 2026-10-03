@@ -235,3 +235,83 @@ for call in &resp.tool_calls {                 // ToolCall { id, name, arguments
 
 Tool wire differences (OpenAI vs Anthropic vs Gemini) are handled inside the
 adapters — you always read/write the same `ToolDefinition` / `ToolCall` shapes.
+
+## Ask a decision (System One)
+
+`Capability::Decision` sends one shared `state` plus 1–64 named, typed questions and
+returns **probabilities**, not text — TypeSafe's System One API
+(`POST {base}/v1/systemone`), served by Ollama (≥ 0.35, local models only),
+OpenRouter and TypeSafe. The facade (`FacadeBuilder::new(config).build().await`)
+auto-registers the `ollama`, `openrouter` (chat **and** decision) and `typesafe`
+(decision only) routers when they are in config; with a bare `Gateway`, register
+`OllamaAdapter` yourself, and
+`gateway::adapters::systemone::SystemOneAdapter::from_config_with_id("openrouter", &cfg)`
+for a hosted router. Config validation rejects an empty router `url`, so give each
+one: `http://localhost:11434` (Ollama), `https://openrouter.ai/api` (serves both
+OpenRouter's chat and `/v1/systemone`), `https://api.typesafe.ai`.
+
+```rust
+use gateway::types::config::{ChainEntry, FallbackChainConfig, FallbackTrigger, ModelConfig};
+use gateway::types::decision::{DecisionAnswer, DecisionQuestion, DecisionQuestions};
+use serde_json::json;
+
+// A local decision model first, a hosted one as fallback. Seed the REAL
+// context_window: the gate counts state + every question against it.
+let nimble = ModelConfig {
+    id: "nimble".into(), api_model_id: Some("nimble".into()), provider: "ollama".into(),
+    capabilities: vec![Capability::Decision], context_window: 32_768, // illustrative — use the real one
+    max_output_tokens: 1,
+    pricing: None, family: None, catalog: None,
+};
+let jev = ModelConfig {
+    id: "jev".into(), api_model_id: Some("typesafe/jev-1.13".into()), provider: "openrouter".into(),
+    capabilities: vec![Capability::Decision], context_window: 65_536, max_output_tokens: 1,
+    pricing: None, family: None, catalog: None,
+};
+let chain = FallbackChainConfig {
+    id: "decide".into(),
+    capability: Capability::Decision,
+    models: vec![
+        ChainEntry { model: "nimble".into(), router: Some("ollama".into()),     api_model_id: None, priority: 1 },
+        ChainEntry { model: "jev".into(),    router: Some("openrouter".into()), api_model_id: None, priority: 2 },
+    ],
+    fallback_triggers: vec![FallbackTrigger::ProviderError, FallbackTrigger::Timeout],
+};
+
+let req = InferenceRequest {
+    capability: Capability::Decision,
+    model: None, router: None, chain: Some("decide".into()),
+    payload: Payload::Decision {
+        state: json!("Order #123 arrived broken; customer wants their money back."),
+        questions: DecisionQuestions::from([
+            ("refund".to_string(), DecisionQuestion::Noul {
+                instructions: json!("Is the customer asking for a refund?"),
+                criteria: None,
+            }),
+        ]),
+        images: vec![],      // bare base64, vision decision models only
+        keep_alive: None,    // Ollama only
+    },
+    budget: None, auth: None, panel: None, consensus: None,
+    allow_fallback: true, credentials: Default::default(), routing: None,
+};
+
+let resp = gateway.execute(&req).await?;
+if let Some(DecisionAnswer::Noul { noul }) = resp.decisions.as_ref().and_then(|d| d.get("refund")) {
+    println!("P(refund) = {noul:.2}");   // a probability of true, not a bool
+}
+```
+
+- **`confidence`** (on `choice` / `score` answers) is how concentrated the
+  probabilities are — **not** whether the answer is right. It is uncalibrated; never
+  show it as accuracy or gate on it as if it were.
+- **`score`** is the probability-weighted mean of the zero-based level indices
+  (`0..=levels-1`), not normalized to 0–1.
+- A structurally malformed call (0 or > 64 questions, < 2 `choice`/`score` criteria,
+  blank state / names / instructions / option keys) fails up front with
+  `GatewayError::InvalidRequest` — no candidate is tried, nothing is retried.
+- `execute_stream` refuses `Decision` (`Unsupported`); use `execute`. Panels work.
+- Hosted routers (`openrouter`, `typesafe`) have no default model — pin one via the
+  model's `api_model_id`.
+
+Full reference: `docs/features/inference/capabilities-and-adapters.md#decision-system-one`.
