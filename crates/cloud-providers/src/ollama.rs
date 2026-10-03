@@ -106,11 +106,126 @@ impl kernel::adapters::capability::EmbedModel for OllamaAdapter {
     }
 }
 
+/// Default decision model when the request pins none (the engine always pins
+/// the candidate's `api_model_id`, so this only serves direct adapter callers).
+const DEFAULT_DECISION_MODEL: &str = "nimble";
+
+/// Oldest Ollama with `/v1/systemone`.
+const MIN_DECISION_VERSION: (u64, u64) = (0, 35);
+
+#[async_trait]
+impl kernel::adapters::capability::DecisionModel for OllamaAdapter {
+    /// System One decisions via `{url}/v1/systemone`. Local-only: Ollama
+    /// rejects cloud models here with a 400, which falls back like any other.
+    async fn decide(
+        &self,
+        config: &RouterConfig,
+        req: &kernel::types::io::DecisionRequest,
+    ) -> Result<kernel::types::io::DecisionResponse, GatewayError> {
+        let model = req.model.as_deref().unwrap_or(DEFAULT_DECISION_MODEL);
+        crate::systemone::decide(&self.client, &config.url, "ollama", model, config, req)
+            .await?
+            .map_err(|r| {
+                // Ollama answers 404 for two unrelated reasons. A JSON error
+                // means the model is not pulled; gin's bare "404 page not
+                // found" means the route itself does not exist — a server
+                // older than System One. Say which, so nobody pulls a model
+                // to fix an outdated server, or upgrades to fix a missing pull.
+                let message = match (r.status, r.is_json_error()) {
+                    (404, true) => format!(
+                        "decision model '{model}' is not pulled on this Ollama — run `ollama pull {model}` ({})",
+                        r.message()
+                    ),
+                    (404, false) => format!(
+                        "this Ollama has no /v1/systemone endpoint — System One decisions need Ollama >= {}.{} ({})",
+                        MIN_DECISION_VERSION.0,
+                        MIN_DECISION_VERSION.1,
+                        r.message().trim()
+                    ),
+                    _ => r.message(),
+                };
+                r.into_error("ollama", message)
+            })
+    }
+}
+
+impl OllamaAdapter {
+    /// Probe whether `model` can serve System One decisions on this server,
+    /// telling "Ollama too old" from "model not pulled" from "not a decision
+    /// model" (gh#72). Reads `GET /api/version`, then `POST /api/show`, whose
+    /// `capabilities` lists `"decision"` for decision models.
+    pub async fn probe_decision_model(
+        &self,
+        config: &RouterConfig,
+        model: &str,
+    ) -> Result<crate::systemone::DecisionModelStatus, GatewayError> {
+        use crate::systemone::DecisionModelStatus;
+
+        #[derive(serde::Deserialize)]
+        struct Version {
+            version: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Show {
+            #[serde(default)]
+            capabilities: Vec<String>,
+        }
+
+        let base = config.url.trim_end_matches('/');
+        let version: Version = self
+            .client
+            .get(format!("{base}/api/version"))
+            .timeout(crate::systemone::request_timeout(config))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        // Dev builds report 0.0.0 and unparseable strings carry no evidence —
+        // only a version that parses AND is older counts as too old.
+        if parse_major_minor(&version.version).is_some_and(|v| v < MIN_DECISION_VERSION) {
+            return Ok(DecisionModelStatus::ServerTooOld {
+                version: version.version,
+            });
+        }
+
+        let show = self
+            .client
+            .post(format!("{base}/api/show"))
+            .timeout(crate::systemone::request_timeout(config))
+            .json(&serde_json::json!({ "model": model }))
+            .send()
+            .await?;
+        if show.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(DecisionModelStatus::NotPulled);
+        }
+        if !show.status().is_success() {
+            return Err(crate::base::error_from_response("ollama", show).await);
+        }
+        let show: Show = show.json().await?;
+        Ok(if show.capabilities.iter().any(|c| c == "decision") {
+            DecisionModelStatus::Ready
+        } else {
+            DecisionModelStatus::NotADecisionModel
+        })
+    }
+}
+
+/// `"0.35.1-rc0"` → `(0, 35)`. `None` for anything that is not `N.N…`, and for
+/// the `0.0.0` dev-build placeholder.
+fn parse_major_minor(version: &str) -> Option<(u64, u64)> {
+    let mut parts = version.trim_start_matches('v').split(['.', '-']);
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    ((major, minor) != (0, 0)).then_some((major, minor))
+}
+
 #[async_trait]
 impl kernel::adapters::RegisterInto for OllamaAdapter {
     async fn register_into(self: std::sync::Arc<Self>, reg: &kernel::adapters::AdapterRegistry) {
         reg.register_chat(self.clone()).await;
-        reg.register_embed(self).await;
+        reg.register_embed(self.clone()).await;
+        reg.register_decision(self).await;
     }
 }
 

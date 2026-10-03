@@ -51,40 +51,46 @@ traces its claims to source, with a **Notes** section for quirks.
 
 ## Capability × provider matrix
 
-Rows are adapters; columns are the six payload-backed capabilities. Derived from
-each adapter's `supports()` (cloud) / `supports_capability()` (embedded).
+Rows are adapters; columns are the seven payload-backed capabilities. Derived from
+each adapter's `RegisterInto` impl (cloud and embedded alike).
 
 > Column key: **Chat** = `TextChat` (+ `TextComplete`), **Embed** = `TextEmbed`,
 > **STT** = `AudioTranscribe`, **TTS** = `AudioGenerate`, **Image** =
-> `ImageGenerate`, **Video** = `VideoGenerate`.
+> `ImageGenerate`, **Video** = `VideoGenerate`, **Decision** = `Decision`
+> (System One — probabilities, not text).
 
-| Adapter | Chat | Embed | STT | TTS | Image | Video |
-|---------|:----:|:-----:|:---:|:---:|:-----:|:-----:|
-| **Cloud** | | | | | | |
-| `anthropic` | ✓ | | | | | |
-| `openai` | ✓ | ✓ | ✓ | ✓ | ✓ | |
-| `gemini` | ✓ | ✓ | | | | |
-| `bedrock` | ✓ | ✓ | | | | |
-| `ollama` | ✓ | ✓ | | | | |
-| `together` | ✓ | | | | ✓ | |
-| `grok` | ✓ | | ✓ | ✓ | | |
-| `flux` | | | | | ✓ | |
-| `recraft` | | | | | ✓ | |
-| `stability` | | | | | ✓ | |
-| `fal` | | | | | ✓ | ✓ |
-| `replicate` | | | | | ✓ | ✓ |
-| `kling` | | | | | | ✓ |
-| `luma` | | | | | | ✓ |
-| `runway` | | | | | | ✓ |
-| `noop` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| **Embedded** | | | | | | |
-| `llama_cpp` | ✓ | ✓ | | | | |
-| `embedded_llama` | ✓ | ✓ | | | | |
-| `fastembed` | | ✓ | | | | |
-| `ort` | | ✓ | | | | |
+| Adapter | Chat | Embed | STT | TTS | Image | Video | Decision |
+|---------|:----:|:-----:|:---:|:---:|:-----:|:-----:|:--------:|
+| **Cloud** | | | | | | | |
+| `anthropic` | ✓ | | | | | | |
+| `openai` | ✓ | ✓ | ✓ | ✓ | ✓ | | |
+| `openrouter` | ✓ | ✓ | ✓ | ✓ | ✓ | | ✓ |
+| `typesafe` | | | | | | | ✓ |
+| `gemini` | ✓ | ✓ | | | | | |
+| `huggingface` | ✓ | ✓ | | | | | |
+| `bedrock` | ✓ | ✓ | | | | | |
+| `ollama` | ✓ | ✓ | | | | | ✓ |
+| `together` | ✓ | | | | ✓ | | |
+| `grok` | ✓ | | ✓ | ✓ | | | |
+| `flux` | | | | | ✓ | | |
+| `recraft` | | | | | ✓ | | |
+| `stability` | | | | | ✓ | | |
+| `fal` | | | | | ✓ | ✓ | |
+| `replicate` | | | | | ✓ | ✓ | |
+| `kling` | | | | | | ✓ | |
+| `luma` | | | | | | ✓ | |
+| `runway` | | | | | | ✓ | |
+| `noop` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **Embedded** | | | | | | | |
+| `llama_cpp` | ✓ | ✓ | | | | | |
+| `embedded_llama` | ✓ | ✓ | | | | | |
+| `fastembed` | | ✓ | | | | | |
+| `ort` | | ✓ | | | | | |
+| `kokoro` | | | | ✓ | | | |
 
 Notes:
 - `noop` is the catch-all test/dev adapter — accepts every capability, returns a canned "no provider" response.
-- `openai` also registers under other ids (`openrouter`, `vercel`, `nvidia`, …) via `with_id`, sharing one implementation across OpenAI-compatible endpoints.
+- `openai` also registers under other ids (`openrouter`, `vercel`, `nvidia`, …) via `with_id`, sharing one implementation across OpenAI-compatible endpoints. Its capability set is fixed regardless of id, so the `openrouter` row's chat…image ticks are OpenAI's set, not a claim about what OpenRouter serves.
+- `openrouter` and `typesafe` are auto-registered by the facade when their router id is in config: `openrouter` = `OpenAIAdapter` (id `openrouter`) + a decision-only `SystemOneAdapter`; `typesafe` = `SystemOneAdapter` only. See [capabilities & adapters § Decision](inference/capabilities-and-adapters.md#decision-system-one).
 - `base` and `async_job` are shared helpers, not adapters — `async_job` drives the submit-then-poll pattern for async media adapters.
 - Update this matrix when an adapter gains or loses a capability.

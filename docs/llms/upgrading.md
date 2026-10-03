@@ -6,7 +6,34 @@ routing call path (build a request, `gateway.execute(&req).await`, read
 `InferenceResponse`) stays source-compatible across every step below; each section
 lists only what you must touch.
 
-## 0.5.1 → next (unreleased — SP-ROUTE-1 / SP-ROUTE-1.1 / SP-ROUTE-1.2)
+## 0.6.x → 0.7.0 (SP-DEC-1 — decision / System One)
+
+A new **`Decision` capability** (gh#72): typed choice / yes-no / score questions
+about one shared `state`, answered with probabilities, over Ollama ≥ 0.35's
+`/v1/systemone`, OpenRouter and TypeSafe. The chat/embed call path is
+unchanged; the breaks are all *additions to exhaustive public types*.
+
+| Area | Change | Action |
+|---|---|---|
+| `Capability` | new variant `Decision` | add an arm to any exhaustive `match` (or mirror list — sensei's `gateway_routers`) |
+| `Payload` | new variant `Decision { state, questions, images, keep_alive }` | add an arm to any exhaustive `match` |
+| `InferenceResponse` | new field `decisions: Option<DecisionAnswers>` | **only if you build the struct literally**: add `decisions: None` |
+| `GatewayError` | new variant `InvalidRequest { message }` — terminal, never a fallback trigger, not retryable | add an arm to any exhaustive `match` |
+| `AdapterRegistry` / `NoopAdapter` | gain a `decision` map; a custom adapter registering everywhere can add `register_decision` | none unless you want decisions |
+| Facade (`FacadeBuilder::build`) | now auto-registers `openrouter` (OpenAI-wire chat + System One decisions) and `typesafe` (decisions only) | if you registered your own adapter under `openrouter` **before** `build()`, register it **after** instead — `build()` now replaces it |
+| `OllamaAdapter` | now also registers into the decision map; new `probe_decision_model` | none |
+
+`confidence` on a decision answer measures **probability concentration, not
+correctness** — do not surface it as accuracy or gate on it as if it were.
+
+## 0.6.0 → 0.6.1
+
+`sensei-local-providers` now requires `llama-cpp-2 >= 0.1.158` (gh#73): older
+versions fail to build against OpenSSL 4 or against the vocab API the adapter
+now uses. Run `cargo update -p llama-cpp-2` if your lockfile pins an older one.
+No source changes.
+
+## 0.5.1 → 0.6.0 (SP-ROUTE-1 / SP-ROUTE-1.1 / SP-ROUTE-1.2)
 
 Per-request **provider routing preferences** land (`sort` / `only` / `ignore` /
 `order`, plus a price-weighted default within equal-priority groups). The call

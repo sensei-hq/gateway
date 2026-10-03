@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 
 use crate::store::UsageTotals;
 use crate::types::config::{MeterUnit, Window};
+use crate::types::decision::{DecisionContent, DecisionQuestion, DecisionQuestions};
 use crate::types::error::GatewayError;
 use crate::types::request::{MediaAttachment, Payload};
 
@@ -26,6 +27,7 @@ pub(super) fn stream_error_code(err: &GatewayError) -> String {
         GatewayError::AllGated { .. } => "all_gated".to_string(),
         GatewayError::ModelNotReady { .. } => "model_not_ready".to_string(),
         GatewayError::InvalidConfig(_) => "invalid_config".to_string(),
+        GatewayError::InvalidRequest { .. } => "invalid_request".to_string(),
         GatewayError::Network(_) => "network".to_string(),
         GatewayError::Serialization(_) => "serialization".to_string(),
     }
@@ -89,7 +91,82 @@ pub(super) fn estimate_input_tokens(payload: &Payload) -> u32 {
         Payload::ImageGenerate { prompt, .. } => (prompt.len() / 4) as u32,
         // Video generation: estimate based on prompt length.
         Payload::VideoGenerate { prompt, .. } => (prompt.len() / 4) as u32,
+        // Billed per question: the provider scores each question in its own
+        // prompt, and every prompt carries the whole set ("shared context is
+        // counted again when the model scores questions separately").
+        Payload::Decision {
+            state, questions, ..
+        } => {
+            let per_prompt = u32::try_from(decision_chars(state, questions) / 4)
+                .unwrap_or(u32::MAX)
+                .saturating_add(decision_prompt_overhead(questions.len()));
+            u32::try_from(questions.len())
+                .unwrap_or(u32::MAX)
+                .saturating_mul(per_prompt)
+        }
     }
+}
+
+/// Tokens a System One provider wraps around the caller's text in ONE scoring
+/// prompt: a fixed preamble plus a per-question frame for every question in the
+/// set. Measured on Ollama 0.35.0 + nimble (2026-10-03) as `104 + 38·N`; rounded
+/// up to `128 + 48·N` so the estimate stays on the safe side for hosts that frame
+/// a little more. Pinned by `decision_tests::the_window_estimate_covers_the_prompt_ollama_actually_builds`.
+fn decision_prompt_overhead(questions: usize) -> u32 {
+    const PREAMBLE: u32 = 128;
+    const PER_QUESTION: u32 = 48;
+    u32::try_from(questions)
+        .unwrap_or(u32::MAX)
+        .saturating_mul(PER_QUESTION)
+        .saturating_add(PREAMBLE)
+}
+
+/// Characters a decision call puts in front of the model in ONE prompt: the
+/// shared state plus EVERY question — its name, instructions and criteria —
+/// since each scoring prompt carries the whole question set (gh#72).
+fn decision_chars(state: &DecisionContent, questions: &DecisionQuestions) -> usize {
+    fn content_chars(c: &DecisionContent) -> usize {
+        match c {
+            serde_json::Value::String(s) => s.len(),
+            other => other.to_string().len(),
+        }
+    }
+    let question_chars: usize = questions
+        .iter()
+        .map(|(name, q)| {
+            name.len()
+                + match q {
+                    DecisionQuestion::Choice {
+                        instructions,
+                        criteria,
+                    } => {
+                        content_chars(instructions)
+                            + criteria
+                                .iter()
+                                .map(|(k, v)| k.len() + v.as_ref().map_or(0, String::len))
+                                .sum::<usize>()
+                    }
+                    DecisionQuestion::Noul {
+                        instructions,
+                        criteria,
+                    } => {
+                        content_chars(instructions)
+                            + criteria.as_ref().map_or(0, |c| {
+                                c.r#false.as_ref().map_or(0, String::len)
+                                    + c.r#true.as_ref().map_or(0, String::len)
+                            })
+                    }
+                    DecisionQuestion::Score {
+                        instructions,
+                        criteria,
+                    } => {
+                        content_chars(instructions)
+                            + criteria.iter().map(String::len).sum::<usize>()
+                    }
+                }
+        })
+        .sum();
+    content_chars(state) + question_chars
 }
 
 /// What one [`MediaAttachment`] is charged against a candidate's context window.
@@ -391,6 +468,11 @@ pub fn estimate_input_tokens_pessimistic(payload: &Payload) -> u32 {
         | Payload::Tts { .. }
         | Payload::ImageGenerate { .. }
         | Payload::VideoGenerate { .. } => 0,
+        // A decision call's state and questions all sit in one prompt the window
+        // bounds — the short-context constraint of gh#72 is enforced right here.
+        Payload::Decision {
+            state, questions, ..
+        } => decision_chars(state, questions),
     };
     // SP-7a.1: media is priced in TOKENS, so it is added AFTER the divide below — running a
     // published per-image token figure back through the `/3` bytes heuristic would
@@ -408,6 +490,16 @@ pub fn estimate_input_tokens_pessimistic(payload: &Payload) -> u32 {
                 .fold(0u32, |acc, attachment| match attachment {
                     MediaAttachment::Image { .. } => acc.saturating_add(MAX_TOKENS_PER_ATTACHMENT),
                 }),
+            // Decision images are shared by every question and occupy the same
+            // window chat attachments do, so they are priced the same way.
+            // ...and the provider's prompt framing, also in tokens — see
+            // `decision_prompt_overhead`.
+            Payload::Decision {
+                images, questions, ..
+            } => u32::try_from(images.len())
+                .unwrap_or(u32::MAX)
+                .saturating_mul(MAX_TOKENS_PER_ATTACHMENT)
+                .saturating_add(decision_prompt_overhead(questions.len())),
             // No other payload kind carries `attachments` today. Left as 0 rather than folded
             // into the arms above so this term reads as "what media costs", independent of
             // which payloads happen to have a media field.
@@ -437,7 +529,7 @@ pub(super) fn request_input_text(payload: &Payload) -> Option<String> {
         Payload::ImageGenerate { prompt, .. } | Payload::VideoGenerate { prompt, .. } => {
             prompt.clone()
         }
-        Payload::Embed { .. } | Payload::Stt { .. } => return None,
+        Payload::Embed { .. } | Payload::Stt { .. } | Payload::Decision { .. } => return None,
     };
     (!text.trim().is_empty()).then_some(text)
 }

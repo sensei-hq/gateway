@@ -21,4 +21,7 @@ pub enum Capability {
 
     // Video modality
     VideoGenerate, // text/image -> video
+
+    // Decision (System One, gh#72)
+    Decision, // state + typed questions (+ images) -> probabilities, not text
 }

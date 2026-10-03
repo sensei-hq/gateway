@@ -4,9 +4,9 @@ description: >-
   Use when adding, integrating, or using the sensei gateway crates
   (sensei-gateway, sensei-local-providers, sensei-local-engine, sensei-vault) in a
   Rust project — a provider-agnostic multimodal inference routing engine (chat,
-  embeddings, image, video, speech) with fallback chains, circuit breaker, budget
-  metering, multi-model consensus/panels, in-process local models, and BYOK
-  credentials. Covers how to add the dependency, pick feature flags, call it by
+  embeddings, image, video, speech, System One decisions) with fallback chains,
+  circuit breaker, budget metering, multi-model consensus/panels, in-process local
+  models, and BYOK credentials. Covers how to add the dependency, pick feature flags, call it by
   capability, run local models, supply credentials, and report issues upstream.
 ---
 
@@ -14,7 +14,7 @@ description: >-
 
 `gateway` (`sensei-gateway`) is a **provider-agnostic multimodal inference routing
 engine for Rust**. You configure routers + models + fallback chains once, then send
-requests **by capability** — chat, embeddings, image, video, speech — and the engine
+requests **by capability** — chat, embeddings, image, video, speech, decisions — and the engine
 picks a healthy endpoint, retries down a fallback chain, trips a per-endpoint circuit
 breaker, meters cost, and (optionally) runs consensus/panels or enforces quotas. The
 caller never touches a provider SDK.
@@ -107,7 +107,7 @@ it for debugging and observability.
 
 ## 5. Modalities (capability traits)
 
-Send requests by capability; six are live (via `kernel` capability traits):
+Send requests by capability; seven are live (via `kernel` capability traits):
 
 - **chat / text** (`ChatModel`) — incl. streaming (`execute_stream`), tool calling, vision input
 - **embeddings** (`EmbedModel`)
@@ -115,6 +115,13 @@ Send requests by capability; six are live (via `kernel` capability traits):
 - **video generation** (`VideoModel`) — e.g. fal, replicate, kling, luma, runway
 - **speech-to-text** (`SttModel`) — openai, grok
 - **text-to-speech** (`TtsModel`) — openai, grok (cloud), kokoro (local)
+- **decision / System One** (`DecisionModel`) — ollama (≥ 0.35, local models), openrouter,
+  typesafe. `Capability::Decision` + `Payload::Decision { state, questions, images,
+  keep_alive }` → `resp.decisions` (probabilities, keyed by question name). Not
+  streamable. A malformed call fails up front with `GatewayError::InvalidRequest`.
+  **`confidence` is probability concentration, not correctness** — never show it as
+  accuracy or gate on it as such; `noul` is P(true), not a bool; `score` is a
+  probability-weighted mean of zero-based levels, not normalized.
 
 Add your own provider by implementing the capability trait(s) + `RegisterInto` — see
 `docs/llms/custom-adapters.md`.

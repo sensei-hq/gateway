@@ -5,8 +5,9 @@
 
 use crate::types::error::GatewayError;
 use crate::types::io::{
-    ChatRequest, ChatResponse, EmbedRequest, EmbedResponse, ImageRequest, ImageResponse,
-    SttRequest, SttResponse, TtsRequest, TtsResponse, VideoRequest, VideoResponse,
+    ChatRequest, ChatResponse, DecisionRequest, DecisionResponse, EmbedRequest, EmbedResponse,
+    ImageRequest, ImageResponse, SttRequest, SttResponse, TtsRequest, TtsResponse, VideoRequest,
+    VideoResponse,
 };
 use crate::types::request::{InferenceRequest, InferenceResponse, Payload};
 
@@ -29,6 +30,7 @@ fn empty_response() -> InferenceResponse {
         audio: None,
         images: None,
         videos: None,
+        decisions: None,
         model: None,
         usage: None,
         tool_calls: Vec::new(),
@@ -68,6 +70,38 @@ pub fn from_chat_response(r: ChatResponse) -> InferenceResponse {
         success: !r.degraded,
         content: r.content,
         tool_calls: r.tool_calls,
+        usage: r.usage,
+        model: r.model,
+        ..empty_response()
+    }
+}
+
+pub fn to_decision_request(
+    req: &InferenceRequest,
+    model: Option<String>,
+) -> Result<DecisionRequest, GatewayError> {
+    let Payload::Decision {
+        state,
+        questions,
+        images,
+        keep_alive,
+    } = &req.payload
+    else {
+        return Err(wrong_payload("decision"));
+    };
+    Ok(DecisionRequest {
+        model: model.or_else(|| req.model.clone()),
+        state: state.clone(),
+        questions: questions.clone(),
+        images: images.clone(),
+        keep_alive: keep_alive.clone(),
+    })
+}
+
+pub fn from_decision_response(r: DecisionResponse) -> InferenceResponse {
+    InferenceResponse {
+        success: !r.degraded,
+        decisions: Some(r.answers),
         usage: r.usage,
         model: r.model,
         ..empty_response()

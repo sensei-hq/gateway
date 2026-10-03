@@ -156,7 +156,7 @@ pub async fn error_from_response(adapter: &str, response: reqwest::Response) -> 
 /// Parse a `Retry-After` header value (integer seconds) to milliseconds.
 /// The HTTP-date form is not supported (returns `None`); callers then fall
 /// back to the lockout policy's synthetic backoff.
-fn parse_retry_after_ms(header: Option<&str>) -> Option<u64> {
+pub(crate) fn parse_retry_after_ms(header: Option<&str>) -> Option<u64> {
     header?
         .trim()
         .parse::<u64>()
@@ -167,7 +167,7 @@ fn parse_retry_after_ms(header: Option<&str>) -> Option<u64> {
 /// Pure mapping of a non-success HTTP status code + response body to a
 /// [`GatewayError`]. Split from [`error_from_response`] so the mapping is
 /// unit-testable without constructing a live [`reqwest::Response`].
-fn map_status_error(
+pub(crate) fn map_status_error(
     adapter: &str,
     status: u16,
     body_text: String,
@@ -267,7 +267,7 @@ where
 }
 
 /// Extract error message from various provider JSON error formats.
-fn extract_error_message(body: &str) -> Option<String> {
+pub(crate) fn extract_error_message(body: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     // OpenAI/Anthropic: { "error": { "message": "..." } }
     v.get("error")

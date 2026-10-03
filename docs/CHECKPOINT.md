@@ -1,40 +1,38 @@
 # Checkpoint
 
-**SP-ROUTE-1.2 — 4/4 TASKS + WHOLE-SLICE REVIEW DONE, on `develop`.** Streaming
-now has the metering and explanation the unary path already had. Suite **1927
-passed / 0 failed / 60 ignored**, real exit 0, zero `panicked at`. Clippy
-(Homebrew 0.1.97 + rustup stable 0.1.98), `fmt --check`, `--features local
---locked` (451), `cargo doc` — all clean, real exit 0, zero unresolved links.
-Plan: `docs/superpowers/plans/2026-09-21-sp-route-1-2-streaming-parity.md`
-(Progress table + review section — **read it first**).
+**SP-DEC-1 — Decision (System One) capability, gh#72: DONE and RELEASED as v0.7.0**
+(tag `b444b6b`). gh#73 released as v0.6.1. **PR #74 (develop→main, both releases,
+Closes #72 #73) is fully green — 18/18 checks — and awaits human review** (main is
+protected). develop head: `ce10413`.
 
 ## Done
 
-T1 metering above the `yield` (`2fb6b86`) · T2 `attempt_start` on the persisted
-row (`ab4e6ee`) · T3 `Done.routing` (`7e89dc3`) · T4 docs (`4aee074`) ·
-**review (this commit): 2 Critical, 1 Important, 1 Minor — 5 mutations, 5 real
-panics.** It found T1 had fixed one third of the defect while T4's docs claimed
-all of it.
-
-- **C1** — neither streaming FAILURE path metered at all. A stream dying after
-  generating real tokens recorded nothing, even fully drained, while `execute`
-  writes a `Failed` row: unary 1, streamed 0. Both sites now write one.
-- **C2** — the write ahead of the `yield` made the terminal event hostage to an
-  unbounded consumer-supplied store: a 100ms-per-event consumer got the full
-  content and NO `Done` — "delivered but unbilled" became "not delivered and
-  unbilled". Bounded at 2s. My T1 comment calling it "the same price the
-  dispatch charges" was false (that dispatch is synchronous); corrected.
-- **I1** pins AC3 on the fallback branch; **M1** pins `routing: None`.
-
-T4's docs are now true — the code was finished so the prose became true.
+- v0.6.1: llama-cpp-2 → 0.1.158 vocab API, floor raised (#73).
+- v0.7.0: SP-DEC-1 T1–T7 (plan `docs/superpowers/plans/2026-10-03-sp-dec-1-decision-capability.md`);
+  whole-slice review 12 must-fix fixed red-first. Shipped tag verified: a fresh
+  consumer on `tag = "v0.7.0"` → facade → Ollama nimble, `success=true`.
+- CI had been red since Rust 1.99 hit stable (2026-10-01): async-trait 0.1.92
+  (`c77cde3`) + `fetch_update` → `try_update` (`ce10413`). Tags v0.6.1/v0.7.0 predate
+  the fix — affects clippy only, not consumers' builds.
+- sensei PR **sensei-hq/sensei#228** (`feat/decision-seed`, closes sensei#202): pins
+  → v0.7.0, `decision` enum + seed (decision models, openrouter/typesafe routers,
+  `decide` chain, Jun–Oct 2026 models), `map_capability`, router mirror guard;
+  senseid 3157/0, workspace 358/0, DB seed test, end-to-end decision via nimble.
 
 ## Next
 
-**Merge `origin/main` into `develop`, then open the develop→main PR** (`main`'s
-ruleset is strict: without main's merge commits the PR sits BEHIND).
+1. Human review/merge of gateway #74 (18/18 green) and sensei #228 (9/9 green).
 
-## Carry-forwards
+## Open questions
 
-Ledger in the SP-ROUTE-1 plan. **1**/**3** closed here, **4** by SP-ROUTE-1.1.
-Open: **2** `ExecutionTrace::routing` forward provision; **5** consensus legs
-drop the caller's `routing`. Open questions: none. Known-broken: nothing.
+None.
+
+## Known-broken (pre-existing, not this work)
+
+- sensei `dbd reconcile` fails on `sensei.libraries` (column used by a view), even on
+  pristine develop. Shared local `sensei_test` is schema-stale (309 failures until
+  re-deployed).
+- gateway `OllamaAdapter::from_config` / `OpenAIAdapter::from_config`: no default
+  timeout when `timeout_ms` is unset (chat path).
+- LOW carry: estimator test doesn't pin question names/option keys; llms README's
+  upgrading row still says "0.3→0.4" first.

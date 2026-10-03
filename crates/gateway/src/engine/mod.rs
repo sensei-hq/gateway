@@ -9,9 +9,10 @@ use uuid::Uuid;
 use crate::adapters::AdapterRegistry;
 use crate::circuit_breaker::CircuitBreakerManager;
 use crate::dispatch::{
-    from_chat_response, from_embed_response, from_image_response, from_stt_response,
-    from_tts_response, from_video_response, to_chat_request, to_embed_request, to_image_request,
-    to_stt_request, to_tts_request, to_video_request,
+    from_chat_response, from_decision_response, from_embed_response, from_image_response,
+    from_stt_response, from_tts_response, from_video_response, to_chat_request,
+    to_decision_request, to_embed_request, to_image_request, to_stt_request, to_tts_request,
+    to_video_request,
 };
 use crate::pruning::{Availability, ChainWarning};
 use crate::selection::{ModelSelectionService, SelectionCriteria};
@@ -803,6 +804,9 @@ pub(super) fn dispatch_outcome(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod decision_tests;
 
 #[cfg(test)]
 mod min_window_tests {

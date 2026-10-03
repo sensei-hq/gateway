@@ -1,6 +1,6 @@
 [package]
 name = "sensei-kernel"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 description = "Shared types, capability traits, and the adapter registry for the sensei gateway"
 license = "MIT"
@@ -11,6 +11,7 @@ name = "kernel"
 [dependencies]
 async-trait = "0.1"
 base64 = "0.22"
+indexmap = { version = "2", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 reqwest = { version = "0.13", default-features = false }

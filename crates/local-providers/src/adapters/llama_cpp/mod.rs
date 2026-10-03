@@ -64,7 +64,7 @@ use llama_cpp_2::{
     },
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
-    model::{AddBos, LlamaChatMessage, LlamaModel, params::LlamaModelParams},
+    model::{LlamaChatMessage, LlamaModel, params::LlamaModelParams},
     sampling::LlamaSampler,
     token::LlamaToken,
 };
@@ -324,8 +324,8 @@ impl LlamaCppAdapter {
             let tokens = self
                 .inner
                 .model
-                .str_to_token(text, AddBos::Always)
-                .map_err(|e| self.err(format!("tokenize: {e}")))?;
+                .vocab()
+                .tokenize(text.as_bytes(), true, true);
             total_tokens += tokens.len();
             all_tokens.push(tokens);
         }
@@ -414,8 +414,8 @@ impl LlamaCppAdapter {
         let prompt_tokens = self
             .inner
             .model
-            .str_to_token(&prompt, AddBos::Always)
-            .map_err(|e| self.err(format!("tokenize prompt: {e}")))?;
+            .vocab()
+            .tokenize(prompt.as_bytes(), true, true);
 
         // Reject prompts that don't leave room for the requested completion.
         if (prompt_tokens.len() as u32).saturating_add(max_new) > self.config.n_ctx {
@@ -464,15 +464,11 @@ impl LlamaCppAdapter {
             let token = sampler.sample(ctx, batch.n_tokens() - 1);
             sampler.accept(token);
 
-            if self.inner.model.is_eog_token(token) {
+            if self.inner.model.vocab().is_eog(token) {
                 break;
             }
 
-            let bytes = self
-                .inner
-                .model
-                .token_to_piece_bytes(token, 32, false, None)
-                .map_err(|e| self.err(format!("token_to_piece_bytes: {e}")))?;
+            let bytes = self.inner.model.vocab().token_to_piece(token, false, None);
             generated_bytes.extend_from_slice(&bytes);
 
             // Feed the sampled token back in for the next step.
@@ -613,8 +609,8 @@ impl kernel::adapters::capability::ChatModel for LlamaCppAdapter {
         let prompt_tokens = self
             .inner
             .model
-            .str_to_token(&prompt, AddBos::Always)
-            .map_err(|e| self.err(format!("tokenize prompt: {e}")))?;
+            .vocab()
+            .tokenize(prompt.as_bytes(), true, true);
         if (prompt_tokens.len() as u32).saturating_add(max_new) > self.config.n_ctx {
             return Err(self.err(format!(
                 "prompt ({} tokens) + max_new ({}) exceeds n_ctx ({})",

@@ -136,7 +136,7 @@ impl<'a> Meter<'a> {
     fn record(&self, tokens: u64) {
         let _ = self
             .live
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
                 Some(t.saturating_add(tokens))
             });
     }
