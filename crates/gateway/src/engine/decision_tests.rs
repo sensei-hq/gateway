@@ -269,18 +269,33 @@ async fn a_provider_rejection_falls_back_to_the_next_decision_router() {
 async fn a_state_too_large_for_a_short_context_model_skips_it_without_dispatch() {
     // Tev1-class models have ~2K-token windows; the gate must route around
     // them rather than let the provider fail (gh#72 "short-context constraint").
-    let gw = gateway_with(64);
+    // No images: an image alone (MAX_TOKENS_PER_ATTACHMENT) would overflow the
+    // window and gate the candidate whether or not the state is counted.
+    let text_only = |state: serde_json::Value| {
+        let mut req = decision_request(state, questions());
+        if let Payload::Decision { images, .. } = &mut req.payload {
+            images.clear();
+        }
+        req
+    };
+
+    // Control: a small state fits the same 1024-token window and IS dispatched,
+    // so the gate is judging the state, not refusing this candidate outright.
+    let gw = gateway_with(1024);
     let ollama = Decider::ok("ollama");
     let openrouter = Decider::ok("openrouter");
     gw.adapters.register_decision(ollama.clone()).await;
     gw.adapters.register_decision(openrouter.clone()).await;
+    gw.execute(&text_only(json!("a short ticket")))
+        .await
+        .expect("small state served by the primary");
+    assert_eq!((ollama.calls(), openrouter.calls()), (1, 0));
 
-    let big_state = json!("x".repeat(4096));
-    gw.execute(&decision_request(big_state, questions()))
+    // A 4096-char state (~1366 tokens) cannot fit: skipped without dispatch.
+    gw.execute(&text_only(json!("x".repeat(4096))))
         .await
         .expect("served by the large-window candidate");
-
-    assert_eq!(ollama.calls(), 0, "the 64-token candidate was gated out");
+    assert_eq!(ollama.calls(), 1, "the 1024-token candidate was gated out");
     assert_eq!(openrouter.calls(), 1);
 }
 
@@ -406,4 +421,52 @@ fn decision_estimates_count_state_every_question_and_each_image() {
     }
     // The cost estimate is non-zero too (it prices input tokens).
     assert!(estimate_input_tokens(&payload(&state, one, 0)) >= 75);
+}
+
+/// Live oracle (Ollama 0.35.0 + nimble, 2026-10-03): state `"x"`, N noul
+/// questions `"q1".."qN"` each `"ok?"`. Ollama wraps every question in a
+/// prompt holding the WHOLE set — 104 + 38·N tokens per prompt — and bills one
+/// prompt per question. Measured `input_tokens`: N=1 → 142, N=8 → 3264,
+/// N=64 → 165879.
+fn tiny_questions(n: usize) -> Payload {
+    Payload::Decision {
+        state: json!("x"),
+        questions: (1..=n)
+            .map(|i| {
+                (
+                    format!("q{i}"),
+                    DecisionQuestion::Noul {
+                        instructions: json!("ok?"),
+                        criteria: None,
+                    },
+                )
+            })
+            .collect(),
+        images: vec![],
+        keep_alive: None,
+    }
+}
+
+#[test]
+fn the_window_estimate_covers_the_prompt_ollama_actually_builds() {
+    // Per-prompt size = billed / N: the window must hold one whole prompt.
+    for (n, per_prompt) in [(1usize, 142u32), (8, 3264 / 8), (64, 165_879 / 64)] {
+        let est = estimate_input_tokens_pessimistic(&tiny_questions(n));
+        assert!(
+            est >= per_prompt,
+            "N={n}: window estimate {est} < measured per-prompt {per_prompt}"
+        );
+    }
+}
+
+#[test]
+fn the_cost_estimate_covers_what_a_decision_call_bills() {
+    use super::util::estimate_input_tokens;
+    for (n, billed) in [(1usize, 142u32), (8, 3264), (64, 165_879)] {
+        let est = estimate_input_tokens(&tiny_questions(n));
+        assert!(
+            est >= billed,
+            "N={n}: cost estimate {est} < billed {billed}"
+        );
+    }
 }
