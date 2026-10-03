@@ -107,10 +107,41 @@ impl kernel::adapters::capability::EmbedModel for OllamaAdapter {
 }
 
 #[async_trait]
+impl kernel::adapters::capability::DecisionModel for OllamaAdapter {
+    async fn decide(
+        &self,
+        _config: &RouterConfig,
+        _req: &kernel::types::io::DecisionRequest,
+    ) -> Result<kernel::types::io::DecisionResponse, GatewayError> {
+        Err(GatewayError::Unsupported {
+            adapter: "ollama".into(),
+            what: "decision (stub)".into(),
+        })
+    }
+}
+
+impl OllamaAdapter {
+    /// Probe whether `model` can serve System One decisions on this server,
+    /// telling "Ollama too old" from "model not pulled" from "not a decision
+    /// model" (gh#72).
+    pub async fn probe_decision_model(
+        &self,
+        _config: &RouterConfig,
+        _model: &str,
+    ) -> Result<crate::systemone::DecisionModelStatus, GatewayError> {
+        Err(GatewayError::Unsupported {
+            adapter: "ollama".into(),
+            what: "probe (stub)".into(),
+        })
+    }
+}
+
+#[async_trait]
 impl kernel::adapters::RegisterInto for OllamaAdapter {
     async fn register_into(self: std::sync::Arc<Self>, reg: &kernel::adapters::AdapterRegistry) {
         reg.register_chat(self.clone()).await;
-        reg.register_embed(self).await;
+        reg.register_embed(self.clone()).await;
+        reg.register_decision(self).await;
     }
 }
 
