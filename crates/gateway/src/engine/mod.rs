@@ -805,6 +805,9 @@ pub(super) fn dispatch_outcome(
 mod tests;
 
 #[cfg(test)]
+mod decision_tests;
+
+#[cfg(test)]
 mod min_window_tests {
     use super::*;
     use crate::adapters::AdapterRegistry;
