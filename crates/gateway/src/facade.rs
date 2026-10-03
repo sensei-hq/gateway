@@ -441,6 +441,34 @@ mod cloud_tests {
         );
     }
 
+    /// SP-DEC-1 T5: the System One routers come up with no manual wiring —
+    /// `openrouter` for chat AND decisions, `typesafe` decision-only, and
+    /// `ollama` gains decisions beside its chat/embed.
+    #[tokio::test]
+    async fn build_registers_decision_routers() {
+        let routers = HashMap::from([
+            ("openrouter".to_string(), router()),
+            ("typesafe".to_string(), router()),
+            ("ollama".to_string(), router()),
+        ]);
+        let builder = FacadeBuilder::new(GatewayConfig {
+            routers,
+            ..Default::default()
+        });
+        let registry = builder.registry().clone();
+        builder.build().await;
+
+        assert!(registry.decision("openrouter").await.is_some());
+        assert!(registry.chat("openrouter").await.is_some());
+        assert!(registry.decision("typesafe").await.is_some());
+        assert!(
+            registry.chat("typesafe").await.is_none(),
+            "typesafe serves decisions only"
+        );
+        assert!(registry.decision("ollama").await.is_some());
+        assert!(registry.chat("ollama").await.is_some());
+    }
+
     #[tokio::test]
     async fn build_with_no_routers_yields_a_gateway_with_no_adapters() {
         let facade = FacadeBuilder::new(GatewayConfig::default()).build().await;
