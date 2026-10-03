@@ -144,9 +144,12 @@ async fn ollama_omits_absent_optionals_and_sends_no_auth_and_defaults_to_nimble(
         .and(path("/v1/systemone"))
         .respond_with(|req: &Request| {
             let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
-            let keys: Vec<_> = body.as_object().unwrap().keys().cloned().collect();
+            // `Value` sorts keys in this crate (no `preserve_order`), so compare
+            // the key SET; order is pinned by the kernel's wire tests.
+            let mut keys: Vec<_> = body.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
             let auth = req.headers.get("authorization").is_some();
-            if keys == ["model", "state", "questions"] && body["model"] == "nimble" && !auth {
+            if keys == ["model", "questions", "state"] && body["model"] == "nimble" && !auth {
                 ResponseTemplate::new(200).set_body_json(ok_body("nimble"))
             } else {
                 ResponseTemplate::new(418)
@@ -414,4 +417,53 @@ async fn both_adapters_register_into_the_decision_map() {
         reg.chat("openrouter").await.is_none(),
         "the generic adapter is decision-only"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Live (opt-in): a real Ollama >= 0.35 with `nimble` pulled.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires a local Ollama >= 0.35 at OLLAMA_URL (default http://localhost:11434) with `nimble` pulled"]
+async fn live_ollama_nimble_answers_and_probes() {
+    let url = std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://localhost:11434".into());
+    let mut cfg = keyless(&url);
+    cfg.timeout_ms = Some(120_000);
+    let adapter = OllamaAdapter::new().unwrap();
+
+    assert_eq!(
+        adapter.probe_decision_model(&cfg, "nimble").await.unwrap(),
+        DecisionModelStatus::Ready
+    );
+    assert_eq!(
+        adapter
+            .probe_decision_model(&cfg, "no-such-decision-model")
+            .await
+            .unwrap(),
+        DecisionModelStatus::NotPulled
+    );
+
+    let resp = adapter
+        .decide(&cfg, &request(Some("nimble"), vec![], None))
+        .await
+        .expect("live decision");
+    let DecisionAnswer::Choice {
+        choice,
+        probabilities,
+        confidence,
+    } = &resp.answers["label"]
+    else {
+        panic!("choice answer expected: {:?}", resp.answers);
+    };
+    assert_eq!(
+        choice, "bug",
+        "a 500-error ticket is a bug: {probabilities:?}"
+    );
+    let total: f64 = probabilities.values().sum();
+    assert!(
+        (total - 1.0).abs() < 1e-6,
+        "probabilities sum to 1: {total}"
+    );
+    assert!((0.0..=1.0).contains(confidence));
+    assert!(resp.usage.is_some_and(|u| u.input_tokens > 0));
 }
