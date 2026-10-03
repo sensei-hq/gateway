@@ -128,6 +128,12 @@ pub enum GatewayError {
     #[error("gateway not configured — no routers, models, or chains have been set")]
     NotConfigured,
 
+    /// The request itself is malformed in a way no candidate could accept
+    /// (e.g. a decision call with no questions). Raised before selection and
+    /// never a fallback trigger — every candidate would reject it identically.
+    #[error("invalid request: {message}")]
+    InvalidRequest { message: String },
+
     #[error("all {attempts} attempts failed: {errors}")]
     AllAttemptsFailed {
         attempts: usize,
@@ -281,6 +287,7 @@ impl GatewayError {
             | GatewayError::AllGated { .. }
             | GatewayError::NotConfigured
             | GatewayError::InvalidConfig(_)
+            | GatewayError::InvalidRequest { .. }
             | GatewayError::Network(_)
             | GatewayError::Serialization(_) => false,
         }
@@ -290,6 +297,25 @@ impl GatewayError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// gh#72 D2: a malformed request fails identically on every candidate, so
+    /// it must neither walk the chain nor invite a retry.
+    #[test]
+    fn invalid_request_is_terminal_never_fallback_or_retry() {
+        let e = GatewayError::InvalidRequest {
+            message: "no questions".into(),
+        };
+        let every_trigger = [
+            FallbackTrigger::RateLimit,
+            FallbackTrigger::Timeout,
+            FallbackTrigger::ProviderError,
+            FallbackTrigger::ModelUnavailable,
+            FallbackTrigger::BudgetExceeded,
+        ];
+        assert!(!e.should_trigger_fallback(&every_trigger));
+        assert!(!e.is_retryable());
+        assert_eq!(e.to_string(), "invalid request: no questions");
+    }
 
     /// `UseLargerContextWindow` RENDERS as its own remedy, not as a spelling of
     /// `RaiseBudget`.

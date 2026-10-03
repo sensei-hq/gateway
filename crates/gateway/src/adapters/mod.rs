@@ -4,7 +4,7 @@ pub mod noop;
 // `gateway::adapters::…` paths so internal code + downstream compile unchanged.
 pub use kernel::adapters::capability;
 pub use kernel::adapters::capability::{
-    ChatModel, EmbedModel, ImageModel, Model, SttModel, TtsModel, VideoModel,
+    ChatModel, DecisionModel, EmbedModel, ImageModel, Model, SttModel, TtsModel, VideoModel,
 };
 pub use kernel::adapters::{AdapterRegistry, RegisterInto};
 

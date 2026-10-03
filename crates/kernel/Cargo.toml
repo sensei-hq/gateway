@@ -11,6 +11,7 @@ name = "kernel"
 [dependencies]
 async-trait = "0.1"
 base64 = "0.22"
+indexmap = { version = "2", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 reqwest = { version = "0.13", default-features = false }

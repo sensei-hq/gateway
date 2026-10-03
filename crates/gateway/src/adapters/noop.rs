@@ -151,6 +151,20 @@ impl crate::adapters::capability::VideoModel for NoopAdapter {
 }
 
 #[async_trait]
+impl crate::adapters::capability::DecisionModel for NoopAdapter {
+    async fn decide(
+        &self,
+        _config: &RouterConfig,
+        _req: &kernel::types::io::DecisionRequest,
+    ) -> Result<kernel::types::io::DecisionResponse, GatewayError> {
+        Ok(kernel::types::io::DecisionResponse {
+            degraded: true,
+            ..Default::default()
+        })
+    }
+}
+
+#[async_trait]
 impl crate::adapters::RegisterInto for NoopAdapter {
     async fn register_into(self: std::sync::Arc<Self>, reg: &crate::adapters::AdapterRegistry) {
         reg.register_chat(self.clone()).await;
@@ -158,7 +172,8 @@ impl crate::adapters::RegisterInto for NoopAdapter {
         reg.register_stt(self.clone()).await;
         reg.register_tts(self.clone()).await;
         reg.register_image(self.clone()).await;
-        reg.register_video(self).await;
+        reg.register_video(self.clone()).await;
+        reg.register_decision(self).await;
     }
 }
 
