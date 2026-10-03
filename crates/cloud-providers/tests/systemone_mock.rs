@@ -312,7 +312,11 @@ async fn probe_distinguishes_too_old_not_pulled_not_decision_and_ready() {
             DecisionModelStatus::NotADecisionModel,
         ),
         ("0.35.1", Some(decision.clone()), DecisionModelStatus::Ready),
-        ("1.2.0", Some(decision), DecisionModelStatus::Ready),
+        ("1.2.0", Some(decision.clone()), DecisionModelStatus::Ready),
+        // A source-built Ollama reports 0.0.0, and an unparseable version is
+        // no evidence of age — neither may be called "too old".
+        ("0.0.0", Some(decision.clone()), DecisionModelStatus::Ready),
+        ("dev", Some(decision), DecisionModelStatus::Ready),
     ];
     for (version, show, expected) in cases {
         let server = probe_server(version, show).await;
@@ -428,7 +432,8 @@ async fn both_adapters_register_into_the_decision_map() {
 async fn live_ollama_nimble_answers_and_probes() {
     let url = std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://localhost:11434".into());
     let mut cfg = keyless(&url);
-    cfg.timeout_ms = Some(120_000);
+    // Generous: a cold nimble load beside other resident models took 104s here.
+    cfg.timeout_ms = Some(300_000);
     let adapter = OllamaAdapter::new().unwrap();
 
     assert_eq!(
@@ -466,4 +471,126 @@ async fn live_ollama_nimble_answers_and_probes() {
     );
     assert!((0.0..=1.0).contains(confidence));
     assert!(resp.usage.is_some_and(|u| u.input_tokens > 0));
+}
+
+// ---------------------------------------------------------------------------
+// Review fixes (SP-DEC-1 T7)
+// ---------------------------------------------------------------------------
+
+/// A host that accepts the connection and never answers must not hang the
+/// caller — even through `with_id`, whose client is built without a config.
+#[tokio::test]
+async fn a_silent_host_times_out_instead_of_hanging() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for s in listener.incoming().flatten() {
+            held.push(s);
+        }
+    });
+    let mut cfg = keyless(&format!("http://{addr}"));
+    cfg.timeout_ms = Some(300);
+
+    let adapter = SystemOneAdapter::with_id("llamacpp").unwrap();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        adapter.decide(&cfg, &request(Some("kev"), vec![], None)),
+    )
+    .await
+    .expect("the adapter's own timeout must fire well before 10s");
+    assert!(outcome.is_err(), "a silent host is an error, not a success");
+}
+
+/// The probe honours the router's `timeout_ms` too, however the adapter was
+/// built — a wedged Ollama must not hang a readiness check.
+#[tokio::test]
+async fn the_probe_times_out_against_a_silent_ollama() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for s in listener.incoming().flatten() {
+            held.push(s);
+        }
+    });
+    let mut cfg = keyless(&format!("http://{addr}"));
+    cfg.timeout_ms = Some(300);
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        OllamaAdapter::new()
+            .unwrap()
+            .probe_decision_model(&cfg, "nimble"),
+    )
+    .await
+    .expect("the probe's own timeout must fire well before 10s");
+    assert!(outcome.is_err());
+}
+
+/// A 2xx that leaves any asked question unanswered is a failed attempt — the
+/// engine must see an error (and fall back), not `success: true` with holes.
+#[tokio::test]
+async fn a_response_missing_any_asked_question_is_a_provider_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model": "nimble",
+            "answers": {"label": {"type": "noul", "noul": 0.5}},
+            "usage": {"input_tokens": 10, "output_tokens": 1}
+        })))
+        .mount(&server)
+        .await;
+
+    let mut req = request(Some("nimble"), vec![], None);
+    req.questions.insert(
+        "urgent".into(),
+        DecisionQuestion::Noul {
+            instructions: json!("Is it urgent?"),
+            criteria: None,
+        },
+    );
+    for err in [
+        OllamaAdapter::new()
+            .unwrap()
+            .decide(&keyless(&server.uri()), &req)
+            .await
+            .unwrap_err(),
+        SystemOneAdapter::with_id("typesafe")
+            .unwrap()
+            .decide(&keyless(&server.uri()), &req)
+            .await
+            .unwrap_err(),
+    ] {
+        match err {
+            GatewayError::ProviderError { message, .. } => {
+                assert!(
+                    message.contains("urgent"),
+                    "names the missing question: {message}"
+                )
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
+    }
+}
+
+/// Router `headers` (attribution, proxy auth) reach decision calls too.
+#[tokio::test]
+async fn configured_router_headers_are_sent_on_decision_calls() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .and(header("x-title", "gw"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body("jev-latest")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut cfg = keyless(&server.uri());
+    cfg.headers.insert("x-title".into(), "gw".into());
+    SystemOneAdapter::with_id("typesafe")
+        .unwrap()
+        .decide(&cfg, &request(Some("jev-latest"), vec![], None))
+        .await
+        .expect("the header-matched mock answers");
 }
