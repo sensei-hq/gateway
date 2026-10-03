@@ -26,6 +26,7 @@ pub(super) fn stream_error_code(err: &GatewayError) -> String {
         GatewayError::AllGated { .. } => "all_gated".to_string(),
         GatewayError::ModelNotReady { .. } => "model_not_ready".to_string(),
         GatewayError::InvalidConfig(_) => "invalid_config".to_string(),
+        GatewayError::InvalidRequest { .. } => "invalid_request".to_string(),
         GatewayError::Network(_) => "network".to_string(),
         GatewayError::Serialization(_) => "serialization".to_string(),
     }
@@ -89,6 +90,7 @@ pub(super) fn estimate_input_tokens(payload: &Payload) -> u32 {
         Payload::ImageGenerate { prompt, .. } => (prompt.len() / 4) as u32,
         // Video generation: estimate based on prompt length.
         Payload::VideoGenerate { prompt, .. } => (prompt.len() / 4) as u32,
+        Payload::Decision { .. } => 0,
     }
 }
 
@@ -391,6 +393,7 @@ pub fn estimate_input_tokens_pessimistic(payload: &Payload) -> u32 {
         | Payload::Tts { .. }
         | Payload::ImageGenerate { .. }
         | Payload::VideoGenerate { .. } => 0,
+        Payload::Decision { .. } => 0,
     };
     // SP-7a.1: media is priced in TOKENS, so it is added AFTER the divide below — running a
     // published per-image token figure back through the `/3` bytes heuristic would
@@ -437,7 +440,7 @@ pub(super) fn request_input_text(payload: &Payload) -> Option<String> {
         Payload::ImageGenerate { prompt, .. } | Payload::VideoGenerate { prompt, .. } => {
             prompt.clone()
         }
-        Payload::Embed { .. } | Payload::Stt { .. } => return None,
+        Payload::Embed { .. } | Payload::Stt { .. } | Payload::Decision { .. } => return None,
     };
     (!text.trim().is_empty()).then_some(text)
 }

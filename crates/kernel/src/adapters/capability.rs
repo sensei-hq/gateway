@@ -10,8 +10,9 @@ use futures::Stream;
 use crate::types::config::RouterConfig;
 use crate::types::error::GatewayError;
 use crate::types::io::{
-    ChatRequest, ChatResponse, EmbedRequest, EmbedResponse, ImageRequest, ImageResponse,
-    SttRequest, SttResponse, TtsRequest, TtsResponse, VideoRequest, VideoResponse,
+    ChatRequest, ChatResponse, DecisionRequest, DecisionResponse, EmbedRequest, EmbedResponse,
+    ImageRequest, ImageResponse, SttRequest, SttResponse, TtsRequest, TtsResponse, VideoRequest,
+    VideoResponse,
 };
 use crate::types::request::StreamChunk;
 
@@ -87,4 +88,16 @@ pub trait VideoModel: Model {
         cfg: &RouterConfig,
         req: &VideoRequest,
     ) -> Result<VideoResponse, GatewayError>;
+}
+
+/// System One decision models (gh#72): typed questions about one shared state,
+/// answered with probabilities. Non-streaming by contract — there is no
+/// `decide_stream`, and the engine's streaming path refuses this capability.
+#[async_trait]
+pub trait DecisionModel: Model {
+    async fn decide(
+        &self,
+        cfg: &RouterConfig,
+        req: &DecisionRequest,
+    ) -> Result<DecisionResponse, GatewayError>;
 }

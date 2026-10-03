@@ -333,6 +333,19 @@ pub enum Payload {
         #[serde(skip_serializing_if = "Option::is_none")]
         resolution: Option<String>,
     },
+    /// System One decision call (gh#72): typed questions about one shared
+    /// `state`, answered with probabilities. See [`super::decision`].
+    Decision {
+        state: super::decision::DecisionContent,
+        questions: super::decision::DecisionQuestions,
+        /// Base64-encoded images shared by every question, in order. Bare
+        /// base64 only — no URLs or data URLs. Vision decision models only.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<String>,
+        /// Ollama's model keep-alive: a duration string (`"5m"`) or seconds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keep_alive: Option<serde_json::Value>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -634,6 +647,10 @@ pub struct InferenceResponse {
     pub images: Option<Vec<ImageResult>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub videos: Option<Vec<VideoResult>>,
+    /// Decision answers keyed by question name ([`Capability::Decision`]).
+    /// Each answer's `confidence` is probability concentration, not correctness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decisions: Option<super::decision::DecisionAnswers>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -956,6 +973,7 @@ mod tests {
             audio: None,
             images: None,
             videos: None,
+            decisions: None,
             model: Some("claude-sonnet".to_string()),
             usage: Some(TokenUsage {
                 input_tokens: 10,
@@ -1016,6 +1034,7 @@ mod tests {
             audio: None,
             images: None,
             videos: None,
+            decisions: None,
             model: None,
             usage: None,
             tool_calls: Vec::new(),
@@ -1342,6 +1361,7 @@ mod tests {
             audio: None,
             images: None,
             videos: None,
+            decisions: None,
             model: Some("whisper-1".to_string()),
             usage: None,
             tool_calls: Vec::new(),
@@ -1370,6 +1390,7 @@ mod tests {
             audio: Some(audio_bytes.clone()),
             images: None,
             videos: None,
+            decisions: None,
             model: Some("tts-1".to_string()),
             usage: None,
             tool_calls: Vec::new(),
@@ -1470,6 +1491,7 @@ mod tests {
                 revised_prompt: None,
             }]),
             videos: None,
+            decisions: None,
             model: Some("dall-e-3".to_string()),
             usage: None,
             tool_calls: Vec::new(),
@@ -1594,6 +1616,7 @@ mod tests {
                 url: Some("https://example.com/video.mp4".to_string()),
                 duration_secs: Some(5.0),
             }]),
+            decisions: None,
             model: Some("video-gen-1".to_string()),
             usage: None,
             tool_calls: Vec::new(),

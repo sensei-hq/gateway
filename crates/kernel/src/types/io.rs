@@ -104,6 +104,24 @@ pub struct VideoResponse {
     pub degraded: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct DecisionRequest {
+    pub model: Option<String>,
+    pub state: super::decision::DecisionContent,
+    pub questions: super::decision::DecisionQuestions,
+    pub images: Vec<String>,
+    pub keep_alive: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DecisionResponse {
+    pub answers: super::decision::DecisionAnswers,
+    pub usage: Option<TokenUsage>,
+    pub model: Option<String>,
+    /// `true` = a placeholder/degraded reply (e.g. the no-provider fallback), not a real provider result.
+    pub degraded: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

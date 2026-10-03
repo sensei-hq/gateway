@@ -71,7 +71,8 @@ impl super::Gateway {
             Capability::TextRerank
             | Capability::TextModerate
             | Capability::ImageEdit
-            | Capability::ImageAnalyze => Some(Err(GatewayError::Unsupported {
+            | Capability::ImageAnalyze
+            | Capability::Decision => Some(Err(GatewayError::Unsupported {
                 adapter: router.to_string(),
                 what: "capability not yet supported (reserved)".to_string(),
             })),
