@@ -67,6 +67,7 @@ each adapter's `RegisterInto` impl (cloud and embedded alike).
 | `openrouter` | ✓ | ✓ | ✓ | ✓ | ✓ | | ✓ |
 | `typesafe` | | | | | | | ✓ |
 | `gemini` | ✓ | ✓ | | | | | |
+| `huggingface` | ✓ | ✓ | | | | | |
 | `bedrock` | ✓ | ✓ | | | | | |
 | `ollama` | ✓ | ✓ | | | | | ✓ |
 | `together` | ✓ | | | | ✓ | | |
@@ -85,6 +86,7 @@ each adapter's `RegisterInto` impl (cloud and embedded alike).
 | `embedded_llama` | ✓ | ✓ | | | | | |
 | `fastembed` | | ✓ | | | | | |
 | `ort` | | ✓ | | | | | |
+| `kokoro` | | | | ✓ | | | |
 
 Notes:
 - `noop` is the catch-all test/dev adapter — accepts every capability, returns a canned "no provider" response.
