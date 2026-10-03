@@ -39,6 +39,16 @@ impl super::Gateway {
             return Err(GatewayError::NotConfigured);
         }
 
+        // A structurally malformed decision call fails identically on every
+        // candidate — reject it once, here, rather than walk the chain (gh#72 D2).
+        if let crate::types::request::Payload::Decision {
+            state, questions, ..
+        } = &request.payload
+        {
+            crate::types::decision::validate_decision(state, questions)
+                .map_err(|message| GatewayError::InvalidRequest { message })?;
+        }
+
         // 2. Build SelectionCriteria from request. TWO size estimates over one payload,
         // for two gates that want opposite biases: `input_tokens` is the cost figure the
         // `BudgetGate` prices from, and `input_tokens_pessimistic` is the window figure

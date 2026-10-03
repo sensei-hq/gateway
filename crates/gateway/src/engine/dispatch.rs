@@ -16,7 +16,7 @@ impl super::Gateway {
         model: Option<String>,
         cfg: &kernel::types::config::RouterConfig,
     ) -> Option<Result<InferenceResponse, GatewayError>> {
-        // gh#39: this exhaustive 6-way match intentionally has no `_` arm —
+        // gh#39: this exhaustive 7-way match intentionally has no `_` arm —
         // it's a compile-time routing guarantee that every `Capability`
         // variant is handled. The qlty complexity smell here is accepted,
         // not contorted into sub-functions.
@@ -65,14 +65,20 @@ impl super::Gateway {
                 }),
                 None => None,
             },
+            Capability::Decision => match self.adapters.decision(router).await {
+                Some(m) => Some(match to_decision_request(request, model) {
+                    Ok(r) => m.decide(cfg, &r).await.map(from_decision_response),
+                    Err(e) => Err(e),
+                }),
+                None => None,
+            },
             // Reserved capabilities have no payload / trait / dispatch route
             // yet — surface an honest "not yet supported" rather than the
             // misleading "no adapter registered".
             Capability::TextRerank
             | Capability::TextModerate
             | Capability::ImageEdit
-            | Capability::ImageAnalyze
-            | Capability::Decision => Some(Err(GatewayError::Unsupported {
+            | Capability::ImageAnalyze => Some(Err(GatewayError::Unsupported {
                 adapter: router.to_string(),
                 what: "capability not yet supported (reserved)".to_string(),
             })),

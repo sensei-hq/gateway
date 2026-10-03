@@ -363,6 +363,47 @@ fn decision_estimates_count_state_every_question_and_each_image() {
         estimate_input_tokens_pessimistic(&payload(&state, one.clone(), 2)),
         base + 2 * MAX_TOKENS_PER_ATTACHMENT
     );
+    // Criteria text is in the prompt too, for every question type: the same
+    // question with 900 more characters of criteria must estimate higher.
+    let long = "z".repeat(900);
+    let variants = |crit: &str| {
+        [
+            DecisionQuestion::Choice {
+                instructions: json!("which?"),
+                criteria: [
+                    ("a".to_string(), Some(crit.to_string())),
+                    ("b".into(), None),
+                ]
+                .into_iter()
+                .collect(),
+            },
+            DecisionQuestion::Noul {
+                instructions: json!("y?"),
+                criteria: Some(crate::types::decision::NoulCriteria {
+                    r#false: Some(crit.to_string()),
+                    r#true: None,
+                }),
+            },
+            DecisionQuestion::Score {
+                instructions: json!("how?"),
+                criteria: vec![crit.to_string(), "high".into()],
+            },
+        ]
+    };
+    for (short_q, long_q) in variants("s").into_iter().zip(variants(&long)) {
+        let est = |q: DecisionQuestion| {
+            estimate_input_tokens_pessimistic(&payload(
+                "state",
+                DecisionQuestions::from([("q".to_string(), q)]),
+                0,
+            ))
+        };
+        let (s, l) = (est(short_q.clone()), est(long_q));
+        assert!(
+            l >= s + 299,
+            "criteria must count for {short_q:?}: {s} vs {l}"
+        );
+    }
     // The cost estimate is non-zero too (it prices input tokens).
     assert!(estimate_input_tokens(&payload(&state, one, 0)) >= 75);
 }
