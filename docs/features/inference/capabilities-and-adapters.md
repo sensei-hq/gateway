@@ -255,7 +255,7 @@ Decision-specific engine behaviour:
 
 ## Capability × provider matrix
 
-Rows are the cloud adapters (`crates/cloud-providers/src/`) plus the 4 embedded
+Rows are the cloud adapters (`crates/cloud-providers/src/`) plus the 5 embedded
 adapters (`crates/local-providers/src/adapters/`). A ✓ means the adapter
 implements that capability trait and is registered into that map.
 
@@ -267,6 +267,7 @@ implements that capability trait and is registered into that map.
 | `openrouter` | ✓ | ✓ | ✓ | ✓ | ✓ |   | ✓ |
 | `typesafe`   |   |   |   |   |   |   | ✓ |
 | `gemini`     | ✓ | ✓ |   |   |   |   |   |
+| `huggingface` | ✓ | ✓ |   |   |   |   |   |
 | `bedrock`    | ✓ | ✓ |   |   |   |   |   |
 | `ollama`     | ✓ | ✓ |   |   |   |   | ✓ |
 | `together`   | ✓ |   |   |   | ✓ |   |   |
@@ -285,6 +286,7 @@ implements that capability trait and is registered into that map.
 | `embedded_llama`  | ✓ | ✓ |   |   |   |   |   |
 | `fastembed`       |   | ✓ |   |   |   |   |   |
 | `ort`             |   | ✓ |   |   |   |   |   |
+| `kokoro`          |   |   |   | ✓ |   |   |   |
 
 `openrouter` is two adapters under one router id: `OpenAIAdapter` (id `openrouter`,
 so it registers OpenAI's fixed chat/embed/STT/TTS/image set — whether OpenRouter

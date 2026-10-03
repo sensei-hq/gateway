@@ -164,6 +164,12 @@ Which errors can vs. cannot advance the walk:
 | `NoCandidates`          | **never** | Raised before the walk; not an in-walk failure. |
 | `NotConfigured`         | **never** | Raised before the walk. |
 | `AllAttemptsFailed`     | **never** | This *is* the terminal error the walk produces. |
+| `InvalidRequest`        | **never** | Raised before the walk: the request is malformed for every candidate (e.g. a decision call with no questions). Not retryable either. |
+| `Unsupported`           | **never** | The adapter cannot perform the sub-operation (e.g. streaming); not a provider fault. |
+| `QuotaExceeded`         | **never** | A per-subject hard stop, not a provider fault. |
+| `ModelNotReady`         | **never** | A still-provisioning model, not a provider fault. |
+| `AllGated`              | **never** | Raised before the walk: every candidate was gated (cooldown, breaker, lockout, budget, window). |
+| `InvalidConfig`         | **never** | A configuration error; no candidate can fix it. |
 
 Two guards to keep in mind:
 

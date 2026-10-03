@@ -21,13 +21,20 @@ acceptance contract, so this file maps it onto tasks rather than restating it.
 - **D1** `Capability::Decision` (serde `decision`) — matches Ollama's capability string and OpenRouter's
   `decisions` output modality.
 - **D2** `GatewayError::InvalidRequest { message }` — a hard stop raised before selection for structural
-  violations (1–64 questions, ≥2 choice/score criteria, non-blank names/state). Not a fallback trigger:
+  violations (1–64 questions, ≥2 choice/score criteria, non-blank names, a state/instructions that
+  is not a whitespace-only string — an empty `{}`/`[]` IS valid upstream and on Ollama; review #1). Not a fallback trigger:
   every candidate would reject it identically. Per-provider *upper* bounds (Ollama 26 options, TypeSafe
   255/10) stay with the provider's 400, which does fall back.
 - **D3** Short context is enforced by the existing `ContextWindowGate`: the pessimistic estimate for a
   decision payload counts state + every question (Tev1 scores each question with the whole set in its
-  prompt), and the consumer seeds a model's real `context_window`.
-- **D4** Routers: Ollama (native, keyless) + a generic id-configurable `SystemOneAdapter` (bearer auth) the
+  prompt) PLUS the provider's prompt framing (measured on Ollama 0.35.0 as `104 + 38·N` tokens per
+  prompt, estimated as `128 + 48·N`; review #2), and the consumer seeds a model's real
+  `context_window`. The cost estimate is `N ×` that prompt — billing counts one prompt per question.
+- **D4** **Supersedes gh#72's "local-only" constraint**: when the issue was written cloud decision
+  serving was "coming soon"; by 2026-10-03 OpenRouter (`/api/v1/systemone` → 401 unauthenticated,
+  vs 404 for an unknown path) and TypeSafe (`/v1/systemone` → 403 "Must supply an API key") both
+  serve it. Ollama itself remains local-only (it rejects cloud models with a 400).
+  Routers: Ollama (native, keyless) + a generic id-configurable `SystemOneAdapter` (bearer auth) the
   facade auto-registers for `openrouter` and `typesafe`. Cloudflare Workers AI (different image shape,
   truncates input) and Liquid (non-standard path, usable via `url`) are carry-forwards.
 - **D5** No streaming: `execute_stream` already refuses every non-chat capability.
@@ -58,7 +65,7 @@ Downstream (sensei, after v0.7.0): `model_capability` gains `decision`, seed dec
 | T4 | `04c9e2e` red → `7bcd6a0` | 9 wiremock + 1 live (Ollama 0.35.0 + nimble, passes); 8/8 mutations caught |
 | T5 | red → `50cafb9` | facade: openrouter (chat + decision), typesafe |
 | T6 | docs commit + re-export fix | docs sync found `systemone` missing from `gateway::adapters` re-exports — fixed, pinned by `reexport_paths`; upgrading.md 0.6.x → 0.7.0 |
-| T7 | — | whole-slice review, then v0.7.0 |
+| T7 | review | 5 reviewers; 12 must-fix (1 CRITICAL, 4 HIGH, 7 MEDIUM) all fixed red-first in four groups: kernel validation (#1, #8), engine estimators (#2, #3, #6), System One adapter (#4, #7, #9, #10), docs/contract (#5, #11, #12). LOW #13, #14 carried. Pre-existing: `OllamaAdapter::from_config`/`OpenAIAdapter::from_config` have no default timeout when `timeout_ms` is unset (chat path) |
 
 Carry-forwards: Cloudflare Workers AI (`clef`, different image shape, truncates); Liquid (non-standard path);
 emulating decisions over logprobs on chat endpoints; sensei seed + `map_capability` (needs sensei#202).
