@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 
 use crate::store::UsageTotals;
 use crate::types::config::{MeterUnit, Window};
+use crate::types::decision::{DecisionContent, DecisionQuestion, DecisionQuestions};
 use crate::types::error::GatewayError;
 use crate::types::request::{MediaAttachment, Payload};
 
@@ -90,8 +91,59 @@ pub(super) fn estimate_input_tokens(payload: &Payload) -> u32 {
         Payload::ImageGenerate { prompt, .. } => (prompt.len() / 4) as u32,
         // Video generation: estimate based on prompt length.
         Payload::VideoGenerate { prompt, .. } => (prompt.len() / 4) as u32,
-        Payload::Decision { .. } => 0,
+        Payload::Decision {
+            state, questions, ..
+        } => (decision_chars(state, questions) / 4) as u32,
     }
+}
+
+/// Characters a decision call puts in front of the model: the shared state
+/// plus EVERY question — its name, instructions and criteria. Every question is
+/// counted because Tev1-class models score each question with the whole set in
+/// the prompt (gh#72); summing is the safe side for both estimates.
+fn decision_chars(state: &DecisionContent, questions: &DecisionQuestions) -> usize {
+    fn content_chars(c: &DecisionContent) -> usize {
+        match c {
+            serde_json::Value::String(s) => s.len(),
+            other => other.to_string().len(),
+        }
+    }
+    let question_chars: usize = questions
+        .iter()
+        .map(|(name, q)| {
+            name.len()
+                + match q {
+                    DecisionQuestion::Choice {
+                        instructions,
+                        criteria,
+                    } => {
+                        content_chars(instructions)
+                            + criteria
+                                .iter()
+                                .map(|(k, v)| k.len() + v.as_ref().map_or(0, String::len))
+                                .sum::<usize>()
+                    }
+                    DecisionQuestion::Noul {
+                        instructions,
+                        criteria,
+                    } => {
+                        content_chars(instructions)
+                            + criteria.as_ref().map_or(0, |c| {
+                                c.r#false.as_ref().map_or(0, String::len)
+                                    + c.r#true.as_ref().map_or(0, String::len)
+                            })
+                    }
+                    DecisionQuestion::Score {
+                        instructions,
+                        criteria,
+                    } => {
+                        content_chars(instructions)
+                            + criteria.iter().map(String::len).sum::<usize>()
+                    }
+                }
+        })
+        .sum();
+    content_chars(state) + question_chars
 }
 
 /// What one [`MediaAttachment`] is charged against a candidate's context window.
@@ -393,7 +445,11 @@ pub fn estimate_input_tokens_pessimistic(payload: &Payload) -> u32 {
         | Payload::Tts { .. }
         | Payload::ImageGenerate { .. }
         | Payload::VideoGenerate { .. } => 0,
-        Payload::Decision { .. } => 0,
+        // A decision call's state and questions all sit in one prompt the window
+        // bounds — the short-context constraint of gh#72 is enforced right here.
+        Payload::Decision {
+            state, questions, ..
+        } => decision_chars(state, questions),
     };
     // SP-7a.1: media is priced in TOKENS, so it is added AFTER the divide below — running a
     // published per-image token figure back through the `/3` bytes heuristic would
@@ -411,6 +467,11 @@ pub fn estimate_input_tokens_pessimistic(payload: &Payload) -> u32 {
                 .fold(0u32, |acc, attachment| match attachment {
                     MediaAttachment::Image { .. } => acc.saturating_add(MAX_TOKENS_PER_ATTACHMENT),
                 }),
+            // Decision images are shared by every question and occupy the same
+            // window chat attachments do, so they are priced the same way.
+            Payload::Decision { images, .. } => u32::try_from(images.len())
+                .unwrap_or(u32::MAX)
+                .saturating_mul(MAX_TOKENS_PER_ATTACHMENT),
             // No other payload kind carries `attachments` today. Left as 0 rather than folded
             // into the arms above so this term reads as "what media costs", independent of
             // which payloads happen to have a media field.
