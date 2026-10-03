@@ -9,8 +9,9 @@ agent that needs to *use* the crate.
 
 A **provider-agnostic multimodal inference routing engine**. You configure providers +
 models + fallback chains once, then send requests **by capability** — chat, embeddings,
-image, video and speech. The caller never picks a provider SDK — the gateway routes,
-retries down a fallback chain, trips a per-endpoint circuit breaker, meters cost, can
+image, video, speech and System One **decisions** (typed questions → probabilities).
+The caller never picks a provider SDK — the gateway routes, retries down a fallback
+chain, trips a per-endpoint circuit breaker, meters cost, can
 run multi-model **consensus/panels**, and (optionally) enforces subscription quotas.
 Credentials (API key or OAuth/bearer) come from a caller-supplied map or the companion
 `vault` crate.
@@ -41,7 +42,7 @@ let resp     = gateway.execute(&request).await?;
 |---|---|
 | [quickstart](quickstart.md) | Get a working chat/embed call end-to-end |
 | [configuration](configuration.md) | Define routers, models, chains, pricing, keys (builder or JSON) |
-| [recipes](recipes.md) | Routing modes, fallback, streaming, cost, budget, persistence, quotas, tools |
+| [recipes](recipes.md) | Routing modes, fallback, streaming, cost, budget, persistence, quotas, tools, decisions |
 | [local](local.md) | Run local models — Ollama (server or embedded), llama.cpp, ONNX, Kokoro TTS + HF download |
 | [custom-adapters](custom-adapters.md) | Add a provider the crate doesn't ship |
 | [upgrading](upgrading.md) | Re-pin a dep across releases (newest-first: 0.3→0.4, 0.2→0.3) |

@@ -122,6 +122,13 @@ what you asked for:
 | `AudioGenerate` | `audio: Option<Vec<u8>>` |
 | `ImageGenerate` | `images: Option<Vec<ImageResult>>` |
 | `VideoGenerate` | `videos: Option<Vec<VideoResult>>` |
+| `Decision` | `decisions: Option<DecisionAnswers>` — keyed by question name, in request order |
+
+For `Decision`, `confidence` is how concentrated the probabilities are, **not** whether
+the answer is correct (uncalibrated — never show it as accuracy or gate on it as such);
+`noul` is a probability of true, not a bool; `score` is a probability-weighted mean of
+zero-based level indices (`0..=levels-1`), not normalized. See
+[recipes § decision](recipes.md#ask-a-decision-system-one).
 
 Always present: `success: bool`, `model: Option<String>`, `usage: Option<TokenUsage>`,
 `estimated_cost` / `actual_cost`, `attempts: Vec<Attempt>` (the fallback trail).
@@ -129,7 +136,8 @@ Always present: `success: bool`, `model: Option<String>`, `usage: Option<TokenUs
 ## Errors
 
 `execute` returns `Result<InferenceResponse, GatewayError>`. Common variants:
-`NotConfigured`, `NoCandidates`, `Authentication`, `RateLimit`, `Timeout`,
+`NotConfigured`, `NoCandidates`, `InvalidRequest` (a structurally malformed decision
+call, raised before selection — never retried or fallen back), `Authentication`, `RateLimit`, `Timeout`,
 `ProviderError`, `BudgetExceeded`, `QuotaExceeded`, `AllAttemptsFailed { attempts_detail }`
 (carries every attempt's error). Prefer `Gateway::try_new(..)` over `new` to validate
 config up front.
