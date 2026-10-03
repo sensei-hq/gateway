@@ -91,16 +91,39 @@ pub(super) fn estimate_input_tokens(payload: &Payload) -> u32 {
         Payload::ImageGenerate { prompt, .. } => (prompt.len() / 4) as u32,
         // Video generation: estimate based on prompt length.
         Payload::VideoGenerate { prompt, .. } => (prompt.len() / 4) as u32,
+        // Billed per question: the provider scores each question in its own
+        // prompt, and every prompt carries the whole set ("shared context is
+        // counted again when the model scores questions separately").
         Payload::Decision {
             state, questions, ..
-        } => (decision_chars(state, questions) / 4) as u32,
+        } => {
+            let per_prompt = u32::try_from(decision_chars(state, questions) / 4)
+                .unwrap_or(u32::MAX)
+                .saturating_add(decision_prompt_overhead(questions.len()));
+            u32::try_from(questions.len())
+                .unwrap_or(u32::MAX)
+                .saturating_mul(per_prompt)
+        }
     }
 }
 
-/// Characters a decision call puts in front of the model: the shared state
-/// plus EVERY question — its name, instructions and criteria. Every question is
-/// counted because Tev1-class models score each question with the whole set in
-/// the prompt (gh#72); summing is the safe side for both estimates.
+/// Tokens a System One provider wraps around the caller's text in ONE scoring
+/// prompt: a fixed preamble plus a per-question frame for every question in the
+/// set. Measured on Ollama 0.35.0 + nimble (2026-10-03) as `104 + 38·N`; rounded
+/// up to `128 + 48·N` so the estimate stays on the safe side for hosts that frame
+/// a little more. Pinned by `decision_tests::the_window_estimate_covers_the_prompt_ollama_actually_builds`.
+fn decision_prompt_overhead(questions: usize) -> u32 {
+    const PREAMBLE: u32 = 128;
+    const PER_QUESTION: u32 = 48;
+    u32::try_from(questions)
+        .unwrap_or(u32::MAX)
+        .saturating_mul(PER_QUESTION)
+        .saturating_add(PREAMBLE)
+}
+
+/// Characters a decision call puts in front of the model in ONE prompt: the
+/// shared state plus EVERY question — its name, instructions and criteria —
+/// since each scoring prompt carries the whole question set (gh#72).
 fn decision_chars(state: &DecisionContent, questions: &DecisionQuestions) -> usize {
     fn content_chars(c: &DecisionContent) -> usize {
         match c {
@@ -469,9 +492,14 @@ pub fn estimate_input_tokens_pessimistic(payload: &Payload) -> u32 {
                 }),
             // Decision images are shared by every question and occupy the same
             // window chat attachments do, so they are priced the same way.
-            Payload::Decision { images, .. } => u32::try_from(images.len())
+            // ...and the provider's prompt framing, also in tokens — see
+            // `decision_prompt_overhead`.
+            Payload::Decision {
+                images, questions, ..
+            } => u32::try_from(images.len())
                 .unwrap_or(u32::MAX)
-                .saturating_mul(MAX_TOKENS_PER_ATTACHMENT),
+                .saturating_mul(MAX_TOKENS_PER_ATTACHMENT)
+                .saturating_add(decision_prompt_overhead(questions.len())),
             // No other payload kind carries `attachments` today. Left as 0 rather than folded
             // into the arms above so this term reads as "what media costs", independent of
             // which payloads happen to have a media field.
