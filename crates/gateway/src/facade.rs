@@ -157,7 +157,9 @@ impl FacadeBuilder {
     }
 }
 
-/// Register the cloud adapter matching each well-known router name from config,
+/// Register the cloud adapter matching each well-known router name from config
+/// (`openrouter` gets both its OpenAI-wire chat adapter and a System One
+/// decision adapter; `typesafe` is decision-only),
 /// returning `(router, error)` for any that failed to build. `bedrock` (which
 /// needs explicit AWS SDK setup) and unrecognised router names are skipped for
 /// the caller to register manually via the shared registry.
@@ -221,6 +223,35 @@ async fn register_cloud_from_config(
                 reg(
                     registry,
                     cp::replicate::ReplicateAdapter::from_config(router),
+                )
+                .await,
+            ),
+            // OpenRouter speaks the OpenAI wire for chat/embed and System One
+            // for decisions — two adapters under one router id (SP-DEC-1).
+            "openrouter" => Some(
+                match reg(
+                    registry,
+                    cp::openai::OpenAIAdapter::from_config_with_id("openrouter", router),
+                )
+                .await
+                {
+                    Ok(()) => {
+                        reg(
+                            registry,
+                            cp::systemone::SystemOneAdapter::from_config_with_id(
+                                "openrouter",
+                                router,
+                            ),
+                        )
+                        .await
+                    }
+                    err => err,
+                },
+            ),
+            "typesafe" => Some(
+                reg(
+                    registry,
+                    cp::systemone::SystemOneAdapter::from_config_with_id("typesafe", router),
                 )
                 .await,
             ),
