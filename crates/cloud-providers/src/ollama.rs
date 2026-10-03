@@ -175,6 +175,7 @@ impl OllamaAdapter {
         let version: Version = self
             .client
             .get(format!("{base}/api/version"))
+            .timeout(crate::systemone::request_timeout(config))
             .send()
             .await?
             .error_for_status()?
@@ -191,6 +192,7 @@ impl OllamaAdapter {
         let show = self
             .client
             .post(format!("{base}/api/show"))
+            .timeout(crate::systemone::request_timeout(config))
             .json(&serde_json::json!({ "model": model }))
             .send()
             .await?;

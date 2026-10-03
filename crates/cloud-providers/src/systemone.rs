@@ -27,6 +27,21 @@ pub const TYPESAFE_BASE_URL: &str = "https://api.typesafe.ai";
 
 const PATH: &str = "/v1/systemone";
 
+/// Bound on one decision call when the router sets no `timeout_ms`. A bare
+/// `reqwest::Client` has NO timeout, so a host that accepts the connection and
+/// never answers would hang the caller forever (the defect `OllamaAdapter::new`
+/// already fixed for chat with the same 120s).
+const DEFAULT_TIMEOUT_SECS: u64 = 120;
+
+/// The deadline applied to every decision request: the router's `timeout_ms`,
+/// else [`DEFAULT_TIMEOUT_SECS`]. Applied per request rather than per client so
+/// it holds however the adapter was built (`with_id` has no config to read).
+pub(crate) fn request_timeout(cfg: &RouterConfig) -> std::time::Duration {
+    cfg.timeout_ms
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+}
+
 /// Whether a local Ollama can serve a decision model right now — the
 /// distinctions gh#72 asks probing to make.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +130,7 @@ pub(crate) async fn decide(
     };
     let mut http = client
         .post(format!("{}{PATH}", base_url.trim_end_matches('/')))
+        .timeout(request_timeout(cfg))
         .json(&body);
     if let Some(key) = resolve_api_key(cfg) {
         http = http.bearer_auth(key);
@@ -147,6 +163,23 @@ pub(crate) async fn decide(
             message: format!("failed to parse System One response: {e}"),
             status: Some(status.as_u16()),
         })?;
+    // A 2xx with holes is not a success: report it as a failed attempt so the
+    // engine records it and falls back, rather than `success: true` over
+    // questions nobody answered.
+    let missing: Vec<&str> = req
+        .questions
+        .keys()
+        .filter(|name| !wire.answers.contains_key(*name))
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        return Err(GatewayError::ProviderError {
+            adapter: adapter.into(),
+            message: format!("System One response has no answer for {missing:?}"),
+            status: Some(status.as_u16()),
+        });
+    }
+
     Ok(Ok(DecisionResponse {
         answers: wire.answers,
         usage: wire.usage.map(|u| TokenUsage {
@@ -257,6 +290,19 @@ mod tests {
             timeout_ms: None,
             headers: HashMap::new(),
         }
+    }
+
+    /// A router with no `timeout_ms` still gets a bound: a wedged host must
+    /// not hang `Gateway::execute` (the defect `OllamaAdapter::new` fixed).
+    #[test]
+    fn requests_are_bounded_even_without_a_configured_timeout() {
+        assert_eq!(
+            request_timeout(&cfg("http://h")),
+            std::time::Duration::from_secs(120)
+        );
+        let mut c = cfg("http://h");
+        c.timeout_ms = Some(2500);
+        assert_eq!(request_timeout(&c), std::time::Duration::from_millis(2500));
     }
 
     #[test]
