@@ -158,6 +158,33 @@ fn validate_accepts_the_documented_shapes() {
         ("urgency", score("How urgent?", &["low", "high"])),
     ]);
     assert_eq!(validate_decision(&json!("a ticket"), &qs), Ok(()));
+
+    // Exactly the documented maximum is legal; 65 is pinned as illegal below.
+    let sixty_four: DecisionQuestions = (0..64).map(|i| (format!("q{i}"), noul("y?"))).collect();
+    assert_eq!(validate_decision(&json!("x"), &sixty_four), Ok(()));
+}
+
+/// Upstream `SystemOneContent` is `string (pattern \S) | object | array` with no
+/// `minProperties`/`minItems`, and a live Ollama 0.35 answers `state: {}` /
+/// `instructions: []` with a 200 — only a blank STRING is invalid.
+#[test]
+fn validate_accepts_empty_object_and_array_content() {
+    let with_instr = |i: serde_json::Value| {
+        questions(vec![(
+            "q",
+            DecisionQuestion::Noul {
+                instructions: i,
+                criteria: None,
+            },
+        )])
+    };
+    for empty in [json!({}), json!([])] {
+        assert_eq!(validate_decision(&empty, &with_instr(json!("y?"))), Ok(()));
+        assert_eq!(
+            validate_decision(&json!("x"), &with_instr(empty.clone())),
+            Ok(())
+        );
+    }
 }
 
 #[test]
@@ -165,8 +192,6 @@ fn validate_rejects_each_structural_violation_with_the_offending_name() {
     let ok = || questions(vec![("q", noul("y?"))]);
     let cases: Vec<(serde_json::Value, DecisionQuestions, &str)> = vec![
         (json!("   "), ok(), "state"),
-        (json!({}), ok(), "state"),
-        (json!([]), ok(), "state"),
         (json!(null), ok(), "state"),
         (json!("x"), questions(vec![]), "1–64"),
         (

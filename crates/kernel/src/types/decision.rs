@@ -12,8 +12,8 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
-/// Free-form content — a non-blank string, or a JSON object/array the provider
-/// serializes as JSON text. Used for `state` and each question's `instructions`.
+/// Free-form content — a non-blank string, or a JSON object/array (possibly
+/// empty) the provider serializes as JSON text. Used for `state` and each question's `instructions`.
 pub type DecisionContent = serde_json::Value;
 
 /// Named questions about the shared state, in request order.
@@ -104,7 +104,7 @@ pub fn validate_decision(
     questions: &DecisionQuestions,
 ) -> Result<(), String> {
     if is_blank(state) {
-        return Err("decision `state` must be a non-blank string, object or array".into());
+        return Err("decision `state` must be a non-blank string, an object or an array".into());
     }
     if questions.is_empty() || questions.len() > MAX_DECISION_QUESTIONS {
         return Err(format!(
@@ -150,11 +150,13 @@ pub fn validate_decision(
     Ok(())
 }
 
+/// Upstream `SystemOneContent` is `string (pattern \S) | object | array` with no
+/// `minProperties` / `minItems`: an empty `{}` or `[]` is valid (Ollama answers
+/// it), only a whitespace-only string — or a non-string scalar / null — is not.
 fn is_blank(content: &DecisionContent) -> bool {
     match content {
         serde_json::Value::String(s) => s.trim().is_empty(),
-        serde_json::Value::Object(o) => o.is_empty(),
-        serde_json::Value::Array(a) => a.is_empty(),
+        serde_json::Value::Object(_) | serde_json::Value::Array(_) => false,
         _ => true,
     }
 }
