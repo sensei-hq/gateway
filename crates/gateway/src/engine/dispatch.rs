@@ -16,7 +16,7 @@ impl super::Gateway {
         model: Option<String>,
         cfg: &kernel::types::config::RouterConfig,
     ) -> Option<Result<InferenceResponse, GatewayError>> {
-        // gh#39: this exhaustive 6-way match intentionally has no `_` arm —
+        // gh#39: this exhaustive 7-way match intentionally has no `_` arm —
         // it's a compile-time routing guarantee that every `Capability`
         // variant is handled. The qlty complexity smell here is accepted,
         // not contorted into sub-functions.
@@ -61,6 +61,13 @@ impl super::Gateway {
             Capability::VideoGenerate => match self.adapters.video(router).await {
                 Some(m) => Some(match to_video_request(request, model) {
                     Ok(r) => m.generate_video(cfg, &r).await.map(from_video_response),
+                    Err(e) => Err(e),
+                }),
+                None => None,
+            },
+            Capability::Decision => match self.adapters.decision(router).await {
+                Some(m) => Some(match to_decision_request(request, model) {
+                    Ok(r) => m.decide(cfg, &r).await.map(from_decision_response),
                     Err(e) => Err(e),
                 }),
                 None => None,

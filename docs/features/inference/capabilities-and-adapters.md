@@ -24,7 +24,7 @@ compile-time impossibility rather than a runtime `ProviderError`.
 
 ## The `Capability` enum
 
-`crates/gateway/src/types/capability.rs` declares **11** capabilities across four
+`crates/kernel/src/types/capability.rs` declares **12** capabilities across five
 modalities:
 
 | Modality | Variant | Meaning |
@@ -40,10 +40,11 @@ modalities:
 | Audio | `AudioTranscribe` | audio → text (STT) |
 | Audio | `AudioGenerate`   | text → audio (TTS) |
 | Video | `VideoGenerate`   | text/image → video |
+| Decision | `Decision`     | state + typed questions (+ images) → probabilities, not text (System One, gh#72) |
 
-Only **6** of these have a corresponding `Payload` variant today
-(`crates/gateway/src/types/request.rs`): `Chat`, `Embed`, `Stt`, `Tts`,
-`ImageGenerate`, `VideoGenerate`. The other **5** are **reserved / future**:
+Only **7** of these have a corresponding `Payload` variant today
+(`crates/kernel/src/types/request.rs`): `Chat`, `Embed`, `Stt`, `Tts`,
+`ImageGenerate`, `VideoGenerate`, `Decision`. The other **5** are **reserved / future**:
 
 - `TextComplete` **folds into `ChatModel`** — a single prompt is a one-message
   chat, so no distinct completion path is built unless a provider ever needs one.
@@ -52,7 +53,7 @@ Only **6** of these have a corresponding `Payload` variant today
   reserved future traits (`RerankModel`, `ModerateModel`, `ImageEditModel`,
   `ImageAnalyzeModel`), not implemented.
 
-So the target model builds exactly **6 capability traits** — the ones backed by a
+So the model builds exactly **7 capability traits** — the ones backed by a
 real `Payload`.
 
 ---
@@ -88,10 +89,13 @@ trait ChatModel: Model {
 #[async_trait] trait TtsModel:   Model { async fn speak(&self, cfg: &RouterConfig, req: &TtsRequest) -> Result<TtsResponse, GatewayError>; }
 #[async_trait] trait ImageModel: Model { async fn generate_image(&self, cfg: &RouterConfig, req: &ImageRequest) -> Result<ImageResponse, GatewayError>; }
 #[async_trait] trait VideoModel: Model { async fn generate_video(&self, cfg: &RouterConfig, req: &VideoRequest) -> Result<VideoResponse, GatewayError>; }
+#[async_trait] trait DecisionModel: Model { async fn decide(&self, cfg: &RouterConfig, req: &DecisionRequest) -> Result<DecisionResponse, GatewayError>; }
 ```
 
 Notes:
 
+- `DecisionModel` is non-streaming by contract — there is no `decide_stream`, and
+  `execute_stream` refuses every non-chat capability with `Unsupported`.
 - `chat_stream` is the only default method — a provider without streaming inherits
   a `GatewayError::Unsupported` instead of being forced to write a stub. (`Unsupported`
   is a new variant added by this refactor to the existing `GatewayError` in
@@ -116,11 +120,14 @@ more parallel-`Option` product type inside adapters.
 | `AudioGenerate`   | `Tts`             | `TtsModel`   | `TtsRequest`   | `TtsResponse`   | `audio` |
 | `ImageGenerate`   | `ImageGenerate`   | `ImageModel` | `ImageRequest` | `ImageResponse` | `images` |
 | `VideoGenerate`   | `VideoGenerate`   | `VideoModel` | `VideoRequest` | `VideoResponse` | `videos` |
+| `Decision`        | `Decision`        | `DecisionModel` | `DecisionRequest` | `DecisionResponse` | `decisions`, `usage` |
 
 The typed request/response structs mirror each `Payload` variant — e.g.
 `ChatRequest { model, messages, system, max_tokens, temperature, tools }` /
 `ChatResponse { content, tool_calls, usage, model }`; `EmbedRequest { model, texts }`
-/ `EmbedResponse { embeddings, usage }`; and so on for STT, TTS, image, and video.
+/ `EmbedResponse { embeddings, usage }`; `DecisionRequest { model, state, questions,
+images, keep_alive }` / `DecisionResponse { answers, usage, model, degraded }`; and so
+on for STT, TTS, image, and video.
 
 **Boundary translation lives in the engine**, not in adapters or consumers:
 
@@ -151,6 +158,7 @@ struct AdapterRegistry {
     tts:   HashMap<String, Arc<dyn TtsModel>>,
     image: HashMap<String, Arc<dyn ImageModel>>,
     video: HashMap<String, Arc<dyn VideoModel>>,
+    decision: HashMap<String, Arc<dyn DecisionModel>>,
 }
 
 impl AdapterRegistry {
@@ -211,49 +219,192 @@ match request.capability {
         model.chat(&candidate.router_config, &chat_req).await.map(from_chat_response)
     }
     Capability::TextEmbed => { /* … embed … */ }
-    // … one arm per capability
+    Capability::Decision  => { /* self.adapters.decision(router) → to_decision_request → decide → from_decision_response */ }
+    // … one arm per capability; `TextComplete` shares the `TextChat` arm
 }
 ```
 
+The real match lives in `crates/gateway/src/engine/dispatch.rs` and is exhaustive
+(no `_` arm), so a new `Capability` variant is a compile error until it is routed.
+`TextComplete` dispatches through the same arm as `TextChat` (to `ChatModel`); the four
+reserved capabilities return `GatewayError::Unsupported`.
+
 Fallback-chain walking, circuit-breaker record-success/failure, attempt tracing,
 and budget filtering are **unchanged** — they already key off `Capability`.
+
+Decision-specific engine behaviour:
+
+- **Validation before selection.** `execute` runs `validate_decision` on a
+  `Payload::Decision` before any candidate is selected. A structural violation — no
+  questions or more than `MAX_DECISION_QUESTIONS` (64), a `choice`/`score` question
+  with fewer than `MIN_DECISION_CRITERIA` (2) criteria, a whitespace-only string
+  `state` / `instructions` (an empty `{}` or `[]` is valid, as upstream), a blank
+  question name or choice option key — returns
+  `GatewayError::InvalidRequest { message }`. It is never a fallback trigger and not
+  retryable: every candidate would reject it identically. Per-provider *upper* bounds
+  (e.g. Ollama's 26 options) are left to the provider's own 400 — a `ProviderError`,
+  which falls back when the chain lists that trigger.
+- **Context-window sizing.** Each scoring prompt holds the shared `state`, **every**
+  question (name, instructions, criteria) and the provider's framing — measured on
+  Ollama 0.35 as `104 + 38·N` tokens, estimated as `128 + 48·N` — so the
+  `ContextWindowGate` skips a decision model whose `context_window` cannot hold one
+  whole prompt. The **cost** estimate is `N ×` that prompt: providers score each
+  question in its own prompt and bill every one. Each decision image is priced like
+  a chat image attachment (`MAX_TOKENS_PER_ATTACHMENT`).
+- **Holes are failures.** A 2xx response missing an answer for any asked question
+  is a `ProviderError` (it falls back), never `success: true` with gaps. Every
+  decision request is bounded by the router's `timeout_ms`, else 120 s.
+- **No streaming.** `execute_stream` returns `Unsupported` for `Decision`.
+  Panels fan out through `execute`, so they get the same validation and gating.
 
 ---
 
 ## Capability × provider matrix
 
-Rows are the 16 cloud adapters (`crates/cloud-providers/src/`) plus the 4 embedded
-adapters (`crates/local-providers/src/adapters/`). A ✓ means the adapter will
-implement that capability trait and be registered into that map.
+Rows are the cloud adapters (`crates/cloud-providers/src/`) plus the 5 embedded
+adapters (`crates/local-providers/src/adapters/`). A ✓ means the adapter
+implements that capability trait and is registered into that map.
 
-| Adapter | Chat | Embed | STT | TTS | Image | Video |
-|---------|:----:|:-----:|:---:|:---:|:-----:|:-----:|
-| **Cloud** | | | | | | |
-| `anthropic`  | ✓ |   |   |   |   |   |
-| `openai`     | ✓ | ✓ | ✓ | ✓ | ✓ |   |
-| `gemini`     | ✓ | ✓ |   |   |   |   |
-| `bedrock`    | ✓ | ✓ |   |   |   |   |
-| `ollama`     | ✓ | ✓ |   |   |   |   |
-| `together`   | ✓ |   |   |   | ✓ |   |
-| `grok`       | ✓ |   | ✓ | ✓ |   |   |
-| `flux`       |   |   |   |   | ✓ |   |
-| `recraft`    |   |   |   |   | ✓ |   |
-| `stability`  |   |   |   |   | ✓ |   |
-| `fal`        |   |   |   |   | ✓ | ✓ |
-| `replicate`  |   |   |   |   | ✓ | ✓ |
-| `kling`      |   |   |   |   |   | ✓ |
-| `luma`       |   |   |   |   |   | ✓ |
-| `runway`     |   |   |   |   |   | ✓ |
-| `noop`       | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| **Embedded** | | | | | | |
-| `llama_cpp`       | ✓ | ✓ |   |   |   |   |
-| `embedded_llama`  | ✓ | ✓ |   |   |   |   |
-| `fastembed`       |   | ✓ |   |   |   |   |
-| `ort`             |   | ✓ |   |   |   |   |
+| Adapter | Chat | Embed | STT | TTS | Image | Video | Decision |
+|---------|:----:|:-----:|:---:|:---:|:-----:|:-----:|:--------:|
+| **Cloud** | | | | | | | |
+| `anthropic`  | ✓ |   |   |   |   |   |   |
+| `openai`     | ✓ | ✓ | ✓ | ✓ | ✓ |   |   |
+| `openrouter` | ✓ | ✓ | ✓ | ✓ | ✓ |   | ✓ |
+| `typesafe`   |   |   |   |   |   |   | ✓ |
+| `gemini`     | ✓ | ✓ |   |   |   |   |   |
+| `huggingface` | ✓ | ✓ |   |   |   |   |   |
+| `bedrock`    | ✓ | ✓ |   |   |   |   |   |
+| `ollama`     | ✓ | ✓ |   |   |   |   | ✓ |
+| `together`   | ✓ |   |   |   | ✓ |   |   |
+| `grok`       | ✓ |   | ✓ | ✓ |   |   |   |
+| `flux`       |   |   |   |   | ✓ |   |   |
+| `recraft`    |   |   |   |   | ✓ |   |   |
+| `stability`  |   |   |   |   | ✓ |   |   |
+| `fal`        |   |   |   |   | ✓ | ✓ |   |
+| `replicate`  |   |   |   |   | ✓ | ✓ |   |
+| `kling`      |   |   |   |   |   | ✓ |   |
+| `luma`       |   |   |   |   |   | ✓ |   |
+| `runway`     |   |   |   |   |   | ✓ |   |
+| `noop`       | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| **Embedded** | | | | | | | |
+| `llama_cpp`       | ✓ | ✓ |   |   |   |   |   |
+| `embedded_llama`  | ✓ | ✓ |   |   |   |   |   |
+| `fastembed`       |   | ✓ |   |   |   |   |   |
+| `ort`             |   | ✓ |   |   |   |   |   |
+| `kokoro`          |   |   |   | ✓ |   |   |   |
 
-`noop` is the catch-all test/dev adapter — it claims all six capabilities.
+`openrouter` is two adapters under one router id: `OpenAIAdapter` (id `openrouter`,
+so it registers OpenAI's fixed chat/embed/STT/TTS/image set — whether OpenRouter
+actually serves each of those is up to OpenRouter) plus a decision-only
+`SystemOneAdapter`. `typesafe` is a decision-only `SystemOneAdapter`. Both are
+auto-registered by the facade when their router id is in config.
+
+`noop` is the catch-all test/dev adapter — it claims all seven capabilities (its
+decision reply is an empty, `degraded` answer set).
 `base` and `async_job` under `crates/gateway/src/adapters/` are shared helpers, not
 providers, and implement no capability trait.
+
+---
+
+## Decision (System One)
+
+A decision call sends one shared `state` plus 1–64 named, typed questions and gets
+back **probabilities**, not text. The wire format is TypeSafe's System One API
+(`POST {base}/v1/systemone`), served by Ollama (≥ 0.35), OpenRouter and TypeSafe.
+Types live in `crates/kernel/src/types/decision.rs` (`gateway::types::decision`);
+`DecisionQuestions` / `DecisionAnswers` are `IndexMap`s because order is semantic —
+choice ties follow option order, score levels are lowest-first, and answers come back
+in request order.
+
+| Question | Criteria | Answer |
+|---|---|---|
+| `Choice { instructions, criteria }` | `IndexMap<option key, Option<description>>`, ≥ 2 | `Choice { choice, probabilities, confidence }` |
+| `Noul { instructions, criteria }` | optional `NoulCriteria { false, true }` descriptions | `Noul { noul }` |
+| `Score { instructions, criteria }` | `Vec<level description>`, lowest first, ≥ 2 | `Score { score, legend, probabilities, confidence }` |
+
+```rust
+use gateway::Capability;
+use gateway::types::decision::{DecisionAnswer, DecisionQuestion, DecisionQuestions};
+use gateway::types::request::{InferenceRequest, Payload};
+use serde_json::json;
+
+let questions = DecisionQuestions::from([
+    ("intent".to_string(), DecisionQuestion::Choice {
+        instructions: json!("What does the customer want?"),
+        criteria: [("refund".to_string(), None),
+                   ("exchange".to_string(), Some("Swap for another item".to_string()))]
+            .into_iter().collect(),
+    }),
+    ("angry".to_string(), DecisionQuestion::Noul {
+        instructions: json!("Is the customer angry?"),
+        criteria: None,
+    }),
+    ("urgency".to_string(), DecisionQuestion::Score {
+        instructions: json!("How urgent is this?"),
+        criteria: vec!["low".into(), "medium".into(), "high".into()],
+    }),
+]);
+
+let req = InferenceRequest {
+    capability: Capability::Decision,
+    model: None, router: None,
+    chain: Some("decide".into()),            // a chain of Decision-capable models
+    payload: Payload::Decision {
+        state: json!("I was charged twice and want my money back today."),
+        questions,
+        images: vec![],                       // bare base64; vision decision models only
+        keep_alive: None,                     // Ollama only, e.g. json!("5m")
+    },
+    budget: None, auth: None, panel: None, consensus: None,
+    allow_fallback: true,
+    credentials: Default::default(),
+    routing: None,
+};
+
+let resp = gateway.execute(&req).await?;     // InvalidRequest if structurally malformed
+for (name, answer) in resp.decisions.unwrap_or_default() {
+    match answer {
+        DecisionAnswer::Choice { choice, probabilities, confidence } => { /* … */ }
+        DecisionAnswer::Noul { noul } => { /* P(true), 0–1 */ }
+        DecisionAnswer::Score { score, legend, .. } => { /* 0..=levels-1 */ }
+    }
+}
+```
+
+Read the numbers for what they are:
+
+- **`confidence` measures how concentrated the probability mass is on one answer,
+  NOT whether that answer is correct.** It is uncalibrated: a confident answer can be
+  wrong. Never present it to a user as accuracy, and never gate on it as if it were.
+- **`noul` is a probability that the condition is true** (0–1), not a bool.
+- **`score` is the probability-weighted mean of the zero-based level indices**, from
+  `0` to `levels − 1` — not rounded and not normalized to 0–1. `legend` maps each
+  index (as a string) to its description.
+
+Routers:
+
+- **`ollama`** — local, keyless; default decision model `nimble` (used only by direct
+  adapter callers — through the engine the candidate's `api_model_id` is sent). Local
+  models only: Ollama rejects cloud models on this endpoint with a 400 (a
+  `ProviderError`, so it falls back when the chain lists that trigger). Its two
+  404s are reworded: a JSON not-found means the model is not pulled
+  (``run `ollama pull <model>` ``); a bare `404 page not found` means the server
+  predates System One (needs Ollama ≥ 0.35). `OllamaAdapter::probe_decision_model(cfg,
+  model)` reports `DecisionModelStatus::{Ready, ServerTooOld { version }, NotPulled,
+  NotADecisionModel}` from `/api/version` and `/api/show`'s `capabilities`.
+  (`DecisionModelStatus` and `SystemOneAdapter` live in `cloud_providers::systemone`,
+  re-exported as `gateway::adapters::systemone` under the `cloud` feature.)
+- **`openrouter`**, **`typesafe`** — `SystemOneAdapter` (bearer auth, decision-only).
+  Their base URL defaults to `https://openrouter.ai/api` / `https://api.typesafe.ai`
+  when `RouterConfig.url` is empty; any other id
+  (`SystemOneAdapter::with_id` / `from_config_with_id`) needs a `url`
+  (`InvalidConfig` otherwise). Config validation (`GatewayBuilder::build`,
+  `Gateway::try_new`) rejects an empty router `url` anyway, so in practice set it —
+  `https://openrouter.ai/api` serves both OpenRouter's chat and `/v1/systemone`.
+  There is no default model: a call with no model is `InvalidRequest`.
+
+Cloudflare Workers AI is **not** supported (different image shape; it truncates input).
 
 ---
 

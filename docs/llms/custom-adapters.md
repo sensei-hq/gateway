@@ -79,9 +79,15 @@ Implement only what your provider does; register into each:
 | `TtsModel` | `speak` | `TtsRequest` / `TtsResponse` |
 | `ImageModel` | `generate_image` | `ImageRequest` / `ImageResponse` |
 | `VideoModel` | `generate_video` | `VideoRequest` / `VideoResponse` |
+| `DecisionModel` | `decide` (no streaming) | `DecisionRequest` / `DecisionResponse` |
 
 A chat+embed adapter implements both and registers into both maps from its single
 `register_into` — one `Arc`, two capabilities.
+
+A host of TypeSafe's System One API (`POST {base}/v1/systemone`) usually needs no new
+adapter: `gateway::adapters::systemone::SystemOneAdapter::from_config_with_id("<router id>",
+&cfg)` is a decision-only, bearer-auth adapter for any such host — give the router a
+`url` (only `openrouter` and `typesafe` have a default).
 
 ## Reuse the OpenAI-compatible core
 

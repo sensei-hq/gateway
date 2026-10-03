@@ -4,13 +4,18 @@
 #![allow(unused_imports)]
 
 use gateway::adapters::capability::{
-    ChatModel, EmbedModel, ImageModel, Model, SttModel, TtsModel, VideoModel,
+    ChatModel, DecisionModel, EmbedModel, ImageModel, Model, SttModel, TtsModel, VideoModel,
 };
+// SP-DEC-1 (gh#72): the decision surface, reached the way `docs/llms` spells it.
 use gateway::adapters::{AdapterRegistry, RegisterInto};
 use gateway::types::config::RouterConfig;
 use gateway::types::cost::{Cost, CostEstimate, TokenUsage};
+use gateway::types::decision::{
+    DecisionAnswer, DecisionAnswers, DecisionQuestion, DecisionQuestions, NoulCriteria,
+};
 use gateway::types::error::GatewayError;
 use gateway::types::io::{ChatRequest, ChatResponse, EmbedRequest, EmbedResponse};
+use gateway::types::io::{DecisionRequest, DecisionResponse};
 use gateway::types::request::{Message, MessageRole, StreamChunk};
 // SP-ROUTE-1's request surface, reached the same way `Message`/`StreamChunk`
 // are — through `types::request`, NOT through a new crate-root re-export.
@@ -28,6 +33,11 @@ use gateway::resilience::ResilienceConfig;
 use gateway::adapters::{
     anthropic::AnthropicAdapter, bedrock::BedrockAdapter, openai::OpenAIAdapter,
 };
+// SP-DEC-1: the System One adapter + Ollama's probe vocabulary, reachable by a
+// consumer that depends only on `sensei-gateway`.
+#[cfg(feature = "cloud")]
+#[allow(unused_imports)]
+use gateway::adapters::systemone::{DecisionModelStatus, SystemOneAdapter};
 
 // Model-registry vocabulary via the facade (no direct `kernel` dependency needed).
 use gateway::registry::{ModelEntry, ModelFormat, ModelResolver, ModelSource, ResolveError};

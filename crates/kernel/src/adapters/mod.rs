@@ -1,6 +1,8 @@
 pub mod capability;
 
-pub use capability::{ChatModel, EmbedModel, ImageModel, Model, SttModel, TtsModel, VideoModel};
+pub use capability::{
+    ChatModel, DecisionModel, EmbedModel, ImageModel, Model, SttModel, TtsModel, VideoModel,
+};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,6 +27,7 @@ pub struct AdapterRegistry {
     tts: Arc<RwLock<HashMap<String, Arc<dyn TtsModel>>>>,
     image: Arc<RwLock<HashMap<String, Arc<dyn ImageModel>>>>,
     video: Arc<RwLock<HashMap<String, Arc<dyn VideoModel>>>>,
+    decision: Arc<RwLock<HashMap<String, Arc<dyn DecisionModel>>>>,
 }
 
 macro_rules! capability_map_accessors {
@@ -51,6 +54,7 @@ impl AdapterRegistry {
     capability_map_accessors!(tts, register_tts, tts, TtsModel);
     capability_map_accessors!(image, register_image, image, ImageModel);
     capability_map_accessors!(video, register_video, video, VideoModel);
+    capability_map_accessors!(decision, register_decision, decision, DecisionModel);
 
     /// Register an adapter into every capability map it implements, in one call:
     /// `registry.register(Arc::new(MyAdapter::new()?)).await`. This is the primary
@@ -71,6 +75,7 @@ impl AdapterRegistry {
         ids.extend(self.tts.read().await.keys().cloned());
         ids.extend(self.image.read().await.keys().cloned());
         ids.extend(self.video.read().await.keys().cloned());
+        ids.extend(self.decision.read().await.keys().cloned());
         ids.into_iter().collect()
     }
 }
@@ -144,6 +149,33 @@ mod tests {
         assert!(reg2.chat("dual").await.is_some());
         assert!(reg2.embed("dual").await.is_some());
         assert!(reg2.stt("dual").await.is_none());
+    }
+
+    struct Decider;
+    impl Model for Decider {
+        fn id(&self) -> &str {
+            "decider"
+        }
+    }
+    #[async_trait]
+    impl DecisionModel for Decider {
+        async fn decide(
+            &self,
+            _c: &RouterConfig,
+            _r: &crate::types::io::DecisionRequest,
+        ) -> Result<crate::types::io::DecisionResponse, GatewayError> {
+            Ok(Default::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_decision_adapter_lives_only_in_the_decision_map_and_is_listed() {
+        let reg = AdapterRegistry::new();
+        reg.register_decision(Arc::new(Decider)).await;
+        assert!(reg.decision("decider").await.is_some());
+        assert!(reg.chat("decider").await.is_none());
+        assert!(reg.decision("dual").await.is_none());
+        assert_eq!(reg.list().await, vec!["decider".to_string()]);
     }
 
     #[tokio::test]

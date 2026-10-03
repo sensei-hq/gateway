@@ -66,15 +66,30 @@ fallback* use the listed constant only when `config.url` is empty.
 | `kling` | const `https://api.klingai.com/v1`, `config.url` fallback | `bearer_auth` | `VideoGenerate` | `kling-v2` | Async submit + poll. |
 | `luma` | const `https://api.lumalabs.ai/dream-machine/v1`, `config.url` fallback | `bearer_auth` | `VideoGenerate` | `ray-2` | Async submit + poll. |
 | `noop` | none | none | **all** (`supports` → `true`) | none (reports model `"none"`) | Last-resort fallback: never errors, returns `success: false` with an "install Ollama / configure a key" message. Not a real provider. |
-| `ollama` | `RouterConfig.url` (canonical `http://localhost:11434`) + `/v1/chat/completions` | `bearer_auth` **only if a key is present** (optional) | `TextChat`, `TextComplete`, `TextEmbed` | `gemma3:27b` | Local OpenAI-compatible server; `DEFAULT_TIMEOUT_SECS` = 120. |
+| `ollama` | `RouterConfig.url` (canonical `http://localhost:11434`) + `/v1/chat/completions`, `/v1/embeddings`, `/v1/systemone` | `bearer_auth` **only if a key is present** (optional) | `TextChat`, `TextEmbed`, `Decision` (`TextComplete` requests are dispatched by the engine to the chat path — the adapter has no completion-specific code) | chat/embed `gemma3:27b`; decision `nimble` (only when the request carries no model) | Local OpenAI-compatible server; `DEFAULT_TIMEOUT_SECS` = 120. Decisions need Ollama ≥ 0.35 and a **local** decision model (cloud models are rejected with a 400 `ProviderError`, which falls back when the chain lists that trigger). A JSON 404 is reworded to ``run `ollama pull <model>` ``; a bare `404 page not found` to "needs Ollama >= 0.35". `probe_decision_model(cfg, model)` → `Ready` / `ServerTooOld { version }` / `NotPulled` / `NotADecisionModel`. |
 | `openai` | `RouterConfig.url` (canonical `https://api.openai.com`) + `/v1/...` | `bearer_auth` | `TextChat`, `TextEmbed`, `AudioTranscribe`, `AudioGenerate`, `ImageGenerate` | `gpt-4o-mini` | `id` is a field, not a constant — reusable for OpenAI-compatible clones (see below). |
+| `openrouter` | chat etc.: `RouterConfig.url` (canonical `https://openrouter.ai/api`) + `/v1/...`; decision: const `https://openrouter.ai/api`, `config.url` fallback, + `/v1/systemone` | `bearer_auth` | `OpenAIAdapter` set (`TextChat`, `TextEmbed`, `AudioTranscribe`, `AudioGenerate`, `ImageGenerate`) + `Decision` | OpenAI adapter defaults for chat etc.; **no default decision model** (a call without one is `InvalidRequest`) | Two adapters under one id, auto-registered by the facade: `OpenAIAdapter::from_config_with_id("openrouter", …)` + `SystemOneAdapter::from_config_with_id("openrouter", …)`. Decision models include `typesafe/jev-1.13`. |
 | `recraft` | const `https://external.api.recraft.ai/v1`, `config.url` fallback | `bearer_auth` | `ImageGenerate` | `recraftv3` | Synchronous `POST /images/generations` (no polling). |
 | `replicate` | const `https://api.replicate.com/v1`, `config.url` fallback | `bearer_auth` | `VideoGenerate`, `ImageGenerate` | `tencent/hunyuan-video` | Async `predictions` submit + poll. |
 | `runway` | const `https://api.runwayml.com/v1`, `config.url` fallback | `bearer_auth` | `VideoGenerate` | `gen-4` | Async submit + poll. |
 | `stability` | const `https://api.stability.ai/v2beta`, `config.url` fallback | `bearer_auth` + multipart form | `ImageGenerate` | `sd3.5-large` | Synchronous multipart upload (no polling). |
+| `typesafe` | const `https://api.typesafe.ai`, `config.url` fallback, + `/v1/systemone` | `bearer_auth` | `Decision` | none (a call without a model is `InvalidRequest`) | `SystemOneAdapter`, decision-only, auto-registered by the facade. TypeSafe's System One API is the origin of the decision wire format. |
 | `together` | const `https://api.together.xyz/v1`, `config.url` fallback | `bearer_auth` | `TextChat`, `ImageGenerate` | chat `meta-llama/Llama-3.3-70B-Instruct-Turbo`; image `black-forest-labs/FLUX.1-schnell-Free` | OpenAI-compatible chat + synchronous `/images/generations`. |
 
 ## Notes on notable behaviour
+
+### System One decision routers (`systemone.rs`)
+
+`SystemOneAdapter` (`crates/cloud-providers/src/systemone.rs`) is a generic,
+id-configurable, decision-only adapter for any bearer-auth host of
+`POST {base}/v1/systemone`. Built with `SystemOneAdapter::with_id(id)` or
+`from_config_with_id(id, config)`. The ids `openrouter` and `typesafe` default their
+base URL when `RouterConfig.url` is empty; any other id needs a `url` (else
+`InvalidConfig`). It never picks a model for you. The Ollama adapter delegates to
+the same POST core and adds its own reading of Ollama's two 404s. Cloudflare Workers
+AI is not supported (different image shape; it truncates input). See
+[capabilities & adapters § Decision](capabilities-and-adapters.md#decision-system-one)
+for the request/answer types and how to read `confidence`, `noul` and `score`.
 
 ### OpenAI-compatible adapters and clones
 

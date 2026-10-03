@@ -1,6 +1,6 @@
 [package]
 name = "sensei-local-providers"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 description = "In-process inference adapters (llama.cpp, fastembed, ONNX Runtime, Kokoro TTS) for the sensei gateway"
 license = "MIT"
@@ -34,7 +34,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["fs", "rt", "sync"] }
 tokio-stream = "0.1"
 tracing = "0.1"
-llama-cpp-2 = { version = "0.1.146", default-features = false, optional = true }
+llama-cpp-2 = { version = "0.1.158", default-features = false, optional = true }
 # fastembed = { version = "5", optional = true }  # deferred (gh#7): pins hf-hub 0.5
 ort = { version = "2.0.0-rc.12", features = ["download-binaries", "ndarray"], optional = true }
 tokenizers = { version = "0.21", optional = true }

@@ -9,7 +9,7 @@ pub mod registry;
 pub mod types;
 
 pub use adapters::capability::{
-    ChatModel, EmbedModel, ImageModel, Model, SttModel, TtsModel, VideoModel,
+    ChatModel, DecisionModel, EmbedModel, ImageModel, Model, SttModel, TtsModel, VideoModel,
 };
 pub use adapters::{AdapterRegistry, RegisterInto};
 pub use readiness::{ProvisionEvent, ProvisionPhase, ReadinessProbe};

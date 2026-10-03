@@ -4,7 +4,7 @@ pub mod noop;
 // `gateway::adapters::…` paths so internal code + downstream compile unchanged.
 pub use kernel::adapters::capability;
 pub use kernel::adapters::capability::{
-    ChatModel, EmbedModel, ImageModel, Model, SttModel, TtsModel, VideoModel,
+    ChatModel, DecisionModel, EmbedModel, ImageModel, Model, SttModel, TtsModel, VideoModel,
 };
 pub use kernel::adapters::{AdapterRegistry, RegisterInto};
 
@@ -14,7 +14,7 @@ pub use kernel::adapters::{AdapterRegistry, RegisterInto};
 #[cfg(feature = "cloud")]
 pub use cloud_providers::{
     anthropic, async_job, base, bedrock, fal, flux, gemini, grok, huggingface, kling, luma, ollama,
-    openai, openai_compat, recraft, replicate, runway, stability, together,
+    openai, openai_compat, recraft, replicate, runway, stability, systemone, together,
 };
 
 #[cfg(test)]

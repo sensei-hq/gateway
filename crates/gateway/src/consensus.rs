@@ -101,6 +101,7 @@ mod tests {
             audio: None,
             images: None,
             videos: None,
+            decisions: None,
             model: None,
             usage: None,
             tool_calls: Vec::new(),

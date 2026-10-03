@@ -20,4 +20,5 @@ pub mod recraft;
 pub mod replicate;
 pub mod runway;
 pub mod stability;
+pub mod systemone;
 pub mod together;

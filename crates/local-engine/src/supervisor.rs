@@ -483,6 +483,7 @@ mod coldboot {
     /// every provider whose job blocking-loads a [`kernel::adapters::RegisterInto`]
     /// adapter and registers it (fastembed / ort / kokoro): only the concrete
     /// adapter type and the `load` closure differ between them.
+    #[cfg(any(feature = "fastembed", feature = "ort", feature = "kokoro"))]
     async fn load_blocking_and_register<A, E, F>(
         tx: &watch::Sender<ProvisionPhase>,
         ctx: &ColdbootCtx,
@@ -523,6 +524,7 @@ mod coldboot {
     /// [`load_blocking_and_register`]. Shared body behind [`run_fastembed`],
     /// [`run_ort`], and [`run_kokoro`] — the three plans that resolve first and
     /// have no download step.
+    #[cfg(any(feature = "fastembed", feature = "ort", feature = "kokoro"))]
     async fn resolve_load_and_register<A, E, F>(
         model: &str,
         tx: &watch::Sender<ProvisionPhase>,
