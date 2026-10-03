@@ -237,17 +237,23 @@ Decision-specific engine behaviour:
 - **Validation before selection.** `execute` runs `validate_decision` on a
   `Payload::Decision` before any candidate is selected. A structural violation — no
   questions or more than `MAX_DECISION_QUESTIONS` (64), a `choice`/`score` question
-  with fewer than `MIN_DECISION_CRITERIA` (2) criteria, a blank `state`, question
-  name, `instructions` or choice option key — returns
+  with fewer than `MIN_DECISION_CRITERIA` (2) criteria, a whitespace-only string
+  `state` / `instructions` (an empty `{}` or `[]` is valid, as upstream), a blank
+  question name or choice option key — returns
   `GatewayError::InvalidRequest { message }`. It is never a fallback trigger and not
   retryable: every candidate would reject it identically. Per-provider *upper* bounds
   (e.g. Ollama's 26 options) are left to the provider's own 400 — a `ProviderError`,
   which falls back when the chain lists that trigger.
-- **Context-window sizing.** Both input-token estimators count the shared `state`
-  plus **every** question (name, instructions, criteria), so the `ContextWindowGate`
-  skips a decision model whose `context_window` is too short for the whole question
-  set. Each decision image is priced like a chat image attachment
-  (`MAX_TOKENS_PER_ATTACHMENT`).
+- **Context-window sizing.** Each scoring prompt holds the shared `state`, **every**
+  question (name, instructions, criteria) and the provider's framing — measured on
+  Ollama 0.35 as `104 + 38·N` tokens, estimated as `128 + 48·N` — so the
+  `ContextWindowGate` skips a decision model whose `context_window` cannot hold one
+  whole prompt. The **cost** estimate is `N ×` that prompt: providers score each
+  question in its own prompt and bill every one. Each decision image is priced like
+  a chat image attachment (`MAX_TOKENS_PER_ATTACHMENT`).
+- **Holes are failures.** A 2xx response missing an answer for any asked question
+  is a `ProviderError` (it falls back), never `success: true` with gaps. Every
+  decision request is bounded by the router's `timeout_ms`, else 120 s.
 - **No streaming.** `execute_stream` returns `Unsupported` for `Decision`.
   Panels fan out through `execute`, so they get the same validation and gating.
 

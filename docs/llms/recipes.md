@@ -256,7 +256,8 @@ use gateway::types::decision::{DecisionAnswer, DecisionQuestion, DecisionQuestio
 use serde_json::json;
 
 // A local decision model first, a hosted one as fallback. Seed the REAL
-// context_window: the gate counts state + every question against it.
+// context_window: the gate counts state + every question + the provider's
+// per-question prompt framing against it.
 let nimble = ModelConfig {
     id: "nimble".into(), api_model_id: Some("nimble".into()), provider: "ollama".into(),
     capabilities: vec![Capability::Decision], context_window: 32_768, // illustrative — use the real one
