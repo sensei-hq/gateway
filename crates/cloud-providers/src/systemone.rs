@@ -55,12 +55,31 @@ pub(crate) struct Host<'a> {
 /// `(path id, body model)` for Workers AI: the catalog id `@cf/<org>/<name>`
 /// goes in the path and only `<name>` in the body (the schema pins the body to
 /// `^\s*(clef|clef-flash)\s*$`). A bare name is a Cloudflare-published model.
-fn workers_ai_model(model: &str) -> (String, &str) {
+///
+/// The model becomes part of the URL PATH and a caller can pin it, so it is
+/// validated, never spliced: each segment must be a plain name
+/// (`[A-Za-z0-9][A-Za-z0-9._-]*`), which rules out `..`, `?`, `#`, `%` and
+/// extra `/` — anything that could steer the request (and the operator's
+/// token) off `/ai/run/` to another Cloudflare API path.
+fn workers_ai_model(model: &str) -> Result<(String, &str), String> {
+    fn plain(segment: &str) -> bool {
+        let mut chars = segment.chars();
+        chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    }
     let model = model.trim();
-    if model.starts_with("@cf/") {
-        (model.to_string(), model.rsplit('/').next().unwrap_or(model))
-    } else {
-        (format!("@cf/cloudflare/{model}"), model)
+    let invalid = || {
+        format!(
+            "'{model}' is not a Workers AI model name (expected e.g. clef or @cf/cloudflare/clef)"
+        )
+    };
+    match model.strip_prefix("@cf/") {
+        Some(rest) => match rest.split('/').collect::<Vec<_>>().as_slice() {
+            [org, name] if plain(org) && plain(name) => Ok((model.to_string(), *name)),
+            _ => Err(invalid()),
+        },
+        None if plain(model) => Ok((format!("@cf/cloudflare/{model}"), model)),
+        None => Err(invalid()),
     }
 }
 
@@ -259,7 +278,8 @@ pub(crate) async fn decide(
     let (url, body_model, keep_alive) = match host.dialect {
         Dialect::SystemOne => (format!("{base}{PATH}"), model, req.keep_alive.as_ref()),
         Dialect::WorkersAi => {
-            let (path_id, short) = workers_ai_model(model);
+            let (path_id, short) = workers_ai_model(model)
+                .map_err(|message| GatewayError::InvalidRequest { message })?;
             (format!("{base}/run/{path_id}"), short, None)
         }
     };
