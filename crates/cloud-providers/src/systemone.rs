@@ -115,7 +115,10 @@ fn encode_images(images: &[String], encoding: ImageEncoding) -> Result<Vec<Strin
                     i + 1
                 )
             })?;
-            Ok(format!("data:{mime};base64,{img}"))
+            // The sniffer reads past line breaks (MIME/PEM-wrapped base64);
+            // the URL must not carry them into the request.
+            let b64: String = img.chars().filter(|c| !c.is_whitespace()).collect();
+            Ok(format!("data:{mime};base64,{b64}"))
         })
         .collect()
 }
