@@ -272,6 +272,7 @@ implements that capability trait and is registered into that map.
 | `openai`     | ✓ | ✓ | ✓ | ✓ | ✓ |   |   |
 | `openrouter` | ✓ | ✓ | ✓ | ✓ | ✓ |   | ✓ |
 | `typesafe`   |   |   |   |   |   |   | ✓ |
+| `cloudflare` |   |   |   |   |   |   | ✓ |
 | `gemini`     | ✓ | ✓ |   |   |   |   |   |
 | `huggingface` | ✓ | ✓ |   |   |   |   |   |
 | `bedrock`    | ✓ | ✓ |   |   |   |   |   |
