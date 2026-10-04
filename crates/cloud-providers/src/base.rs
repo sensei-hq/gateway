@@ -286,6 +286,49 @@ pub(crate) fn extract_error_message(body: &str) -> Option<String> {
                 .and_then(|d| d.as_str())
                 .map(|s| s.to_string())
         })
+        // FastAPI validation (e.g. SGLang 422): { "detail": [{ "loc": [..], "msg": "..." }] }
+        .or_else(|| {
+            let items = v.get("detail")?.as_array()?;
+            joined(items.iter().filter_map(|d| {
+                let msg = d.get("msg")?.as_str()?;
+                let loc: Vec<String> = d
+                    .get("loc")
+                    .and_then(|l| l.as_array())
+                    .map(|l| {
+                        l.iter()
+                            .map(|p| p.as_str().map_or_else(|| p.to_string(), str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some(if loc.is_empty() {
+                    msg.to_string()
+                } else {
+                    format!("{}: {msg}", loc.join("."))
+                })
+            }))
+        })
+        // Cloudflare v4 envelope: { "success": false, "errors": [{ "code", "message" }] }
+        .or_else(|| {
+            let items = v.get("errors")?.as_array()?;
+            joined(
+                items
+                    .iter()
+                    .filter_map(|e| e.get("message")?.as_str().map(str::to_string)),
+            )
+        })
+        // OpenAI-legacy flat body (e.g. SGLang 400/500): { "object": "error", "message": "..." }
+        .or_else(|| {
+            v.get("message")
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string())
+        })
+}
+
+/// `"a; b"` from the messages, or `None` when there are none — so an empty
+/// `errors: []` on a success envelope never reads as an error message.
+fn joined(messages: impl Iterator<Item = String>) -> Option<String> {
+    let all: Vec<String> = messages.collect();
+    (!all.is_empty()).then(|| all.join("; "))
 }
 
 #[cfg(test)]
