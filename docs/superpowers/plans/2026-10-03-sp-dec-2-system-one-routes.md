@@ -66,3 +66,14 @@ LoRA adapter → 400. Optional `--api-key` bearer.
 
 | # | Commit | Notes |
 |---|---|---|
+| T1 | `6825012` red → `4924875` | error extraction: Cloudflare `errors[]`, flat `message`, FastAPI `detail` list; 3/3 mutations |
+| T2 | red → `0647e80` | per-host image encoding; mime sniff; 6/6 mutations (GIF87a pinned) |
+| T3 | `8907f30` red → `9c6c6d3`, `ea53944` | `Dialect::WorkersAi` + `CloudflareAdapter`; 6/6 mutations (success flag pinned). `9c6c6d3` landed with the docs_sync guard red (a `;`-chained commit) — fixed next commit |
+| T4 | `a3435d5` | llama.cpp/SGLang error bodies; LIVE vs llama-server b11381 + Nimble v3 — and with bare images the real server returns its 400 |
+| T5 | `c25adfc` red → `71e8f90`, `2d2eaf2`, `92d85af` | facade ids; live engine e2e (facade → decide chain → llama.cpp, 1 attempt); docs (recipes compile) |
+| T6 | review `wf_77336922-196` | 5 reviewers + 3-skeptic majority: 8 survive, 1 refuted. Fixed red-first: **#1 MEDIUM** Workers AI model spliced into the URL path → validated (`7bca090`); **#2 MEDIUM** facade test now proves which adapter (`437a896`); #4 LOW wrapped base64 in data URLs (`a2d80c6`); #5 LOW upgrading accuracy (`ba4d7a9`). Gate: 1980 passed, clippy 0.1.98 + 0.1.99, live adapter + engine |
+
+Carry-forwards (LOW, reported not fixed): #3 test pins Cloudflare's error reasons; #7 test pins extraction order; #8 Cloudflare image limits
+(GIF / >4 images are sent and fall back on Cloudflare's 400). #6 — a client-side image error trips the breaker and is `retryable` —
+is the engine's existing policy for ANY caller-caused 4xx; fix belongs at the engine (exclude caller-fault errors from breaker votes
+and HardFailure), not here. Pre-existing doc nit: `providers.md` `together` base shows `/v1`, code is `https://api.together.xyz`.
