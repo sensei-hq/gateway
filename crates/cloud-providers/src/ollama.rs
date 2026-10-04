@@ -123,8 +123,16 @@ impl kernel::adapters::capability::DecisionModel for OllamaAdapter {
         req: &kernel::types::io::DecisionRequest,
     ) -> Result<kernel::types::io::DecisionResponse, GatewayError> {
         let model = req.model.as_deref().unwrap_or(DEFAULT_DECISION_MODEL);
-        crate::systemone::decide(&self.client, &config.url, "ollama", model, config, req)
-            .await?
+        crate::systemone::decide(
+            &self.client,
+            &config.url,
+            "ollama",
+            model,
+            config,
+            req,
+            crate::systemone::ImageEncoding::Bare,
+        )
+        .await?
             .map_err(|r| {
                 // Ollama answers 404 for two unrelated reasons. A JSON error
                 // means the model is not pulled; gin's bare "404 page not
