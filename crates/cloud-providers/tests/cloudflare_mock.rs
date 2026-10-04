@@ -183,6 +183,8 @@ async fn a_2xx_envelope_without_success_is_a_provider_error() {
     for body in [
         json!({"result": null, "success": false, "errors": [{"code": 3040, "message": "Out of capacity"}], "messages": []}),
         json!({"result": null, "success": true, "errors": [], "messages": []}),
+        // A result IS present, but the envelope says it failed: the flag wins.
+        json!({"result": {"model": "clef", "answers": {"has_ollama": {"type": "noul", "noul": 0.5}}, "usage": {"input_tokens": 1, "output_tokens": 0}}, "success": false, "errors": [{"code": 3007, "message": "Timeout"}], "messages": []}),
     ] {
         let server = MockServer::start().await;
         Mock::given(method("POST"))

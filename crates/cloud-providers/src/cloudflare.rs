@@ -1,5 +1,18 @@
 //! Cloudflare Workers AI — System One decision models `clef` / `clef-flash`
-//! (SP-DEC-2). Stub until T3 lands.
+//! (SP-DEC-2).
+//!
+//! Workers AI serves them only at `POST
+//! https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/run/@cf/cloudflare/<model>`
+//! — there is no `/v1/systemone` — so this adapter speaks the shared System One
+//! core in its [`Dialect::WorkersAi`](crate::systemone) form. Configure the
+//! router with `url = "https://api.cloudflare.com/client/v4/accounts/<account_id>/ai"`
+//! (the account id is part of every path) and a Workers AI token (Read + Edit)
+//! in `api_key` / `api_key_env`.
+//!
+//! **Long state is truncated silently by Workers AI.** Seed the models'
+//! `context_window` (65,536) so the engine's window gate — which counts the
+//! state, every question, the prompt framing and each image — never routes a
+//! request here that Cloudflare would truncate.
 
 use async_trait::async_trait;
 use reqwest::Client;
@@ -40,14 +53,35 @@ impl kernel::adapters::capability::Model for CloudflareAdapter {
 impl kernel::adapters::capability::DecisionModel for CloudflareAdapter {
     async fn decide(
         &self,
-        _config: &RouterConfig,
-        _req: &DecisionRequest,
+        config: &RouterConfig,
+        req: &DecisionRequest,
     ) -> Result<DecisionResponse, GatewayError> {
-        let _ = &self.client;
-        Err(GatewayError::Unsupported {
-            adapter: self.id.clone(),
-            what: "decision (stub)".into(),
-        })
+        let Some(model) = req.model.as_deref() else {
+            return Err(GatewayError::InvalidRequest {
+                message: format!(
+                    "a decision call to '{}' needs a model (clef or clef-flash)",
+                    self.id
+                ),
+            });
+        };
+        let base_url = config.url.trim_end_matches('/');
+        if base_url.is_empty() {
+            return Err(GatewayError::InvalidConfig(format!(
+                "router '{}' needs url = https://api.cloudflare.com/client/v4/accounts/<account_id>/ai",
+                self.id
+            )));
+        }
+        let host = crate::systemone::Host {
+            adapter: &self.id,
+            dialect: crate::systemone::Dialect::WorkersAi,
+            images: crate::systemone::ImageEncoding::DataUrl,
+        };
+        crate::systemone::decide(&self.client, base_url, host, model, config, req)
+            .await?
+            .map_err(|r| {
+                let message = r.message();
+                r.into_error(&self.id, message)
+            })
     }
 }
 

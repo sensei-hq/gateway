@@ -27,6 +27,43 @@ pub const TYPESAFE_BASE_URL: &str = "https://api.typesafe.ai";
 
 const PATH: &str = "/v1/systemone";
 
+/// Which wire a System One host speaks. Everything else — transport, auth,
+/// timeout, header forwarding, error mapping, the missing-answer check — is
+/// shared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Dialect {
+    /// TypeSafe's API verbatim: `POST {base}/v1/systemone`, the body `model`
+    /// as given, the response body is the result. Ollama, OpenRouter,
+    /// TypeSafe, llama.cpp, SGLang.
+    SystemOne,
+    /// Cloudflare Workers AI REST (verified 2026-10-03): `POST
+    /// {base}/run/@cf/cloudflare/{model}` with `base = .../accounts/<id>/ai`;
+    /// the body `model` is the SHORT name; no `keep_alive` (not in the
+    /// schema); the result is wrapped in `{result, success, errors, messages}`.
+    WorkersAi,
+}
+
+/// Who is being called and how: the adapter id errors are tagged with, the
+/// wire dialect, and the image encoding the host accepts.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Host<'a> {
+    pub adapter: &'a str,
+    pub dialect: Dialect,
+    pub images: ImageEncoding,
+}
+
+/// `(path id, body model)` for Workers AI: the catalog id `@cf/<org>/<name>`
+/// goes in the path and only `<name>` in the body (the schema pins the body to
+/// `^\s*(clef|clef-flash)\s*$`). A bare name is a Cloudflare-published model.
+fn workers_ai_model(model: &str) -> (String, &str) {
+    let model = model.trim();
+    if model.starts_with("@cf/") {
+        (model.to_string(), model.rsplit('/').next().unwrap_or(model))
+    } else {
+        (format!("@cf/cloudflare/{model}"), model)
+    }
+}
+
 /// How a host wants `DecisionRequest.images` (bare base64 from the caller).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ImageEncoding {
@@ -141,6 +178,23 @@ struct WireRequest<'a> {
     keep_alive: Option<&'a serde_json::Value>,
 }
 
+/// Workers AI's REST envelope around a result. Unknown fields are ignored.
+#[derive(Deserialize)]
+struct WorkersAiEnvelope {
+    #[serde(default)]
+    success: bool,
+    #[serde(default)]
+    result: Option<WireResponse>,
+    #[serde(default)]
+    errors: Vec<WorkersAiError>,
+}
+
+#[derive(Deserialize)]
+struct WorkersAiError {
+    #[serde(default)]
+    message: String,
+}
+
 /// Unknown fields (OpenRouter's `id`, `provider`, `usage.cost`) are ignored.
 #[derive(Deserialize)]
 struct WireResponse {
@@ -189,30 +243,34 @@ impl Rejection {
 pub(crate) async fn decide(
     client: &Client,
     base_url: &str,
-    adapter: &str,
+    host: Host<'_>,
     model: &str,
     cfg: &RouterConfig,
     req: &DecisionRequest,
-    image_encoding: ImageEncoding,
 ) -> Result<Result<DecisionResponse, Rejection>, GatewayError> {
-    let images = encode_images(&req.images, image_encoding).map_err(|message| {
-        GatewayError::ProviderError {
+    let adapter = host.adapter;
+    let images =
+        encode_images(&req.images, host.images).map_err(|message| GatewayError::ProviderError {
             adapter: adapter.into(),
             message,
             status: None,
+        })?;
+    let base = base_url.trim_end_matches('/');
+    let (url, body_model, keep_alive) = match host.dialect {
+        Dialect::SystemOne => (format!("{base}{PATH}"), model, req.keep_alive.as_ref()),
+        Dialect::WorkersAi => {
+            let (path_id, short) = workers_ai_model(model);
+            (format!("{base}/run/{path_id}"), short, None)
         }
-    })?;
+    };
     let body = WireRequest {
-        model,
+        model: body_model,
         state: &req.state,
         questions: &req.questions,
         images,
-        keep_alive: req.keep_alive.as_ref(),
+        keep_alive,
     };
-    let mut http = client
-        .post(format!("{}{PATH}", base_url.trim_end_matches('/')))
-        .timeout(request_timeout(cfg))
-        .json(&body);
+    let mut http = client.post(url).timeout(request_timeout(cfg)).json(&body);
     if let Some(key) = resolve_api_key(cfg) {
         http = http.bearer_auth(key);
     }
@@ -236,14 +294,39 @@ pub(crate) async fn decide(
         }));
     }
 
-    let wire: WireResponse = response
-        .json()
-        .await
-        .map_err(|e| GatewayError::ProviderError {
-            adapter: adapter.into(),
-            message: format!("failed to parse System One response: {e}"),
-            status: Some(status.as_u16()),
-        })?;
+    let parse_err = |e: reqwest::Error| GatewayError::ProviderError {
+        adapter: adapter.into(),
+        message: format!("failed to parse System One response: {e}"),
+        status: Some(status.as_u16()),
+    };
+    let wire: WireResponse = match host.dialect {
+        Dialect::SystemOne => response.json().await.map_err(parse_err)?,
+        Dialect::WorkersAi => {
+            let envelope: WorkersAiEnvelope = response.json().await.map_err(parse_err)?;
+            match envelope.result {
+                Some(result) if envelope.success => result,
+                // A 2xx that is not a success — or carries no result — did
+                // not answer anything; never read it as an empty success.
+                _ => {
+                    let reasons: Vec<String> = envelope
+                        .errors
+                        .into_iter()
+                        .map(|e| e.message)
+                        .filter(|m| !m.is_empty())
+                        .collect();
+                    return Err(GatewayError::ProviderError {
+                        adapter: adapter.into(),
+                        message: if reasons.is_empty() {
+                            "Workers AI returned no result".into()
+                        } else {
+                            format!("Workers AI returned no result: {}", reasons.join("; "))
+                        },
+                        status: Some(status.as_u16()),
+                    });
+                }
+            }
+        }
+    };
     // A 2xx with holes is not a success: report it as a failed attempt so the
     // engine records it and falls back, rather than `success: true` over
     // questions nobody answered.
@@ -341,20 +424,17 @@ impl kernel::adapters::capability::DecisionModel for SystemOneAdapter {
             });
         };
         let base_url = self.base_url(config)?;
-        decide(
-            &self.client,
-            base_url,
-            &self.id,
-            model,
-            config,
-            req,
-            ImageEncoding::DataUrl,
-        )
-        .await?
-        .map_err(|r| {
-            let message = r.message();
-            r.into_error(&self.id, message)
-        })
+        let host = Host {
+            adapter: &self.id,
+            dialect: Dialect::SystemOne,
+            images: ImageEncoding::DataUrl,
+        };
+        decide(&self.client, base_url, host, model, config, req)
+            .await?
+            .map_err(|r| {
+                let message = r.message();
+                r.into_error(&self.id, message)
+            })
     }
 }
 
