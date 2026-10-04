@@ -159,7 +159,8 @@ impl FacadeBuilder {
 
 /// Register the cloud adapter matching each well-known router name from config
 /// (`openrouter` gets both its OpenAI-wire chat adapter and a System One
-/// decision adapter; `typesafe` is decision-only),
+/// decision adapter; `typesafe`, `cloudflare`, `llamacpp` and `sglang` are
+/// decision-only),
 /// returning `(router, error)` for any that failed to build. `bedrock` (which
 /// needs explicit AWS SDK setup) and unrecognised router names are skipped for
 /// the caller to register manually via the shared registry.
@@ -252,6 +253,23 @@ async fn register_cloud_from_config(
                 reg(
                     registry,
                     cp::systemone::SystemOneAdapter::from_config_with_id("typesafe", router),
+                )
+                .await,
+            ),
+            // SP-DEC-2: Cloudflare Workers AI (clef / clef-flash) and the
+            // self-hosted System One servers — decision-only; a chat adapter the
+            // caller registers under the same id lives in its own map, untouched.
+            "cloudflare" => Some(
+                reg(
+                    registry,
+                    cp::cloudflare::CloudflareAdapter::from_config(router),
+                )
+                .await,
+            ),
+            id @ ("llamacpp" | "sglang") => Some(
+                reg(
+                    registry,
+                    cp::systemone::SystemOneAdapter::from_config_with_id(id, router),
                 )
                 .await,
             ),

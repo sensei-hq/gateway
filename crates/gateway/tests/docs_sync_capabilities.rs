@@ -64,7 +64,7 @@ fn registering_modules(src: &str) -> Vec<String> {
 /// facade registers as the `openrouter` and `typesafe` routers.
 fn row_names(module: &str) -> Vec<&str> {
     match module {
-        "systemone" => vec!["openrouter", "typesafe"],
+        "systemone" => vec!["openrouter", "typesafe", "llamacpp", "sglang"],
         other => vec![other],
     }
 }
