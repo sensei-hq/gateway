@@ -67,6 +67,8 @@ each adapter's `RegisterInto` impl (cloud and embedded alike).
 | `openrouter` | ✓ | ✓ | ✓ | ✓ | ✓ | | ✓ |
 | `typesafe` | | | | | | | ✓ |
 | `cloudflare` | | | | | | | ✓ |
+| `llamacpp` | | | | | | | ✓ |
+| `sglang` | | | | | | | ✓ |
 | `gemini` | ✓ | ✓ | | | | | |
 | `huggingface` | ✓ | ✓ | | | | | |
 | `bedrock` | ✓ | ✓ | | | | | |

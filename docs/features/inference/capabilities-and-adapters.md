@@ -273,6 +273,8 @@ implements that capability trait and is registered into that map.
 | `openrouter` | ✓ | ✓ | ✓ | ✓ | ✓ |   | ✓ |
 | `typesafe`   |   |   |   |   |   |   | ✓ |
 | `cloudflare` |   |   |   |   |   |   | ✓ |
+| `llamacpp`   |   |   |   |   |   |   | ✓ |
+| `sglang`     |   |   |   |   |   |   | ✓ |
 | `gemini`     | ✓ | ✓ |   |   |   |   |   |
 | `huggingface` | ✓ | ✓ |   |   |   |   |   |
 | `bedrock`    | ✓ | ✓ |   |   |   |   |   |
