@@ -500,6 +500,38 @@ mod cloud_tests {
         assert!(registry.chat("ollama").await.is_some());
     }
 
+    /// SP-DEC-2 D6: Cloudflare Workers AI and the self-hosted System One
+    /// servers come up decision-only. A chat adapter the caller registered
+    /// under the same id (e.g. llama.cpp's /v1/chat/completions via an
+    /// OpenAI-compatible adapter) is untouched — decisions live in their own map.
+    #[tokio::test]
+    async fn build_registers_the_sp_dec_2_decision_routers_decision_only() {
+        let routers = HashMap::from([
+            ("cloudflare".to_string(), router()),
+            ("llamacpp".to_string(), router()),
+            ("sglang".to_string(), router()),
+        ]);
+        let builder = FacadeBuilder::new(GatewayConfig {
+            routers,
+            ..Default::default()
+        });
+        let registry = builder.registry().clone();
+        let callers_chat =
+            Arc::new(cloud_providers::openai::OpenAIAdapter::with_id("llamacpp").unwrap());
+        registry.register_chat(callers_chat).await;
+        builder.build().await;
+
+        for id in ["cloudflare", "llamacpp", "sglang"] {
+            assert!(registry.decision(id).await.is_some(), "{id} decides");
+        }
+        assert!(registry.chat("cloudflare").await.is_none());
+        assert!(registry.chat("sglang").await.is_none());
+        assert!(
+            registry.chat("llamacpp").await.is_some(),
+            "the caller's own llamacpp chat adapter survives build()"
+        );
+    }
+
     #[tokio::test]
     async fn build_with_no_routers_yields_a_gateway_with_no_adapters() {
         let facade = FacadeBuilder::new(GatewayConfig::default()).build().await;
