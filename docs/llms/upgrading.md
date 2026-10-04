@@ -6,6 +6,25 @@ routing call path (build a request, `gateway.execute(&req).await`, read
 `InferenceResponse`) stays source-compatible across every step below; each section
 lists only what you must touch.
 
+## 0.7.x → next (unreleased — SP-DEC-2)
+
+More System One decision routes: **Cloudflare Workers AI** (`clef`, `clef-flash`) and
+**self-hosted** llama.cpp and SGLang servers. No public type changes —
+`RouterConfig` / `DecisionRequest` are untouched and the new surface is additive —
+but two runtime behaviours change for existing decision routers.
+
+| Area | Change | Action |
+|---|---|---|
+| Decision `images` on `SystemOneAdapter` (`openrouter`, `typesafe`, `llamacpp`, `sglang`, any custom id) | now sent as `data:<mime>;base64,…` with the mime sniffed from the magic bytes (PNG / JPEG / WebP / GIF); previously the bare base64 was sent. A value already starting `data:` passes through. An image that is none of the four is a `ProviderError` **before any request is sent** | keep passing bare base64; make sure every image is PNG, JPEG, WebP or GIF. If a chain lists `ProviderError` as a trigger, an unrecognisable image now falls back instead of reaching the host |
+| `OllamaAdapter` decision images | unchanged — still bare base64 (Ollama rejects data URLs) | none |
+| Error messages from decision hosts | the provider's extracted message rather than the raw JSON body: `base::extract_error_message` now also reads a Cloudflare `{errors:[{message}]}` array, a flat `{message}` and a FastAPI `{detail:[{loc,msg}]}` list (a body that matched before yields the same message) | re-check anything asserting on the raw JSON text of a decision error |
+| Facade (`FacadeBuilder::build`) | now auto-registers `cloudflare` (`CloudflareAdapter`), `llamacpp` and `sglang` (`SystemOneAdapter`), all decision-only | if you registered your own **decision** adapter under one of those ids **before** `build()`, register it **after** instead — `build()` now replaces it. A **chat** adapter under the same id (e.g. an OpenAI-compatible `llamacpp`) is untouched |
+| New adapter | `cloud_providers::cloudflare::CloudflareAdapter` (`gateway::adapters::cloudflare`): `new()` / `from_config(&RouterConfig)`; `url = https://api.cloudflare.com/client/v4/accounts/<account_id>/ai`, a Workers AI token (Read + Edit) in `api_key` / `api_key_env` | none unless you want Cloudflare — seed `context_window: 65_536` (it truncates long state silently) |
+
+There is no `vllm` id: vLLM has no upstream `/v1/systemone`. See
+[recipes § decision](recipes.md#ask-a-decision-system-one) for Cloudflare and
+`llama-server` router configs.
+
 ## 0.6.x → 0.7.0 (SP-DEC-1 — decision / System One)
 
 A new **`Decision` capability** (gh#72): typed choice / yes-no / score questions
