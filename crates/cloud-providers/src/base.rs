@@ -345,6 +345,47 @@ mod tests {
         assert_eq!(extract_error_message(body), Some("bad request".to_string()),);
     }
 
+    /// SP-DEC-2 D4: the System One hosts' error bodies, verbatim from the
+    /// verified research (Cloudflare live probe, SGLang + llama.cpp source).
+    #[test]
+    fn extract_error_message_reads_the_system_one_hosts_error_shapes() {
+        // Cloudflare v4 envelope (live 401).
+        let cf = r#"{"result":null,"success":false,"errors":[{"code":10000,"message":"Authentication error"}],"messages":[]}"#;
+        assert_eq!(
+            extract_error_message(cf).as_deref(),
+            Some("Authentication error")
+        );
+        // Several v4 errors are all kept, in order.
+        let cf2 = r#"{"result":null,"success":false,"errors":[{"code":5007,"message":"No such model"},{"code":3003,"message":"Incomplete request"}]}"#;
+        assert_eq!(
+            extract_error_message(cf2).as_deref(),
+            Some("No such model; Incomplete request")
+        );
+        // SGLang 400/500: flat OpenAI-legacy body.
+        let sglang = r#"{"object":"error","message":"model names the LoRA adapter 'qwen3:27b'","type":"BadRequestError","param":null,"code":400}"#;
+        assert_eq!(
+            extract_error_message(sglang).as_deref(),
+            Some("model names the LoRA adapter 'qwen3:27b'")
+        );
+        // SGLang 422: FastAPI validation list.
+        let fastapi = r#"{"detail":[{"type":"missing","loc":["body","questions"],"msg":"Field required"},{"type":"value_error","loc":["body","state"],"msg":"state must not be empty"}]}"#;
+        assert_eq!(
+            extract_error_message(fastapi).as_deref(),
+            Some("body.questions: Field required; body.state: state must not be empty")
+        );
+        // llama.cpp: already the nested shape — unchanged.
+        let llama = r#"{"error":{"code":501,"message":"This model is not a decision model","type":"not_supported_error"}}"#;
+        assert_eq!(
+            extract_error_message(llama).as_deref(),
+            Some("This model is not a decision model")
+        );
+        // A success envelope or an empty errors array carries no message.
+        assert_eq!(
+            extract_error_message(r#"{"success":true,"errors":[]}"#),
+            None
+        );
+    }
+
     #[test]
     fn extract_error_message_invalid_json() {
         let body = "not json";
