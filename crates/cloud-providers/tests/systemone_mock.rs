@@ -18,7 +18,7 @@ use cloud_providers::ollama::OllamaAdapter;
 use cloud_providers::systemone::{DecisionModelStatus, SystemOneAdapter};
 
 use serde_json::json;
-use wiremock::matchers::{body_json, header, header_exists, method, path};
+use wiremock::matchers::{body_json, body_partial_json, header, header_exists, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 mod common;
@@ -593,4 +593,109 @@ async fn configured_router_headers_are_sent_on_decision_calls() {
         .decide(&cfg, &request(Some("jev-latest"), vec![], None))
         .await
         .expect("the header-matched mock answers");
+}
+
+// ---------------------------------------------------------------------------
+// SP-DEC-2 T2 — images are encoded per host
+// ---------------------------------------------------------------------------
+
+/// Real magic-byte prefixes, base64'd: a PNG and a JPEG header.
+const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ";
+const JPEG_B64: &str = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJ";
+const WEBP_B64: &str = "UklGRiQAAABXRUJQVlA4IBgAAAAwAQCdASoBAAEAAwA0JaQAA3AA";
+
+/// llama.cpp rejects bare base64 (400 "images must be data URLs"), Cloudflare
+/// and vLLM's example accept only data URLs, SGLang takes either — so the
+/// generic adapter sends data URLs with the sniffed mime type.
+#[tokio::test]
+async fn the_generic_adapter_sends_images_as_data_urls_with_the_sniffed_mime() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .and(body_partial_json(json!({"images": [
+            format!("data:image/png;base64,{PNG_B64}"),
+            format!("data:image/jpeg;base64,{JPEG_B64}"),
+            format!("data:image/webp;base64,{WEBP_B64}"),
+            "data:image/gif;base64,R0lGODlhAQABAAAAACw="
+        ]})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body("nimble-v3")))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let images = vec![
+        PNG_B64.to_string(),
+        JPEG_B64.to_string(),
+        WEBP_B64.to_string(),
+        // Already a data URL: passed through untouched.
+        "data:image/gif;base64,R0lGODlhAQABAAAAACw=".to_string(),
+    ];
+    SystemOneAdapter::with_id("llamacpp")
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &request(Some("nimble-v3"), images, None),
+        )
+        .await
+        .expect("data-URL images accepted");
+}
+
+/// Ollama is the one host that REQUIRES bare base64 ("URLs and data URLs are
+/// not supported") — it must keep receiving exactly what the caller gave.
+#[tokio::test]
+async fn ollama_keeps_receiving_bare_base64_images() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .and(body_partial_json(json!({"images": [PNG_B64]})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body("clef")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    OllamaAdapter::new()
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &request(Some("clef"), vec![PNG_B64.to_string()], None),
+        )
+        .await
+        .expect("bare base64 accepted by ollama");
+}
+
+/// An image whose bytes are no known format cannot be given a truthful mime
+/// type — fail before any request (a ProviderError, so the chain can fall
+/// back) rather than send a guessed one.
+#[tokio::test]
+async fn an_unrecognisable_image_fails_before_any_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body("x")))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let err = SystemOneAdapter::with_id("llamacpp")
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &request(
+                Some("x"),
+                vec![PNG_B64.to_string(), "aGVsbG8gd29ybGQ=".to_string()],
+                None,
+            ),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        GatewayError::ProviderError {
+            message,
+            status: None,
+            ..
+        } => {
+            assert!(
+                message.contains("image 2"),
+                "names the offending image: {message}"
+            )
+        }
+        other => panic!("expected ProviderError before sending, got {other:?}"),
+    }
 }
