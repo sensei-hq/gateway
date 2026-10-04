@@ -27,6 +27,79 @@ pub const TYPESAFE_BASE_URL: &str = "https://api.typesafe.ai";
 
 const PATH: &str = "/v1/systemone";
 
+/// How a host wants `DecisionRequest.images` (bare base64 from the caller).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImageEncoding {
+    /// Sent verbatim. Ollama REQUIRES this ("URLs and data URLs are not
+    /// supported").
+    Bare,
+    /// `data:<sniffed mime>;base64,<b64>` — what llama.cpp (bare → 400),
+    /// Cloudflare, vLLM's example and SGLang all accept.
+    DataUrl,
+}
+
+/// Encode the caller's images for a host. A value already in data-URL form
+/// passes through. For `DataUrl`, the mime type is read from the decoded magic
+/// bytes; an image that is no known format cannot be labelled truthfully, so
+/// it is an error (before anything is sent) rather than a guessed type.
+fn encode_images(images: &[String], encoding: ImageEncoding) -> Result<Vec<String>, String> {
+    if encoding == ImageEncoding::Bare {
+        return Ok(images.to_vec());
+    }
+    images
+        .iter()
+        .enumerate()
+        .map(|(i, img)| {
+            if img.starts_with("data:") {
+                return Ok(img.clone());
+            }
+            let mime = sniff_image_mime(img).ok_or_else(|| {
+                format!(
+                    "image {} is not PNG, JPEG, WebP or GIF base64 — cannot build a data URL for it",
+                    i + 1
+                )
+            })?;
+            Ok(format!("data:{mime};base64,{img}"))
+        })
+        .collect()
+}
+
+/// The image type from the first decoded bytes of a base64 string.
+fn sniff_image_mime(b64: &str) -> Option<&'static str> {
+    use base64::Engine as _;
+    // 16 base64 chars = 12 bytes: enough for every signature below, and a
+    // multiple of 4 so a prefix decodes without padding.
+    let prefix: String = b64
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .take(16)
+        .collect();
+    let head = base64::engine::general_purpose::STANDARD
+        .decode(prefix)
+        .ok()?;
+    match head.as_slice() {
+        [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, ..] => Some("image/png"),
+        [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
+        [
+            b'R',
+            b'I',
+            b'F',
+            b'F',
+            _,
+            _,
+            _,
+            _,
+            b'W',
+            b'E',
+            b'B',
+            b'P',
+            ..,
+        ] => Some("image/webp"),
+        [b'G', b'I', b'F', b'8', b'7' | b'9', b'a', ..] => Some("image/gif"),
+        _ => None,
+    }
+}
+
 /// Bound on one decision call when the router sets no `timeout_ms`. A bare
 /// `reqwest::Client` has NO timeout, so a host that accepts the connection and
 /// never answers would hang the caller forever (the defect `OllamaAdapter::new`
@@ -62,8 +135,8 @@ struct WireRequest<'a> {
     model: &'a str,
     state: &'a DecisionContent,
     questions: &'a DecisionQuestions,
-    #[serde(skip_serializing_if = "<[String]>::is_empty")]
-    images: &'a [String],
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    images: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     keep_alive: Option<&'a serde_json::Value>,
 }
@@ -120,12 +193,20 @@ pub(crate) async fn decide(
     model: &str,
     cfg: &RouterConfig,
     req: &DecisionRequest,
+    image_encoding: ImageEncoding,
 ) -> Result<Result<DecisionResponse, Rejection>, GatewayError> {
+    let images = encode_images(&req.images, image_encoding).map_err(|message| {
+        GatewayError::ProviderError {
+            adapter: adapter.into(),
+            message,
+            status: None,
+        }
+    })?;
     let body = WireRequest {
         model,
         state: &req.state,
         questions: &req.questions,
-        images: &req.images,
+        images,
         keep_alive: req.keep_alive.as_ref(),
     };
     let mut http = client
@@ -260,12 +341,20 @@ impl kernel::adapters::capability::DecisionModel for SystemOneAdapter {
             });
         };
         let base_url = self.base_url(config)?;
-        decide(&self.client, base_url, &self.id, model, config, req)
-            .await?
-            .map_err(|r| {
-                let message = r.message();
-                r.into_error(&self.id, message)
-            })
+        decide(
+            &self.client,
+            base_url,
+            &self.id,
+            model,
+            config,
+            req,
+            ImageEncoding::DataUrl,
+        )
+        .await?
+        .map_err(|r| {
+            let message = r.message();
+            r.into_error(&self.id, message)
+        })
     }
 }
 
@@ -290,6 +379,35 @@ mod tests {
             timeout_ms: None,
             headers: HashMap::new(),
         }
+    }
+
+    /// Every signature the sniffer claims, from real file headers; anything
+    /// else — text, truncated input, non-base64 — is no type at all.
+    #[test]
+    fn image_mime_is_read_from_the_magic_bytes() {
+        use base64::Engine as _;
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let cases: [(&[u8], Option<&str>); 9] = [
+            (b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR", Some("image/png")),
+            (b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01", Some("image/jpeg")),
+            (b"RIFF$\0\0\0WEBPVP8 ", Some("image/webp")),
+            (b"GIF87a\x01\0\x01\0\0\0", Some("image/gif")),
+            (b"GIF89a\x01\0\x01\0\0\0", Some("image/gif")),
+            (b"RIFF$\0\0\0WAVEfmt ", None), // RIFF, but audio
+            (b"GIF86a\x01\0\x01\0\0\0", None),
+            (b"hello world!", None),
+            (b"\x89PN", None), // too short to be a PNG signature
+        ];
+        for (bytes, want) in cases {
+            assert_eq!(sniff_image_mime(&b64(bytes)), want, "{bytes:?}");
+        }
+        assert_eq!(sniff_image_mime("not base64 at all!!"), None);
+        // Line-wrapped base64 (whitespace inside) still sniffs.
+        let wrapped: String = b64(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR")
+            .chars()
+            .flat_map(|c| [c, '\n'])
+            .collect();
+        assert_eq!(sniff_image_mime(&wrapped), Some("image/png"));
     }
 
     /// A router with no `timeout_ms` still gets a bound: a wedged host must
