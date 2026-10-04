@@ -275,3 +275,42 @@ async fn live_clef_flash_answers() {
         DecisionAnswer::Noul { .. }
     ));
 }
+
+/// SP-DEC-2 review #1: the model string becomes part of the URL path, and a
+/// caller can pin it (`InferenceRequest.model`). Anything that is not a plain
+/// model name — `..` segments, `?`, `#`, extra `/`, `%` — would let a request
+/// escape `/ai/run/` and carry the operator's token to another Cloudflare API
+/// path. It must be refused before any request.
+#[tokio::test]
+async fn a_path_hostile_model_is_refused_before_any_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(clef_result("clef"))))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let adapter = CloudflareAdapter::new().unwrap();
+    for model in [
+        "../../../zones",
+        "@cf/cloudflare/../../../../user/tokens",
+        "clef?account=other",
+        "clef#frag",
+        "clef/extra",
+        "@cf/cloudflare/clef/extra",
+        "@cf//clef",
+        "clef%2F..%2F",
+        "..",
+        "",
+        "   ",
+    ] {
+        match adapter
+            .decide(&cfg(&server), &request(Some(model), vec![]))
+            .await
+        {
+            Err(GatewayError::InvalidRequest { message }) => {
+                assert!(message.contains("model"), "{model:?}: {message}")
+            }
+            other => panic!("{model:?} must be refused, got {other:?}"),
+        }
+    }
+}
