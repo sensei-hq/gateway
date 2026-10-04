@@ -66,6 +66,7 @@ each adapter's `RegisterInto` impl (cloud and embedded alike).
 | `openai` | ✓ | ✓ | ✓ | ✓ | ✓ | | |
 | `openrouter` | ✓ | ✓ | ✓ | ✓ | ✓ | | ✓ |
 | `typesafe` | | | | | | | ✓ |
+| `cloudflare` | | | | | | | ✓ |
 | `gemini` | ✓ | ✓ | | | | | |
 | `huggingface` | ✓ | ✓ | | | | | |
 | `bedrock` | ✓ | ✓ | | | | | |
