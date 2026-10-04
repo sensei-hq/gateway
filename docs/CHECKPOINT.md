@@ -1,38 +1,39 @@
 # Checkpoint
 
-**SP-DEC-1 — Decision (System One) capability, gh#72: DONE and RELEASED as v0.7.0**
-(tag `b444b6b`). gh#73 released as v0.6.1. **PR #74 (develop→main, both releases,
-Closes #72 #73) is fully green — 18/18 checks — and awaits human review** (main is
-protected). develop head: `ce10413`.
+**SP-DEC-2 — more System One routes (Cloudflare Workers AI + self-hosted llama.cpp/SGLang):
+T1–T6 DONE on `develop`, review fixed, gate PASS. NOT released.** Plan:
+`docs/superpowers/plans/2026-10-03-sp-dec-2-system-one-routes.md` (Contract + Progress — read first).
+Previous: v0.7.0 (SP-DEC-1) released + merged to main (`51cf9bc`, PR #74); GitHub Release page
+published.
+
+Gate: workspace **1980 passed / 0 failed**, `--features local` ok, fmt ok, clippy **0.1.98 and
+0.1.99** (real rustup driver on PATH) ok; live llama.cpp adapter + engine tests ok.
 
 ## Done
 
-- v0.6.1: llama-cpp-2 → 0.1.158 vocab API, floor raised (#73).
-- v0.7.0: SP-DEC-1 T1–T7 (plan `docs/superpowers/plans/2026-10-03-sp-dec-1-decision-capability.md`);
-  whole-slice review 12 must-fix fixed red-first. Shipped tag verified: a fresh
-  consumer on `tag = "v0.7.0"` → facade → Ollama nimble, `success=true`.
-- CI had been red since Rust 1.99 hit stable (2026-10-01): async-trait 0.1.92
-  (`c77cde3`) + `fetch_update` → `try_update` (`ce10413`). Tags v0.6.1/v0.7.0 predate
-  the fix — affects clippy only, not consumers' builds.
-- sensei PR **sensei-hq/sensei#228** (`feat/decision-seed`, closes sensei#202): pins
-  → v0.7.0, `decision` enum + seed (decision models, openrouter/typesafe routers,
-  `decide` chain, Jun–Oct 2026 models), `map_capability`, router mirror guard;
-  senseid 3157/0, workspace 358/0, DB seed test, end-to-end decision via nimble.
+T1 error extraction (`4924875`) · T2 per-host image encoding (`0647e80`) · T3 `Dialect::WorkersAi` +
+`CloudflareAdapter` (`9c6c6d3`) · T4 self-hosted + live llama.cpp (`a3435d5`) · T5 facade ids
+(`71e8f90`), live engine e2e (`2d2eaf2`), docs (`92d85af`) · T6 review `wf_77336922-196`: MEDIUM #1
+model→URL-path injection fixed (`7bca090`), MEDIUM #2 facade test (`437a896`), LOW #4 (`a2d80c6`),
+LOW #5 (`ba4d7a9`).
+
+Live test rig (outside the repo): `~/opt/llamacpp-systemone/bin-b11381/llama-b11381/llama-server -m
+~/opt/llamacpp-systemone/models/Bespoke-Nimble-9B-v3-Q4_K_M.gguf --alias nimble-v3 --port 8091 -c 8192`,
+then `LLAMACPP_URL=http://localhost:8091 cargo test … -- --ignored`. Server stopped.
 
 ## Next
 
-1. Human review/merge of gateway #74 (18/18 green) and sensei #228 (9/9 green).
+1. Ask the user: release (additive + two runtime behaviour changes — see upgrading.md "0.7.x → next";
+   likely v0.8.0) and a develop→main PR.
+2. Cloudflare live test needs `CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_TOKEN` (never run — no creds).
 
 ## Open questions
 
-None.
+Release version for SP-DEC-2?
 
-## Known-broken (pre-existing, not this work)
+## Known-broken / carry-forwards
 
-- sensei `dbd reconcile` fails on `sensei.libraries` (column used by a view), even on
-  pristine develop. Shared local `sensei_test` is schema-stale (309 failures until
-  re-deployed).
-- gateway `OllamaAdapter::from_config` / `OpenAIAdapter::from_config`: no default
-  timeout when `timeout_ms` is unset (chat path).
-- LOW carry: estimator test doesn't pin question names/option keys; llms README's
-  upgrading row still says "0.3→0.4" first.
+- LOW #3/#7/#8 test gaps; #6 engine policy: any caller-caused error (client-side image error or a
+  provider 4xx) trips the circuit breaker and is `retryable` — fix at the engine.
+- Pre-existing: `OllamaAdapter::from_config` / `OpenAIAdapter::from_config` no default timeout;
+  `providers.md` `together` base URL nit; sensei `dbd reconcile` fails on `sensei.libraries`.
