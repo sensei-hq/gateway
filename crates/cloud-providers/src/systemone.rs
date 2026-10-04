@@ -481,6 +481,24 @@ mod tests {
         }
     }
 
+    /// Line-wrapped base64 (MIME/PEM style) sniffs fine — and the data URL
+    /// built from it must not carry the line breaks into the request.
+    #[test]
+    fn a_wrapped_image_becomes_a_single_line_data_url() {
+        let wrapped = "iVBORw0KGgoAAAANSUhE\nUgAAAAEAAAABCAYAAAAf\r\nFcSJ".to_string();
+        let encoded = encode_images(&[wrapped], ImageEncoding::DataUrl).unwrap();
+        assert_eq!(
+            encoded,
+            ["data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"]
+        );
+        // Bare (Ollama) still sends exactly what the caller gave.
+        let wrapped = "iVBORw0KGgo\nAAAANSUhE".to_string();
+        assert_eq!(
+            encode_images(std::slice::from_ref(&wrapped), ImageEncoding::Bare).unwrap(),
+            [wrapped]
+        );
+    }
+
     /// Every signature the sniffer claims, from real file headers; anything
     /// else — text, truncated input, non-base64 — is no type at all.
     #[test]
