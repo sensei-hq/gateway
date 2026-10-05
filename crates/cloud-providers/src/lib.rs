@@ -6,6 +6,7 @@ pub mod anthropic;
 pub mod async_job;
 pub mod base;
 pub mod bedrock;
+pub mod cloudflare;
 pub mod fal;
 pub mod flux;
 pub mod gemini;

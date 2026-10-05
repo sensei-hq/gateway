@@ -272,6 +272,9 @@ implements that capability trait and is registered into that map.
 | `openai`     | ✓ | ✓ | ✓ | ✓ | ✓ |   |   |
 | `openrouter` | ✓ | ✓ | ✓ | ✓ | ✓ |   | ✓ |
 | `typesafe`   |   |   |   |   |   |   | ✓ |
+| `cloudflare` |   |   |   |   |   |   | ✓ |
+| `llamacpp`   |   |   |   |   |   |   | ✓ |
+| `sglang`     |   |   |   |   |   |   | ✓ |
 | `gemini`     | ✓ | ✓ |   |   |   |   |   |
 | `huggingface` | ✓ | ✓ |   |   |   |   |   |
 | `bedrock`    | ✓ | ✓ |   |   |   |   |   |
@@ -297,8 +300,11 @@ implements that capability trait and is registered into that map.
 `openrouter` is two adapters under one router id: `OpenAIAdapter` (id `openrouter`,
 so it registers OpenAI's fixed chat/embed/STT/TTS/image set — whether OpenRouter
 actually serves each of those is up to OpenRouter) plus a decision-only
-`SystemOneAdapter`. `typesafe` is a decision-only `SystemOneAdapter`. Both are
-auto-registered by the facade when their router id is in config.
+`SystemOneAdapter`. `typesafe`, `llamacpp` and `sglang` are decision-only
+`SystemOneAdapter`s; `cloudflare` is the decision-only `CloudflareAdapter`. All five
+are auto-registered by the facade when their router id is in config (a chat adapter
+you register under `llamacpp` or `sglang` lives in the chat map and is untouched).
+`llamacpp` (a self-hosted `llama-server`) is not the embedded `llama_cpp` engine.
 
 `noop` is the catch-all test/dev adapter — it claims all seven capabilities (its
 decision reply is an empty, `degraded` answer set).
@@ -311,7 +317,9 @@ providers, and implement no capability trait.
 
 A decision call sends one shared `state` plus 1–64 named, typed questions and gets
 back **probabilities**, not text. The wire format is TypeSafe's System One API
-(`POST {base}/v1/systemone`), served by Ollama (≥ 0.35), OpenRouter and TypeSafe.
+(`POST {base}/v1/systemone`), served by Ollama (≥ 0.35), OpenRouter, TypeSafe and
+the self-hosted llama.cpp and SGLang servers; Cloudflare Workers AI serves the same
+models (`clef`, `clef-flash`) on its own REST route.
 Types live in `crates/kernel/src/types/decision.rs` (`gateway::types::decision`);
 `DecisionQuestions` / `DecisionAnswers` are `IndexMap`s because order is semantic —
 choice ties follow option order, score levels are lowest-first, and answers come back
@@ -353,7 +361,7 @@ let req = InferenceRequest {
     payload: Payload::Decision {
         state: json!("I was charged twice and want my money back today."),
         questions,
-        images: vec![],                       // bare base64; vision decision models only
+        images: vec![],                       // bare base64 (encoded per host); vision decision models only
         keep_alive: None,                     // Ollama only, e.g. json!("5m")
     },
     budget: None, auth: None, panel: None, consensus: None,
@@ -403,8 +411,49 @@ Routers:
   `Gateway::try_new`) rejects an empty router `url` anyway, so in practice set it —
   `https://openrouter.ai/api` serves both OpenRouter's chat and `/v1/systemone`.
   There is no default model: a call with no model is `InvalidRequest`.
+- **`llamacpp`**, **`sglang`** — self-hosted servers, also `SystemOneAdapter`
+  (decision-only; bearer only when a key is configured). No default base URL — set
+  `url` to the server (e.g. `http://localhost:8091`). No default model.
+  - *llama.cpp* needs release b11364+ (nimble) / b11371+ (clef) — Homebrew's formula
+    is too old. `/v1/systemone` is always registered but returns 501 `This model is
+    not a decision model` unless the GGUF carries `<arch>.decision.type` + a
+    `systemone` template; Ollama's `nimble` blob does not — use
+    `ggml-org/Bespoke-Nimble-9B-v3-GGUF`. Images ≤ 8, need a vision model +
+    `--mmproj` (else 501). The response `model` is the server alias;
+    `usage.output_tokens` is always 0.
+  - *SGLang* has `/v1/systemone` in v0.5.21, but images and decision checkpoints are
+    only on main (#42183) — **v0.5.21 silently drops images** (200, text-only
+    answers). A model name containing `:` is parsed as a LoRA adapter → 400; use a
+    colon-free name. Optional `--api-key` bearer. `usage.output_tokens` is 0.
+- **`cloudflare`** — `CloudflareAdapter` (`cloud_providers::cloudflare`, re-exported as
+  `gateway::adapters::cloudflare`), decision-only, for Workers AI's `clef` /
+  `clef-flash`. It is a wire **dialect** of the same core, not a copy: `POST
+  {url}/run/@cf/cloudflare/{model}` with `url =
+  https://api.cloudflare.com/client/v4/accounts/<account_id>/ai` (empty →
+  `InvalidConfig`); the body `model` is the short name (a full `@cf/cloudflare/clef…`
+  id is accepted and split — path gets the id, body the name); `keep_alive` is not
+  sent; the `{result, success, errors, messages}` envelope is unwrapped, and a 2xx
+  with `success: false` or no `result` is a `ProviderError`. Bearer: a Workers AI API
+  token (Read + Edit) in `api_key` / `api_key_env`. No default model. Host limits:
+  images ≤ 4, PNG / JPEG / WebP; `choice` 2–255 options, `score` 2–10 levels, 1–64
+  questions. 65,536-token window; input-only pricing ($0.24/M `clef`, $0.09/M
+  `clef-flash`).
+  **Long state is truncated silently.** Seed the models' `context_window` with
+  65,536 so the `ContextWindowGate` — which counts state, every question, the prompt
+  framing and each image — keeps every request routed here within it.
+- **vLLM** has no upstream `/v1/systemone` (PR #59299 open; only an example proxy) —
+  not supported, and there is no `vllm` facade id.
 
-Cloudflare Workers AI is **not** supported (different image shape; it truncates input).
+**Image encoding is per host.** Callers always pass bare base64 in `images`. Ollama
+receives it verbatim (it rejects data URLs). Every `SystemOneAdapter` id and
+`CloudflareAdapter` send `data:<mime>;base64,…` with the mime sniffed from the
+decoded magic bytes (PNG / JPEG / WebP / GIF); a value already starting `data:`
+passes through. An unrecognisable image is a `ProviderError` before any request is
+sent (so a chain listing that trigger falls back), never a guessed type.
+
+**Error messages** from every System One host are the provider's extracted message
+(`{error:{message}}`, a Cloudflare `{errors:[{message}]}` array, a flat `{message}`, or
+a FastAPI `{detail:[{loc,msg}]}` list), falling back to the raw body.
 
 ---
 

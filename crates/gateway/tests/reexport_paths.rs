@@ -37,6 +37,9 @@ use gateway::adapters::{
 // consumer that depends only on `sensei-gateway`.
 #[cfg(feature = "cloud")]
 #[allow(unused_imports)]
+use gateway::adapters::cloudflare::CloudflareAdapter;
+#[cfg(feature = "cloud")]
+#[allow(unused_imports)]
 use gateway::adapters::systemone::{DecisionModelStatus, SystemOneAdapter};
 
 // Model-registry vocabulary via the facade (no direct `kernel` dependency needed).

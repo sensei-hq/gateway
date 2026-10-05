@@ -38,6 +38,33 @@ models you've `ollama pull`ed are available for chat + embed, and decision model
 [recipes § decision](recipes.md#ask-a-decision-system-one). Use this when Ollama is
 already running on the box and you don't want to link native engines.
 
+## Self-hosted decision servers (llama.cpp, SGLang)
+
+For System One **decisions** you can also point a router at your own `llama-server`
+or SGLang server — again no `local-providers` / `local-engine` needed. The facade
+auto-registers the router ids `llamacpp` and `sglang` as decision-only
+`SystemOneAdapter`s (POST `{url}/v1/systemone`; bearer only if a key is configured).
+This `llamacpp` router is an HTTP server, unrelated to the embedded `llama-cpp`
+feature below, and a chat adapter you register under the same id is left untouched.
+
+- **llama.cpp** — needs release b11364+ (nimble) / b11371+ (clef); Homebrew's formula
+  is too old. The GGUF must carry `<arch>.decision.type` + a `systemone` template, else
+  every call is 501 `This model is not a decision model`; Ollama's `nimble` blob does
+  not, so use `ggml-org/Bespoke-Nimble-9B-v3-GGUF`:
+  `llama-server -m Bespoke-Nimble-9B-v3-Q4_K_M.gguf --alias nimble-v3 --port 8091 -c 8192`,
+  router `url = "http://localhost:8091"`, model `api_model_id = "nimble-v3"`. Images
+  (≤ 8) need a vision model + `--mmproj` (else 501). The response `model` is the alias;
+  `usage.output_tokens` is always 0. Live-verified with b11381.
+- **SGLang** — `/v1/systemone` ships in v0.5.21, but images and decision checkpoints
+  are only on main (#42183): **v0.5.21 silently drops images** (200, text-only
+  answers). A model name containing `:` is parsed as a LoRA adapter → 400; serve it
+  under a colon-free name. Optional `--api-key` bearer. `usage.output_tokens` is 0.
+- **vLLM** — no upstream `/v1/systemone` (PR #59299 open; only an example proxy); not
+  supported, no `vllm` id.
+
+Neither has a default model — pin one via `api_model_id`. Router + model config:
+[recipes § decision](recipes.md#ask-a-decision-system-one).
+
 ## Embedded Ollama models
 
 To run Ollama's downloaded models **in-process** (no server process), reuse Ollama's
