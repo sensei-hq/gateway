@@ -6,7 +6,7 @@ routing call path (build a request, `gateway.execute(&req).await`, read
 `InferenceResponse`) stays source-compatible across every step below; each section
 lists only what you must touch.
 
-## 0.7.x → next (unreleased — SP-DEC-2)
+## 0.7.x → 0.8.0 (SP-DEC-2 — more System One routes)
 
 More System One decision routes: **Cloudflare Workers AI** (`clef`, `clef-flash`) and
 **self-hosted** llama.cpp and SGLang servers. No public type changes —
