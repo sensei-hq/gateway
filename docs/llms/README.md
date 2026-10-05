@@ -9,7 +9,9 @@ agent that needs to *use* the crate.
 
 A **provider-agnostic multimodal inference routing engine**. You configure providers +
 models + fallback chains once, then send requests **by capability** — chat, embeddings,
-image, video, speech and System One **decisions** (typed questions → probabilities).
+image, video, speech and System One **decisions** (typed questions → probabilities —
+over Ollama, OpenRouter, TypeSafe, Cloudflare Workers AI, or a self-hosted llama.cpp /
+SGLang server).
 The caller never picks a provider SDK — the gateway routes, retries down a fallback
 chain, trips a per-endpoint circuit breaker, meters cost, can
 run multi-model **consensus/panels**, and (optionally) enforces subscription quotas.
@@ -43,9 +45,9 @@ let resp     = gateway.execute(&request).await?;
 | [quickstart](quickstart.md) | Get a working chat/embed call end-to-end |
 | [configuration](configuration.md) | Define routers, models, chains, pricing, keys (builder or JSON) |
 | [recipes](recipes.md) | Routing modes, fallback, streaming, cost, budget, persistence, quotas, tools, decisions |
-| [local](local.md) | Run local models — Ollama (server or embedded), llama.cpp, ONNX, Kokoro TTS + HF download |
+| [local](local.md) | Run local models — Ollama (server or embedded), llama.cpp, ONNX, Kokoro TTS + HF download, self-hosted decision servers |
 | [custom-adapters](custom-adapters.md) | Add a provider the crate doesn't ship |
-| [upgrading](upgrading.md) | Re-pin a dep across releases (newest-first: 0.3→0.4, 0.2→0.3) |
+| [upgrading](upgrading.md) | Re-pin a dep across releases (newest-first: 0.7→0.8, 0.6→0.7, 0.6.0→0.6.1, 0.5→0.6, … 0.2→0.3) |
 
 ## Key invariants (don't fight these)
 

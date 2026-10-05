@@ -159,7 +159,8 @@ impl FacadeBuilder {
 
 /// Register the cloud adapter matching each well-known router name from config
 /// (`openrouter` gets both its OpenAI-wire chat adapter and a System One
-/// decision adapter; `typesafe` is decision-only),
+/// decision adapter; `typesafe`, `cloudflare`, `llamacpp` and `sglang` are
+/// decision-only),
 /// returning `(router, error)` for any that failed to build. `bedrock` (which
 /// needs explicit AWS SDK setup) and unrecognised router names are skipped for
 /// the caller to register manually via the shared registry.
@@ -252,6 +253,23 @@ async fn register_cloud_from_config(
                 reg(
                     registry,
                     cp::systemone::SystemOneAdapter::from_config_with_id("typesafe", router),
+                )
+                .await,
+            ),
+            // SP-DEC-2: Cloudflare Workers AI (clef / clef-flash) and the
+            // self-hosted System One servers — decision-only; a chat adapter the
+            // caller registers under the same id lives in its own map, untouched.
+            "cloudflare" => Some(
+                reg(
+                    registry,
+                    cp::cloudflare::CloudflareAdapter::from_config(router),
+                )
+                .await,
+            ),
+            id @ ("llamacpp" | "sglang") => Some(
+                reg(
+                    registry,
+                    cp::systemone::SystemOneAdapter::from_config_with_id(id, router),
                 )
                 .await,
             ),
@@ -498,6 +516,94 @@ mod cloud_tests {
         );
         assert!(registry.decision("ollama").await.is_some());
         assert!(registry.chat("ollama").await.is_some());
+    }
+
+    /// SP-DEC-2 D6: Cloudflare Workers AI and the self-hosted System One
+    /// servers come up decision-only, each wired to the RIGHT adapter — proven
+    /// by calling it: `cloudflare` must speak the Workers AI dialect
+    /// (`/run/@cf/cloudflare/<model>`, enveloped result), `llamacpp`/`sglang`
+    /// plain System One (`/v1/systemone`). A chat adapter the caller registered
+    /// under the same id (e.g. llama.cpp's /v1/chat/completions via an
+    /// OpenAI-compatible adapter) is untouched — decisions live in their own map.
+    #[tokio::test]
+    async fn build_registers_the_sp_dec_2_decision_routers_decision_only() {
+        use crate::types::decision::{DecisionQuestion, DecisionQuestions};
+        use crate::types::io::DecisionRequest;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let answer = serde_json::json!({
+            "model": "m",
+            "answers": {"q": {"type": "noul", "noul": 0.5}},
+            "usage": {"input_tokens": 1, "output_tokens": 0}
+        });
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/client/v4/accounts/acct/ai/run/@cf/cloudflare/clef"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "result": answer, "success": true, "errors": [], "messages": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(answer.clone()))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let at = |url: String| RouterConfig { url, ..router() };
+        let cloudflare = at(format!("{}/client/v4/accounts/acct/ai", server.uri()));
+        let self_hosted = at(server.uri());
+        let routers = HashMap::from([
+            ("cloudflare".to_string(), cloudflare.clone()),
+            ("llamacpp".to_string(), self_hosted.clone()),
+            ("sglang".to_string(), self_hosted.clone()),
+        ]);
+        let builder = FacadeBuilder::new(GatewayConfig {
+            routers,
+            ..Default::default()
+        });
+        let registry = builder.registry().clone();
+        let callers_chat =
+            Arc::new(cloud_providers::openai::OpenAIAdapter::with_id("llamacpp").unwrap());
+        registry.register_chat(callers_chat).await;
+        builder.build().await;
+
+        let req = |model: &str| DecisionRequest {
+            model: Some(model.into()),
+            state: serde_json::json!("x"),
+            questions: DecisionQuestions::from([(
+                "q".to_string(),
+                DecisionQuestion::Noul {
+                    instructions: serde_json::json!("y?"),
+                    criteria: None,
+                },
+            )]),
+            images: vec![],
+            keep_alive: None,
+        };
+        for (id, cfg, model) in [
+            ("cloudflare", &cloudflare, "clef"),
+            ("llamacpp", &self_hosted, "nimble-v3"),
+            ("sglang", &self_hosted, "qwen"),
+        ] {
+            let adapter = registry
+                .decision(id)
+                .await
+                .unwrap_or_else(|| panic!("{id} decides"));
+            adapter
+                .decide(cfg, &req(model))
+                .await
+                .unwrap_or_else(|e| panic!("{id} reached the wrong wire: {e}"));
+        }
+        assert!(registry.chat("cloudflare").await.is_none());
+        assert!(registry.chat("sglang").await.is_none());
+        assert!(
+            registry.chat("llamacpp").await.is_some(),
+            "the caller's own llamacpp chat adapter survives build()"
+        );
     }
 
     #[tokio::test]

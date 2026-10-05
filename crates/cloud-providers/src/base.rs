@@ -286,6 +286,49 @@ pub(crate) fn extract_error_message(body: &str) -> Option<String> {
                 .and_then(|d| d.as_str())
                 .map(|s| s.to_string())
         })
+        // FastAPI validation (e.g. SGLang 422): { "detail": [{ "loc": [..], "msg": "..." }] }
+        .or_else(|| {
+            let items = v.get("detail")?.as_array()?;
+            joined(items.iter().filter_map(|d| {
+                let msg = d.get("msg")?.as_str()?;
+                let loc: Vec<String> = d
+                    .get("loc")
+                    .and_then(|l| l.as_array())
+                    .map(|l| {
+                        l.iter()
+                            .map(|p| p.as_str().map_or_else(|| p.to_string(), str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some(if loc.is_empty() {
+                    msg.to_string()
+                } else {
+                    format!("{}: {msg}", loc.join("."))
+                })
+            }))
+        })
+        // Cloudflare v4 envelope: { "success": false, "errors": [{ "code", "message" }] }
+        .or_else(|| {
+            let items = v.get("errors")?.as_array()?;
+            joined(
+                items
+                    .iter()
+                    .filter_map(|e| e.get("message")?.as_str().map(str::to_string)),
+            )
+        })
+        // OpenAI-legacy flat body (e.g. SGLang 400/500): { "object": "error", "message": "..." }
+        .or_else(|| {
+            v.get("message")
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string())
+        })
+}
+
+/// `"a; b"` from the messages, or `None` when there are none — so an empty
+/// `errors: []` on a success envelope never reads as an error message.
+fn joined(messages: impl Iterator<Item = String>) -> Option<String> {
+    let all: Vec<String> = messages.collect();
+    (!all.is_empty()).then(|| all.join("; "))
 }
 
 #[cfg(test)]
@@ -343,6 +386,47 @@ mod tests {
     fn extract_error_message_string_format() {
         let body = r#"{"error":"bad request"}"#;
         assert_eq!(extract_error_message(body), Some("bad request".to_string()),);
+    }
+
+    /// SP-DEC-2 D4: the System One hosts' error bodies, verbatim from the
+    /// verified research (Cloudflare live probe, SGLang + llama.cpp source).
+    #[test]
+    fn extract_error_message_reads_the_system_one_hosts_error_shapes() {
+        // Cloudflare v4 envelope (live 401).
+        let cf = r#"{"result":null,"success":false,"errors":[{"code":10000,"message":"Authentication error"}],"messages":[]}"#;
+        assert_eq!(
+            extract_error_message(cf).as_deref(),
+            Some("Authentication error")
+        );
+        // Several v4 errors are all kept, in order.
+        let cf2 = r#"{"result":null,"success":false,"errors":[{"code":5007,"message":"No such model"},{"code":3003,"message":"Incomplete request"}]}"#;
+        assert_eq!(
+            extract_error_message(cf2).as_deref(),
+            Some("No such model; Incomplete request")
+        );
+        // SGLang 400/500: flat OpenAI-legacy body.
+        let sglang = r#"{"object":"error","message":"model names the LoRA adapter 'qwen3:27b'","type":"BadRequestError","param":null,"code":400}"#;
+        assert_eq!(
+            extract_error_message(sglang).as_deref(),
+            Some("model names the LoRA adapter 'qwen3:27b'")
+        );
+        // SGLang 422: FastAPI validation list.
+        let fastapi = r#"{"detail":[{"type":"missing","loc":["body","questions"],"msg":"Field required"},{"type":"value_error","loc":["body","state"],"msg":"state must not be empty"}]}"#;
+        assert_eq!(
+            extract_error_message(fastapi).as_deref(),
+            Some("body.questions: Field required; body.state: state must not be empty")
+        );
+        // llama.cpp: already the nested shape — unchanged.
+        let llama = r#"{"error":{"code":501,"message":"This model is not a decision model","type":"not_supported_error"}}"#;
+        assert_eq!(
+            extract_error_message(llama).as_deref(),
+            Some("This model is not a decision model")
+        );
+        // A success envelope or an empty errors array carries no message.
+        assert_eq!(
+            extract_error_message(r#"{"success":true,"errors":[]}"#),
+            None
+        );
     }
 
     #[test]

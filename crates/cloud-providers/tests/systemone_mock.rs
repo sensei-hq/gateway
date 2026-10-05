@@ -18,7 +18,7 @@ use cloud_providers::ollama::OllamaAdapter;
 use cloud_providers::systemone::{DecisionModelStatus, SystemOneAdapter};
 
 use serde_json::json;
-use wiremock::matchers::{body_json, header, header_exists, method, path};
+use wiremock::matchers::{body_json, body_partial_json, header, header_exists, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 mod common;
@@ -593,4 +593,243 @@ async fn configured_router_headers_are_sent_on_decision_calls() {
         .decide(&cfg, &request(Some("jev-latest"), vec![], None))
         .await
         .expect("the header-matched mock answers");
+}
+
+// ---------------------------------------------------------------------------
+// SP-DEC-2 T2 — images are encoded per host
+// ---------------------------------------------------------------------------
+
+/// Real magic-byte prefixes, base64'd: a PNG and a JPEG header.
+const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ";
+const JPEG_B64: &str = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJ";
+const WEBP_B64: &str = "UklGRiQAAABXRUJQVlA4IBgAAAAwAQCdASoBAAEAAwA0JaQAA3AA";
+
+/// llama.cpp rejects bare base64 (400 "images must be data URLs"), Cloudflare
+/// and vLLM's example accept only data URLs, SGLang takes either — so the
+/// generic adapter sends data URLs with the sniffed mime type.
+#[tokio::test]
+async fn the_generic_adapter_sends_images_as_data_urls_with_the_sniffed_mime() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .and(body_partial_json(json!({"images": [
+            format!("data:image/png;base64,{PNG_B64}"),
+            format!("data:image/jpeg;base64,{JPEG_B64}"),
+            format!("data:image/webp;base64,{WEBP_B64}"),
+            "data:image/gif;base64,R0lGODlhAQABAAAAACw="
+        ]})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body("nimble-v3")))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let images = vec![
+        PNG_B64.to_string(),
+        JPEG_B64.to_string(),
+        WEBP_B64.to_string(),
+        // Already a data URL: passed through untouched.
+        "data:image/gif;base64,R0lGODlhAQABAAAAACw=".to_string(),
+    ];
+    SystemOneAdapter::with_id("llamacpp")
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &request(Some("nimble-v3"), images, None),
+        )
+        .await
+        .expect("data-URL images accepted");
+}
+
+/// Ollama is the one host that REQUIRES bare base64 ("URLs and data URLs are
+/// not supported") — it must keep receiving exactly what the caller gave.
+#[tokio::test]
+async fn ollama_keeps_receiving_bare_base64_images() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .and(body_partial_json(json!({"images": [PNG_B64]})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body("clef")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    OllamaAdapter::new()
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &request(Some("clef"), vec![PNG_B64.to_string()], None),
+        )
+        .await
+        .expect("bare base64 accepted by ollama");
+}
+
+/// An image whose bytes are no known format cannot be given a truthful mime
+/// type — fail before any request (a ProviderError, so the chain can fall
+/// back) rather than send a guessed one.
+#[tokio::test]
+async fn an_unrecognisable_image_fails_before_any_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body("x")))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let err = SystemOneAdapter::with_id("llamacpp")
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &request(
+                Some("x"),
+                vec![PNG_B64.to_string(), "aGVsbG8gd29ybGQ=".to_string()],
+                None,
+            ),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        GatewayError::ProviderError {
+            message,
+            status: None,
+            ..
+        } => {
+            assert!(
+                message.contains("image 2"),
+                "names the offending image: {message}"
+            )
+        }
+        other => panic!("expected ProviderError before sending, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SP-DEC-2 T4 — self-hosted servers through the generic adapter
+// ---------------------------------------------------------------------------
+
+/// Error bodies verbatim from llama.cpp b11381 and SGLang's source: each
+/// surfaces as the server's own message, with its status, as a ProviderError
+/// (so the chain falls back), never as raw JSON.
+#[tokio::test]
+async fn self_hosted_error_bodies_surface_the_servers_message() {
+    let cases = [
+        // llama.cpp: a model without decision metadata.
+        (
+            501,
+            json!({"error":{"code":501,"message":"This model is not a decision model","type":"not_supported_error"}}),
+            "This model is not a decision model",
+        ),
+        // llama.cpp: validation.
+        (
+            400,
+            json!({"error":{"code":400,"message":"questions.severity: \"criteria\" must be an array of 2 to 10 levels","type":"invalid_request_error"}}),
+            "questions.severity: \"criteria\" must be an array of 2 to 10 levels",
+        ),
+        // SGLang 400: flat OpenAI-legacy body (a ':' model name reads as LoRA).
+        (
+            400,
+            json!({"object":"error","message":"model names the LoRA adapter 'qwen3:27b'","type":"BadRequestError","param":null,"code":400}),
+            "model names the LoRA adapter 'qwen3:27b'",
+        ),
+        // SGLang 422: FastAPI validation list.
+        (
+            422,
+            json!({"detail":[{"type":"missing","loc":["body","questions"],"msg":"Field required"}]}),
+            "body.questions: Field required",
+        ),
+    ];
+    for (status, body, want) in cases {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(body))
+            .mount(&server)
+            .await;
+        match SystemOneAdapter::with_id("sglang")
+            .unwrap()
+            .decide(
+                &keyless(&server.uri()),
+                &request(Some("qwen3:27b"), vec![], None),
+            )
+            .await
+            .unwrap_err()
+        {
+            GatewayError::ProviderError {
+                status: Some(s),
+                message,
+                adapter,
+            } => {
+                assert_eq!((s, adapter.as_str()), (status, "sglang"));
+                assert_eq!(message, want);
+            }
+            other => panic!("{status}: expected ProviderError, got {other:?}"),
+        }
+    }
+}
+
+/// Live, opt-in: a real llama.cpp server >= b11364 serving a decision GGUF
+/// (verified with b11381 + ggml-org/Bespoke-Nimble-9B-v3-GGUF Q4_K_M):
+///   llama-server -m Bespoke-Nimble-9B-v3-Q4_K_M.gguf --alias nimble-v3 --port 8091 -c 8192
+///   LLAMACPP_URL=http://localhost:8091 cargo test -p sensei-cloud-providers \
+///     --test systemone_mock live_llama_cpp -- --ignored
+#[tokio::test]
+#[ignore = "requires LLAMACPP_URL: a llama.cpp server >= b11364 serving a decision GGUF"]
+async fn live_llama_cpp_answers_and_takes_data_url_images() {
+    let url = std::env::var("LLAMACPP_URL").expect("LLAMACPP_URL");
+    let mut cfg = keyless(&url);
+    cfg.timeout_ms = Some(300_000);
+    let adapter = SystemOneAdapter::with_id("llamacpp").unwrap();
+
+    let mut req = request(Some("nimble-v3"), vec![], None);
+    req.questions.insert(
+        "urgent".into(),
+        DecisionQuestion::Noul {
+            instructions: json!("Is this urgent?"),
+            criteria: None,
+        },
+    );
+    let resp = adapter
+        .decide(&cfg, &req)
+        .await
+        .expect("live llama.cpp decision");
+    let DecisionAnswer::Choice {
+        choice,
+        probabilities,
+        ..
+    } = &resp.answers["label"]
+    else {
+        panic!("choice answer expected: {:?}", resp.answers);
+    };
+    // Assert the contract, not the model's opinion: the choice is one of the
+    // asked options and is the argmax, and the distribution sums to 1.
+    assert_eq!(
+        probabilities.keys().collect::<Vec<_>>(),
+        ["billing", "bug"],
+        "every option scored, in order"
+    );
+    let argmax = probabilities
+        .iter()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(k, _)| k.as_str());
+    assert_eq!(Some(choice.as_str()), argmax, "{probabilities:?}");
+    assert!((probabilities.values().sum::<f64>() - 1.0).abs() < 1e-6);
+    assert!(matches!(
+        resp.answers["urgent"],
+        DecisionAnswer::Noul { .. }
+    ));
+    assert!(resp.usage.is_some_and(|u| u.input_tokens > 0));
+
+    // The image is ENCODED correctly — llama.cpp rejects a bare base64 image
+    // with 400 "images must be data URLs" — and then refused only because a
+    // text-only decision model has no vision projector: 501, not 400.
+    match adapter
+        .decide(
+            &cfg,
+            &request(Some("nimble-v3"), vec![PNG_B64.to_string()], None),
+        )
+        .await
+        .unwrap_err()
+    {
+        GatewayError::ProviderError {
+            status: Some(501), ..
+        } => {}
+        other => panic!("expected the 501 that follows a valid data URL, got {other:?}"),
+    }
 }

@@ -241,14 +241,18 @@ adapters — you always read/write the same `ToolDefinition` / `ToolCall` shapes
 `Capability::Decision` sends one shared `state` plus 1–64 named, typed questions and
 returns **probabilities**, not text — TypeSafe's System One API
 (`POST {base}/v1/systemone`), served by Ollama (≥ 0.35, local models only),
-OpenRouter and TypeSafe. The facade (`FacadeBuilder::new(config).build().await`)
-auto-registers the `ollama`, `openrouter` (chat **and** decision) and `typesafe`
-(decision only) routers when they are in config; with a bare `Gateway`, register
-`OllamaAdapter` yourself, and
+OpenRouter, TypeSafe and self-hosted llama.cpp / SGLang servers; Cloudflare Workers AI
+serves `clef` / `clef-flash` on its own route. The facade
+(`FacadeBuilder::new(config).build().await`) auto-registers the `ollama`,
+`openrouter` (chat **and** decision), and the decision-only `typesafe`, `cloudflare`,
+`llamacpp` and `sglang` routers when they are in config; with a bare `Gateway`,
+register `OllamaAdapter` yourself,
 `gateway::adapters::systemone::SystemOneAdapter::from_config_with_id("openrouter", &cfg)`
-for a hosted router. Config validation rejects an empty router `url`, so give each
-one: `http://localhost:11434` (Ollama), `https://openrouter.ai/api` (serves both
-OpenRouter's chat and `/v1/systemone`), `https://api.typesafe.ai`.
+for a `/v1/systemone` host (same call with `"typesafe"`, `"llamacpp"`, `"sglang"`), and
+`gateway::adapters::cloudflare::CloudflareAdapter::from_config(&cfg)` for Cloudflare.
+Config validation rejects an empty router `url`, so give each one:
+`http://localhost:11434` (Ollama), `https://openrouter.ai/api` (serves both
+OpenRouter's chat and `/v1/systemone`), `https://api.typesafe.ai`, and the two below.
 
 ```rust
 use gateway::types::config::{ChainEntry, FallbackChainConfig, FallbackTrigger, ModelConfig};
@@ -312,7 +316,81 @@ if let Some(DecisionAnswer::Noul { noul }) = resp.decisions.as_ref().and_then(|d
   blank state / names / instructions / option keys) fails up front with
   `GatewayError::InvalidRequest` — no candidate is tried, nothing is retried.
 - `execute_stream` refuses `Decision` (`Unsupported`); use `execute`. Panels work.
-- Hosted routers (`openrouter`, `typesafe`) have no default model — pin one via the
-  model's `api_model_id`.
+- Only `ollama` has a default decision model (`nimble`); every other router
+  (`openrouter`, `typesafe`, `cloudflare`, `llamacpp`, `sglang`) needs one pinned via
+  the model's `api_model_id`, else `InvalidRequest`.
+- `images` are always bare base64 from you; the adapter encodes them per host —
+  verbatim for Ollama, `data:<sniffed mime>;base64,…` for every other host. An image
+  that is not PNG / JPEG / WebP / GIF is a `ProviderError` before anything is sent.
+
+### Cloudflare Workers AI (`clef`, `clef-flash`)
+
+```rust
+use gateway::types::config::{ModelConfig, ModelPricing, RouterConfig};
+
+let builder = GatewayBuilder::new()
+    .add_router("cloudflare", RouterConfig {
+        // The account id is part of every path; the adapter appends /run/@cf/cloudflare/<model>.
+        url: "https://api.cloudflare.com/client/v4/accounts/<account_id>/ai".into(),
+        api_key_env: Some("CLOUDFLARE_API_TOKEN".into()), // a Workers AI token (Read + Edit)
+        api_key: None,
+        enabled: true,
+        timeout_ms: Some(30_000),
+        headers: Default::default(),
+    })
+    .add_model(ModelConfig {
+        id: "clef-flash".into(),
+        api_model_id: Some("clef-flash".into()),   // or "clef", or "@cf/cloudflare/clef-flash"
+        provider: "cloudflare".into(),
+        capabilities: vec![Capability::Decision],
+        // REQUIRED to be the real window: Workers AI truncates long state SILENTLY,
+        // so the window gate is what keeps a request within it.
+        context_window: 65_536,
+        max_output_tokens: 1,
+        // Input-only pricing: $0.09/M (clef-flash), $0.24/M (clef).
+        pricing: Some(ModelPricing { input_per_1k: 0.00009, output_per_1k: 0.0, per_request: None }),
+        family: None, catalog: None,
+    });
+```
+
+Host limits the gateway does not check for you: ≤ 4 images, PNG / JPEG / WebP only;
+`choice` 2–255 options, `score` 2–10 levels. A 2xx whose envelope says
+`success: false` (or carries no `result`) is a `ProviderError`.
+
+### Self-hosted llama.cpp (`llama-server`)
+
+Needs llama.cpp release b11364+ (nimble) / b11371+ (clef) — Homebrew's formula is too
+old — and a GGUF that carries `<arch>.decision.type` + a `systemone` template (else
+every call is 501 `This model is not a decision model`). Ollama's `nimble` blob does
+**not**; use `ggml-org/Bespoke-Nimble-9B-v3-GGUF`:
+
+```sh
+llama-server -m Bespoke-Nimble-9B-v3-Q4_K_M.gguf --alias nimble-v3 --port 8091 -c 8192
+```
+
+```rust
+let builder = builder
+    .add_router("llamacpp", RouterConfig {
+        url: "http://localhost:8091".into(), // the adapter appends /v1/systemone
+        api_key_env: None,                   // keyless unless you started it with --api-key
+        api_key: None,
+        enabled: true,
+        timeout_ms: Some(60_000),
+        headers: Default::default(),
+    })
+    .add_model(ModelConfig {
+        id: "nimble-v3".into(), api_model_id: Some("nimble-v3".into()), provider: "llamacpp".into(),
+        capabilities: vec![Capability::Decision],
+        context_window: 8_192,               // match the server's -c
+        max_output_tokens: 1,
+        pricing: None, family: None, catalog: None,
+    });
+```
+
+The response `model` is the server alias and `usage.output_tokens` is always 0. Images
+(≤ 8) need a vision model + `--mmproj` (else 501). An `sglang` router is configured
+the same way; on SGLang v0.5.21 images are **silently dropped** (images need main,
+#42183), and a model name containing `:` is read as a LoRA adapter (400) — use a
+colon-free name. vLLM has no `/v1/systemone` and is not supported.
 
 Full reference: `docs/features/inference/capabilities-and-adapters.md#decision-system-one`.
