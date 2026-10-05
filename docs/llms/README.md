@@ -47,7 +47,7 @@ let resp     = gateway.execute(&request).await?;
 | [recipes](recipes.md) | Routing modes, fallback, streaming, cost, budget, persistence, quotas, tools, decisions |
 | [local](local.md) | Run local models — Ollama (server or embedded), llama.cpp, ONNX, Kokoro TTS + HF download, self-hosted decision servers |
 | [custom-adapters](custom-adapters.md) | Add a provider the crate doesn't ship |
-| [upgrading](upgrading.md) | Re-pin a dep across releases (newest-first: 0.7→next, 0.6→0.7, 0.6.0→0.6.1, 0.5→0.6, … 0.2→0.3) |
+| [upgrading](upgrading.md) | Re-pin a dep across releases (newest-first: 0.7→0.8, 0.6→0.7, 0.6.0→0.6.1, 0.5→0.6, … 0.2→0.3) |
 
 ## Key invariants (don't fight these)
 
