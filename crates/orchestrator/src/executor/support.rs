@@ -1108,6 +1108,136 @@ mod tests {
         );
     }
 
+    /// AG-12: an `EffectRecorded` charging `micro` micro-dollars under effect id `id`.
+    fn priced_effect(id: &str, micro: u64, seq: Seq) -> (Seq, orchestrator_core::JournalEvent) {
+        use orchestrator_core::{EffectClass, EffectId, JournalEvent, NodeId, TokenUsage};
+        (
+            seq,
+            JournalEvent::EffectRecorded {
+                node: NodeId("n1".into()),
+                effect_id: EffectId(id.into()),
+                class: EffectClass::Pure,
+                input_hash: "h".into(),
+                seq,
+                output: EffectOutput::Inline(serde_json::Value::Null),
+                observation: None,
+                usage: Some(TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 10,
+                    total_tokens: 20,
+                    cost_micro_usd: Some(micro),
+                }),
+            },
+        )
+    }
+
+    /// AG-12: the money cap folds from `RunStarted.money_budget` and the latest
+    /// `MoneyBudgetRaised`, and the two caps never move each other.
+    #[test]
+    fn a_money_budget_is_folded_and_the_latest_money_raise_wins() {
+        use orchestrator_core::{JournalEvent, MoneyBudget, TokenBudget};
+        let evs = vec![
+            (
+                0,
+                JournalEvent::RunStarted {
+                    version: "v1".into(),
+                    budget: Some(TokenBudget { total_tokens: 900 }),
+                    money_budget: Some(MoneyBudget {
+                        total_micro_usd: 1_000,
+                    }),
+                },
+            ),
+            (
+                1,
+                JournalEvent::MoneyBudgetRaised {
+                    new_total_micro_usd: 5_000,
+                },
+            ),
+            (
+                2,
+                JournalEvent::BudgetRaised {
+                    new_total_tokens: 7_000,
+                },
+            ),
+            (
+                3,
+                JournalEvent::MoneyBudgetRaised {
+                    new_total_micro_usd: 3_000,
+                },
+            ),
+        ];
+        let (fold, _, _) = fold_journal(&evs);
+        assert_eq!(fold.money_budget(), Some(3_000), "latest money raise wins");
+        assert_eq!(
+            fold.budget(),
+            Some(7_000),
+            "a money raise never moves the token cap"
+        );
+        assert_eq!(crate::executor::money_spend_of(&evs), (0, Some(3_000)));
+
+        let (money_only, _, _) = fold_journal(&[(
+            0,
+            JournalEvent::RunStarted {
+                version: "v1".into(),
+                budget: None,
+                money_budget: Some(MoneyBudget {
+                    total_micro_usd: 42,
+                }),
+            },
+        )]);
+        assert_eq!(
+            (money_only.budget(), money_only.money_budget()),
+            (None, Some(42))
+        );
+    }
+
+    /// AG-12: money spend is keyed by effect id exactly like tokens — a duplicate record
+    /// (the two-phase `Confirmed` reconcile) counts ONCE, distinct effects sum, and a
+    /// compacted Map child's cost re-enters under its original id.
+    #[test]
+    fn money_spend_is_keyed_by_effect_id_and_survives_compaction() {
+        use orchestrator_core::{ChildStatus, CompactChild, JournalEvent, NodeId, TokenUsage};
+        let (fold, _, _) = fold_journal(&[
+            priced_effect("a", 300, 0),
+            priced_effect("a", 300, 1),
+            priced_effect("b", 50, 2),
+        ]);
+        assert_eq!(
+            fold.money_spent(),
+            350,
+            "dup counted once, distinct effects sum"
+        );
+
+        let manifest = (
+            3,
+            JournalEvent::MapCompacted {
+                node: NodeId("m".into()),
+                children: vec![CompactChild {
+                    index: 0,
+                    status: ChildStatus::Ok,
+                    digest: None,
+                    input_hash: None,
+                    usage: Some(TokenUsage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        total_tokens: 2,
+                        cost_micro_usd: Some(1_000),
+                    }),
+                }],
+            },
+        );
+        let (fold, _, _) = fold_journal(&[manifest.clone(), manifest]);
+        assert_eq!(
+            fold.money_spent(),
+            1_000,
+            "a compacted child's cost counts once"
+        );
+        assert_eq!(
+            crate::executor::money_spend_of(&[priced_effect("x", 7, 0)]),
+            (7, None)
+        );
+    }
+
     #[test]
     fn an_unbudgeted_run_folds_no_budget_and_no_spend() {
         use orchestrator_core::JournalEvent;
