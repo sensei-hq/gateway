@@ -11,7 +11,7 @@ keeps the engine, the persistence traits and in-memory stores. Last release: v0.
 - [x] **TM-2** #78 — config WRITE path behind a trait (`ConfigStore`)
 - [x] **TM-3** #79 — exported store conformance suite
 - [x] **TM-4** #80 — `GatewayConfig` source seam + always-on registry↔chain cross-check
-- [ ] **TM-5** #81 — backend-selectable boot (memory | postgres)
+- [x] **TM-5** #81 — backend-selectable boot (memory | postgres)
 - [ ] **TM-6** torii#24 — tenant-scoped orchestrator schema + RLS + per-tenant config versions
 - [ ] **TM-7** torii#25 — store traits over that schema (passes TM-3)
 - [ ] **TM-8** torii#26 — move the CLI/worker into torii
@@ -19,7 +19,12 @@ keeps the engine, the persistence traits and in-memory stores. Last release: v0.
 
 ## Next
 
-TM-5 (#81): boot builds every store through one backend seam (memory | postgres); the tiers name no `Postgres*` type; the memory backend needs no `DATABASE_URL`.
+Phase 1 (gateway) DONE. Phase 2 is in `sensei-hq/torii`: TM-6 (torii#24) tenant-scoped orchestrator
+schema + RLS + per-tenant config versions. Work in a torii worktree (its main checkout has someone
+else's uncommitted changes). torii pins the gateway at v0.5.1 by git tag; its workspace `[patch]`
+points at `../gateway/crates/*` for local development, so Phase 2 can build against this branch —
+a gateway release carrying TM-2..TM-5 (`ConfigStore`, `sensei-orchestrator-testkit`) is needed
+before torii's CI can.
 
 ## Open questions
 
