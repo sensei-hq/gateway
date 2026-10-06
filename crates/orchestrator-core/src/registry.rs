@@ -622,6 +622,12 @@ impl Registry {
                     });
                 }
             }
+            // AG-15: the tool policy must say something TRUE about a tool the agent can
+            // call. A ceiling or a confirmation on an unlisted tool is inert — the s1 gate
+            // refuses every call of it first — so an author reading the config would
+            // believe a guard exists that never fires. (A human-backed agent lists no
+            // tools at all, so this also rejects a policy on one.)
+            validate_tool_policy(agent)?;
             // A bool, not a binding: the chain rule below needs only "is this human?",
             // and its condition reads better negated than as a match arm. The rules
             // that follow bind the timeout instead (see below).
@@ -762,8 +768,144 @@ impl Registry {
             )));
         }
 
+        self.validate_escalations()?;
+
         Ok(())
     }
+
+    /// AG-15: every `escalate_to` must describe an escalation that can actually happen.
+    ///
+    /// A cross-agent rule, so — like the default-planner rule above — it runs here rather
+    /// than in `from_config`, which keeps the `with_agent` builder path covered too. Walked
+    /// in NAME order, not `HashMap` order, so the error a broken config produces (and in
+    /// particular the cycle path it prints) is the same on every load.
+    fn validate_escalations(&self) -> Result<(), OrchestratorError> {
+        let mut names: Vec<&String> = self.agents.keys().collect();
+        names.sort_unstable();
+        for name in names {
+            let agent = &self.agents[name];
+            let Some(target) = &agent.escalate_to else {
+                continue;
+            };
+            // Escalation is the answer to a human SLA running out. A model-backed agent has
+            // no SLA, and a human one without a timeout waits forever — either way the
+            // declaration can never fire.
+            match &agent.backed_by {
+                AgentBacking::Model => {
+                    return Err(OrchestratorError::RegistryLoad(format!(
+                        "agent {name:?} declares escalate_to {target:?} but is model-backed; \
+                         escalation hands an unanswered human question on, so only a \
+                         human-backed agent can escalate"
+                    )));
+                }
+                AgentBacking::Human { timeout: None } => {
+                    return Err(OrchestratorError::RegistryLoad(format!(
+                        "agent {name:?} declares escalate_to {target:?} but has no timeout; \
+                         its SLA never expires, so it never escalates — set `timeout:` or \
+                         drop `escalate_to:`"
+                    )));
+                }
+                AgentBacking::Human { timeout: Some(_) } => {}
+            }
+            if target == name {
+                return Err(OrchestratorError::RegistryLoad(format!(
+                    "agent {name:?} escalates to itself; an escalation must hand the \
+                     question to a different agent"
+                )));
+            }
+            let Some(next) = self.agents.get(target) else {
+                return Err(OrchestratorError::RegistryLoad(format!(
+                    "agent {name:?} escalates to {target:?}, which does not exist"
+                )));
+            };
+            if !matches!(next.backed_by, AgentBacking::Human { .. }) {
+                return Err(OrchestratorError::RegistryLoad(format!(
+                    "agent {name:?} escalates to {target:?}, which is not human-backed; the \
+                     escalated question is the journaled human question, put to a person"
+                )));
+            }
+            // Follow the chain from here. Each hop is to an existing agent (checked as each
+            // agent's own turn comes round, or reported below as the dangling name), so a
+            // walk longer than the agent count must have revisited one.
+            let mut path = vec![name.as_str()];
+            let mut cur = target.as_str();
+            loop {
+                if path.contains(&cur) {
+                    path.push(cur);
+                    return Err(OrchestratorError::RegistryLoad(format!(
+                        "escalation cycle: {}; each expiry would hand the question round \
+                         forever, so the chain must end at an agent with no escalate_to",
+                        path.join(" -> ")
+                    )));
+                }
+                path.push(cur);
+                match self.agents.get(cur).and_then(|a| a.escalate_to.as_deref()) {
+                    Some(n) => cur = n,
+                    None => break,
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// AG-15: the per-agent half of the tool-policy rules (see [`AgentDefinition::tool_limits`],
+/// [`AgentDefinition::confirm_tools`] and [`AgentDefinition::confirm_timeout`]). Keys are
+/// checked in sorted order so a config with several mistakes reports the same one each load.
+fn validate_tool_policy(agent: &AgentDefinition) -> Result<(), OrchestratorError> {
+    let listed = |tool: &str| agent.tools.iter().any(|t| t == tool);
+    let mut limited: Vec<(&String, &u32)> = agent.tool_limits.iter().collect();
+    limited.sort_unstable();
+    for (tool, ceiling) in limited {
+        if !listed(tool) {
+            return Err(OrchestratorError::RegistryLoad(format!(
+                "agent {:?} sets tool_limits for {tool:?}, which it does not list in its \
+                 tools; the agent can never call it, so the ceiling would never apply",
+                agent.name
+            )));
+        }
+        if *ceiling == 0 {
+            return Err(OrchestratorError::RegistryLoad(format!(
+                "agent {:?} sets a tool_limits ceiling of 0 for {tool:?}; a ceiling must be \
+                 at least 1 — to forbid the tool, remove it from the agent's tools",
+                agent.name
+            )));
+        }
+    }
+    for tool in &agent.confirm_tools {
+        if !listed(tool) {
+            return Err(OrchestratorError::RegistryLoad(format!(
+                "agent {:?} lists {tool:?} in confirm_tools, but it does not list that tool \
+                 in its tools; the agent can never call it, so nothing would be confirmed",
+                agent.name
+            )));
+        }
+    }
+    if let Some(t) = agent.confirm_timeout {
+        if agent.confirm_tools.is_empty() {
+            return Err(OrchestratorError::RegistryLoad(format!(
+                "agent {:?} sets confirm_timeout but confirms no tool; the timeout is inert \
+                 without confirm_tools",
+                agent.name
+            )));
+        }
+        if t <= chrono::Duration::zero() {
+            return Err(OrchestratorError::RegistryLoad(format!(
+                "agent {:?} has a non-positive confirm_timeout ({t}); omit it to wait \
+                 indefinitely",
+                agent.name
+            )));
+        }
+        if t > crate::graph::MAX_AWAIT_SIGNAL_TIMEOUT {
+            return Err(OrchestratorError::RegistryLoad(format!(
+                "agent {:?} has a confirm_timeout ({t}) that is too long; the maximum is {}; \
+                 omit it to wait indefinitely",
+                agent.name,
+                crate::graph::MAX_AWAIT_SIGNAL_TIMEOUT
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// A cheaply-clonable handle to a live, swappable [`Registry`] + a monotonic
@@ -1088,6 +1230,76 @@ fn parse_default_planner(map: &HashMap<String, FmValue>) -> Result<bool, Orchest
     }
 }
 
+/// AG-15: a list-valued key where absent is the ONLY silent path. `optional_list` maps a
+/// scalar to an empty list, which for `confirm_tools: deploy` would silently drop the very
+/// confirmation the author meant to require — the `activate_on` footgun.
+fn strict_list(
+    map: &HashMap<String, FmValue>,
+    key: &str,
+) -> Result<Vec<String>, OrchestratorError> {
+    match map.get(key) {
+        None => Ok(Vec::new()),
+        Some(FmValue::List(v)) => Ok(v.clone()),
+        Some(FmValue::Scalar(_)) => Err(OrchestratorError::FrontmatterParse(format!(
+            "{key} must be a list, e.g. `{key}: [deploy]`; omit the key to leave it unset"
+        ))),
+    }
+}
+
+/// AG-15: a scalar-valued key where absent is the ONLY silent path. `optional_scalar` maps
+/// both `escalate_to:` and `escalate_to: [a]` to `None`, which would drop an escalation the
+/// author believes they configured.
+fn strict_scalar(
+    map: &HashMap<String, FmValue>,
+    key: &str,
+) -> Result<Option<String>, OrchestratorError> {
+    match map.get(key) {
+        None => Ok(None),
+        Some(FmValue::Scalar(s)) if !s.is_empty() => Ok(Some(s.clone())),
+        Some(_) => Err(OrchestratorError::FrontmatterParse(format!(
+            "{key} must be a single non-empty name; omit the key to leave it unset"
+        ))),
+    }
+}
+
+/// AG-15: `tool_limits: [shell=3, deploy=1]` → per-tool call ceilings. Every malformed
+/// spelling is loud — a scalar, an entry without `=`, a ceiling that is not a non-negative
+/// integer. Whether a ceiling is POSITIVE and names a listed tool is semantic and belongs to
+/// [`Registry::validate`], which also sees a definition that arrived as a jsonb row.
+fn parse_tool_limits(
+    map: &HashMap<String, FmValue>,
+) -> Result<HashMap<String, u32>, OrchestratorError> {
+    if let Some(FmValue::Scalar(_)) = map.get("tool_limits") {
+        return Err(OrchestratorError::FrontmatterParse(
+            "tool_limits must be a list, e.g. `tool_limits: [shell=3]`".into(),
+        ));
+    }
+    optional_pairs(map, "tool_limits")?
+        .into_iter()
+        .map(|(tool, n)| match n.parse::<u32>() {
+            Ok(n) => Ok((tool, n)),
+            Err(_) => Err(OrchestratorError::FrontmatterParse(format!(
+                "tool_limits entry {tool}={n:?} is not a whole number of calls"
+            ))),
+        })
+        .collect()
+}
+
+/// AG-15: `confirm_timeout: 2h`, in the same `<number><unit>` grammar as `timeout`.
+fn parse_confirm_timeout(
+    map: &HashMap<String, FmValue>,
+) -> Result<Option<chrono::Duration>, OrchestratorError> {
+    match map.get("confirm_timeout") {
+        None => Ok(None),
+        Some(FmValue::Scalar(t)) if !t.is_empty() => parse_fm_duration(t).map(Some),
+        Some(_) => Err(OrchestratorError::FrontmatterParse(
+            "confirm_timeout must be a scalar <number><unit>, e.g. `confirm_timeout: 2h`; \
+             omit the key to wait indefinitely"
+                .into(),
+        )),
+    }
+}
+
 impl AgentDefinition {
     /// Parse an agent from the md+frontmatter subset.
     ///
@@ -1112,10 +1324,10 @@ impl AgentDefinition {
             system_prompt: body.to_string(),
             backed_by: parse_backing(&f)?,
             default_planner: parse_default_planner(&f)?,
-            tool_limits: Default::default(),
-            confirm_tools: Vec::new(),
-            confirm_timeout: None,
-            escalate_to: None,
+            tool_limits: parse_tool_limits(&f)?,
+            confirm_tools: strict_list(&f, "confirm_tools")?,
+            confirm_timeout: parse_confirm_timeout(&f)?,
+            escalate_to: strict_scalar(&f, "escalate_to")?,
         })
     }
 }
