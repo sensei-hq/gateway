@@ -2547,6 +2547,59 @@ mod tests {
     /// re-check-then-fallback, which would reopen a (narrower) version of the very
     /// race this method exists to close (see the doc comment on the method for the
     /// full argument). Proven here directly against a table where the row is absent.
+    /// TM-3: the Postgres journal, CAS and blackboard keep the store conformance suite — the
+    /// contract torii's tenant-scoped stores are held to after the move. Each suite case uses
+    /// fresh run ids and content, so these need no table reset.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
+    #[tokio::test]
+    async fn the_postgres_journal_keeps_the_conformance_suite() {
+        let Some(url) = db_url() else { return };
+        orchestrator_testkit::journal(&PostgresJournal::new(connect(&url).await.unwrap())).await;
+    }
+
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
+    #[tokio::test]
+    async fn the_postgres_content_store_keeps_the_conformance_suite() {
+        let Some(url) = db_url() else { return };
+        orchestrator_testkit::content(&PostgresContentStore::new(connect(&url).await.unwrap()))
+            .await;
+    }
+
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
+    #[tokio::test]
+    async fn the_postgres_context_store_keeps_the_conformance_suite() {
+        let Some(url) = db_url() else { return };
+        orchestrator_testkit::context(&PostgresContextStore::new(connect(&url).await.unwrap()))
+            .await;
+    }
+
+    /// The scheduler suite sweeps the whole table (`claim_due`, `list_paused`, pruning), so it
+    /// runs under the scheduler guard against an emptied table.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
+    #[tokio::test]
+    async fn the_postgres_scheduler_store_keeps_the_conformance_suite() {
+        let Some(url) = db_url() else { return };
+        let _guard = scheduler_guard().await;
+        let pool = connect(&url).await.unwrap();
+        sqlx::query("delete from orchestrator.scheduled_runs")
+            .execute(&pool)
+            .await
+            .unwrap();
+        orchestrator_testkit::scheduler(&PostgresSchedulerStore::new(pool)).await;
+    }
+
     /// TM-2: the Postgres store keeps the same [`ConfigStore`] contract as the in-memory one
     /// — the single contract both implementations are held to (TM-3 exports it).
     #[cfg_attr(
@@ -2562,7 +2615,7 @@ mod tests {
             .execute(src.pool_for_test())
             .await
             .unwrap();
-        crate::config_source::contract::config_store_contract(&src).await;
+        orchestrator_testkit::config_store(&src).await;
     }
 
     #[cfg_attr(
