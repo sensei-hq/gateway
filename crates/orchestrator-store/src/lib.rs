@@ -13,7 +13,7 @@ use orchestrator_core::{ExecutionJournal, JournalError, JournalEvent, RunId, Seq
 mod config_source;
 mod scheduler_store;
 mod stores;
-pub use config_source::{FilesystemConfigSource, InMemoryConfigSource};
+pub use config_source::{FilesystemConfigSource, InMemoryConfigSource, InMemoryConfigStore};
 pub use scheduler_store::InMemorySchedulerStore;
 pub use stores::{InMemoryContentStore, InMemoryContextStore};
 
