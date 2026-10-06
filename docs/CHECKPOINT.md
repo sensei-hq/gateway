@@ -9,7 +9,7 @@ keeps the engine, the persistence traits and in-memory stores. Last release: v0.
 
 - [x] **TM-1** #77 — redirect data-tier docs to §11 (the extraction into the gateway is cancelled)
 - [x] **TM-2** #78 — config WRITE path behind a trait (`ConfigStore`)
-- [ ] **TM-3** #79 — exported store conformance suite
+- [x] **TM-3** #79 — exported store conformance suite
 - [ ] **TM-4** #80 — `GatewayConfig` source seam + always-on registry↔chain cross-check
 - [ ] **TM-5** #81 — backend-selectable boot (memory | postgres)
 - [ ] **TM-6** torii#24 — tenant-scoped orchestrator schema + RLS + per-tenant config versions
@@ -19,7 +19,7 @@ keeps the engine, the persistence traits and in-memory stores. Last release: v0.
 
 ## Next
 
-TM-3: lift the ConfigStore contract (`orchestrator-store` `config_source::contract`) into an exported conformance suite covering every store trait.
+TM-4 (#80): a `GatewayConfigSource` seam boot consumes instead of reading `--gateway-config` itself, plus an always-on boot check that every registry chain id exists in the loaded `GatewayConfig`.
 
 ## Open questions
 
