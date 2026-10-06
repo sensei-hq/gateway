@@ -6,6 +6,22 @@ routing call path (build a request, `gateway.execute(&req).await`, read
 `InferenceResponse`) stays source-compatible across every step below; each section
 lists only what you must touch.
 
+## 0.8.x → 0.9.0 (torii move, phase 1 — persistence behind traits)
+
+Groundwork for moving persistence into torii (torii `docs/DECISIONS.md` §11: the gateway is a
+library; torii owns persistence). The routing engine is untouched. Changes are confined to the
+orchestrator crates and the `torii` CLI.
+
+| Area | Change | Action |
+|---|---|---|
+| `PostgresConfigSource::store_and_bump` / `store_and_bump_if` | moved from inherent methods onto the new `orchestrator_core::ConfigStore` trait (same signatures and semantics) | add `use orchestrator_core::ConfigStore;` where you call them |
+| New: `ConfigStore` | the write side of `ConfigSource` (`store_and_bump`, `store_and_bump_if`); `orchestrator_store::InMemoryConfigStore` implements it, versioned | none |
+| New crate: `sensei-orchestrator-testkit` | the store conformance suite — `journal`, `content`, `context`, `scheduler`, `config_store`, each over a trait object | run it against any store you implement |
+| New: `Registry::chain_bindings()` | iterates `(area, kind, chain)` | none |
+| `torii` boot | now **always** refuses to start when a registry agent, phase or binding names a chain the gateway config lacks, naming each missing id and who names it (previously only `config push` checked, and only when given `--gateway-config`; a mismatch surfaced at run time as a `NodeFailed`) | define the chain, or fix the binding, before upgrading |
+| `torii` backend | `TORII_BACKEND=postgres` (default, unchanged: `DATABASE_URL` required) or `memory` (no database; the registry is seeded from `TORII_REGISTRY_DIR`) | none |
+| `sensei-torii` library API | `boot::heavy` takes `&dyn GatewayConfigSource` (`FileGatewayConfigSource::new(path)` keeps the old behaviour); `LightDeps` holds trait objects; `EnvConfig` carries a `Backend` instead of a bare database URL; `cmd::config` takes `&dyn ConfigStore` | only if you drive the CLI's library directly |
+
 ## 0.7.x → 0.8.0 (SP-DEC-2 — more System One routes)
 
 More System One decision routes: **Cloudflare Workers AI** (`clef`, `clef-flash`) and
