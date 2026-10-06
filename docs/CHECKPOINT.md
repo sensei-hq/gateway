@@ -1,40 +1,35 @@
 # Checkpoint
 
-**Torii move — epic [#76](https://github.com/sensei-hq/gateway/issues/76): "Gateway is a library; torii
-owns persistence"** (torii `docs/DECISIONS.md` §11, ratified 2026-09-17). Move `crates/torii`, the
-orchestrator Postgres store adapters and the `orchestrator` schema to `sensei-hq/torii`; the gateway
-keeps the engine, the persistence traits and in-memory stores. Last release: v0.10.0 (on main, 2026-10-06). **Epic #76 COMPLETE.**
+**Agentic completion — epic [torii#45](https://github.com/sensei-hq/torii/issues/45): complete the
+agentic runtime and incorporate it into torii.** Follows epic #76 (done 2026-10-06: the gateway is a
+library, torii owns persistence, the stores and the `torii` CLI; gateway v0.10.0, torii pins it).
+Last release: v0.10.0 (on main). torii `develop` now carries DECISIONS §11 (torii PR #32).
 
-## Todo (the epic's checklist, in order)
+## Todo (the epic's actionable checklist, in order)
 
-- [x] **TM-1** #77 — redirect data-tier docs to §11 (the extraction into the gateway is cancelled)
-- [x] **TM-2** #78 — config WRITE path behind a trait (`ConfigStore`)
-- [x] **TM-3** #79 — exported store conformance suite
-- [x] **TM-4** #80 — `GatewayConfig` source seam + always-on registry↔chain cross-check
-- [x] **TM-5** #81 — backend-selectable boot (memory | postgres)
-- [x] **TM-6** torii#24 — tenant-scoped orchestrator schema + RLS + per-tenant config versions (torii PR #27, `a5f6b4d`)
-- [x] **TM-7** torii#25 — store traits over that schema (passes TM-3) (torii PR #28, `e9dbe59`)
-- [x] **TM-8** torii#26 — move the CLI/worker into torii (torii PR #30, `73a5a0e`; v0.9.0 released)
-- [x] **TM-9** #82 — delete `crates/torii`, Postgres adapters, `database/`; release (v0.10.0, PR #84)
+- [ ] **AG-1** gateway#85 — wire the planner discovery tools (SP-REG-2) per run in `Executor::pinned`
+- [ ] **AG-2** gateway#86 — `OrchestratorHooks` for HITL events (signal, gate, agent answer, loop gate)
+- [ ] **AG-3** gateway#87 — scheduler wake backoff / jitter / `max_attempts` (+ testkit; torii store)
+- [ ] gateway release carrying AG-1..AG-3; torii re-pins all 13 sensei-* deps (`one_gateway_ref`)
+- [ ] **AG-5** torii#34 — boot seams: hooks, transient retry, concurrency, lease, registry reload
+- [ ] **AG-4** torii#33 — `torii run results <id>`
+- [ ] **AG-6** torii#35 — `torii config show` / `config pull`
+- [ ] **AG-7** torii#36 — refuse UUID-shaped org slugs at write time; fix `authz.sql` declassify
 
 ## Next
 
-**Epic torii#45 — complete the agentic runtime and incorporate it into torii.** Actionable, in
-order: gateway#85 AG-1 discovery tools (SP-REG-2) → #86 AG-2 HITL hooks → #87 AG-3 wake
-backoff/max_attempts → gateway release + torii re-pin → torii#34 AG-5 boot seams → #33 AG-4
-`run results` → #35 AG-6 `config show/pull` → #36 AG-7 slugs + authz.sql. Decisions C1–C8 =
-torii#37–#44 (gate the API/UI/deploy work). Lower-priority engine follow-ons: gateway#88.
+AG-1 (gateway#85): read `docs/superpowers/specs/2026-09-15-sp-reg-programme-design.md` §SP-REG-2,
+then red-first in `crates/orchestrator` (in-memory). Work on a feature branch; `make clean` after
+any release; torii work in a torii worktree (the main checkout has the user's uncommitted changes).
 
-## Open questions
+## Open questions — decisions the user owns (gate the API, UI and deployment work)
 
-None. (Decided 2026-10-06: cut v0.9.0; shared torii crate for CLI + API.)
-Torii's main checkout has others' uncommitted changes — always work in a torii worktree.
+torii#37 C1 agent runtime v1 + UI? · #38 C2 one app or two · #39 C3 shipped registry content ·
+#40 C4 mockup-vs-engine contradictions · #41 C5 spend model · #42 C6 who may answer a gate ·
+#43 C7 worker deployment/tenancy · #44 C8 X2 schema vs `registry.*`/`runs.*`.
 
 ## Known-broken / carry-forwards
 
-- `orchestrator` sandbox straggler test's 5s bound trips under full-suite load (passes alone).
-- torii `database/tests/authz.sql` declassify case fails on unmodified develop (pre-existing);
-  `run.sh` stops there, so later suites only run individually.
-- Out of the epic's scope: SP-REG-2 discovery tools, a results command, SP-REG-4 content.
-- From SP-DEC-2: Cloudflare never run live; engine counts caller-caused errors against the breaker;
-  LOW test gaps. Pre-existing: `OllamaAdapter`/`OpenAIAdapter::from_config` no default timeout.
+- Lower-priority engine follow-ons (SP-7c, HITL/coordinator/budget/sandbox/perf, routing nits,
+  the flaky sandbox-straggler test, the `seq: 0` fixture) are tracked in gateway#88.
+- torii `authz.sql` declassify case fails on unmodified develop — AG-7 (torii#36).
