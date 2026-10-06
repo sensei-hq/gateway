@@ -50,4 +50,6 @@ pub use registry::{
     NetworkPolicy, Permissions, Registry, RegistryConfig, RegistryHandle, ResourceCaps, SkillDef,
     ToolSpec,
 };
-pub use scheduler::{RunLock, RunStatus, ScheduledRun, SchedulerStore, UncontendedRunLock};
+pub use scheduler::{
+    RunLock, RunStatus, ScheduledRun, SchedulerStore, UncontendedRunLock, WakeAttempt,
+};
