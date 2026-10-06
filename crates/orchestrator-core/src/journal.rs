@@ -137,7 +137,7 @@ pub enum JournalEvent {
         /// AG-12: the run's MONEY cap, in micro-dollars, alongside (or instead of) the
         /// token cap. `None` (and every pre-AG-12 journal) ⇒ no money cap. Skipped when
         /// `None`, so a run without one serializes byte-identically to before.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         money_budget: Option<crate::budget::MoneyBudget>,
     },
     NodeStarted {
@@ -782,10 +782,16 @@ pub struct Snapshot {
     /// half of the ledger, carried for exactly the reason `spent`/`budget` are. Default
     /// and skipped when zero/`None`, so a snapshot of a run without a money cap is
     /// byte-identical to before.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub spent_micro_usd: u64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub money_budget_micro_usd: Option<u64>,
+}
+
+/// `skip_serializing_if` predicate for the snapshot's money spend: zero is the
+/// pre-AG-12 shape, so it is omitted rather than written.
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 /// The durable-journal seam. This repo ships the in-memory implementation; torii's
