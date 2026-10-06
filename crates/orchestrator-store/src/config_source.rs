@@ -39,29 +39,49 @@ impl InMemoryConfigStore {
 #[async_trait::async_trait]
 impl ConfigSource for InMemoryConfigStore {
     async fn load(&self) -> Result<RegistryConfig, OrchestratorError> {
-        Err(OrchestratorError::RegistryLoad(
-            "InMemoryConfigStore: not implemented".into(),
-        ))
+        Ok(self.lock()?.0.clone())
+    }
+
+    async fn version(&self) -> Result<Option<u64>, OrchestratorError> {
+        Ok(Some(self.lock()?.1))
+    }
+
+    /// Content and generation are read under ONE lock, so the pair can never be torn.
+    async fn load_versioned(&self) -> Result<(RegistryConfig, Option<u64>), OrchestratorError> {
+        let state = self.lock()?;
+        Ok((state.0.clone(), Some(state.1)))
     }
 }
 
 #[async_trait::async_trait]
 impl ConfigStore for InMemoryConfigStore {
-    async fn store_and_bump(&self, _cfg: &RegistryConfig) -> Result<u64, OrchestratorError> {
-        Err(OrchestratorError::RegistryLoad(
-            "InMemoryConfigStore: not implemented".into(),
-        ))
+    async fn store_and_bump(&self, cfg: &RegistryConfig) -> Result<u64, OrchestratorError> {
+        let mut state = self.lock()?;
+        state.1 += 1;
+        state.0 = cfg.clone();
+        Ok(state.1)
     }
 
     async fn store_and_bump_if(
         &self,
-        _cfg: &RegistryConfig,
-        _expected: u64,
+        cfg: &RegistryConfig,
+        expected: u64,
     ) -> Result<Option<u64>, OrchestratorError> {
-        let _ = &self.state;
-        Err(OrchestratorError::RegistryLoad(
-            "InMemoryConfigStore: not implemented".into(),
-        ))
+        let mut state = self.lock()?;
+        if state.1 != expected {
+            return Ok(None);
+        }
+        state.1 += 1;
+        state.0 = cfg.clone();
+        Ok(Some(state.1))
+    }
+}
+
+impl InMemoryConfigStore {
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, (RegistryConfig, u64)>, OrchestratorError> {
+        self.state
+            .lock()
+            .map_err(|_| OrchestratorError::RegistryLoad("in-memory config store poisoned".into()))
     }
 }
 

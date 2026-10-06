@@ -504,6 +504,7 @@ pub async fn heavy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orchestrator_core::ConfigStore;
     // Only this probe test connects unconditionally (production code goes through
     // `connect_with_max` so `env.pool_size` is honored) — imported here, not at module
     // scope, so a non-test build of this lib (linked into `main.rs`) doesn't carry an
