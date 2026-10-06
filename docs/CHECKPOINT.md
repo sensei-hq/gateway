@@ -1,35 +1,35 @@
 # Checkpoint
 
-**Agentic completion — epic [torii#45](https://github.com/sensei-hq/torii/issues/45): complete the
-agentic runtime and incorporate it into torii.** Follows epic #76 (done 2026-10-06: the gateway is a
-library, torii owns persistence, the stores and the `torii` CLI; gateway v0.10.0, torii pins it).
-Last release: v0.10.0 (on main). torii `develop` now carries DECISIONS §11 (torii PR #32).
+**Agentic completion — epic [torii#45](https://github.com/sensei-hq/torii/issues/45).** Agents run
+end to end in the product: seiki (cloud) configures/publishes, torii (local app) submits/watches/
+answers, one runtime = the gateway orchestrator. All 8 product decisions made 2026-10-06 (C1–C8,
+torii#37–#44; see the epic). Follows epic #76 (done; gateway v0.10.0, torii pins it).
 
-## Todo (the epic's actionable checklist, in order)
+## Todo — Phase 1, this repo (then release + torii re-pin)
 
-- [ ] **AG-1** gateway#85 — wire the planner discovery tools (SP-REG-2) per run in `Executor::pinned`
-- [ ] **AG-2** gateway#86 — `OrchestratorHooks` for HITL events (signal, gate, agent answer, loop gate)
-- [ ] **AG-3** gateway#87 — scheduler wake backoff / jitter / `max_attempts` (+ testkit; torii store)
-- [ ] gateway release carrying AG-1..AG-3; torii re-pins all 13 sensei-* deps (`one_gateway_ref`)
-- [ ] **AG-5** torii#34 — boot seams: hooks, transient retry, concurrency, lease, registry reload
-- [ ] **AG-4** torii#33 — `torii run results <id>`
-- [ ] **AG-6** torii#35 — `torii config show` / `config pull`
-- [ ] **AG-7** torii#36 — refuse UUID-shaped org slugs at write time; fix `authz.sql` declassify
+- [ ] **AG-1** #85 — planner discovery tools (SP-REG-2) per run in `Executor::pinned`
+- [ ] **AG-2** #86 — `OrchestratorHooks` for HITL events (feeds torii's SSE stream)
+- [ ] **AG-3** #87 — scheduler wake backoff / jitter / `max_attempts` (+ testkit)
+- [ ] **AG-12** #89 — money-denominated run budget (torii derives the cap; the engine enforces)
+- [ ] **AG-15** #90 — per-tool call limit, confirm-before-run, escalation
+- [ ] release; torii re-pins all 13 sensei-* deps (`one_gateway_ref`)
+
+Phase 2 (torii): #34 boot seams · #33 run results · #35 config show/pull · #46 config init +
+defaults · #47 gate authz · #49 budgets from caps · #36 slugs + authz.sql.
+Phase 3 (torii): #51 API + retire X2 design · #50 seiki publishing · #48 per-tenant workers · #52 UI.
 
 ## Next
 
-AG-1 (gateway#85): read `docs/superpowers/specs/2026-09-15-sp-reg-programme-design.md` §SP-REG-2,
-then red-first in `crates/orchestrator` (in-memory). Work on a feature branch; `make clean` after
-any release; torii work in a torii worktree (the main checkout has the user's uncommitted changes).
+AG-1 (#85): read `docs/superpowers/specs/2026-09-15-sp-reg-programme-design.md` §SP-REG-2, then
+red-first in `crates/orchestrator` (in-memory). Feature branch; `make clean` after any release;
+torii work in a torii worktree (the main checkout has the user's uncommitted changes).
 
-## Open questions — decisions the user owns (gate the API, UI and deployment work)
+## Open questions
 
-torii#37 C1 agent runtime v1 + UI? · #38 C2 one app or two · #39 C3 shipped registry content ·
-#40 C4 mockup-vs-engine contradictions · #41 C5 spend model · #42 C6 who may answer a gate ·
-#43 C7 worker deployment/tenancy · #44 C8 X2 schema vs `registry.*`/`runs.*`.
+None — all product decisions are recorded on the epic.
 
 ## Known-broken / carry-forwards
 
-- Lower-priority engine follow-ons (SP-7c, HITL/coordinator/budget/sandbox/perf, routing nits,
-  the flaky sandbox-straggler test, the `seq: 0` fixture) are tracked in gateway#88.
-- torii `authz.sql` declassify case fails on unmodified develop — AG-7 (torii#36).
+- Lower-priority engine follow-ons (SP-7c, HITL/coordinator/sandbox/perf, per-entity engine
+  versions, routing nits, flaky sandbox-straggler test, `seq: 0` fixture): #88.
+- torii `authz.sql` declassify case fails on unmodified develop — torii#36.
