@@ -286,8 +286,8 @@ pub struct RegistryConfig {
 }
 
 /// A pluggable source of registry config (SP-2). **This is the extension seam**
-/// future backends implement — a filesystem source now, `PostgresConfigSource` /
-/// `ConvexConfigSource` later — while [`Registry`] itself is the uniform,
+/// backends implement — a filesystem source and an in-memory store here, torii's
+/// tenant-scoped `PgConfigStore` (sensei-hq/torii) — while [`Registry`] itself is the uniform,
 /// backend-agnostic *assembled result* (built + validated by
 /// [`Registry::from_config`]), NOT an extension point.
 #[async_trait::async_trait]
@@ -297,7 +297,7 @@ pub trait ConfigSource: Send + Sync {
 
     /// The durable config generation, if this source is versioned. Default `None`
     /// ⇒ [`RegistryHandle`] keeps its local monotonic counter (filesystem / in-memory
-    /// are unversioned). A versioned backend (`PostgresConfigSource`) returns
+    /// are unversioned). A versioned backend (torii's `PgConfigStore`) returns
     /// `Some(n)` so the generation is globally meaningful across processes.
     async fn version(&self) -> Result<Option<u64>, OrchestratorError> {
         Ok(None)
@@ -1513,7 +1513,7 @@ mod tests {
 
     /// SP-REG-3's serde fence, and the reason the field carries `#[serde(default)]`.
     ///
-    /// `PostgresConfigSource::read_all` deserializes every `config_agents` row and
+    /// A durable store's load (torii's `PgConfigStore`) deserializes every agent row and
     /// `collect::<Result<_,_>>()?`s them, so ONE un-deserializable row returns `Err`
     /// for the WHOLE `RegistryConfig` — bricking torii boot and every scheduler wake
     /// that re-resolves config. The row below is the exact key set of a live
@@ -2280,7 +2280,7 @@ mod tests {
         }
     }
 
-    /// A ConfigSource that reports a durable generation (mirrors PostgresConfigSource).
+    /// A ConfigSource that reports a durable generation (as torii's PgConfigStore does).
     /// Overrides `load_versioned` for the same reason the real backend must: a versioned
     /// source owes callers ONE consistent (config, generation) pair, and the default's two
     /// separate reads are the torn-pair hazard. Its own fields are immutable, so returning

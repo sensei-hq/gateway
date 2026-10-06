@@ -6,8 +6,8 @@
 //! collisions are loud, a scheduler whose transitions are conditional and whose wakes are claimed
 //! exactly once, a drive lock that is exclusive, and a config generation that moves only with the
 //! content. Each property is written down ONCE here, as a function over the trait object, and
-//! every backend runs it: the gateway's in-memory stores, the gateway's Postgres stores, and —
-//! after the move (torii `docs/DECISIONS.md` §11) — torii's tenant-scoped stores. A backend that
+//! every backend runs it: the gateway's in-memory stores here, and torii's tenant-scoped Postgres
+//! stores in sensei-hq/torii (`docs/DECISIONS.md` §11: torii owns persistence). A backend that
 //! passes is interchangeable with the others as far as the executor can tell.
 //!
 //! # Use
