@@ -1,5 +1,10 @@
 # torii
 
+> **This crate is moving to the Torii product repo** — epic
+> [sensei-hq/gateway#76](https://github.com/sensei-hq/gateway/issues/76), step TM-8
+> ([sensei-hq/torii#26](https://github.com/sensei-hq/torii/issues/26)). Torii `docs/DECISIONS.md` §11:
+> the gateway is a library; torii owns persistence. Until the move lands, everything below holds.
+
 The operator control plane for the sensei orchestrator: submit and observe runs, intervene on the
 ones waiting for a human, drive due wakes, and manage the durable registry config.
 
@@ -15,6 +20,8 @@ toolkit does not yet do something, it says so rather than describing an intentio
 | **`DATABASE_URL`** | Environment only. There is deliberately no flag: a flag would leak the password into `ps`. |
 | **`TORII_FENCE_VERSION`** | Needed by `run submit` and `worker serve`. Set it **explicitly** (e.g. `v1`) and keep a fleet agreed on it — it is recorded in every run and checked on resume, so deriving it from a build version would strand every paused run on a routine deploy. |
 | **`TORII_POOL_SIZE`** | Optional. Defaults are fine to start. |
+| **`TORII_BACKEND`** | Optional: `postgres` (the default — everything above applies) or `memory`. `memory` keeps every store in the process — no database, no `DATABASE_URL` — for development and CI. Nothing survives the process, so a run it submits can only be observed or woken by that same process. |
+| **`TORII_REGISTRY_DIR`** | With `TORII_BACKEND=memory`: the registry directory (the `agents/ skills/ tools/` layout `config push` reads) loaded at boot, since there is no database to push to. |
 | **A gateway config** | `--gateway-config <file>`, JSON. Needed by `run submit` and `worker serve`. |
 
 ## The gateway config
@@ -29,11 +36,12 @@ toolkit does not yet do something, it says so rather than describing an intentio
 `ollama` is convenient for a first boot because it registers without credentials. A real
 deployment adds `models` and named `chains`.
 
-> **Know this before you author agents.** An agent's `chain` (or its `(area, kind)` chain binding)
-> is a **string**. `Registry::validate` only checks that the string is present — the id is resolved
-> later, in the gateway, against *this* file's `chains` map, which `torii config push` never reads.
-> If they disagree, selection yields no candidates and the node fails terminally with a message
-> naming neither cause nor remedy. Keep the two in step by hand; nothing checks it for you yet.
+> **Know this before you author agents.** An agent's `chain`, its per-phase `chains`, and every
+> `(area, kind)` chain binding are **strings** resolved against *this* file's `chains` map. Two
+> checks keep them in step: `torii config push --gateway-config <file>` refuses a registry that
+> names a chain the file lacks (opt-in, at push time), and `run submit` / `worker serve` **always**
+> refuse to boot on one — naming each missing chain and the agent, phase or binding that names it
+> — rather than letting every run that reaches it fail with no candidates.
 
 ## The registry directory
 

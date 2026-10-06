@@ -2,13 +2,18 @@
 title: Management API
 doctype: feature
 module: data-tier
-status: planned
+status: superseded
 phase: 4
 spec: SP-DATA
 source: new (CLI + API)
 ---
 
 # Management API
+
+> **Superseded — this lives in the Torii product repo, not the gateway.** `sensei-hq/torii`
+> `docs/DECISIONS.md` §11 (ratified 2026-09-17): *"Gateway is a library; torii owns persistence."*
+> The SP-DATA Phase-4 extraction of torii's catalog/config/metering into the gateway is **cancelled**.
+> The text below is the original plan, kept for the record. See [the data-tier README](README.md).
 
 > **Status: Planned (Phase 4 · SP-DATA).** Modeled on strategos's CLI + Hono API.
 

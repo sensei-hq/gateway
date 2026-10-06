@@ -7,6 +7,17 @@ status: partial
 
 # Orchestrator
 
+> **Moving to the Torii product repo** (epic [sensei-hq/gateway#76](https://github.com/sensei-hq/gateway/issues/76),
+> torii `docs/DECISIONS.md` §11 "Gateway is a library; torii owns persistence"). The engine
+> (`orchestrator-core`, `orchestrator`) stays here as a library with its persistence **traits** and
+> in-memory stores. The Postgres store adapters (`orchestrator-store`'s `postgres` feature), the
+> `orchestrator` schema in `database/`, and the `torii` operator CLI (`crates/torii`) move to
+> `sensei-hq/torii`, re-implemented over a tenant-scoped schema.
+>
+> **Implementing a store?** `sensei-orchestrator-testkit` is the contract: call
+> `journal`, `content`, `context`, `scheduler` and `config_store` from a `#[tokio::test]` with a
+> fresh, isolated store. The gateway's in-memory and Postgres stores both pass it; torii's must too.
+
 The agentic execution framework that wraps the gateway: a hierarchical,
 runtime-expandable graph of agents on a durable step-journal, resumable without
 re-spending tokens and with no silent failures. Full design in

@@ -10,7 +10,7 @@ source: data-tier (metering store)
 
 # Usage Metering
 
-> **Status: Planned (Phase 4 · SP-DATA).** Data-tier over the DB-agnostic seam.
+> **Status: lives in torii** (`metering` schema) — torii `docs/DECISIONS.md` §11 cancelled the gateway data-tier. The gateway keeps the DB-agnostic seam (`GatewayStore`); torii implements it.
 
 Live counters of consumption against free-tier and paid limits, with reset
 windows, at per-key / per-model / per-pool granularity. Feeds free-tier-aware

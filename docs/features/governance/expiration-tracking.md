@@ -44,4 +44,4 @@ Feature: Expiration tracking
 
 ## Notes
 
-- In-memory today; persisted in the data-tier when live metering lands (Phase 4).
+- In-memory today; persisted by torii (it owns metering — torii DECISIONS §11), not by the gateway.

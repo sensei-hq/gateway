@@ -21,7 +21,7 @@ metadata, a tiers dimension, a refresh mechanism, and config versioning.
 | [Tiers & chains](tiers-and-chains.md) | Implemented (SP-CAT) | `crates/gateway/src/catalog/{tiers,assemble}.rs` | tiers as a dimension; chains compose tier-refs. `headroom`/`least-used` stub to `priority` (deferred) |
 | [Reference chains](reference-chains.md) | Implemented (SP-REF) | `crates/gateway/src/catalog/presets.rs` | portable attribute-derived tier/chain presets + illustrative runnable demo catalog |
 | [Catalog refresh](catalog-refresh.md) | Partial (SP-CAT) | `crates/gateway/src/catalog/totals.rs` | re-audit + totals drift gate implemented; external DB `config_loader` deferred (SP-DATA) |
-| [Config versioning](config-versioning.md) | Planned (Phase 4 · SP-DATA) | data-tier | `config_versions` + bump; ties to the replay version-fence — deferred |
+| [Config versioning](config-versioning.md) | Catalog: in torii (DECISIONS §11). Orchestrator registry: done (SP-DATA-2), moving to torii (#76) | torii | `config_versions` + bump; ties to the replay version-fence |
 
 ## Notes
 

@@ -5,9 +5,8 @@ use crate::cmd::Outcome;
 use crate::diff::{ConfigDiff, diff};
 use crate::errors::CliError;
 use crate::render::one_line;
-use orchestrator_core::{ConfigSource, Registry, RegistryConfig, SchedulerStore};
+use orchestrator_core::{ConfigSource, ConfigStore, Registry, RegistryConfig, SchedulerStore};
 use orchestrator_store::FilesystemConfigSource;
-use orchestrator_store::postgres::PostgresConfigSource;
 use std::io::{BufRead, Read, Write};
 use std::path::Path;
 
@@ -114,7 +113,7 @@ pub fn describe_diff(
     s
 }
 
-pub async fn version(src: &PostgresConfigSource, json: bool) -> Result<Outcome, CliError> {
+pub async fn version(src: &dyn ConfigStore, json: bool) -> Result<Outcome, CliError> {
     let v = src.version().await?.unwrap_or(0);
     Ok(Outcome::ok(if json {
         // Pretty-printed, matching every other `--json` path (`render::json`) — one
@@ -154,7 +153,7 @@ pub async fn version(src: &PostgresConfigSource, json: bool) -> Result<Outcome, 
 /// trains skimming on the one line that must not be skimmed, and for a large diff
 /// scrolls the copy they actually approved out of view).
 async fn write_and_report(
-    src: &PostgresConfigSource,
+    src: &dyn ConfigStore,
     incoming: &RegistryConfig,
     current_v: u64,
     text: Option<&str>,
@@ -176,61 +175,8 @@ async fn write_and_report(
     }
 }
 
-/// `confirm` is called ONLY when the diff removes something and `--yes` was absent.
-/// Task 10 wires it to [`interactive_confirm`] against real stdin/stderr; a scripted
-/// push (`< /dev/null`, a cron job) hits EOF there, which `interactive_confirm`
-/// specifies as a refusal — so a scripted push that would delete config refuses
-/// instead of proceeding. `push` itself has no way to enforce that through the `&mut
-/// dyn FnMut` shape; it is `interactive_confirm`'s contract, verified by its own tests.
-///
-/// `scheduler` is read (never written) purely to count the in-flight work this push would
-/// strand — see [`plan_push`]. `LightDeps` already carries the scheduler store over the
-/// same pool, so this costs no new connection.
-/// Every chain id the incoming registry references that the gateway's catalog does not
-/// define, as `(what referenced it, the id)` pairs, sorted and deduplicated.
-///
-/// **Why this check exists at all.** An agent's chain is a STRING, and `Registry::validate`
-/// only checks that it is PRESENT — the id is resolved much later, in the gateway, against
-/// `GatewayConfig.chains`, a file `torii config push` otherwise never reads. When the two
-/// disagree the failure surfaces at run time as an empty candidate set →
-/// `GatewayError::NoCandidates` → a terminal `NodeFailed`, naming neither the cause nor the
-/// remedy. This turns that into a push-time refusal naming both sides.
-///
-/// Attribution is why this does not simply use `Registry::chain_names`, which returns a
-/// deduplicated SET and so cannot say WHICH agent referenced a missing id.
-fn unresolved_chain_refs(
-    incoming: &RegistryConfig,
-    chains: &std::collections::HashMap<String, kernel::types::config::FallbackChainConfig>,
-) -> Vec<(String, String)> {
-    let mut out = std::collections::BTreeSet::new();
-    for a in &incoming.agents {
-        if let Some(c) = &a.chain
-            && !chains.contains_key(c)
-        {
-            out.insert((format!("agent {:?}", a.name), c.clone()));
-        }
-        // Per-phase overrides are checked too. A name-keyed check that walks only
-        // `agent.chain` passes every obvious test while missing the two collections a
-        // real config is most likely to drift in.
-        for (phase, c) in &a.chains {
-            if !chains.contains_key(c) {
-                out.insert((format!("agent {:?} phase {:?}", a.name, phase), c.clone()));
-            }
-        }
-    }
-    for b in &incoming.chain_bindings {
-        if !chains.contains_key(&b.chain) {
-            out.insert((
-                format!("chain binding {:?}/{:?}", b.area, b.kind),
-                b.chain.clone(),
-            ));
-        }
-    }
-    out.into_iter().collect()
-}
-
 pub async fn push(
-    src: &PostgresConfigSource,
+    src: &dyn ConfigStore,
     scheduler: &dyn SchedulerStore,
     dir: &Path,
     gateway_config: Option<&Path>,
@@ -265,7 +211,14 @@ pub async fn push(
         })?;
         let gw: kernel::types::config::GatewayConfig = serde_json::from_str(&raw)
             .map_err(|e| crate::boot::gateway_config_parse_error(gw_path, &e))?;
-        let missing = unresolved_chain_refs(&incoming, &gw.chains);
+        let missing = crate::boot::unresolved_chain_refs(
+            incoming.agents.iter(),
+            incoming
+                .chain_bindings
+                .iter()
+                .map(|b| (b.area.as_str(), b.kind.as_str(), b.chain.as_str())),
+            &gw.chains,
+        );
         if !missing.is_empty() {
             let detail = missing
                 .iter()
@@ -367,6 +320,22 @@ pub fn interactive_confirm(prompt: &str, r: &mut impl BufRead, w: &mut impl Writ
 mod tests {
     use super::*;
     use orchestrator_core::{Activation, SkillDef};
+    use orchestrator_store::postgres::PostgresConfigSource;
+
+    /// Push-time attribution, through the function boot shares (TM-4).
+    fn unresolved_chain_refs(
+        incoming: &RegistryConfig,
+        chains: &std::collections::HashMap<String, kernel::types::config::FallbackChainConfig>,
+    ) -> Vec<(String, String)> {
+        crate::boot::unresolved_chain_refs(
+            incoming.agents.iter(),
+            incoming
+                .chain_bindings
+                .iter()
+                .map(|b| (b.area.as_str(), b.kind.as_str(), b.chain.as_str())),
+            chains,
+        )
+    }
 
     fn skill(name: &str, body: &str) -> SkillDef {
         SkillDef {

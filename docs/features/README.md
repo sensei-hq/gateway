@@ -11,8 +11,9 @@ The `gateway` crate is a provider-agnostic **LLM inference routing engine**:
 connect provider credentials once, then route requests through named fallback
 chains with health gates, budget filtering, and request tracing. The
 `local-providers` crate adds in-process inference behind the same adapter
-abstraction. Planned work extends this into an **agentic execution framework**
-(orchestrator) and a **decoupled data-tier** for catalog/config/usage. See the
+abstraction. The **agentic execution framework** (orchestrator) builds on it. Persistence —
+catalog/config/usage data and the orchestrator's Postgres store — belongs to the
+Torii product repo, not here ([data-tier](data-tier/README.md), torii DECISIONS §11). See the
 program design in
 [`../superpowers/specs/2026-08-06-sensei-orchestrator-design.md`](../superpowers/specs/2026-08-06-sensei-orchestrator-design.md)
 and the full feature catalog in
@@ -40,10 +41,10 @@ traces its claims to source, with a **Notes** section for quirks.
 |---|---|---|
 | [orchestrator](orchestrator/README.md) | Planned | execution graph · durable journal · agents/skills/tools · shared context · hooks |
 
-### Data-tier (Phase 4 — planned, extracted from torii)
+### Data-tier (superseded — torii owns persistence, DECISIONS §11)
 | Module | Status | Covers |
 |---|---|---|
-| [data-tier](data-tier/README.md) | Planned | catalog control-plane · management API · metering store |
+| [data-tier](data-tier/README.md) | Superseded — torii owns persistence ([§11](data-tier/README.md)) | catalog control-plane · management API · metering store — in `sensei-hq/torii` |
 
 > **Layout:** every feature page leads with frontmatter (`doctype: feature`,
 > `status`, `phase`/`spec`, `source`) and carries a `## Scenarios` (Gherkin)
