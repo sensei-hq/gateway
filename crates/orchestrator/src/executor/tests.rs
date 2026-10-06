@@ -27454,3 +27454,238 @@ async fn a_budget_the_renderer_under_spends_is_refused_on_the_measured_cut() {
          must re-decide rather than replay a budget that was never used"
     );
 }
+
+/// AG-1 (gateway#85, SP-REG-2): the planner discovery tools are composed PER RUN, from the
+/// registry `Executor::pinned` pins — never at boot (spec `2026-09-15-sp-reg-programme-design.md`
+/// §3). Production wires a registry handle and no discovery tools of its own; these prove a
+/// planner can still use them, against the run's own registry.
+mod discovery_tools_per_run {
+    use super::*;
+    use crate::agent::tools::{ListAgents, ListChains, ListSkills, ListTools, ValidatePlan};
+    use kernel::types::io::ChatResponse;
+    use orchestrator_core::{RegistryConfig, RegistryHandle, ToolSpec};
+    use orchestrator_store::InMemoryConfigSource;
+
+    const ALL: [&str; 5] = [
+        "list_agents",
+        "list_skills",
+        "list_tools",
+        "list_chains",
+        "validate_plan",
+    ];
+
+    /// The five tools' MODEL-FACING specs: an agent can only declare a tool the core registry
+    /// knows (`Registry::validate`), exactly as an operator's pushed `tools/*.json` would.
+    fn discovery_specs() -> Vec<ToolSpec> {
+        let empty = Arc::new(Registry::default());
+        vec![
+            ListAgents(empty.clone()).spec(),
+            ListSkills(empty.clone()).spec(),
+            ListTools(empty.clone()).spec(),
+            ListChains(empty.clone()).spec(),
+            ValidatePlan {
+                registry: empty,
+                max_nodes: 512,
+            }
+            .spec(),
+        ]
+    }
+
+    fn named(name: &str, area: &str, tools: &[&str]) -> AgentDefinition {
+        AgentDefinition {
+            name: name.into(),
+            area: area.into(),
+            tools: tools.iter().map(|t| t.to_string()).collect(),
+            ..agent_def("c")
+        }
+    }
+
+    fn config(agents: Vec<AgentDefinition>) -> RegistryConfig {
+        RegistryConfig {
+            agents,
+            tools: discovery_specs(),
+            ..Default::default()
+        }
+    }
+
+    fn registry(agents: Vec<AgentDefinition>) -> Registry {
+        Registry::from_config(config(agents)).expect("valid registry")
+    }
+
+    fn one_agent_graph(agent: &str) -> Graph {
+        Graph {
+            nodes: vec![agent_node("n1", agent, "go")],
+        }
+    }
+
+    /// Every journaled tool output, as JSON text.
+    async fn tool_outputs(journal: &InMemoryJournal, run: RunId) -> Vec<String> {
+        journal
+            .load(run)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                JournalEvent::EffectRecorded {
+                    output: EffectOutput::Inline(v),
+                    ..
+                } => Some(v.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Done gate 1: a planner declaring `list_agents` gets the PINNED registry's agents — the
+    /// one the handle holds when the run starts, not whatever existed when the executor was
+    /// built. The executor wires no discovery tools itself, as production's boot does not.
+    #[tokio::test]
+    async fn a_planner_lists_the_pinned_registrys_agents_not_a_boot_snapshot() {
+        let handle = RegistryHandle::new(registry(vec![named(
+            "planner",
+            "planning",
+            &["list_agents"],
+        )]));
+        let (gw, _c) = scripted_gateway(vec![
+            tool_call_response("t1", "list_agents", "{}"),
+            final_response("done"),
+        ])
+        .await;
+        let journal = InMemoryJournal::new();
+        let exec = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_registry_handle(handle.clone());
+
+        // AFTER the executor exists, the live config gains an agent.
+        handle
+            .reload(&InMemoryConfigSource(config(vec![
+                named("planner", "planning", &["list_agents"]),
+                named("late-agent", "research", &[]),
+            ])))
+            .await
+            .expect("reload");
+
+        let run = RunId(uuid::Uuid::new_v4());
+        let out = exec
+            .run(run, &one_agent_graph("planner"))
+            .await
+            .expect("run");
+        assert!(out.failed.is_none(), "{out:?}");
+        let outputs = tool_outputs(&journal, run).await;
+        assert!(
+            outputs.iter().any(|o| o.contains("late-agent")),
+            "list_agents answered from the pinned registry: {outputs:?}"
+        );
+    }
+
+    /// All five are present on the pinned path: an unregistered tool hard-fails the node
+    /// (`UnknownTool`), so a clean completion after calling each proves each is wired.
+    #[tokio::test]
+    async fn every_discovery_tool_is_callable_on_the_pinned_path() {
+        let handle = RegistryHandle::new(registry(vec![
+            named("planner", "planning", &ALL),
+            named("worker", "research", &[]),
+        ]));
+        let plan = r#"{"graph":{"nodes":[{"id":"w","kind":{"Agent":{"agent":"worker","input":"go","phase":null}},"deps":[]}]},"node_plans":{}}"#;
+        let mut script: Vec<ChatResponse> = ALL[..4]
+            .iter()
+            .enumerate()
+            .map(|(i, t)| tool_call_response(&format!("t{i}"), t, "{}"))
+            .collect();
+        script.push(tool_call_response(
+            "t4",
+            "validate_plan",
+            &serde_json::json!({ "plan": plan }).to_string(),
+        ));
+        script.push(final_response("done"));
+        let (gw, _c) = scripted_gateway(script).await;
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let out = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_registry_handle(handle)
+            .run(run, &one_agent_graph("planner"))
+            .await
+            .expect("run");
+        assert!(
+            out.failed.is_none(),
+            "every discovery tool is registered: {out:?}"
+        );
+        assert_eq!(
+            tool_outputs(&journal, run).await.len(),
+            6,
+            "five tool effects + the final model turn were recorded"
+        );
+    }
+
+    /// Done gate 2: the no-handle path does NOT register them (spec §3 — only the pinned
+    /// path can detect config drift for a fresh call). Asserted explicitly: an earlier draft's
+    /// gate demanded the opposite.
+    #[tokio::test]
+    async fn the_no_handle_path_does_not_register_discovery_tools() {
+        let (gw, _c) = scripted_gateway(vec![
+            tool_call_response("t1", "list_agents", "{}"),
+            final_response("done"),
+        ])
+        .await;
+        let out = Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1")
+            .with_registry(Arc::new(registry(vec![named(
+                "planner",
+                "planning",
+                &["list_agents"],
+            )])))
+            .run(RunId(uuid::Uuid::new_v4()), &one_agent_graph("planner"))
+            .await
+            .expect("an outcome");
+        let failed = format!("{:?}", out.failed);
+        assert!(
+            failed.contains("list_agents"),
+            "with_registry (no handle) must not wire discovery tools — UnknownTool: {failed}"
+        );
+    }
+
+    /// Done gate 3: an agent that declares none of them is offered none — the model-facing tool
+    /// set (and with it `agent_input_hash`) is unchanged by the per-run wiring.
+    #[tokio::test]
+    async fn an_agent_declaring_no_discovery_tool_is_offered_none() {
+        let (gw, _c, offered) = scripted_tool_watching_gateway(vec![final_response("done")]).await;
+        let out = Executor::new(Arc::new(gw), Arc::new(InMemoryJournal::new()), "v1")
+            .with_registry_handle(RegistryHandle::new(registry(vec![named(
+                "a",
+                "research",
+                &[],
+            )])))
+            .run(RunId(uuid::Uuid::new_v4()), &one_agent_graph("a"))
+            .await
+            .expect("run");
+        assert!(out.failed.is_none(), "{out:?}");
+        let offered = offered.lock().unwrap().clone();
+        assert!(
+            offered.iter().all(|turn| turn.is_empty()),
+            "no tool schema reaches the model for an agent that declares none: {offered:?}"
+        );
+    }
+
+    /// Done gate 4: registering them widens nothing — an agent that does not DECLARE
+    /// `list_agents` still cannot call it (the s1 gate refuses; the tool never executes).
+    #[tokio::test]
+    async fn an_undeclared_discovery_tool_still_cannot_be_called() {
+        let (gw, _c) = scripted_gateway(vec![
+            tool_call_response("t1", "list_agents", "{}"),
+            final_response("done"),
+        ])
+        .await;
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_registry_handle(RegistryHandle::new(registry(vec![
+                named("a", "research", &[]),
+                named("secret-agent", "research", &[]),
+            ])))
+            .run(run, &one_agent_graph("a"))
+            .await
+            .expect("an outcome");
+        let outputs = tool_outputs(&journal, run).await;
+        assert!(
+            outputs.iter().all(|o| !o.contains("secret-agent")),
+            "an undeclared list_agents must not execute: {outputs:?}"
+        );
+    }
+}
