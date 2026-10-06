@@ -21,8 +21,8 @@ source: crates/orchestrator*
 > `<root>/skills/*.md` via `from_frontmatter`, `<root>/tools/*.json` via serde —
 > ALL md/JSON parsing isolated here; missing subdir ⇒ empty, missing root / bad
 > file ⇒ loud `RegistryLoad`) and **`InMemoryConfigSource`**. `ConfigSource` is
-> the **extension seam** (`PostgresConfigSource`/`ConvexConfigSource`/`HttpConfigSource`
-> impl it later, reusing `from_config` unchanged); `Registry` is the uniform
+> the **extension seam** (torii's tenant-scoped `PgConfigStore` implements it; any other
+> backend can, reusing `from_config` unchanged); `Registry` is the uniform
 > assembled result. The in-memory `.with_*` builders + `from_frontmatter` stay.
 > Tool **executors** still bind via `ToolRegistry` (a disk `ToolSpec` with no code
 > executor loads/validates but is a loud `UnknownTool` at execution — MCP bridge
