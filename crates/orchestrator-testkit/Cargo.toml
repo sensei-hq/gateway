@@ -1,6 +1,6 @@
 [package]
 name = "sensei-orchestrator-testkit"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 description = "Store conformance suite for the sensei orchestrator's persistence traits — the contract every backend (in-memory, Postgres, torii's tenant-scoped stores) must keep"
 license = "MIT"
