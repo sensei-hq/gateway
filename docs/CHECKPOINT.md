@@ -19,10 +19,11 @@ keeps the engine, the persistence traits and in-memory stores. Last release: v0.
 
 ## Next
 
-Epic #76 is done: torii owns persistence; torii pins v0.10.0 (torii#31). One verification left:
-the DB-gated torii suites against the PUBLISHED v0.10.0 tag (Docker was down — a privileged
-helper prompt) — CI-shape without a DB passed 427/0; pre-tag with a DB 486/0. Follow-ups:
-torii API should refuse UUID-shaped org slugs at write time; LOW: EffectIntent fixture seq=0.
+**Epic torii#45 — complete the agentic runtime and incorporate it into torii.** Actionable, in
+order: gateway#85 AG-1 discovery tools (SP-REG-2) → #86 AG-2 HITL hooks → #87 AG-3 wake
+backoff/max_attempts → gateway release + torii re-pin → torii#34 AG-5 boot seams → #33 AG-4
+`run results` → #35 AG-6 `config show/pull` → #36 AG-7 slugs + authz.sql. Decisions C1–C8 =
+torii#37–#44 (gate the API/UI/deploy work). Lower-priority engine follow-ons: gateway#88.
 
 ## Open questions
 
