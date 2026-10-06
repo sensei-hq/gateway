@@ -6352,7 +6352,73 @@ impl OrchestratorHooks for RecordingHooks {
     ) {
         self.push(format!("context_write({})", k.0));
     }
+    // AG-2: the human-in-the-loop hooks. Each records its node and the fields a UI keys
+    // on, so `mod hitl_hooks` can assert both WHICH occurrence fired and WHAT it carried.
+    async fn on_signal_awaited(
+        &self,
+        _r: RunId,
+        n: &NodeId,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        self.push(format!("signal_awaited({},{deadline:?})", n.0));
+    }
+    async fn on_signal_received(&self, _r: RunId, n: &NodeId, payload: &serde_json::Value) {
+        self.push(format!("signal_received({},{payload})", n.0));
+    }
+    async fn on_gate_awaited(
+        &self,
+        _r: RunId,
+        n: &NodeId,
+        _deadline: Option<chrono::DateTime<chrono::Utc>>,
+        options: &[orchestrator_core::GateOption],
+    ) {
+        let names: Vec<&str> = options.iter().map(|o| o.name.as_str()).collect();
+        self.push(format!("gate_awaited({},{})", n.0, names.join("|")));
+    }
+    async fn on_gate_decided(
+        &self,
+        _r: RunId,
+        n: &NodeId,
+        option: &str,
+        actor: &str,
+        note: Option<&str>,
+    ) {
+        self.push(format!("gate_decided({},{option},{actor},{note:?})", n.0));
+    }
+    async fn on_agent_awaited(
+        &self,
+        _r: RunId,
+        n: &NodeId,
+        _deadline: Option<chrono::DateTime<chrono::Utc>>,
+        _prompt: &str,
+    ) {
+        self.push(format!("agent_awaited({})", n.0));
+    }
+    async fn on_agent_answered(&self, _r: RunId, n: &NodeId, text: &str, actor: &str) {
+        self.push(format!("agent_answered({},{text},{actor})", n.0));
+    }
+    async fn on_loop_gate_awaited(
+        &self,
+        _r: RunId,
+        n: &NodeId,
+        _deadline: Option<chrono::DateTime<chrono::Utc>>,
+        _prompt: &str,
+        menu: &[orchestrator_core::LoopGateOption],
+    ) {
+        let names: Vec<&str> = menu.iter().map(|o| o.name.as_str()).collect();
+        self.push(format!("loop_gate_awaited({},{})", n.0, names.join("|")));
+    }
+    async fn on_loop_gate_decided(&self, _r: RunId, n: &NodeId, option: &str, actor: &str) {
+        self.push(format!("loop_gate_decided({},{option},{actor})", n.0));
+    }
+    async fn on_loop_gate_settled(&self, _r: RunId, n: &NodeId, option: &str) {
+        self.push(format!("loop_gate_settled({},{option})", n.0));
+    }
 }
+
+/// AG-2 (#86): the human-in-the-loop hooks, exactly once per real occurrence and never
+/// on a resumed replay. A file of its own rather than more of this one.
+mod hitl_hooks;
 
 /// Acceptance §9.1 — run + node lifecycle fires in order.
 #[tokio::test]

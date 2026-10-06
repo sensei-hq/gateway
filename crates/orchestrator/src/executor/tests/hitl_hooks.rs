@@ -1,0 +1,439 @@
+//! AG-2 (sensei-hq/gateway#86): the human-in-the-loop `OrchestratorHooks`.
+//!
+//! Every test here drives a run the way production does — one drive per process, a
+//! FRESH `Executor` each time over the same durable journal, with the decision appended
+//! BETWEEN drives exactly as torii's CLI appends it — and asserts on what each drive
+//! fired. The property under test is the issue's "done when": each event fires exactly
+//! once per real occurrence, and never on a resumed replay.
+//!
+//! The fixtures that keep a run resumable after its human node has completed carry a
+//! second, never-answered `AwaitSignal` (`hold`). Without it the honouring drive
+//! finalizes the run, and `start` on a terminal run returns the folded outcome without
+//! re-driving — which is precisely the case that CANNOT see a replay re-fire.
+
+use super::human_agent::human_registry;
+use super::*;
+use orchestrator_core::{GateOption, GateOutcome, LoopGateOption};
+
+/// The hook names this slice adds — the filter that separates them from the run/node
+/// lifecycle the same spy records.
+const HITL: [&str; 9] = [
+    "signal_awaited(",
+    "signal_received(",
+    "gate_awaited(",
+    "gate_decided(",
+    "agent_awaited(",
+    "agent_answered(",
+    "loop_gate_awaited(",
+    "loop_gate_decided(",
+    "loop_gate_settled(",
+];
+
+fn is_hitl(entry: &str) -> bool {
+    HITL.iter().any(|p| entry.starts_with(p))
+}
+
+/// The never-answered sibling that keeps the run live (see the module doc).
+fn hold() -> Node {
+    Node {
+        id: NodeId("hold".into()),
+        kind: NodeKind::AwaitSignal { timeout: None },
+        deps: vec![],
+    }
+}
+
+/// A shared journal and a shared spy, with one fresh executor per drive.
+struct Harness {
+    journal: InMemoryJournal,
+    hooks: RecordingHooks,
+    run: RunId,
+    registry: Option<Arc<Registry>>,
+    seen: usize,
+}
+
+impl Harness {
+    fn new(registry: Option<Arc<Registry>>) -> Self {
+        Harness {
+            journal: InMemoryJournal::new(),
+            hooks: RecordingHooks::default(),
+            run: RunId(uuid::Uuid::new_v4()),
+            registry,
+            seen: 0,
+        }
+    }
+
+    /// One drive by a brand-new executor (a process restart), returning ONLY the hook
+    /// entries this drive fired — every one, lifecycle included, so ordering against
+    /// `node_failed` is visible.
+    async fn drive(&mut self, graph: &Graph) -> Vec<String> {
+        let (gw, _calls) = recording_gateway().await;
+        let mut ex = Executor::new(Arc::new(gw), Arc::new(self.journal.clone()), "v1")
+            .with_hooks(Arc::new(self.hooks.clone()));
+        if let Some(r) = &self.registry {
+            ex = ex.with_registry(r.clone());
+        }
+        ex.start(self.run, graph)
+            .await
+            .expect("the drive yields an outcome");
+        let log = self.hooks.log();
+        let fresh = log[self.seen..].to_vec();
+        self.seen = log.len();
+        fresh
+    }
+
+    /// The HITL hooks this drive fired, in order.
+    async fn drive_hitl(&mut self, graph: &Graph) -> Vec<String> {
+        self.drive(graph)
+            .await
+            .into_iter()
+            .filter(|e| is_hitl(e))
+            .collect()
+    }
+
+    /// What torii's CLI does: append a row straight to the journal, between drives.
+    async fn append(&self, event: JournalEvent) {
+        self.journal
+            .append(self.run, event)
+            .await
+            .expect("an out-of-process append");
+    }
+}
+
+// ----------------------------------------------------------------- AwaitSignal
+
+fn signal_graph() -> Graph {
+    Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("gate".into()),
+                kind: NodeKind::AwaitSignal { timeout: None },
+                deps: vec![],
+            },
+            hold(),
+        ],
+    }
+}
+
+/// `on_signal_awaited` fires once per ask (never on a re-pause), and
+/// `on_signal_received` fires on the drive that completes the node on its signal —
+/// and on no later drive, though every later drive of this still-live run re-completes
+/// that node from the fold.
+#[tokio::test]
+async fn signal_hooks_fire_once_per_occurrence_and_never_on_a_resumed_replay() {
+    let mut h = Harness::new(None);
+    let graph = signal_graph();
+
+    assert_eq!(
+        h.drive_hitl(&graph).await,
+        vec!["signal_awaited(gate,None)", "signal_awaited(hold,None)"],
+        "the first drive asks both nodes, once each"
+    );
+    assert_eq!(
+        h.drive_hitl(&graph).await,
+        Vec::<String>::new(),
+        "a resume that re-pauses both nodes asks nobody anything new"
+    );
+
+    h.append(JournalEvent::SignalReceived {
+        node: NodeId("gate".into()),
+        payload: serde_json::json!({ "decision": "approved" }),
+    })
+    .await;
+    assert_eq!(
+        h.drive_hitl(&graph).await,
+        vec![r#"signal_received(gate,{"decision":"approved"})"#],
+        "the drive that honours the signal reports it, once"
+    );
+    assert_eq!(
+        h.drive_hitl(&graph).await,
+        Vec::<String>::new(),
+        "a resumed drive that REPLAYS the completed node must not report the signal again"
+    );
+    assert_eq!(h.drive_hitl(&graph).await, Vec::<String>::new());
+}
+
+/// The early-signal race: a signal folded before its node ever ran completes the node
+/// without an ask, so `on_signal_received` fires with no `on_signal_awaited` — and,
+/// again, never on a replay.
+#[tokio::test]
+async fn an_early_signal_reports_received_without_an_ask_and_never_again() {
+    let mut h = Harness::new(None);
+    let graph = signal_graph();
+    h.append(JournalEvent::RunStarted {
+        version: "v1".into(),
+        budget: None,
+    })
+    .await;
+    h.append(JournalEvent::SignalReceived {
+        node: NodeId("gate".into()),
+        payload: serde_json::json!("early"),
+    })
+    .await;
+
+    assert_eq!(
+        h.drive_hitl(&graph).await,
+        vec![
+            r#"signal_received(gate,"early")"#,
+            "signal_awaited(hold,None)"
+        ],
+    );
+    assert_eq!(h.drive_hitl(&graph).await, Vec::<String>::new());
+}
+
+// ------------------------------------------------------------------- HumanGate
+
+fn gate_graph() -> Graph {
+    Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("release".into()),
+                kind: NodeKind::HumanGate {
+                    options: vec![
+                        GateOption {
+                            name: "ship".into(),
+                            outcome: GateOutcome::Complete,
+                        },
+                        GateOption {
+                            name: "reject".into(),
+                            outcome: GateOutcome::Fail,
+                        },
+                    ],
+                    timeout: None,
+                },
+                deps: vec![],
+            },
+            hold(),
+        ],
+    }
+}
+
+fn gate_decided(option: &str, note: Option<&str>) -> JournalEvent {
+    JournalEvent::GateDecided {
+        node: NodeId("release".into()),
+        option: option.into(),
+        actor: "alice".into(),
+        note: note.map(str::to_string),
+    }
+}
+
+/// A `Complete` decision: `on_gate_awaited` once, `on_gate_decided` on the honouring
+/// drive only.
+#[tokio::test]
+async fn gate_hooks_fire_once_per_occurrence_and_never_on_a_resumed_replay() {
+    let mut h = Harness::new(None);
+    let graph = gate_graph();
+
+    assert_eq!(
+        h.drive_hitl(&graph).await,
+        vec![
+            "gate_awaited(release,ship|reject)",
+            "signal_awaited(hold,None)"
+        ],
+    );
+    assert_eq!(h.drive_hitl(&graph).await, Vec::<String>::new());
+
+    h.append(gate_decided("ship", None)).await;
+    assert_eq!(
+        h.drive_hitl(&graph).await,
+        vec!["gate_decided(release,ship,alice,None)"],
+    );
+    assert_eq!(
+        h.drive_hitl(&graph).await,
+        Vec::<String>::new(),
+        "a resumed drive that replays the completed gate must not report the decision again"
+    );
+}
+
+/// A `Fail` decision is honoured too — it is what the human chose — and is reported
+/// BEFORE the node failure it causes; the failure is then read back on every later
+/// drive, which reports nothing.
+#[tokio::test]
+async fn a_rejecting_gate_decision_is_reported_once_before_the_node_fails() {
+    let mut h = Harness::new(None);
+    let graph = gate_graph();
+    h.drive(&graph).await;
+
+    h.append(gate_decided("reject", Some("not yet"))).await;
+    let fired = h.drive(&graph).await;
+    let decided = fired
+        .iter()
+        .position(|e| e == r#"gate_decided(release,reject,alice,Some("not yet"))"#);
+    let failed = fired.iter().position(|e| e == "node_failed(release)");
+    assert!(
+        decided.is_some() && failed.is_some() && decided < failed,
+        "the decision is reported, then the failure it caused: {fired:?}"
+    );
+    assert_eq!(h.drive_hitl(&graph).await, Vec::<String>::new());
+}
+
+// ------------------------------------------------------- human-backed Agent
+
+fn agent_graph() -> Graph {
+    Graph {
+        nodes: vec![agent_node("review", "reviewer", "the Acme MSA"), hold()],
+    }
+}
+
+#[tokio::test]
+async fn agent_hooks_fire_once_per_occurrence_and_never_on_a_resumed_replay() {
+    let mut h = Harness::new(Some(human_registry(None)));
+    let graph = agent_graph();
+
+    assert_eq!(
+        h.drive_hitl(&graph).await,
+        vec!["agent_awaited(review)", "signal_awaited(hold,None)"],
+    );
+    assert_eq!(h.drive_hitl(&graph).await, Vec::<String>::new());
+
+    h.append(JournalEvent::AgentAnswered {
+        node: NodeId("review".into()),
+        text: "it does not".into(),
+        actor: "bob".into(),
+    })
+    .await;
+    assert_eq!(
+        h.drive_hitl(&graph).await,
+        vec!["agent_answered(review,it does not,bob)"],
+    );
+    assert_eq!(
+        h.drive_hitl(&graph).await,
+        Vec::<String>::new(),
+        "a resumed drive that replays the answered node must not report the answer again"
+    );
+}
+
+// ------------------------------------------------------------ human loop gate
+
+fn loop_gate_graph() -> Graph {
+    Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("lp".into()),
+                kind: NodeKind::Loop {
+                    body: LoopBody::ModelCall { chain: "c".into() },
+                    input: serde_json::json!({ "prompt": "draft it" }),
+                    gate: GateSpec::Human {
+                        agent: AgentRef("reviewer".into()),
+                        menu: vec![
+                            LoopGateOption {
+                                name: "revise".into(),
+                                stops: false,
+                            },
+                            LoopGateOption {
+                                name: "ship".into(),
+                                stops: true,
+                            },
+                        ],
+                    },
+                    max_iters: 3,
+                },
+                deps: vec![],
+            },
+            hold(),
+        ],
+    }
+}
+
+fn loop_decided(i: usize, option: &str) -> JournalEvent {
+    JournalEvent::LoopGateDecided {
+        node: NodeId(format!("lp/{i}/__gate__")),
+        option: option.into(),
+        actor: "carol".into(),
+    }
+}
+
+/// One ask per ITERATION; decided-then-settled on the drive that settles each gate; and
+/// nothing on the drives that replay the settled gates (`run_loop` re-derives every
+/// iteration's gate on every drive, so iteration 0's is replayed on each one).
+#[tokio::test]
+async fn loop_gate_hooks_fire_once_per_occurrence_and_never_on_a_resumed_replay() {
+    let mut h = Harness::new(Some(human_registry(None)));
+    let graph = loop_gate_graph();
+
+    assert_eq!(
+        h.drive_hitl(&graph).await,
+        vec![
+            "loop_gate_awaited(lp/0/__gate__,revise|ship)",
+            "signal_awaited(hold,None)"
+        ],
+    );
+    assert_eq!(h.drive_hitl(&graph).await, Vec::<String>::new());
+
+    h.append(loop_decided(0, "revise")).await;
+    assert_eq!(
+        h.drive_hitl(&graph).await,
+        vec![
+            "loop_gate_decided(lp/0/__gate__,revise,carol)",
+            "loop_gate_settled(lp/0/__gate__,revise)",
+            "loop_gate_awaited(lp/1/__gate__,revise|ship)",
+        ],
+        "iteration 0's gate settles on `revise`, so iteration 1 runs and asks"
+    );
+    assert_eq!(
+        h.drive_hitl(&graph).await,
+        Vec::<String>::new(),
+        "replaying iteration 0's settled gate reports nothing"
+    );
+
+    h.append(loop_decided(1, "ship")).await;
+    assert_eq!(
+        h.drive_hitl(&graph).await,
+        vec![
+            "loop_gate_decided(lp/1/__gate__,ship,carol)",
+            "loop_gate_settled(lp/1/__gate__,ship)",
+        ],
+    );
+    assert_eq!(
+        h.drive_hitl(&graph).await,
+        Vec::<String>::new(),
+        "replaying both settled gates reports nothing"
+    );
+}
+
+// ------------------------------------------------------ hooks change nothing
+
+/// The whole journal of a gate run driven WITHOUT hooks, across the ask, a resume, the
+/// decision and a replay. Pinned literally: the bookkeeping row the hooked path writes
+/// to make `on_gate_decided` exactly-once must never appear when no hooks are wired —
+/// "an executor with no hooks journals exactly what it did before".
+#[tokio::test]
+async fn an_unhooked_run_journals_exactly_what_it_did_before() {
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = gate_graph();
+    let drive = || async {
+        let (gw, _calls) = recording_gateway().await;
+        Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .start(run, &graph)
+            .await
+            .expect("drives");
+    };
+    drive().await;
+    journal
+        .append(run, gate_decided("ship", None))
+        .await
+        .unwrap();
+    drive().await;
+    drive().await;
+
+    let labels: Vec<String> = journal
+        .load(run)
+        .await
+        .unwrap()
+        .iter()
+        .map(|(_, e)| label(e))
+        .collect();
+    assert_eq!(
+        labels,
+        vec![
+            "RunStarted",
+            "GateAwaited(release)",
+            "RunPaused",
+            "SignalAwaited(hold)",
+            "RunPaused",
+            "GateDecided(release)",
+            "RunPaused",
+            "RunPaused",
+        ]
+    );
+}
