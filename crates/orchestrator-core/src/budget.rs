@@ -83,7 +83,7 @@ pub struct TokenUsage {
     ///
     /// `Some` only on a run with a money cap in force when the call was made: an
     /// unbudgeted or token-only run journals byte-identically to before.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_micro_usd: Option<u64>,
 }
 
