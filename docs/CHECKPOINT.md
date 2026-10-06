@@ -19,22 +19,22 @@ keeps the engine, the persistence traits and in-memory stores. Last release: v0.
 
 ## Next
 
-TM-8 (torii#26), decided: FIRST bump torii `services/gateway` to the current gateway API (7 compile
-errors: new `routing`/`catalog` fields) and extract `config_loader` into a lib crate shared by
-`services/gateway` and the CLI — own PR. Then move `crates/torii` onto `torii-orchestrator-store`
-(tenant flag/env) + that loader as its `GatewayConfigSource`; keep the memory backend; port tests
-(e2e_pg.rs → per-tenant). torii pins gateway crates by `branch = "develop"` until a release.
+Release v0.9.0 (TM-2..TM-5): PR #83 develop→main awaits CI + the user's review/merge; then tag
+`v0.9.0` on the merge commit + GitHub Release. TM-8 (torii#26), design on the issue: ONE shared
+torii crate (pool, catalog→GatewayConfig loader, tenant-scoped stores) used by BOTH the API and
+the CLI. TM-8a pin all torii gateway deps to v0.9.0 + fix services/gateway (7 errors); TM-8b
+shared crate + loader move; TM-8c move the CLI onto it.
 
 ## Open questions
 
-Cut gateway v0.9.0 (TM-2..TM-5 + testkit) so torii can pin ONE tag? (asked 2026-10-06)
+None. (Decided 2026-10-06: cut v0.9.0; shared torii crate for CLI + API.)
 Torii's main checkout has others' uncommitted changes — always work in a torii worktree.
 
 ## Known-broken / carry-forwards
 
+- `orchestrator` sandbox straggler test's 5s bound trips under full-suite load (passes alone).
 - torii `database/tests/authz.sql` declassify case fails on unmodified develop (pre-existing);
   `run.sh` stops there, so later suites only run individually.
-- Out of the epic's scope (agentic execution): SP-REG-2 discovery tools, a results command, SP-REG-4
-  shipped content (needs a product decision).
+- Out of the epic's scope: SP-REG-2 discovery tools, a results command, SP-REG-4 content.
 - From SP-DEC-2: Cloudflare never run live; engine counts caller-caused errors against the breaker;
   LOW test gaps. Pre-existing: `OllamaAdapter`/`OpenAIAdapter::from_config` no default timeout.
