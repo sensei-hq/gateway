@@ -10,7 +10,7 @@ source: data-tier + crates/gateway/src/selection.rs
 
 # Predicted Lockout
 
-> **Status: Planned (Phase 4 · SP-DATA).** Needs live [usage metering](usage-metering.md).
+> **Status: Planned — needs live [usage metering](usage-metering.md), which torii owns** (DECISIONS §11). The gateway side is the selection gate that would consume it.
 
 Pre-emptively lock out a model when metering shows its remaining quota is
 effectively exhausted — before the provider returns a 429 — so a fan-out doesn't

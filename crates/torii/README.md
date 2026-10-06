@@ -1,5 +1,10 @@
 # torii
 
+> **This crate is moving to the Torii product repo** — epic
+> [sensei-hq/gateway#76](https://github.com/sensei-hq/gateway/issues/76), step TM-8
+> ([sensei-hq/torii#26](https://github.com/sensei-hq/torii/issues/26)). Torii `docs/DECISIONS.md` §11:
+> the gateway is a library; torii owns persistence. Until the move lands, everything below holds.
+
 The operator control plane for the sensei orchestrator: submit and observe runs, intervene on the
 ones waiting for a human, drive due wakes, and manage the durable registry config.
 
