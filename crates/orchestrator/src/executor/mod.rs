@@ -1053,6 +1053,7 @@ impl Executor {
             JournalEvent::RunStarted {
                 version: this.version.clone(),
                 budget,
+                money_budget: None,
             },
         )
         .await?;
@@ -1128,7 +1129,11 @@ impl Executor {
         // The fence compares the executor version string only; `budget` is
         // deliberately not fenced (a config-only change, not a code-version change).
         if let Some(recorded) = events.iter().find_map(|(_, e)| match e {
-            JournalEvent::RunStarted { version, budget: _ } => Some(version.clone()),
+            JournalEvent::RunStarted {
+                version,
+                budget: _,
+                money_budget: _,
+            } => Some(version.clone()),
             _ => None,
         }) && recorded != self.version
         {

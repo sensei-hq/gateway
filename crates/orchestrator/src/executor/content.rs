@@ -26,6 +26,7 @@ pub(super) fn convert_usage(u: kernel::types::cost::TokenUsage) -> orchestrator_
         input_tokens: u.input_tokens,
         output_tokens: u.output_tokens,
         total_tokens: u.total_tokens,
+        cost_micro_usd: None,
     }
 }
 

@@ -943,6 +943,7 @@ mod tests {
             input_tokens: 100,
             output_tokens: 50,
             total_tokens: 150,
+            cost_micro_usd: None,
         };
         let ev = |seq: Seq| {
             (
@@ -985,6 +986,7 @@ mod tests {
                         input_tokens: 0,
                         output_tokens: 0,
                         total_tokens: total,
+                        cost_micro_usd: None,
                     }),
                 },
             )
@@ -1011,6 +1013,7 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: total,
                 total_tokens: total,
+                cost_micro_usd: None,
             }),
         };
         let manifest = || JournalEvent::MapCompacted {
@@ -1031,6 +1034,7 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 100,
                 total_tokens: 100,
+                cost_micro_usd: None,
             }),
         };
         let (fold, _, _) = fold_journal(&[(0, manifest())]);
@@ -1080,6 +1084,7 @@ mod tests {
                     budget: Some(TokenBudget {
                         total_tokens: 1_000,
                     }),
+                    money_budget: None,
                 },
             ),
             (
@@ -1111,6 +1116,7 @@ mod tests {
             JournalEvent::RunStarted {
                 version: "v1".into(),
                 budget: None,
+                money_budget: None,
             },
         )];
         let (fold, _, _) = fold_journal(&evs);

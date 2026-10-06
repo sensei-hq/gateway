@@ -47,6 +47,7 @@ fn started(version: &str) -> JournalEvent {
     JournalEvent::RunStarted {
         version: version.into(),
         budget: None,
+        money_budget: None,
     }
 }
 
