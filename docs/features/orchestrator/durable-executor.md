@@ -26,7 +26,8 @@ source: crates/orchestrator*
 > memoize / re-read via an injected `Clock`) and **Mutation** (two-phase
 > `EffectIntent → EffectRecorded` + in-doubt reconcile → durable `RunPaused`);
 > see the [effect-class table](#the-effect-class-model). Real reconcile providers,
-> a sandbox/permission model, and a `PostgresJournal` remain [deferred](#deferred).
+> a sandbox/permission model, and a durable journal remain [deferred](#deferred) here — the durable,
+> tenant-scoped `PgJournal` lives in torii (sensei-hq/torii).
 
 The executor drives a graph of nodes, each a call to the real
 [gateway](../routing/README.md), and journals every step so a crashed run can
@@ -65,8 +66,8 @@ provider⇒`RunPaused`, R3). Default tools use the structural key ⇒ byte-ident
 
 - **`ExecutionJournal`** is an append-only log of `JournalEvent`s per `RunId`
   (`RunStarted` · `NodeStarted` · `EffectRecorded` · `NodeCompleted` ·
-  `NodeFailed` · `RunCompleted`). It is the seam a `PostgresJournal` implements
-  later; slice 1 ships only the in-memory `InMemoryJournal`.
+  `NodeFailed` · `RunCompleted`). It is the seam a durable journal implements
+  (torii's tenant-scoped `PgJournal`); this repo ships only the in-memory `InMemoryJournal`.
 - **Structural `effect_id`** = `sha256_hex("{parent_path}|{loop_iteration}|{local_index}")`.
   It is derived from a node's *position*, not its content, so the same node
   across a crash/resume maps to the same recorded effect. (Loop iterations get
@@ -214,6 +215,6 @@ Held off to later SP-1 slices (and beyond); slice 1 ships none of these:
   [hooks](hooks.md)). ~~quota→pause~~ **Done** (see [gateway-error mapping](#gateway-error--pause-vs-fail-112)).
   This **completes the SP-1 walking skeleton**.
 - **Later** — planner, runtime `PlanDelta`/`Subgraph`/`Branch`, streaming, and a
-  `PostgresJournal`. There is **no persistence beyond the in-memory journal** yet;
-  `ExecutionJournal` is the seam a durable store implements later. The two-phase
+  durable journal. This repo keeps **no persistence beyond the in-memory journal**: the durable
+  stores live in torii (`PgJournal` and its siblings), implementing `ExecutionJournal`. The two-phase
   `EffectIntent` fsync is in-memory here (**SP-DATA**).

@@ -6,6 +6,22 @@ routing call path (build a request, `gateway.execute(&req).await`, read
 `InferenceResponse`) stays source-compatible across every step below; each section
 lists only what you must touch.
 
+## 0.9.x → 0.10.0 (torii move, done — the gateway carries no persistence)
+
+**Breaking: crates and a feature are removed.** Persistence belongs to torii (torii
+`docs/DECISIONS.md` §11), and it now lives there: tenant-scoped Postgres stores, their schema and
+the `torii` operator CLI are in [sensei-hq/torii](https://github.com/sensei-hq/torii). The routing
+engine, the executor, the persistence traits, the in-memory stores and the conformance suite are
+unchanged.
+
+| Area | Change | Action |
+|---|---|---|
+| `sensei-torii` (`crates/torii`, binary `torii`) | **removed** | use torii's `crates/cli` (`torii-cli`, binary `torii`): it needs `TORII_TENANT`, and on Postgres its gateway config is torii's catalog (`--gateway-config` only with `TORII_BACKEND=memory`) |
+| `orchestrator-store`'s `postgres` feature (`PostgresJournal`, `PostgresContentStore`, `PostgresContextStore`, `PostgresSchedulerStore`, `PostgresConfigSource`, `connect`) | **removed**, with its `test-support` feature and `test_guard` | implement the `orchestrator_core` traits over your database, or use torii's tenant-scoped `PgJournal`/`PgContentStore`/`PgContextStore`/`PgSchedulerStore`/`PgConfigStore`; hold them to `sensei-orchestrator-testkit` |
+| `sensei-orchestrator`'s `postgres-tests` feature | **removed** | none — durable cross-process tests run in torii |
+| `database/` (the `orchestrator.*` schema) | **removed** | torii's schema is `registry.*` + `runs.*`, per tenant |
+| `orchestrator-store` | now the in-memory stores and `FilesystemConfigSource` only; no `sqlx` | none |
+
 ## 0.8.x → 0.9.0 (torii move, phase 1 — persistence behind traits)
 
 Groundwork for moving persistence into torii (torii `docs/DECISIONS.md` §11: the gateway is a

@@ -26,7 +26,7 @@ pub const FORMAT_VERSION: i32 = 1;
 /// SP-6 s3. It lives in `orchestrator-core` because BOTH the executor and `torii` need
 /// it and neither can borrow the other's bound. `torii` already has one —
 /// `cmd::run::MAX_PAYLOAD_BYTES`, enforced by `cmd::run::check_payload_size` — but the
-/// executor cannot reach it: `sensei-torii` depends on `sensei-orchestrator` and
+/// executor cannot reach it: the `torii` CLI (sensei-hq/torii) depends on `sensei-orchestrator` and
 /// `sensei-orchestrator-core`, so a dependency the other way is a CYCLE the crate graph
 /// cannot express, not merely a visibility problem. (`check_payload_size` is also
 /// `pub(crate)`, and takes a `serde_json::Value` rather than a `&str` — but the cycle is
@@ -313,7 +313,7 @@ pub enum JournalEvent {
     /// journal alone. Recomposing it needs `assemble_prompt` (`orchestrator`), which
     /// takes a resolved `Registry` AND the run's already-materialized dependency
     /// outputs for its `## Context` section; `torii`'s read path has neither — the light
-    /// boot tier carries a `PostgresConfigSource` (raw config rows, for `config diff`)
+    /// boot tier carries a `ConfigStore` (raw config rows, for `config diff`)
     /// and a journal, not a `Registry`, a blackboard, or the executor. And it DOES
     /// transfer that fixing the question at ask time is what lets a late answer be
     /// honoured against the question actually given.
@@ -696,7 +696,7 @@ pub enum JournalEvent {
     /// The other FOUR — `node`, `source_window`, `retained_bytes`, `dropped_deps` — are
     /// DISCLOSURE: what an audit reads to learn that a turn answered on a degraded prompt.
     /// Nothing reconstructs the cut from them. **No `torii` command reads any of them today**
-    /// (`rg 'JournalEvent::' crates/torii/src` has no `ContextBudgeted` arm), so the operator
+    /// (torii's `crates/cli/src` has no `ContextBudgeted` arm), so the operator
     /// surface for this event is still outstanding — an earlier version of this paragraph
     /// claimed `torii` reads them, which was aspirational rather than true. The only reader is
     /// the exhaustive `label` test helper in `crates/orchestrator/src/executor/tests.rs`.
@@ -761,8 +761,8 @@ pub struct Snapshot {
     pub budget: Option<u64>,
 }
 
-/// The durable-journal seam. Slice 1 ships an in-memory implementation; a
-/// `PostgresJournal` implements this same trait in a later slice.
+/// The durable-journal seam. This repo ships the in-memory implementation; torii's
+/// tenant-scoped `PgJournal` (sensei-hq/torii) implements this same trait.
 ///
 /// `append` is strict: a write error is surfaced (fatal/pause), never swallowed.
 #[async_trait::async_trait]
@@ -1160,7 +1160,7 @@ mod tests {
     /// The only other assertion in the workspace is in
     /// `the_context_budgeted_event_round_trips`, which restates this same pin for SP-7b's
     /// AC12 at the variant that slice added, and is equally blind to a variant being added.
-    /// The only non-test readers are `PostgresJournal`'s resume fence and its
+    /// The only non-test readers are a durable journal's resume fence (torii's `PgJournal`) and its
     /// `IncompatibleFormat` error.
     ///
     /// **Nothing in this crate notices that a variant was ADDED.** An earlier version of

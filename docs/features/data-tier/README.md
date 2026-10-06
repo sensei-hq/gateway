@@ -23,11 +23,12 @@ metadata, refresh, metering and config management (SP-DATA Phase 4, design D12) 
 | In-memory implementations (tests, development, embedding) | ✓ | — |
 | Every Postgres schema, migration, tenancy, RLS | — | ✓ |
 | Catalog / config / metering **data**, registry content, staging, versioning, publish | — | ✓ |
-| The operator CLI/worker (today `crates/torii` here) | moving out | ✓ |
+| The operator CLI/worker (`torii`, now torii `crates/cli`) | — (moved) | ✓ |
 
 The move is tracked by the epic [sensei-hq/gateway#76](https://github.com/sensei-hq/gateway/issues/76)
-(TM-1…TM-9): the gateway makes its seams movable, torii implements them over a tenant-scoped schema
-and takes the CLI, then the gateway deletes its Postgres adapters, `database/` and `crates/torii`.
+(TM-1…TM-9) and **complete**: the gateway made its seams movable (v0.9.0), torii implemented them
+over a tenant-scoped schema and took the CLI, and the gateway deleted its Postgres adapters,
+`database/` and `crates/torii` (TM-9, v0.10.0).
 
 ## The original pages (historical)
 
