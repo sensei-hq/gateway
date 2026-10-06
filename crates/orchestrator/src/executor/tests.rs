@@ -27608,10 +27608,22 @@ mod discovery_tools_per_run {
             out.failed.is_none(),
             "every discovery tool is registered: {out:?}"
         );
-        assert_eq!(
-            tool_outputs(&journal, run).await.len(),
-            6,
-            "five tool effects + the final model turn were recorded"
+        // Each tool answered (its own top-level key), and validate_plan judged the plan — which
+        // names `worker` — against the PINNED registry, where `worker` exists.
+        let outputs: Vec<serde_json::Value> = tool_outputs(&journal, run)
+            .await
+            .iter()
+            .filter_map(|o| serde_json::from_str(o).ok())
+            .collect();
+        for key in ["agents", "skills", "tools", "chains", "ok"] {
+            assert!(
+                outputs.iter().any(|o| o.get(key).is_some()),
+                "a {key:?} answer was recorded: {outputs:?}"
+            );
+        }
+        assert!(
+            outputs.iter().any(|o| o["ok"] == serde_json::json!(true)),
+            "validate_plan accepted a plan over the pinned registry: {outputs:?}"
         );
     }
 
