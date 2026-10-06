@@ -869,6 +869,36 @@ mod tests {
         }
     }
 
+    /// An over-threshold output is journaled as a `Ref` into the CAS, and a durable journal
+    /// (torii's `PgJournal`) stores it as JSON. On resume it must come back as the SAME `Ref`,
+    /// or replay hands downstream the raw `{digest, size, summary}` object instead of the
+    /// stored value — with zero re-spend, so every replay assertion still passes. In-memory
+    /// journals never serialize, so this is the only place the round-trip is held.
+    #[test]
+    fn an_effect_output_ref_round_trips_as_the_same_ref() {
+        use crate::content::{ContentRef, Digest};
+        let r = ContentRef {
+            digest: Digest("d".into()),
+            size: 3,
+            summary: Some("s".into()),
+        };
+        let e = JournalEvent::EffectRecorded {
+            node: NodeId("n1".into()),
+            effect_id: effect_id("", 0, 0),
+            class: EffectClass::Pure,
+            input_hash: "abc".into(),
+            seq: 1,
+            output: EffectOutput::Ref(r.clone()),
+            observation: None,
+            usage: None,
+        };
+        let back: JournalEvent = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+        let JournalEvent::EffectRecorded { output, .. } = back else {
+            panic!("wrong variant")
+        };
+        assert_eq!(output, EffectOutput::Ref(r));
+    }
+
     #[test]
     fn journal_event_roundtrips() {
         let e = JournalEvent::EffectRecorded {
