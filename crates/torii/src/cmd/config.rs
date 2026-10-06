@@ -5,9 +5,8 @@ use crate::cmd::Outcome;
 use crate::diff::{ConfigDiff, diff};
 use crate::errors::CliError;
 use crate::render::one_line;
-use orchestrator_core::{ConfigSource, Registry, RegistryConfig, SchedulerStore};
+use orchestrator_core::{ConfigSource, ConfigStore, Registry, RegistryConfig, SchedulerStore};
 use orchestrator_store::FilesystemConfigSource;
-use orchestrator_store::postgres::PostgresConfigSource;
 use std::io::{BufRead, Read, Write};
 use std::path::Path;
 
@@ -114,7 +113,7 @@ pub fn describe_diff(
     s
 }
 
-pub async fn version(src: &PostgresConfigSource, json: bool) -> Result<Outcome, CliError> {
+pub async fn version(src: &dyn ConfigStore, json: bool) -> Result<Outcome, CliError> {
     let v = src.version().await?.unwrap_or(0);
     Ok(Outcome::ok(if json {
         // Pretty-printed, matching every other `--json` path (`render::json`) — one
@@ -154,7 +153,7 @@ pub async fn version(src: &PostgresConfigSource, json: bool) -> Result<Outcome, 
 /// trains skimming on the one line that must not be skimmed, and for a large diff
 /// scrolls the copy they actually approved out of view).
 async fn write_and_report(
-    src: &PostgresConfigSource,
+    src: &dyn ConfigStore,
     incoming: &RegistryConfig,
     current_v: u64,
     text: Option<&str>,
@@ -230,7 +229,7 @@ fn unresolved_chain_refs(
 }
 
 pub async fn push(
-    src: &PostgresConfigSource,
+    src: &dyn ConfigStore,
     scheduler: &dyn SchedulerStore,
     dir: &Path,
     gateway_config: Option<&Path>,
@@ -367,6 +366,7 @@ pub fn interactive_confirm(prompt: &str, r: &mut impl BufRead, w: &mut impl Writ
 mod tests {
     use super::*;
     use orchestrator_core::{Activation, SkillDef};
+    use orchestrator_store::postgres::PostgresConfigSource;
 
     fn skill(name: &str, body: &str) -> SkillDef {
         SkillDef {

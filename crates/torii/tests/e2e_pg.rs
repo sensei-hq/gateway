@@ -26,6 +26,7 @@ use orchestrator::test_support::{
     CallLog, FakeClock, gated_gateway, metered_gateway, recording_gateway,
 };
 use orchestrator::{Executor, Scheduler};
+use orchestrator_core::ConfigStore;
 use orchestrator_core::{
     ConfigSource, ContextKey, ContextStore, ExecutionJournal, GateOption, GateOutcome, GateSpec,
     Graph, JournalEvent, LoopBody, LoopGateOption, Node, NodeId, NodeKind, RegistryHandle, RunId,
