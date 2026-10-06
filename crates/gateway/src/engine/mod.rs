@@ -503,6 +503,31 @@ impl Gateway {
             .min()
     }
 
+    /// The WORST-CASE price of a chain: the component-wise maximum of every entry's
+    /// [`ModelPricing`](kernel::types::config::ModelPricing) — the largest
+    /// `input_per_1k`, the largest `output_per_1k`, and the largest `per_request` fee.
+    ///
+    /// Added for the AG-12 money clamp in the orchestrator, which must turn a run's
+    /// remaining micro-dollars into a `max_tokens` BEFORE selection, exactly as the
+    /// SP-DATA-5 token clamp does, and so cannot know which entry will serve. A bound
+    /// computed from the most expensive price on every axis is safe for whichever entry
+    /// wins — the same argument [`Self::min_max_output_tokens`] makes with its `min`.
+    /// The axes are maximised independently, so the composite may be dearer than any
+    /// single entry; that only biases the clamp toward asking for less.
+    ///
+    /// **`None` when ANY resolvable entry has `pricing: None`**, as well as for an
+    /// unknown chain or one with no resolvable models. `pricing: None` means "free" to
+    /// routing (it sorts first under `sort: price`), but to a money cap it means
+    /// "unmeasured": the gateway reports no `actual_cost` for such a call, so the cap
+    /// could not see what it spent. The caller fails closed on `None`; a genuinely free
+    /// model declares an explicit zero price, which this returns as `Some`.
+    pub async fn worst_case_pricing(
+        &self,
+        _chain: &str,
+    ) -> Option<kernel::types::config::ModelPricing> {
+        None
+    }
+
     /// Attach a readiness probe (the local engine's provisioning supervisor).
     /// Builder-style, mirroring [`Self::with_store`]. When set, chain exhaustion
     /// consults the probe and degrades a still-provisioning candidate to a
@@ -922,6 +947,78 @@ mod min_window_tests {
 
         assert_eq!(gw.min_max_output_tokens("c").await, Some(4_096));
         assert_eq!(gw.min_max_output_tokens("nope").await, None);
+    }
+
+    fn priced(
+        mut m: ModelConfig,
+        input_per_1k: f64,
+        output_per_1k: f64,
+        per_request: Option<f64>,
+    ) -> ModelConfig {
+        m.pricing = Some(kernel::types::config::ModelPricing {
+            input_per_1k,
+            output_per_1k,
+            per_request,
+        });
+        m
+    }
+
+    /// AG-12 — the money clamp's price is the chain's WORST case on every axis, because
+    /// it is applied before selection and must hold for whichever entry serves. The two
+    /// entries are dearer on DIFFERENT axes, so a fold that picked one whole entry (the
+    /// "most expensive model") would get one axis wrong and this assertion catches it.
+    #[tokio::test]
+    async fn worst_case_pricing_is_the_componentwise_maximum_of_the_chain() {
+        let gw = Gateway::new(
+            two_model_chain(
+                priced(model("a", 8_000), 1.0, 2.0, None),
+                priced(model("b", 8_000), 0.5, 3.0, Some(0.01)),
+            ),
+            AdapterRegistry::new(),
+            CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+        );
+        let p = gw
+            .worst_case_pricing("c")
+            .await
+            .expect("every entry is priced, so the chain is");
+        assert_eq!(
+            (p.input_per_1k, p.output_per_1k, p.per_request),
+            (1.0, 3.0, Some(0.01))
+        );
+        assert!(gw.worst_case_pricing("nope").await.is_none());
+    }
+
+    /// AG-12 — ONE unpriced entry makes the whole chain unpriced: the clamp cannot bound
+    /// a call that might land on a model whose spend the gateway will not report. An
+    /// explicit zero price is a price, and is returned.
+    #[tokio::test]
+    async fn an_unpriced_entry_makes_the_chain_unpriced_but_an_explicit_zero_does_not() {
+        let unpriced = Gateway::new(
+            two_model_chain(
+                priced(model("a", 8_000), 1.0, 2.0, None),
+                model("free", 8_000),
+            ),
+            AdapterRegistry::new(),
+            CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+        );
+        assert!(unpriced.worst_case_pricing("c").await.is_none());
+
+        let zero = Gateway::new(
+            two_model_chain(
+                priced(model("a", 8_000), 0.0, 0.0, None),
+                priced(model("b", 8_000), 0.0, 0.0, None),
+            ),
+            AdapterRegistry::new(),
+            CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+        );
+        let p = zero
+            .worst_case_pricing("c")
+            .await
+            .expect("an explicit zero price is a price");
+        assert_eq!(
+            (p.input_per_1k, p.output_per_1k, p.per_request),
+            (0.0, 0.0, None)
+        );
     }
 
     #[tokio::test]
