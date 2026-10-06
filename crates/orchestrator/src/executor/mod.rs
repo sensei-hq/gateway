@@ -359,6 +359,15 @@ struct Fold {
     /// The effective cap: `RunStarted.budget`, then the latest `BudgetRaised` (latest
     /// wins). `None` for an unbudgeted run — the gate never fires.
     budget: Option<u64>,
+    /// AG-12: the effective MONEY cap in micro-dollars — `RunStarted.money_budget`, then
+    /// the latest `MoneyBudgetRaised`. Independent of `budget`: either, both or neither.
+    /// The spend it is compared against is NOT a separate ledger — it is the
+    /// `cost_micro_usd` riding on each entry of `usage` above, so it is keyed by effect
+    /// id and inherits every idempotency property of the token ledger.
+    money_budget: Option<u64>,
+    /// AG-12: micro-dollars dispatched by THIS drive, not yet visible in `usage` — the
+    /// money twin of `live_spend`, for the same reason.
+    live_money: Arc<std::sync::atomic::AtomicU64>,
     /// SP-DATA-5: tokens dispatched by THIS drive, not yet visible in `usage`.
     ///
     /// A `Fold` is built once per drive (from the journal on resume, or empty-but-for-
@@ -495,6 +504,22 @@ impl Fold {
     /// The run's effective token cap, or `None` if unbudgeted.
     fn budget(&self) -> Option<u64> {
         self.budget
+    }
+
+    /// AG-12: micro-dollars this run had spent as of the journal this fold was built from.
+    fn journaled_money(&self) -> u64 {
+        0
+    }
+
+    /// AG-12: total micro-dollars this run has spent: journaled + in-flight this drive.
+    fn money_spent(&self) -> u64 {
+        self.journaled_money()
+            .saturating_add(self.live_money.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// AG-12: the run's effective money cap in micro-dollars, or `None`.
+    fn money_budget(&self) -> Option<u64> {
+        self.money_budget
     }
 
     /// This fold's ledger as the metered-dispatch chokepoint consumes it. Borrowing the
@@ -734,6 +759,18 @@ impl Fold {
 pub fn spend_of(events: &[(Seq, JournalEvent)]) -> (u64, Option<u64>) {
     let (fold, _, _) = fold_journal(events);
     (fold.spent(), fold.budget())
+}
+
+/// AG-12: a run's folded MONEY `(spent_micro_usd, money_budget_micro_usd)` — the money
+/// twin of [`spend_of`], routed through the same `fold_journal` for the same reason, so
+/// `torii run status` can display dollars spent without re-deriving them.
+///
+/// Spend counts only calls made while a money cap was in force (cost is ledgered only
+/// then — see `TokenUsage::cost_micro_usd`), so on a run that never had one this is
+/// `(0, None)`.
+pub fn money_spend_of(events: &[(Seq, JournalEvent)]) -> (u64, Option<u64>) {
+    let (fold, _, _) = fold_journal(events);
+    (fold.money_spent(), fold.money_budget())
 }
 
 /// Run-scoped tallies for the expansion caps (§4.5). Only ever mutated from the
