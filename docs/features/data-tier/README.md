@@ -2,25 +2,37 @@
 title: Data-tier — Module Reference
 doctype: module
 module: data-tier
-status: planned
+status: superseded
 ---
 
-# Data-tier
+# Data-tier — superseded: torii owns persistence
 
-A decoupled, user-agnostic subsystem — **extracted from torii** — that manages
-catalog metadata, refresh, and usage tracking over the DB-agnostic seam. Scoped
-to model / chain / flow / config management; torii's user / tenancy / governance
-stay in torii (tenancy made optional/injectable). Design §12.2 / SP-DATA (D12).
+The plan recorded here — a decoupled data-tier **extracted from torii** into the gateway for catalog
+metadata, refresh, metering and config management (SP-DATA Phase 4, design D12) — is **cancelled**.
+`sensei-hq/torii` `docs/DECISIONS.md` §11 (ratified 2026-09-17):
 
-## Status
+> *Gateway will always be a library, but torii will be the web interface and the persistence. Moving
+> these to gateway will break its usage as a library.*
 
-| Feature | Status | Source | Notes |
-|---|---|---|---|
-| [Catalog control-plane](catalog-control-plane.md) | Planned (Phase 4 · SP-DATA) | torii `catalog`/`config` schemas | schema + import/loader + config versioning |
-| [Management API](management-api.md) | Planned (Phase 4 · SP-DATA) | new (CLI + API) | configure catalog; observe usage/lockouts/expirations |
-| [Metering store](metering-store.md) | Planned (Phase 4 · SP-DATA) | torii `metering` schema | usage counters + reset windows + predicted lockout |
+## Who owns what
 
-## Notes
+| | Gateway (this repo — a library) | Torii (`sensei-hq/torii` — the product) |
+|---|---|---|
+| Routing engine, adapters, health gates, catalog **types** + pure `assemble()` | ✓ | consumes |
+| Persistence **traits** (`GatewayStore`, the orchestrator store traits, a future catalog/metering seam) | ✓ | implements |
+| In-memory implementations (tests, development, embedding) | ✓ | — |
+| Every Postgres schema, migration, tenancy, RLS | — | ✓ |
+| Catalog / config / metering **data**, registry content, staging, versioning, publish | — | ✓ |
+| The operator CLI/worker (today `crates/torii` here) | moving out | ✓ |
 
-- Wraps the pure DB-agnostic seam (`GatewayStore`/`VaultStore`-style); shared `catalog.*`/`keyvault.*` schema across the sensei-hq family.
-- The pure gateway core stays stateless; all stateful tracking lives here.
+The move is tracked by the epic [sensei-hq/gateway#76](https://github.com/sensei-hq/gateway/issues/76)
+(TM-1…TM-9): the gateway makes its seams movable, torii implements them over a tenant-scoped schema
+and takes the CLI, then the gateway deletes its Postgres adapters, `database/` and `crates/torii`.
+
+## The original pages (historical)
+
+| Page | Was | Now |
+|---|---|---|
+| [Catalog control-plane](catalog-control-plane.md) | Planned (Phase 4 · SP-DATA) | torii — `catalog` / `config` schemas, `config_loader.rs` |
+| [Management API](management-api.md) | Planned (Phase 4 · SP-DATA) | torii — its admin surface |
+| [Metering store](metering-store.md) | Planned (Phase 4 · SP-DATA) | torii — `metering` schema |
