@@ -23,8 +23,8 @@
 ##   in lockstep). The current version is read from crates/gateway/Cargo.toml —
 ##   that is the single source of truth.
 
-.PHONY: help build test test-fast fmt fmt-check clippy lint cov cov-html \
-        check bump release clean hooks
+.PHONY: help build test test-fast fmt fmt-check clippy lint cov cov-check cov-html \
+        check bump release clean sweep hooks
 
 # Single source of truth: the [package] version of the gateway crate.
 VERSION := $(shell grep -m1 '^version = ' crates/gateway/Cargo.toml | sed -E 's/version = "(.*)"/\1/')
@@ -78,11 +78,16 @@ hooks: ## Install the tracked git pre-commit hook (fmt-check + clippy)
 # flags and need a C/C++ toolchain, so coverage targets the gateway crate — the
 # routing engine and provider adapters that carry the testable logic.
 
-cov: ## Print a per-file coverage summary for the gateway crate
-	cargo llvm-cov -p sensei-gateway --summary-only
+# `cov` / `cov-check` reclaim their instrumented build afterwards (a separate, rarely-reused
+# target tree) while keeping the command's own exit status. `cov-html` does NOT: it would delete
+# the report it just opened — run `make clean` when done reading it.
+cov: ## Print a per-file coverage summary for the gateway crate (then reclaims the coverage build)
+	@ok=0; cargo llvm-cov -p sensei-gateway --summary-only || ok=$$?; \
+	 cargo llvm-cov clean >/dev/null 2>&1 || true; exit $$ok
 
-cov-check: ## Fail if gateway line coverage drops below 80% (the CI gate)
-	cargo llvm-cov -p sensei-gateway --summary-only --fail-under-lines 80
+cov-check: ## Fail if gateway line coverage drops below 80% (the CI gate; reclaims afterwards)
+	@ok=0; cargo llvm-cov -p sensei-gateway --summary-only --fail-under-lines 80 || ok=$$?; \
+	 cargo llvm-cov clean >/dev/null 2>&1 || true; exit $$ok
 
 cov-html: ## Generate + open an HTML coverage report for the gateway crate
 	cargo llvm-cov -p sensei-gateway --html --open
@@ -169,7 +174,27 @@ bump: ## Bump version, commit, tag, push (v=patch|minor|major|<version>)
 	@$(MAKE) clean
 	@echo "Pushed v$(_v). Re-pin the gateway / local-providers / local-engine git dep in sensei to tag v$(_v)."
 
-# ── Clean ─────────────────────────────────────────────────────────────────────
+# ── Clean / disk ──────────────────────────────────────────────────────────────
+# target/ is what fills the disk (it reached 26 GB here after two releases cut by hand rather
+# than through `make bump`, which reclaims). `bump` runs `clean` after the tag is pushed; a
+# release done any other way must end with `make clean` too. `sweep` is the day-to-day tool: it
+# prunes stale artifacts while keeping the current working set warm, where `clean` forces a
+# full rebuild.
 
-clean: ## Remove the Cargo target/ directory
-	cargo clean
+clean: ## Reclaim disk: remove target/ and report the MB actually freed
+	@before=$$(du -sk target 2>/dev/null | awk '{print $$1}'); before=$${before:-0}; \
+	 cargo clean; \
+	 echo "target/ cleaned — $$(( before / 1024 )) MB reclaimed; the next build recompiles."
+
+sweep: ## Prune STALE Rust artifacts (other toolchains, >14d untouched), keeping the build warm
+	@if ! command -v cargo-sweep >/dev/null 2>&1; then \
+	  echo "cargo-sweep not installed. Install it with:"; \
+	  echo "  cargo install cargo-sweep"; \
+	  echo "Or run 'make clean' to wipe target/ entirely (forces a full rebuild)."; \
+	  exit 1; \
+	fi
+	@before=$$(du -sk target 2>/dev/null | awk '{print $$1}'); before=$${before:-0}; \
+	 cargo sweep --installed; \
+	 cargo sweep --time 14; \
+	 after=$$(du -sk target 2>/dev/null | awk '{print $$1}'); after=$${after:-0}; \
+	 echo "Swept — $$(( (before - after) / 1024 )) MB reclaimed, current working set kept warm."
