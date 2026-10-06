@@ -10,7 +10,7 @@ source: data-tier (torii config_versions)
 
 # Config Versioning
 
-> **Status: Planned (Phase 4 · SP-DATA).** Reuses torii's `config_versions` + `bump_config_version`.
+> **Status: torii owns it** (DECISIONS §11) — torii's `config_versions` + `bump_config_version` (per tenant) version the catalog. The orchestrator's registry generation (SP-DATA-2, `orchestrator.config_versions`) is built but moves to torii with the Postgres stores (epic #76, TM-6).
 
 A monotonically-increasing config version stamped whenever the catalog changes.
 Consumers pin the version they assembled from; the orchestrator's durable replay

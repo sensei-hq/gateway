@@ -1,0 +1,20 @@
+[package]
+name = "sensei-orchestrator-testkit"
+version = "0.9.0"
+edition = "2024"
+description = "Store conformance suite for the sensei orchestrator's persistence traits — the contract every backend (in-memory, Postgres, torii's tenant-scoped stores) must keep"
+license = "MIT"
+
+[lib]
+name = "orchestrator_testkit"
+
+[dependencies]
+orchestrator-core = { package = "sensei-orchestrator-core", path = "../orchestrator-core" }
+chrono = "0.4"
+serde = "1"
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+orchestrator-store = { package = "sensei-orchestrator-store", path = "../orchestrator-store" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

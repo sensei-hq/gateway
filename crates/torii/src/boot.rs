@@ -10,17 +10,26 @@ use orchestrator::agent::tools::{
     FsReadTool, FsWriteReconciler, FsWriteTool, ReconcileRegistry, ShellTool, ToolRegistry,
 };
 use orchestrator::{Executor, Scheduler};
-use orchestrator_core::{Clock, PatternRedactor, RegistryHandle, RulePlannerSelector, SystemClock};
+use orchestrator_core::{
+    Clock, ConfigSource, ConfigStore, ContentStore, ContextStore, ExecutionJournal,
+    PatternRedactor, RegistryHandle, RulePlannerSelector, SchedulerStore, SystemClock,
+};
 use orchestrator_store::postgres::{
     PostgresConfigSource, PostgresContentStore, PostgresContextStore, PostgresJournal,
     PostgresSchedulerStore, connect_with_max,
 };
-use std::path::Path;
+use orchestrator_store::{
+    FilesystemConfigSource, InMemoryConfigStore, InMemoryContentStore, InMemoryContextStore,
+    InMemoryJournal, InMemorySchedulerStore,
+};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub const ENV_DATABASE_URL: &str = "DATABASE_URL";
 pub const ENV_FENCE_VERSION: &str = "TORII_FENCE_VERSION";
 pub const ENV_POOL_SIZE: &str = "TORII_POOL_SIZE";
+pub const ENV_BACKEND: &str = "TORII_BACKEND";
+pub const ENV_REGISTRY_DIR: &str = "TORII_REGISTRY_DIR";
 
 /// [`connect_with_max`]'s own default, restated here as the fallback when
 /// `TORII_POOL_SIZE` is unset — see that function's doc comment for why 8.
@@ -37,10 +46,23 @@ const DEFAULT_POOL_SIZE: u32 = 8;
 /// certain-mistake without trying to enforce a capacity policy this code cannot know.
 const MAX_POOL_SIZE: u32 = 1000;
 
-/// The validated environment. `fence_version` is only required by the heavy tier.
+/// Where every store lives (TM-5, gateway#81). Chosen by `TORII_BACKEND`.
+#[derive(PartialEq)]
+pub enum Backend {
+    /// The default: one Postgres pool behind every store. Needs `DATABASE_URL`.
+    Postgres { database_url: String },
+    /// Every store in this process's memory — no database at all. For development and
+    /// tests: nothing survives the process, so a run submitted here can be observed or
+    /// woken only by the same process. The registry is seeded at boot from
+    /// `TORII_REGISTRY_DIR` (the same `agents/ skills/ tools/` layout `config push` reads).
+    Memory { registry_dir: Option<PathBuf> },
+}
+
+/// The validated environment. `fence_version` is only required by the heavy tier;
+/// `pool_size` only by the Postgres backend.
 #[derive(PartialEq)]
 pub struct EnvConfig {
-    pub database_url: String,
+    pub backend: Backend,
     pub fence_version: Option<String>,
     pub pool_size: u32,
 }
@@ -52,8 +74,12 @@ pub struct EnvConfig {
 /// sure it never prints the secret.
 impl std::fmt::Debug for EnvConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let backend = match &self.backend {
+            Backend::Postgres { database_url } => format!("postgres({})", redact_url(database_url)),
+            Backend::Memory { registry_dir } => format!("memory({registry_dir:?})"),
+        };
         f.debug_struct("EnvConfig")
-            .field("database_url", &redact_url(&self.database_url))
+            .field("backend", &backend)
             .field("fence_version", &self.fence_version)
             .field("pool_size", &self.pool_size)
             .finish()
@@ -89,25 +115,41 @@ fn parse_pool_size(s: &str) -> Result<u32, String> {
 /// Validate the environment through an injected getter, so tests never mutate
 /// process env (which is `unsafe` in edition 2024 and racy across parallel tests).
 pub fn env_config_from(get: impl Fn(&str) -> Option<String>) -> Result<EnvConfig, CliError> {
-    let database_url = get(ENV_DATABASE_URL)
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| {
-            CliError::error(format!(
-                "{ENV_DATABASE_URL} is not set.\n\
-                 torii reads the Postgres connection string from the environment only — a flag \
-                 would put the password in `ps` output and shell history."
-            ))
-        })?;
+    let non_empty = |k: &str| get(k).filter(|s| !s.trim().is_empty());
+    let backend = match non_empty(ENV_BACKEND).map(|s| s.trim().to_ascii_lowercase()) {
+        None => postgres_backend(&non_empty)?,
+        Some(b) if b == "postgres" => postgres_backend(&non_empty)?,
+        Some(b) if b == "memory" => Backend::Memory {
+            registry_dir: non_empty(ENV_REGISTRY_DIR).map(PathBuf::from),
+        },
+        Some(other) => {
+            return Err(CliError::error(format!(
+                "unknown {ENV_BACKEND} {other:?}: expected `postgres` (the default) or `memory`"
+            )));
+        }
+    };
     let fence_version = get(ENV_FENCE_VERSION).filter(|s| !s.trim().is_empty());
     let pool_size = match get(ENV_POOL_SIZE).filter(|s| !s.trim().is_empty()) {
         Some(raw) => parse_pool_size(&raw).map_err(CliError::error)?,
         None => DEFAULT_POOL_SIZE,
     };
     Ok(EnvConfig {
-        database_url,
+        backend,
         fence_version,
         pool_size,
     })
+}
+
+fn postgres_backend(non_empty: &impl Fn(&str) -> Option<String>) -> Result<Backend, CliError> {
+    let database_url = non_empty(ENV_DATABASE_URL).ok_or_else(|| {
+        CliError::error(format!(
+            "{ENV_DATABASE_URL} is not set.\n\
+             torii reads the Postgres connection string from the environment only — a flag \
+             would put the password in `ps` output and shell history. (For a run with no \
+             database at all, set {ENV_BACKEND}=memory.)"
+        ))
+    })?;
+    Ok(Backend::Postgres { database_url })
 }
 
 pub fn env_config() -> Result<EnvConfig, CliError> {
@@ -180,6 +222,99 @@ fn connect_failure(database_url: &str, err: &str) -> String {
     )
 }
 
+/// Where the heavy tier gets its [`GatewayConfig`](kernel::types::config::GatewayConfig) — the
+/// routers, models and chains (TM-4, gateway#80). Boot consumes this seam instead of reading a
+/// file itself, so the same boot runs against a JSON file (the gateway CLI's
+/// `--gateway-config`) or, after the move to torii, torii's own `catalog` schema.
+#[async_trait::async_trait]
+pub trait GatewayConfigSource: Send + Sync {
+    /// Load and parse the whole config. Errors must never echo its contents: it holds
+    /// provider API keys.
+    async fn load(&self) -> Result<kernel::types::config::GatewayConfig, CliError>;
+    /// Names the source in operator messages (a path, a database) — never its contents.
+    fn describe(&self) -> String;
+}
+
+/// The `--gateway-config <file>` source: a JSON `GatewayConfig`.
+pub struct FileGatewayConfigSource {
+    path: PathBuf,
+}
+
+impl FileGatewayConfigSource {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+#[async_trait::async_trait]
+impl GatewayConfigSource for FileGatewayConfigSource {
+    async fn load(&self) -> Result<kernel::types::config::GatewayConfig, CliError> {
+        // The file holds provider API keys: report its PATH on failure, never its contents.
+        let raw = std::fs::read_to_string(&self.path)
+            .map_err(|e| CliError::error(format!("cannot read {}: {e}", self.path.display())))?;
+        serde_json::from_str(&raw).map_err(|e| gateway_config_parse_error(&self.path, &e))
+    }
+    fn describe(&self) -> String {
+        self.path.display().to_string()
+    }
+}
+
+/// Every chain id the registry references — agent `chain`, per-phase `chains`, `(area, kind)`
+/// bindings — that the gateway config does not define, attributed to who referenced it.
+/// Shared by `config push --gateway-config` (push time) and the heavy tier (boot time).
+pub(crate) fn unresolved_chain_refs<'a>(
+    agents: impl Iterator<Item = &'a orchestrator_core::AgentDefinition>,
+    bindings: impl Iterator<Item = (&'a str, &'a str, &'a str)>,
+    chains: &std::collections::HashMap<String, kernel::types::config::FallbackChainConfig>,
+) -> Vec<(String, String)> {
+    let mut out = std::collections::BTreeSet::new();
+    for a in agents {
+        if let Some(c) = &a.chain
+            && !chains.contains_key(c)
+        {
+            out.insert((format!("agent {:?}", a.name), c.clone()));
+        }
+        // Per-phase overrides too: a check that walks only `agent.chain` passes every obvious
+        // test while missing the collection a real config is most likely to drift in.
+        for (phase, c) in &a.chains {
+            if !chains.contains_key(c) {
+                out.insert((format!("agent {:?} phase {:?}", a.name, phase), c.clone()));
+            }
+        }
+    }
+    for (area, kind, c) in bindings {
+        if !chains.contains_key(c) {
+            out.insert((format!("chain binding {area:?}/{kind:?}"), c.to_string()));
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// The always-on boot check (TM-4): a registry bound to a chain the gateway config does not
+/// define refuses to boot, naming every missing id and who referenced it. Without it the
+/// mismatch surfaces only at run time, as an empty candidate set and a terminal `NodeFailed`
+/// naming neither the cause nor the remedy.
+pub(crate) fn require_chains_resolve(
+    registry: &orchestrator_core::Registry,
+    gw: &kernel::types::config::GatewayConfig,
+    source: &str,
+) -> Result<(), CliError> {
+    let missing = unresolved_chain_refs(registry.agents(), registry.chain_bindings(), &gw.chains);
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let list = missing
+        .iter()
+        .map(|(who, chain)| format!("{who} → chain {chain:?}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(CliError::error(format!(
+        "the registry references chains the gateway config ({source}) does not define: {list}. \
+         Every run reaching one of them would fail with no candidates. Add the chains to the \
+         gateway config, or push a registry that uses ones it defines."
+    )))
+}
+
 /// A gateway-config parse failure reports the serde error's LOCATION ONLY — never its
 /// `Display`, which echoes the offending VALUE (`invalid type: string "sk-live-…",
 /// expected struct RouterConfig`). This file is the one that holds provider API keys, and
@@ -240,7 +375,7 @@ pub fn init_tracing() {
 fn require_adapters(
     registered: &[String],
     configured_routers: &[String],
-    gateway_config: &Path,
+    gateway_config: &str,
 ) -> Result<(), CliError> {
     if registered.is_empty() {
         let detail = if configured_routers.is_empty() {
@@ -255,9 +390,8 @@ fn require_adapters(
             )
         };
         return Err(CliError::error(format!(
-            "{} registered no provider adapters: {detail}. Every model call would fail, and a \
-             worker would terminally fail every run it wakes.",
-            gateway_config.display()
+            "{gateway_config} registered no provider adapters: {detail}. Every model call would \
+             fail, and a worker would terminally fail every run it wakes."
         )));
     }
     Ok(())
@@ -297,29 +431,65 @@ fn require_agents(
 /// operator must be able to inspect AND raise a run's budget on a box with no
 /// model credentials.
 pub struct LightDeps {
-    pub scheduler_store: Arc<PostgresSchedulerStore>,
-    pub journal: Arc<PostgresJournal>,
-    pub config_source: PostgresConfigSource,
+    pub scheduler_store: Arc<dyn SchedulerStore>,
+    pub journal: Arc<dyn ExecutionJournal>,
+    pub config_source: Arc<dyn ConfigStore>,
 }
 
-/// The light tier over an ALREADY-connected pool. Split out so `heavy()` can
-/// share its ONE pool with the light-tier adapters instead of opening a second
-/// one — `light()` below keeps its own single-connect path for standalone
-/// light-tier commands (`run status`, `config diff`, …), which never call
-/// `heavy()` at all.
-fn light_from_pool(pool: sqlx::PgPool) -> LightDeps {
-    LightDeps {
-        scheduler_store: Arc::new(PostgresSchedulerStore::new(pool.clone())),
-        journal: Arc::new(PostgresJournal::new(pool.clone())),
-        config_source: PostgresConfigSource::new(pool),
+/// Every store one backend provides — the light tier's three plus the heavy tier's CAS and
+/// blackboard — built in ONE place, so no tier names a backend type (TM-5).
+struct Stores {
+    light: LightDeps,
+    content: Arc<dyn ContentStore>,
+    context: Arc<dyn ContextStore>,
+}
+
+async fn open_stores(env: &EnvConfig) -> Result<Stores, CliError> {
+    match &env.backend {
+        Backend::Postgres { database_url } => {
+            // ONE pool for every store: cloning a `PgPool` is an `Arc::clone`, not a new
+            // connection, so the whole process is capped at `TORII_POOL_SIZE` connections
+            // (see `connect_with_max`'s doc comment for why 8 is the default).
+            let pool = connect_with_max(database_url, env.pool_size)
+                .await
+                .map_err(|e| CliError::error(connect_failure(database_url, &e.to_string())))?;
+            Ok(Stores {
+                light: LightDeps {
+                    scheduler_store: Arc::new(PostgresSchedulerStore::new(pool.clone())),
+                    journal: Arc::new(PostgresJournal::new(pool.clone())),
+                    config_source: Arc::new(PostgresConfigSource::new(pool.clone())),
+                },
+                content: Arc::new(PostgresContentStore::new(pool.clone())),
+                context: Arc::new(PostgresContextStore::new(pool)),
+            })
+        }
+        Backend::Memory { registry_dir } => {
+            let config = InMemoryConfigStore::new();
+            if let Some(dir) = registry_dir {
+                let cfg = FilesystemConfigSource::new(dir).load().await.map_err(|e| {
+                    CliError::error(format!(
+                        "{ENV_REGISTRY_DIR}={}: cannot load the registry: {e}",
+                        dir.display()
+                    ))
+                })?;
+                config.store_and_bump(&cfg).await?;
+            }
+            let content: Arc<dyn ContentStore> = Arc::new(InMemoryContentStore::new());
+            Ok(Stores {
+                light: LightDeps {
+                    scheduler_store: Arc::new(InMemorySchedulerStore::new()),
+                    journal: Arc::new(InMemoryJournal::default()),
+                    config_source: Arc::new(config),
+                },
+                context: Arc::new(InMemoryContextStore::new(content.clone())),
+                content,
+            })
+        }
     }
 }
 
 pub async fn light(env: &EnvConfig) -> Result<LightDeps, CliError> {
-    let pool = connect_with_max(&env.database_url, env.pool_size)
-        .await
-        .map_err(|e| CliError::error(connect_failure(&env.database_url, &e.to_string())))?;
-    Ok(light_from_pool(pool))
+    Ok(open_stores(env).await?.light)
 }
 
 /// Heavy tier: a full Executor behind a Scheduler. Adds the gateway config file
@@ -337,40 +507,30 @@ pub struct HeavyDeps {
 
 pub async fn heavy(
     env: &EnvConfig,
-    gateway_config: &Path,
+    gateway_config: &dyn GatewayConfigSource,
     workspace_root: Option<&Path>,
 ) -> Result<HeavyDeps, CliError> {
     let fence = require_fence(env)?.to_string();
 
-    // Read + parse the gateway config file FIRST (pure, no network): the most
-    // likely operator typo — a bad `--gateway-config` path — is caught instantly
-    // instead of only after a TCP connect and auth handshake. The file holds
-    // provider API keys: report its PATH on failure, never its contents.
-    let raw = std::fs::read_to_string(gateway_config)
-        .map_err(|e| CliError::error(format!("cannot read {}: {e}", gateway_config.display())))?;
-    let gw_config: kernel::types::config::GatewayConfig =
-        serde_json::from_str(&raw).map_err(|e| gateway_config_parse_error(gateway_config, &e))?;
+    // Load the gateway config FIRST: for a file source that is pure and offline, so the most
+    // likely operator typo — a bad `--gateway-config` path — is caught instantly instead of
+    // only after a TCP connect and auth handshake.
+    let gw_config = gateway_config.load().await?;
+    let gw_source = gateway_config.describe();
 
-    // ONE shared pool for the whole heavy tier: `PgPool` is `Pool<DB>(Arc<PoolInner>)`,
-    // so cloning it is an `Arc::clone`, not a new connection. One `connect_with_max()`
-    // + N clones caps the whole tier at its single `max_connections(env.pool_size)`;
-    // four separate `connect()` calls (this function's original shape) would each
-    // hold their own, up to 4x as many backends per worker process. Tradeoff: the
-    // four Postgres adapters contend over `env.pool_size` connections total instead
-    // of that many each — with the executor's default concurrency of 8 and
-    // short-lived journal/CAS acquires, the default of 8 should be fine for most
-    // workers. If it ever isn't, the lever is `TORII_POOL_SIZE` (see
-    // `env_config_from` / `orchestrator_store::postgres::connect`'s doc comment for
-    // why 8 was the original default and what a shared-pool worker should weigh).
-    let url = &env.database_url;
-    let pool = connect_with_max(url, env.pool_size)
-        .await
-        .map_err(|e| CliError::error(connect_failure(url, &e.to_string())))?;
-    let light = light_from_pool(pool.clone());
+    // Every store from ONE backend (TM-5): for Postgres, one shared pool; for memory, this
+    // process's heap. The journal the Executor writes is the SAME one the Scheduler reads, so
+    // `tick`'s pause-deadline read sees what `run` wrote.
+    let Stores {
+        light,
+        content,
+        context,
+    } = open_stores(env).await?;
 
     // One atomic (config, generation) read — the fence generation must match the
     // config it was computed from.
-    let handle = RegistryHandle::from_source(&light.config_source).await?;
+    let handle =
+        RegistryHandle::from_source(light.config_source.as_ref() as &dyn ConfigSource).await?;
     // `snapshot()`, not `.current()` + `.generation()` as two separate lock
     // acquisitions: those release the lock in between, which is exactly the torn
     // -read shape SP-DATA-2 eliminated. Not reachable today (boot is sequential
@@ -388,6 +548,9 @@ pub async fn heavy(
         "registry loaded"
     );
     require_agents(agents_n, skills_n, tools_n, generation)?;
+    // TM-4: always on — a registry bound to a chain this gateway config lacks refuses to
+    // boot, rather than failing every run that reaches the chain.
+    require_chains_resolve(&registry, &gw_config, &gw_source)?;
 
     // `Gateway::new` is the low-level, hand-wired constructor (an empty adapter
     // registry). `FacadeBuilder` is the composition root that actually registers a
@@ -400,19 +563,8 @@ pub async fn heavy(
     let builder = gateway::FacadeBuilder::new(gw_config);
     let registered = builder.registry().clone();
     let facade = builder.build().await;
-    require_adapters(
-        &registered.list().await,
-        &configured_routers,
-        gateway_config,
-    )?;
+    require_adapters(&registered.list().await, &configured_routers, &gw_source)?;
     let gateway = Arc::new(facade.gateway);
-
-    // SP-DATA-5 Task 5: reuse `light.journal` rather than opening a second
-    // `PostgresJournal` over another pool clone — `light_from_pool` already built
-    // one over this exact pool, and the Scheduler needs the SAME journal the
-    // Executor writes to (so `tick`'s pause-deadline read sees what `run` wrote).
-    let content = Arc::new(PostgresContentStore::new(pool.clone()));
-    let context = Arc::new(PostgresContextStore::new(pool));
 
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let mut executor = Executor::new(gateway, light.journal.clone(), fence)
@@ -504,11 +656,19 @@ pub async fn heavy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orchestrator_core::ConfigStore;
     // Only this probe test connects unconditionally (production code goes through
     // `connect_with_max` so `env.pool_size` is honored) — imported here, not at module
     // scope, so a non-test build of this lib (linked into `main.rs`) doesn't carry an
     // unused import.
     use orchestrator_store::postgres::connect;
+
+    fn pg_url(e: &EnvConfig) -> &str {
+        match &e.backend {
+            Backend::Postgres { database_url } => database_url,
+            Backend::Memory { .. } => panic!("expected the postgres backend"),
+        }
+    }
 
     fn getter<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |k| {
@@ -517,6 +677,50 @@ mod tests {
                 .find(|(key, _)| *key == k)
                 .map(|(_, v)| v.to_string())
         }
+    }
+
+    /// TM-5: the memory backend needs no DATABASE_URL, and takes its registry dir.
+    #[test]
+    fn the_memory_backend_needs_no_database_url_and_reads_its_registry_dir() {
+        let e = env_config_from(getter(&[(ENV_BACKEND, "memory")])).expect("memory boots bare");
+        assert!(matches!(e.backend, Backend::Memory { registry_dir: None }));
+        let e = env_config_from(getter(&[
+            (ENV_BACKEND, " Memory "),
+            (ENV_REGISTRY_DIR, "/tmp/reg"),
+            (ENV_DATABASE_URL, "postgres://ignored"),
+        ]))
+        .expect("ok");
+        assert!(
+            matches!(&e.backend, Backend::Memory { registry_dir: Some(d) } if d == &PathBuf::from("/tmp/reg")),
+            "case-insensitive, trimmed, and DATABASE_URL does not override the choice"
+        );
+    }
+
+    /// TM-5: an explicit `postgres` is the default backend, and still needs DATABASE_URL;
+    /// anything else is refused naming the choices.
+    #[test]
+    fn the_backend_choice_is_explicit_and_validated() {
+        let e = env_config_from(getter(&[
+            (ENV_BACKEND, "postgres"),
+            (ENV_DATABASE_URL, "postgres://h/db"),
+        ]))
+        .expect("ok");
+        assert_eq!(pg_url(&e), "postgres://h/db");
+        assert!(env_config_from(getter(&[(ENV_BACKEND, "postgres")])).is_err());
+        let err = env_config_from(getter(&[(ENV_BACKEND, "sqlite")])).expect_err("unknown");
+        assert!(
+            err.message.contains("sqlite") && err.message.contains("memory"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// The Debug impl still never prints a database password, now through the backend.
+    #[test]
+    fn env_config_debug_redacts_the_postgres_password() {
+        let e =
+            env_config_from(getter(&[(ENV_DATABASE_URL, "postgres://u:hunter2@h/db")])).unwrap();
+        assert!(!format!("{e:?}").contains("hunter2"), "{e:?}");
     }
 
     #[test]
@@ -529,7 +733,7 @@ mod tests {
     #[test]
     fn the_light_tier_needs_only_a_database_url() {
         let e = env_config_from(getter(&[(ENV_DATABASE_URL, "postgres://h/db")])).expect("ok");
-        assert_eq!(e.database_url, "postgres://h/db");
+        assert_eq!(pg_url(&e), "postgres://h/db");
         assert_eq!(e.fence_version, None);
     }
 
@@ -647,7 +851,7 @@ mod tests {
         let url = format!("postgres://u:{pw}@h:5432/db");
         let e = env_config_from(getter(&[(ENV_DATABASE_URL, &url)])).expect("ok");
         // The redaction helper is what every message uses.
-        assert!(!redact_url(&e.database_url).contains(&pw));
+        assert!(!redact_url(pg_url(&e)).contains(&pw));
     }
 
     /// FIX 6: `{:?}` on `EnvConfig` must never print the plaintext password —
@@ -752,13 +956,129 @@ mod tests {
         );
     }
 
+    fn chain(id: &str) -> kernel::types::config::FallbackChainConfig {
+        kernel::types::config::FallbackChainConfig {
+            id: id.into(),
+            capability: kernel::types::capability::Capability::TextChat,
+            models: vec![],
+            fallback_triggers: vec![],
+        }
+    }
+
+    fn registry_with(
+        agent_chain: &str,
+        phase_chain: &str,
+        binding_chain: &str,
+    ) -> orchestrator_core::Registry {
+        let cfg: orchestrator_core::RegistryConfig = serde_json::from_value(serde_json::json!({
+            "agents": [{
+                "name": "researcher", "area": "research", "kind": "lead",
+                "chain": agent_chain, "chains": {"draft": phase_chain},
+                "tools": [], "skills": [], "system_prompt": "x"
+            }],
+            "skills": [], "tools": [],
+            "chain_bindings": [{"area": "research", "kind": "worker", "chain": binding_chain}]
+        }))
+        .expect("registry config");
+        orchestrator_core::Registry::from_config(cfg).expect("registry")
+    }
+
+    fn gw_with(chains: &[&str]) -> kernel::types::config::GatewayConfig {
+        kernel::types::config::GatewayConfig {
+            chains: chains.iter().map(|c| (c.to_string(), chain(c))).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// TM-4: the boot check is ALWAYS on. A registry whose chains all resolve boots.
+    #[test]
+    fn boot_accepts_a_registry_whose_chains_all_resolve() {
+        let reg = registry_with("deep", "fast", "cheap");
+        assert!(
+            require_chains_resolve(&reg, &gw_with(&["deep", "fast", "cheap"]), "gw.json").is_ok()
+        );
+    }
+
+    /// TM-4: a registry bound to a chain the gateway does not define refuses to boot, naming
+    /// every missing id AND who referenced it — agent, per-phase override, and binding.
+    #[test]
+    fn boot_refuses_a_registry_bound_to_chains_the_gateway_lacks() {
+        let reg = registry_with("deep", "nope-phase", "nope-binding");
+        let err = require_chains_resolve(&reg, &gw_with(&["deep"]), "gw.json")
+            .expect_err("unresolved chains must refuse to boot");
+        for needle in [
+            "nope-phase",
+            "nope-binding",
+            "agent \"researcher\" phase \"draft\"",
+            "chain binding \"research\"/\"worker\"",
+            "gw.json",
+        ] {
+            assert!(
+                err.message.contains(needle),
+                "missing {needle:?} in: {}",
+                err.message
+            );
+        }
+        assert!(
+            !err.message.contains("\"deep\""),
+            "a resolved chain is not reported: {}",
+            err.message
+        );
+    }
+
+    /// TM-4: the file source parses a JSON GatewayConfig and names itself by path.
+    #[tokio::test]
+    async fn the_file_gateway_config_source_loads_and_describes_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gw.json");
+        std::fs::write(
+            &path,
+            r#"{"routers":{"ollama":{"url":"http://127.0.0.1:11434"}}}"#,
+        )
+        .unwrap();
+        let src = FileGatewayConfigSource::new(&path);
+        let gw = src.load().await.expect("a valid file loads");
+        assert!(gw.routers.contains_key("ollama"));
+        assert!(src.describe().contains("gw.json"), "{}", src.describe());
+    }
+
+    /// TM-4: the file source keeps boot's existing error contract — a missing file names the
+    /// path; a bad file names the path and location but NEVER echoes a value (it holds keys).
+    #[tokio::test]
+    async fn the_file_gateway_config_source_errors_name_the_path_never_the_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = FileGatewayConfigSource::new(dir.path().join("absent.json"));
+        let err = missing
+            .load()
+            .await
+            .expect_err("a missing file is an error");
+        assert!(err.message.contains("absent.json"), "{}", err.message);
+
+        let key = "sk-live-NEVER-PRINT-ME";
+        let bad = dir.path().join("bad.json");
+        std::fs::write(&bad, format!(r#"{{"routers":{{"openai":"{key}"}}}}"#)).unwrap();
+        let err = FileGatewayConfigSource::new(&bad)
+            .load()
+            .await
+            .expect_err("a string where a router belongs does not parse");
+        assert!(
+            !err.message.contains(key),
+            "the key must never reach stderr: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("bad.json") && err.message.contains("line 1"),
+            "{}",
+            err.message
+        );
+    }
+
     /// FIX 1: `FacadeBuilder::build` never fails on a bad router — this is the only
     /// place a completely misconfigured gateway is caught. No live provider needed:
     /// the check is pure over the already-registered adapter ids.
     #[test]
     fn heavy_refuses_a_gateway_config_that_registered_no_adapters() {
-        let err =
-            require_adapters(&[], &[], Path::new("/tmp/gateway.json")).expect_err("must refuse");
+        let err = require_adapters(&[], &[], "/tmp/gateway.json").expect_err("must refuse");
         assert_eq!(err.code, crate::errors::EXIT_ERROR);
         assert!(err.message.contains("gateway.json"), "{}", err.message);
         assert!(
@@ -779,12 +1099,8 @@ mod tests {
     /// operator's names and keys may already be correct for a case torii can't wire.
     #[test]
     fn heavy_names_the_configured_routers_that_produced_no_adapter() {
-        let err = require_adapters(
-            &[],
-            &["bedrock".to_string()],
-            Path::new("/tmp/gateway.json"),
-        )
-        .expect_err("must refuse");
+        let err = require_adapters(&[], &["bedrock".to_string()], "/tmp/gateway.json")
+            .expect_err("must refuse");
         assert!(
             err.message.contains("bedrock"),
             "must name the skipped router: {}",
@@ -797,7 +1113,7 @@ mod tests {
         require_adapters(
             &["anthropic".to_string()],
             &["anthropic".to_string()],
-            Path::new("/tmp/gateway.json"),
+            "/tmp/gateway.json",
         )
         .expect("at least one adapter is enough");
     }
@@ -861,6 +1177,64 @@ mod tests {
     /// seed away between the write and `heavy()`'s read. `config_guard` now
     /// serializes every durable-config writer in this crate, which closes that
     /// race at the source; the retry below is kept as the backstop for any
+    /// TM-4 at the boot path: `heavy()` itself refuses a registry bound to a chain the
+    /// gateway config does not define, naming the chain — the unit tests prove the check,
+    /// this proves `heavy()` runs it, against a real database.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
+    #[tokio::test]
+    async fn heavy_refuses_a_registry_bound_to_a_chain_the_gateway_config_lacks() {
+        let Some(url) = crate::test_guard::db_url() else {
+            return;
+        };
+        let _guard = crate::test_guard::config_guard().await;
+        let config_source = PostgresConfigSource::new(connect(&url).await.expect("connect"));
+        let seed = orchestrator_core::RegistryConfig {
+            agents: vec![orchestrator_core::AgentDefinition {
+                default_planner: false,
+                name: "torii-unbound-probe-agent".to_string(),
+                area: "test".to_string(),
+                kind: "test".to_string(),
+                chain: Some("torii-chain-nobody-defined".to_string()),
+                chains: Default::default(),
+                grants: Default::default(),
+                tools: vec![],
+                skills: vec![],
+                system_prompt: "probe".to_string(),
+                backed_by: Default::default(),
+            }],
+            ..Default::default()
+        };
+        config_source.store_and_bump(&seed).await.expect("seed");
+
+        let gw_dir = tempfile::tempdir().expect("tmp dir");
+        let gw_path = gw_dir.path().join("gateway.json");
+        std::fs::write(
+            &gw_path,
+            r#"{"routers":{"ollama":{"url":"http://127.0.0.1:11434"}}}"#,
+        )
+        .expect("write gateway config");
+        let env = EnvConfig {
+            backend: Backend::Postgres {
+                database_url: url.clone(),
+            },
+            fence_version: Some("torii-unbound-probe-fence".to_string()),
+            pool_size: DEFAULT_POOL_SIZE,
+        };
+        let err = match heavy(&env, &FileGatewayConfigSource::new(&gw_path), None).await {
+            Ok(_) => panic!("heavy() must refuse a registry bound to an undefined chain"),
+            Err(e) => e,
+        };
+        assert!(
+            err.message.contains("torii-chain-nobody-defined")
+                && err.message.contains("torii-unbound-probe-agent"),
+            "{}",
+            err.message
+        );
+    }
+
     /// **SP-REG-0 — the production executor must have a planner selector wired.**
     ///
     /// `PlannerRef::Select` fails for TWO independent reasons, and only the first is
@@ -911,12 +1285,14 @@ mod tests {
         let gw_path = gw_dir.join("gateway.json");
         std::fs::write(
             &gw_path,
-            r#"{"routers":{"ollama":{"url":"http://127.0.0.1:11434"}}}"#,
+            r#"{"routers":{"ollama":{"url":"http://127.0.0.1:11434"}},"chains":{"torii-selector-probe-chain":{"id":"torii-selector-probe-chain","capability":"text_chat","models":[],"fallback_triggers":[]}}}"#,
         )
         .expect("write gateway config");
 
         let env = EnvConfig {
-            database_url: url.clone(),
+            backend: Backend::Postgres {
+                database_url: url.clone(),
+            },
             fence_version: Some("torii-selector-probe-fence".to_string()),
             pool_size: DEFAULT_POOL_SIZE,
         };
@@ -929,7 +1305,7 @@ mod tests {
                 .store_and_bump(&seed)
                 .await
                 .expect("seed the probe agent");
-            match heavy(&env, &gw_path, None).await {
+            match heavy(&env, &FileGatewayConfigSource::new(&gw_path), None).await {
                 Ok(d) => {
                     deps = Some(d);
                     break;
@@ -1003,7 +1379,7 @@ mod tests {
         // a real `heavy()` boot with no live provider.
         std::fs::write(
             &gw_path,
-            r#"{"routers":{"ollama":{"url":"http://127.0.0.1:11434"}}}"#,
+            r#"{"routers":{"ollama":{"url":"http://127.0.0.1:11434"}},"chains":{"torii-boot-probe-chain":{"id":"torii-boot-probe-chain","capability":"text_chat","models":[],"fallback_triggers":[]}}}"#,
         )
         .expect("write gateway config");
 
@@ -1013,7 +1389,9 @@ mod tests {
         let tag = format!("torii-boot-probe-{}", uuid::Uuid::new_v4());
         let sep = if url.contains('?') { '&' } else { '?' };
         let env = EnvConfig {
-            database_url: format!("{url}{sep}application_name={tag}"),
+            backend: Backend::Postgres {
+                database_url: format!("{url}{sep}application_name={tag}"),
+            },
             fence_version: Some("torii-boot-probe-fence".to_string()),
             pool_size: DEFAULT_POOL_SIZE,
         };
@@ -1037,7 +1415,7 @@ mod tests {
                 .await
                 .expect("seed the probe agent");
             let before = backend_count(&probe_pool, &tag).await;
-            match heavy(&env, &gw_path, None).await {
+            match heavy(&env, &FileGatewayConfigSource::new(&gw_path), None).await {
                 Ok(deps) => {
                     let after = backend_count(&probe_pool, &tag).await;
                     outcome = Some((deps, before, after));

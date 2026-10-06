@@ -5,10 +5,10 @@
 
 use chrono::{DateTime, Utc};
 use orchestrator_core::{
-    ChainBinding, ConfigSource, ContentRef, ContentStore, ContextKey, ContextRef, ContextStore,
-    Digest, ExecutionJournal, FORMAT_VERSION, Graph, JournalError, JournalEvent, OrchestratorError,
-    RegistryConfig, RunId, RunStatus, ScheduledRun, SchedulerStore, Scope, Seq, Snapshot,
-    digest_of,
+    ChainBinding, ConfigSource, ConfigStore, ContentRef, ContentStore, ContextKey, ContextRef,
+    ContextStore, Digest, ExecutionJournal, FORMAT_VERSION, Graph, JournalError, JournalEvent,
+    OrchestratorError, RegistryConfig, RunId, RunStatus, ScheduledRun, SchedulerStore, Scope, Seq,
+    Snapshot, digest_of,
 };
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
@@ -633,6 +633,40 @@ impl PostgresConfigSource {
         &self.pool
     }
 
+    /// Replace-all write of the whole registry in one transaction, WITHOUT bumping the generation.
+    ///
+    /// The UN-COUPLED writer, gated behind `test-support` because a `store` whose caller forgets
+    /// [`bump_config_version`](Self::bump_config_version) changes content without advancing the
+    /// generation — a cross-process resume then matches the (unchanged) fence and silently runs the
+    /// new config. Production code uses [`store_and_bump`](Self::store_and_bump); tests need the
+    /// un-coupled pair to PROVE that the coupled path is what fixes it.
+    ///
+    /// The gate is `test-support` OR `test`, and needs both halves: `test` alone cannot reach the
+    /// three callers in `sensei-orchestrator`'s executor tests (a DIFFERENT crate, where `cfg(test)`
+    /// is not enabled for a dependency), and `test-support` alone cannot reach THIS crate's own unit
+    /// tests under `cargo test --workspace` — `crates/torii` depends on us with
+    /// `features = ["postgres"]` unconditionally, so workspace feature unification compiles this
+    /// module's tests with `postgres` on but `test-support` off. Neither cfg is ever active in a
+    /// production build, which is the property that matters: the footgun stays unreachable.
+    #[cfg(any(feature = "test-support", test))]
+    pub async fn store(&self, cfg: &RegistryConfig) -> Result<(), OrchestratorError> {
+        let mut tx = self.pool.begin().await.map_err(store_err)?;
+        write_all(&mut tx, cfg).await?;
+        tx.commit().await.map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Atomic upsert-increment of the single-row global generation; returns the new version.
+    /// The other half of the un-coupled pair — see [`store`](Self::store) for why it is gated.
+    #[cfg(any(feature = "test-support", test))]
+    pub async fn bump_config_version(&self) -> Result<u64, OrchestratorError> {
+        let mut conn = self.pool.acquire().await.map_err(store_err)?;
+        bump_on(&mut conn).await
+    }
+}
+
+#[async_trait::async_trait]
+impl ConfigStore for PostgresConfigSource {
     /// Replace the whole registry AND advance the generation in ONE transaction,
     /// unconditionally. Returns the new generation.
     ///
@@ -678,7 +712,7 @@ impl PostgresConfigSource {
     /// Deliberately NOT solved by raising the isolation level: REPEATABLE READ or
     /// SERIALIZABLE would turn the merge into a `40001` serialization failure, which
     /// only converts silent corruption into a retry obligation for every caller.
-    pub async fn store_and_bump(&self, cfg: &RegistryConfig) -> Result<u64, OrchestratorError> {
+    async fn store_and_bump(&self, cfg: &RegistryConfig) -> Result<u64, OrchestratorError> {
         let mut tx = self.pool.begin().await.map_err(store_err)?;
         let v = bump_on(&mut tx).await?;
         write_all(&mut tx, cfg).await?;
@@ -753,7 +787,7 @@ impl PostgresConfigSource {
     ///
     /// Both arms are one round trip and one transaction, so there is no window
     /// between "decide" and "write" for anything to land in, in either case.
-    pub async fn store_and_bump_if(
+    async fn store_and_bump_if(
         &self,
         cfg: &RegistryConfig,
         expected: u64,
@@ -789,37 +823,6 @@ impl PostgresConfigSource {
         write_all(&mut tx, cfg).await?;
         tx.commit().await.map_err(store_err)?;
         Ok(Some(v as u64))
-    }
-
-    /// Replace-all write of the whole registry in one transaction, WITHOUT bumping the generation.
-    ///
-    /// The UN-COUPLED writer, gated behind `test-support` because a `store` whose caller forgets
-    /// [`bump_config_version`](Self::bump_config_version) changes content without advancing the
-    /// generation — a cross-process resume then matches the (unchanged) fence and silently runs the
-    /// new config. Production code uses [`store_and_bump`](Self::store_and_bump); tests need the
-    /// un-coupled pair to PROVE that the coupled path is what fixes it.
-    ///
-    /// The gate is `test-support` OR `test`, and needs both halves: `test` alone cannot reach the
-    /// three callers in `sensei-orchestrator`'s executor tests (a DIFFERENT crate, where `cfg(test)`
-    /// is not enabled for a dependency), and `test-support` alone cannot reach THIS crate's own unit
-    /// tests under `cargo test --workspace` — `crates/torii` depends on us with
-    /// `features = ["postgres"]` unconditionally, so workspace feature unification compiles this
-    /// module's tests with `postgres` on but `test-support` off. Neither cfg is ever active in a
-    /// production build, which is the property that matters: the footgun stays unreachable.
-    #[cfg(any(feature = "test-support", test))]
-    pub async fn store(&self, cfg: &RegistryConfig) -> Result<(), OrchestratorError> {
-        let mut tx = self.pool.begin().await.map_err(store_err)?;
-        write_all(&mut tx, cfg).await?;
-        tx.commit().await.map_err(store_err)?;
-        Ok(())
-    }
-
-    /// Atomic upsert-increment of the single-row global generation; returns the new version.
-    /// The other half of the un-coupled pair — see [`store`](Self::store) for why it is gated.
-    #[cfg(any(feature = "test-support", test))]
-    pub async fn bump_config_version(&self) -> Result<u64, OrchestratorError> {
-        let mut conn = self.pool.acquire().await.map_err(store_err)?;
-        bump_on(&mut conn).await
     }
 }
 
@@ -2544,6 +2547,77 @@ mod tests {
     /// re-check-then-fallback, which would reopen a (narrower) version of the very
     /// race this method exists to close (see the doc comment on the method for the
     /// full argument). Proven here directly against a table where the row is absent.
+    /// TM-3: the Postgres journal, CAS and blackboard keep the store conformance suite — the
+    /// contract torii's tenant-scoped stores are held to after the move. Each suite case uses
+    /// fresh run ids and content, so these need no table reset.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
+    #[tokio::test]
+    async fn the_postgres_journal_keeps_the_conformance_suite() {
+        let Some(url) = db_url() else { return };
+        orchestrator_testkit::journal(&PostgresJournal::new(connect(&url).await.unwrap())).await;
+    }
+
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
+    #[tokio::test]
+    async fn the_postgres_content_store_keeps_the_conformance_suite() {
+        let Some(url) = db_url() else { return };
+        orchestrator_testkit::content(&PostgresContentStore::new(connect(&url).await.unwrap()))
+            .await;
+    }
+
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
+    #[tokio::test]
+    async fn the_postgres_context_store_keeps_the_conformance_suite() {
+        let Some(url) = db_url() else { return };
+        orchestrator_testkit::context(&PostgresContextStore::new(connect(&url).await.unwrap()))
+            .await;
+    }
+
+    /// The scheduler suite sweeps the whole table (`claim_due`, `list_paused`, pruning), so it
+    /// runs under the scheduler guard against an emptied table.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
+    #[tokio::test]
+    async fn the_postgres_scheduler_store_keeps_the_conformance_suite() {
+        let Some(url) = db_url() else { return };
+        let _guard = scheduler_guard().await;
+        let pool = connect(&url).await.unwrap();
+        sqlx::query("delete from orchestrator.scheduled_runs")
+            .execute(&pool)
+            .await
+            .unwrap();
+        orchestrator_testkit::scheduler(&PostgresSchedulerStore::new(pool)).await;
+    }
+
+    /// TM-2: the Postgres store keeps the same [`ConfigStore`] contract as the in-memory one
+    /// — the single contract both implementations are held to (TM-3 exports it).
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
+    #[tokio::test]
+    async fn the_postgres_config_store_keeps_the_contract() {
+        let Some(url) = db_url() else { return };
+        let _guard = config_guard().await;
+        let src = PostgresConfigSource::new(connect(&url).await.unwrap());
+        sqlx::query("delete from orchestrator.config_versions")
+            .execute(src.pool_for_test())
+            .await
+            .unwrap();
+        orchestrator_testkit::config_store(&src).await;
+    }
+
     #[cfg_attr(
         not(have_database_url),
         ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"

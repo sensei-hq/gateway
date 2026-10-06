@@ -16,12 +16,19 @@ The orchestrator stack builds **on top of** the routing engine above. `gateway` 
 it — no dependency, and no notion of agents, skills or tools — so the five crates above are usable
 entirely on their own.
 
+> **Moving to torii.** The gateway is a library; persistence belongs to the product that runs it
+> (torii `docs/DECISIONS.md` §11). The Postgres backends and the `torii` CLI are being moved into
+> [`sensei-hq/torii`](https://github.com/sensei-hq/torii) — tenant-scoped there — and will be
+> removed from this repo in a later release. The traits, the executor, the in-memory stores and the
+> conformance suite stay here.
+
 | Crate | What it is |
 |---|---|
-| [`orchestrator-core`](crates/orchestrator-core) (`sensei-orchestrator-core`) | The domain types and the seams: `Graph`/`NodeKind`, the registry vocabulary (`AgentDefinition`, `SkillDef`, `ToolSpec`, `Activation`), and the traits a backend implements — `ExecutionJournal`, `ContentStore`, `ContextStore`, `ConfigSource`, `SchedulerStore`. No I/O. |
+| [`orchestrator-core`](crates/orchestrator-core) (`sensei-orchestrator-core`) | The domain types and the seams: `Graph`/`NodeKind`, the registry vocabulary (`AgentDefinition`, `SkillDef`, `ToolSpec`, `Activation`), and the traits a backend implements — `ExecutionJournal`, `ContentStore`, `ContextStore`, `ConfigSource` + its write side `ConfigStore`, `SchedulerStore`. No I/O. |
 | [`orchestrator`](crates/orchestrator) (`sensei-orchestrator`) | The durable, resumable executor: journal-and-fold replay, effect classes (Pure / Observation / Mutation with two-phase in-doubt reconcile), hierarchical nodes (`Subgraph`, `Branch`, `Expand`, `Loop`), permission enforcement, secret redaction, workspace and subprocess isolation, human-in-the-loop gates, and context budgeting. |
-| [`orchestrator-store`](crates/orchestrator-store) (`sensei-orchestrator-store`) | Postgres backends for those seams (`postgres` feature), plus in-memory ones for tests. A run journaled in one process resumes in another with no token re-spend. |
-| [`torii`](crates/torii) (`sensei-torii`) | **The operator CLI** — submit and observe runs, intervene on human-gated ones, drive due wakes, manage durable config. See [its README](crates/torii/README.md) for a quickstart, including what you must set up by hand and the gaps it does not yet cover. |
+| [`orchestrator-store`](crates/orchestrator-store) (`sensei-orchestrator-store`) | Postgres backends for those seams (`postgres` feature), plus in-memory ones (including a writable, versioned `InMemoryConfigStore`). A run journaled in one process resumes in another with no token re-spend. |
+| [`orchestrator-testkit`](crates/orchestrator-testkit) (`sensei-orchestrator-testkit`) | The store conformance suite: one function per persistence trait, each its documented contract. Every backend runs it — the in-memory stores, the Postgres stores, and torii's tenant-scoped stores. |
+| [`torii`](crates/torii) (`sensei-torii`) | **The operator CLI** — submit and observe runs, intervene on human-gated ones, drive due wakes, manage durable config, on a Postgres or an in-memory backend (`TORII_BACKEND`). See [its README](crates/torii/README.md) for a quickstart, including what you must set up by hand and the gaps it does not yet cover. |
 
 `local-providers` features (all off by default — each pulls heavyweight native deps):
 

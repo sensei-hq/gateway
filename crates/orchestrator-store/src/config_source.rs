@@ -5,8 +5,8 @@
 use std::path::{Path, PathBuf};
 
 use orchestrator_core::{
-    AgentDefinition, ChainBinding, ConfigSource, OrchestratorError, Permissions, RegistryConfig,
-    SkillDef, ToolSpec,
+    AgentDefinition, ChainBinding, ConfigSource, ConfigStore, OrchestratorError, Permissions,
+    RegistryConfig, SkillDef, ToolSpec,
 };
 
 /// A `ConfigSource` returning a fixed `RegistryConfig` — for tests + programmatic
@@ -18,6 +18,70 @@ pub struct InMemoryConfigSource(pub RegistryConfig);
 impl ConfigSource for InMemoryConfigSource {
     async fn load(&self) -> Result<RegistryConfig, OrchestratorError> {
         Ok(self.0.clone())
+    }
+}
+
+/// A versioned, writable in-memory registry store (TM-2): the [`ConfigStore`] the CLI and tests
+/// use when there is no database. Generation starts at 0 (never written) and advances by one per
+/// write; content and generation change together under one lock, so `load_versioned` can never
+/// return a torn pair.
+#[derive(Default)]
+pub struct InMemoryConfigStore {
+    state: std::sync::Mutex<(RegistryConfig, u64)>,
+}
+
+impl InMemoryConfigStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait::async_trait]
+impl ConfigSource for InMemoryConfigStore {
+    async fn load(&self) -> Result<RegistryConfig, OrchestratorError> {
+        Ok(self.lock()?.0.clone())
+    }
+
+    async fn version(&self) -> Result<Option<u64>, OrchestratorError> {
+        Ok(Some(self.lock()?.1))
+    }
+
+    /// Content and generation are read under ONE lock, so the pair can never be torn.
+    async fn load_versioned(&self) -> Result<(RegistryConfig, Option<u64>), OrchestratorError> {
+        let state = self.lock()?;
+        Ok((state.0.clone(), Some(state.1)))
+    }
+}
+
+#[async_trait::async_trait]
+impl ConfigStore for InMemoryConfigStore {
+    async fn store_and_bump(&self, cfg: &RegistryConfig) -> Result<u64, OrchestratorError> {
+        let mut state = self.lock()?;
+        state.1 += 1;
+        state.0 = cfg.clone();
+        Ok(state.1)
+    }
+
+    async fn store_and_bump_if(
+        &self,
+        cfg: &RegistryConfig,
+        expected: u64,
+    ) -> Result<Option<u64>, OrchestratorError> {
+        let mut state = self.lock()?;
+        if state.1 != expected {
+            return Ok(None);
+        }
+        state.1 += 1;
+        state.0 = cfg.clone();
+        Ok(Some(state.1))
+    }
+}
+
+impl InMemoryConfigStore {
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, (RegistryConfig, u64)>, OrchestratorError> {
+        self.state
+            .lock()
+            .map_err(|_| OrchestratorError::RegistryLoad("in-memory config store poisoned".into()))
     }
 }
 

@@ -337,6 +337,33 @@ pub trait ConfigSource: Send + Sync {
     }
 }
 
+/// The WRITE side of a versioned config source (torii move, TM-2, gateway#78): replace the
+/// whole registry AND advance its generation in one atomic step. The read side is
+/// [`ConfigSource`]; a `ConfigStore` is always versioned, so its `version()` returns `Some(_)`
+/// (`Some(0)` before the first write) and it MUST override
+/// [`ConfigSource::load_versioned`] with a single consistent snapshot.
+///
+/// This is the seam the operator CLI's `config push` writes through, so it can run against any
+/// backend — the gateway's in-memory store, or torii's tenant-scoped Postgres store — instead
+/// of one concrete type.
+#[async_trait::async_trait]
+pub trait ConfigStore: ConfigSource {
+    /// Replace the whole registry and advance the generation, atomically. Returns the new
+    /// generation. Concurrent writers serialize: each lands wholly before or after another,
+    /// never merged.
+    async fn store_and_bump(&self, cfg: &RegistryConfig) -> Result<u64, OrchestratorError>;
+
+    /// Compare-and-swap form of [`store_and_bump`](Self::store_and_bump): write ONLY if the
+    /// current generation is still `expected`. `Ok(None)` ⇒ it moved and NOTHING was written;
+    /// `Ok(Some(v))` ⇒ written, `v` is the new generation. A first push is `expected = 0`
+    /// against a store that has never been written.
+    async fn store_and_bump_if(
+        &self,
+        cfg: &RegistryConfig,
+        expected: u64,
+    ) -> Result<Option<u64>, OrchestratorError>;
+}
+
 /// In-memory registry of agents/skills/tool-specs, built by a demo/preset
 /// builder or from parsed frontmatter. Pure config: no I/O, no persistence.
 #[derive(Debug, Clone, Default)]
@@ -398,6 +425,13 @@ impl Registry {
             set.insert(c.clone());
         }
         set.into_iter().collect()
+    }
+    /// Every `(area, kind) → chain` binding, as `(area, kind, chain)`. Lets a caller that must
+    /// say WHICH binding references a missing chain attribute it (`chain_names` is a set).
+    pub fn chain_bindings(&self) -> impl Iterator<Item = (&str, &str, &str)> {
+        self.chain_bindings
+            .iter()
+            .map(|((area, kind), chain)| (area.as_str(), kind.as_str(), chain.as_str()))
     }
     pub fn with_chain_binding(mut self, b: ChainBinding) -> Self {
         self.chain_bindings.insert((b.area, b.kind), b.chain);
