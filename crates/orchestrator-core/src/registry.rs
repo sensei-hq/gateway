@@ -74,6 +74,53 @@ pub struct AgentDefinition {
     /// load.
     #[serde(default)]
     pub default_planner: bool,
+    /// AG-15: a per-tool CALL CEILING (tool name → the most calls of that tool one
+    /// invocation of this agent may make). The call after the ceiling is refused with a
+    /// terse `call_limit_reached` fed back to the model, exactly as an ungranted tool is.
+    ///
+    /// **Scope: ONE agent invocation** — one ReAct loop, i.e. one `Agent` node, one
+    /// `Map`/`Consolidate` child, one `Loop` iteration's body. Not the whole run: the count
+    /// is derived from the invocation's own transcript, which the journal replays turn by
+    /// turn, so it is replay-safe by construction; a run-wide count would race between
+    /// concurrently driven `Map` children and so decide differently on a resume.
+    ///
+    /// **What counts is every call the model REQUESTED**, in transcript order — including
+    /// one denied by its grant, refused at confirmation, or refused by this very ceiling.
+    /// A count of calls that actually EXECUTED would need each prior call's outcome, which
+    /// a memo replay hands back only as an opaque recorded value.
+    ///
+    /// Every key must name a tool the agent LISTS and every ceiling must be at least 1,
+    /// both checked at load ([`Registry::validate`]). `#[serde(default)]` ⇒ absent means no
+    /// ceiling, and `skip_serializing_if` keeps an unused field off the serialized form, so
+    /// existing `config_agents` rows and registries are byte-identical.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub tool_limits: HashMap<String, u32>,
+    /// AG-15: CONFIRM-BEFORE-RUN. Every call of a tool named here pauses the run on a human
+    /// decision BEFORE the tool executes (`ToolConfirmAwaited` → `ToolConfirmDecided`), and
+    /// runs only if approved. A rejection — or a deadline that passes first — feeds a terse
+    /// `not_confirmed` refusal back to the model, exactly as an ungranted tool is.
+    ///
+    /// Each entry must name a tool the agent LISTS (checked at load). Who may answer is the
+    /// operator surface's concern (`torii`); the decision records an `actor`, as a gate does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub confirm_tools: Vec<String>,
+    /// AG-15: how long a tool confirmation waits before it counts as refused. `None` waits
+    /// indefinitely. Meaningful only with a non-empty `confirm_tools`, positive, and no
+    /// longer than `MAX_AWAIT_SIGNAL_TIMEOUT` — all checked at load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_timeout: Option<chrono::Duration>,
+    /// AG-15: the agent a human-backed agent's question is handed to when its SLA
+    /// (`AgentBacking::Human { timeout }`) expires unanswered, instead of failing the node.
+    ///
+    /// The escalation target is asked the SAME journaled question (not one recomposed from
+    /// its own prompt), on its OWN SLA starting at the escalation instant, and it may itself
+    /// escalate — a chain, which load rejects if it cycles. Only the last agent in the chain
+    /// expiring fails the node. Legal only on a human-backed agent with a timeout, and the
+    /// target must exist, be human-backed and not be the agent itself — all checked at load.
+    /// Applies to a top-level human-backed `Agent` node; a `GateSpec::Human` loop gate does
+    /// not escalate, and its expiry failure says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalate_to: Option<String>,
 }
 
 /// A skill: an injectable instruction module composed into a prompt by name.
@@ -1065,6 +1112,10 @@ impl AgentDefinition {
             system_prompt: body.to_string(),
             backed_by: parse_backing(&f)?,
             default_planner: parse_default_planner(&f)?,
+            tool_limits: Default::default(),
+            confirm_tools: Vec::new(),
+            confirm_timeout: None,
+            escalate_to: None,
         })
     }
 }
@@ -1404,6 +1455,10 @@ mod tests {
         let mk = |name: &str| AgentDefinition {
             name: name.into(),
             default_planner: true,
+            tool_limits: Default::default(),
+            confirm_tools: Vec::new(),
+            confirm_timeout: None,
+            escalate_to: None,
             ..role_agent(crate::planner::PLANNER_AREA, "reasoning", Some("c"))
         };
         for names in [vec!["beta", "alpha"], vec!["zeta", "alpha", "beta"]] {
@@ -1468,6 +1523,10 @@ mod tests {
             agents: vec![AgentDefinition {
                 name: "researcher".into(),
                 default_planner: true,
+                tool_limits: Default::default(),
+                confirm_tools: Vec::new(),
+                confirm_timeout: None,
+                escalate_to: None,
                 ..role_agent("research", "reasoning", Some("c"))
             }],
             skills: vec![],
@@ -1500,6 +1559,10 @@ mod tests {
                 AgentDefinition {
                     name: "beta".into(),
                     default_planner: true,
+                    tool_limits: Default::default(),
+                    confirm_tools: Vec::new(),
+                    confirm_timeout: None,
+                    escalate_to: None,
                     ..role_agent(crate::planner::PLANNER_AREA, "reasoning", Some("c"))
                 },
             ],
@@ -1533,6 +1596,10 @@ mod tests {
         // trip exactly as a missing frontmatter key would drop it.
         let marked = AgentDefinition {
             default_planner: true,
+            tool_limits: Default::default(),
+            confirm_tools: Vec::new(),
+            confirm_timeout: None,
+            escalate_to: None,
             ..serde_json::from_value::<AgentDefinition>(serde_json::to_value(&a).unwrap()).unwrap()
         };
         let back: AgentDefinition =
@@ -1757,6 +1824,10 @@ mod tests {
     fn role_agent(area: &str, kind: &str, chain: Option<&str>) -> AgentDefinition {
         AgentDefinition {
             default_planner: false,
+            tool_limits: Default::default(),
+            confirm_tools: Vec::new(),
+            confirm_timeout: None,
+            escalate_to: None,
             name: "role".into(),
             area: area.into(),
             kind: kind.into(),
@@ -2327,6 +2398,10 @@ mod tests {
         let bad = RegistryConfig {
             agents: vec![AgentDefinition {
                 default_planner: false,
+                tool_limits: Default::default(),
+                confirm_tools: Vec::new(),
+                confirm_timeout: None,
+                escalate_to: None,
                 name: "a".into(),
                 area: "x".into(),
                 kind: "y".into(),
@@ -2514,6 +2589,10 @@ mod tests {
     fn human_agent(name: &str) -> AgentDefinition {
         AgentDefinition {
             default_planner: false,
+            tool_limits: Default::default(),
+            confirm_tools: Vec::new(),
+            confirm_timeout: None,
+            escalate_to: None,
             name: name.to_string(),
             area: "review".into(),
             kind: "human".into(),
@@ -2699,5 +2778,259 @@ mod tests {
             m.contains("non-positive"),
             "must be the lower-bound rule: {m}"
         );
+    }
+
+    // ---- AG-15 (#90): per-tool call ceiling, confirm-before-run, escalation ----
+
+    /// A model-backed agent that LISTS `fs_read` (which `registry_of` registers), on an
+    /// explicit chain so the chain rule is satisfied and the rule under test is the one
+    /// that fires.
+    fn tool_user(name: &str) -> AgentDefinition {
+        let mut a = human_agent(name);
+        a.backed_by = AgentBacking::Model;
+        a.chain = Some("c".into());
+        a.tools = vec!["fs_read".into()];
+        a
+    }
+
+    /// A human-backed agent with an SLA, escalating to `to`.
+    fn escalating(name: &str, to: Option<&str>) -> AgentDefinition {
+        let mut a = human_agent(name);
+        a.backed_by = AgentBacking::Human {
+            timeout: Some(chrono::Duration::hours(1)),
+        };
+        a.escalate_to = to.map(str::to_string);
+        a
+    }
+
+    #[test]
+    fn agent_from_frontmatter_parses_the_ag15_policy_fields() {
+        let md = "---\nname: ops\narea: ops\nkind: k\nchain: c\ntools: [shell, deploy]\n\
+                  tool_limits: [shell=3, deploy=1]\nconfirm_tools: [deploy]\n\
+                  confirm_timeout: 2h\n---\nbody\n";
+        let a = AgentDefinition::from_frontmatter(md).expect("parses");
+        assert_eq!(
+            a.tool_limits,
+            HashMap::from([("shell".to_string(), 3), ("deploy".to_string(), 1)])
+        );
+        assert_eq!(a.confirm_tools, vec!["deploy".to_string()]);
+        assert_eq!(a.confirm_timeout, Some(chrono::Duration::hours(2)));
+        assert_eq!(a.escalate_to, None);
+
+        let md = "---\nname: reviewer\narea: review\nkind: human\nbacked_by: human\n\
+                  timeout: 4h\nescalate_to: legal-lead\n---\nQ?\n";
+        let a = AgentDefinition::from_frontmatter(md).expect("parses");
+        assert_eq!(a.escalate_to.as_deref(), Some("legal-lead"));
+    }
+
+    /// Absent keys are the ONLY silent path; every present-but-unusable spelling is loud,
+    /// the `parse_backing`/`activate_on` discipline: a ceiling the author believes they set
+    /// must never silently become "no ceiling".
+    #[test]
+    fn agent_from_frontmatter_rejects_malformed_ag15_policy_fields() {
+        for (bad, why) in [
+            ("tool_limits: shell=3", "a scalar tool_limits"),
+            ("tool_limits: [shell]", "a tool_limits entry with no '='"),
+            ("tool_limits: [shell=three]", "a non-numeric ceiling"),
+            ("tool_limits: [shell=-1]", "a negative ceiling"),
+            ("confirm_tools: deploy", "a scalar confirm_tools"),
+            ("confirm_timeout: 2 hours", "an unparsable confirm_timeout"),
+            ("confirm_timeout: [2h]", "a list confirm_timeout"),
+            ("escalate_to: [a, b]", "a list escalate_to"),
+            ("escalate_to:", "an empty escalate_to"),
+        ] {
+            let md = format!("---\nname: n\narea: a\nkind: k\nchain: c\n{bad}\n---\nb\n");
+            let e = AgentDefinition::from_frontmatter(&md).expect_err(why);
+            assert!(
+                matches!(e, OrchestratorError::FrontmatterParse(_)),
+                "{why} must be a loud parse error, got {e}"
+            );
+        }
+    }
+
+    /// The jsonb surface: a row written before AG-15 deserializes with every policy field
+    /// at its inert default, and an agent that uses none of them SERIALIZES byte-identically
+    /// to the pre-AG-15 shape (no new keys), so a `config diff` over an untouched agent is
+    /// empty.
+    #[test]
+    fn ag15_fields_are_serde_defaulted_and_absent_when_unused() {
+        let row = serde_json::json!({
+            "name": "researcher", "area": "research", "kind": "reasoning",
+            "chain": "c", "tools": [], "skills": [], "system_prompt": "b"
+        });
+        let a: AgentDefinition = serde_json::from_value(row).expect("a pre-AG-15 row loads");
+        assert!(a.tool_limits.is_empty());
+        assert!(a.confirm_tools.is_empty());
+        assert_eq!(a.confirm_timeout, None);
+        assert_eq!(a.escalate_to, None);
+        let v = serde_json::to_value(&a).unwrap();
+        for key in [
+            "tool_limits",
+            "confirm_tools",
+            "confirm_timeout",
+            "escalate_to",
+        ] {
+            assert!(
+                v.get(key).is_none(),
+                "unused {key} must not be serialized: {v}"
+            );
+        }
+
+        let mut used = escalating("reviewer", Some("lead"));
+        used.tool_limits.insert("x".into(), 2);
+        used.confirm_tools = vec!["x".into()];
+        used.confirm_timeout = Some(chrono::Duration::hours(1));
+        let back: AgentDefinition =
+            serde_json::from_value(serde_json::to_value(&used).unwrap()).unwrap();
+        assert_eq!(back.tool_limits, used.tool_limits);
+        assert_eq!(back.confirm_tools, used.confirm_tools);
+        assert_eq!(back.confirm_timeout, used.confirm_timeout);
+        assert_eq!(back.escalate_to, used.escalate_to);
+    }
+
+    #[test]
+    fn a_valid_ag15_policy_loads() {
+        let mut a = tool_user("ops");
+        a.tool_limits.insert("fs_read".into(), 1);
+        a.confirm_tools = vec!["fs_read".into()];
+        a.confirm_timeout = Some(chrono::Duration::hours(2));
+        registry_of(vec![
+            a,
+            escalating("reviewer", Some("lead")),
+            escalating("lead", Some("director")),
+            escalating("director", None),
+        ])
+        .validate()
+        .expect("a ceiling, a confirmation and an acyclic escalation chain all load");
+    }
+
+    #[test]
+    fn a_call_ceiling_must_name_a_listed_tool_and_be_positive() {
+        let mut a = tool_user("ops");
+        a.tool_limits.insert("shell".into(), 2);
+        let m = format!("{}", registry_of(vec![a]).validate().expect_err("unlisted"));
+        assert!(m.contains("ops") && m.contains("shell"), "{m}");
+        assert!(m.contains("tool_limits"), "must name the rule: {m}");
+        assert!(m.contains("does not list"), "must name the reason: {m}");
+
+        let mut a = tool_user("ops");
+        a.tool_limits.insert("fs_read".into(), 0);
+        let m = format!("{}", registry_of(vec![a]).validate().expect_err("zero"));
+        assert!(m.contains("ops") && m.contains("fs_read"), "{m}");
+        assert!(m.contains("at least 1"), "must name the bound: {m}");
+    }
+
+    #[test]
+    fn a_confirmation_must_name_a_listed_tool() {
+        let mut a = tool_user("ops");
+        a.confirm_tools = vec!["deploy".into()];
+        let m = format!("{}", registry_of(vec![a]).validate().expect_err("unlisted"));
+        assert!(m.contains("ops") && m.contains("deploy"), "{m}");
+        assert!(m.contains("confirm_tools"), "must name the rule: {m}");
+        assert!(m.contains("does not list"), "must name the reason: {m}");
+    }
+
+    #[test]
+    fn a_confirm_timeout_needs_confirm_tools_and_obeys_the_bounds() {
+        let mut a = tool_user("ops");
+        a.confirm_timeout = Some(chrono::Duration::hours(1));
+        let m = format!("{}", registry_of(vec![a]).validate().expect_err("inert"));
+        assert!(m.contains("ops") && m.contains("confirm_timeout"), "{m}");
+        assert!(m.contains("confirms no tool"), "must name the reason: {m}");
+
+        let with = |t| {
+            let mut a = tool_user("ops");
+            a.confirm_tools = vec!["fs_read".into()];
+            a.confirm_timeout = Some(t);
+            registry_of(vec![a]).validate()
+        };
+        with(crate::graph::MAX_AWAIT_SIGNAL_TIMEOUT).expect("exactly the bound");
+        let m = format!("{}", with(chrono::Duration::zero()).expect_err("zero"));
+        assert!(m.contains("non-positive"), "{m}");
+        let m = format!(
+            "{}",
+            with(crate::graph::MAX_AWAIT_SIGNAL_TIMEOUT + chrono::Duration::days(1))
+                .expect_err("over the bound")
+        );
+        assert!(m.contains("too long"), "{m}");
+    }
+
+    #[test]
+    fn an_escalation_target_must_exist_and_not_be_the_agent_itself() {
+        let m = format!(
+            "{}",
+            registry_of(vec![escalating("reviewer", Some("ghost"))])
+                .validate()
+                .expect_err("dangling")
+        );
+        assert!(m.contains("reviewer") && m.contains("ghost"), "{m}");
+        assert!(m.contains("does not exist"), "must name the reason: {m}");
+
+        let m = format!(
+            "{}",
+            registry_of(vec![escalating("reviewer", Some("reviewer"))])
+                .validate()
+                .expect_err("self")
+        );
+        assert!(m.contains("reviewer"), "{m}");
+        assert!(m.contains("itself"), "must name the reason: {m}");
+    }
+
+    #[test]
+    fn escalation_is_only_from_and_to_a_human_backed_agent_with_an_sla() {
+        // From a model-backed agent: it has no SLA to expire.
+        let mut a = tool_user("ops");
+        a.escalate_to = Some("lead".into());
+        let m = format!(
+            "{}",
+            registry_of(vec![a, escalating("lead", None)])
+                .validate()
+                .expect_err("model-backed escalator")
+        );
+        assert!(m.contains("ops") && m.contains("escalate_to"), "{m}");
+        assert!(m.contains("human-backed"), "{m}");
+
+        // From a human with NO timeout: it never expires, so it never escalates.
+        let mut a = escalating("reviewer", Some("lead"));
+        a.backed_by = AgentBacking::Human { timeout: None };
+        let m = format!(
+            "{}",
+            registry_of(vec![a, escalating("lead", None)])
+                .validate()
+                .expect_err("no SLA")
+        );
+        assert!(m.contains("reviewer") && m.contains("timeout"), "{m}");
+        assert!(m.contains("never expires"), "must name the reason: {m}");
+
+        // To a model-backed agent: the escalation target is asked by a person.
+        let mut lead = tool_user("lead");
+        lead.tools = vec![];
+        let m = format!(
+            "{}",
+            registry_of(vec![escalating("reviewer", Some("lead")), lead])
+                .validate()
+                .expect_err("model-backed target")
+        );
+        assert!(m.contains("reviewer") && m.contains("lead"), "{m}");
+        assert!(m.contains("not human-backed"), "must name the reason: {m}");
+    }
+
+    /// A cycle never ends: each expiry would hand the question round forever. The message
+    /// is asserted identical across fresh registries because `validate` walks a `HashMap`.
+    #[test]
+    fn an_escalation_cycle_is_loud_and_deterministic() {
+        let build = || {
+            registry_of(vec![
+                escalating("a", Some("b")),
+                escalating("b", Some("c")),
+                escalating("c", Some("a")),
+            ])
+        };
+        let first = format!("{}", build().validate().expect_err("cycle"));
+        assert!(first.contains("cycle"), "{first}");
+        assert!(first.contains("a -> b -> c -> a"), "{first}");
+        for _ in 0..16 {
+            assert_eq!(format!("{}", build().validate().unwrap_err()), first);
+        }
     }
 }

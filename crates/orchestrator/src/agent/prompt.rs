@@ -986,6 +986,10 @@ mod tests {
     fn registry() -> (Registry, AgentDefinition) {
         let agent = AgentDefinition {
             default_planner: false,
+            tool_limits: Default::default(),
+            confirm_tools: Vec::new(),
+            confirm_timeout: None,
+            escalate_to: None,
             name: "r".into(),
             area: "research".into(),
             kind: "reasoning".into(),
