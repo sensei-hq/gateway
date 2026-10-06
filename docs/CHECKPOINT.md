@@ -19,10 +19,10 @@ keeps the engine, the persistence traits and in-memory stores. Last release: v0.
 
 ## Next
 
-TM-9 (#82): delete `crates/torii`, `database/`, `orchestrator-store`'s postgres feature + adapters +
-`test_guard` (and any orchestrator `postgres-tests`); no sqlx in orchestrator crates; docs point at
-torii; upgrading.md records the break; release as a minor bump (ask before merging to main).
-torii now has `torii-core` (shared API+CLI data layer) and `crates/cli`; it pins gateway v0.9.0.
+TM-9 (#82) built + reviewed on develop (2 reviewers; HIGH Ref round-trip + MEDIUM graph guard +
+3 doc MEDIUMs fixed; LOW: EffectIntent fixture seq=0 equals the default). Release v0.10.0 (breaking):
+open develop→main PR, ask the user whether to merge, then tag + GitHub Release; re-pin torii to
+v0.10.0 (one_gateway_ref guards it) and confirm torii CI; tick #82 + epic #76 (closes the epic).
 
 ## Open questions
 
