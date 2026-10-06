@@ -8,7 +8,7 @@ keeps the engine, the persistence traits and in-memory stores. Last release: v0.
 ## Todo (the epic's checklist, in order)
 
 - [x] **TM-1** #77 — redirect data-tier docs to §11 (the extraction into the gateway is cancelled)
-- [ ] **TM-2** #78 — config WRITE path behind a trait (`ConfigStore`)
+- [x] **TM-2** #78 — config WRITE path behind a trait (`ConfigStore`)
 - [ ] **TM-3** #79 — exported store conformance suite
 - [ ] **TM-4** #80 — `GatewayConfig` source seam + always-on registry↔chain cross-check
 - [ ] **TM-5** #81 — backend-selectable boot (memory | postgres)
@@ -19,7 +19,7 @@ keeps the engine, the persistence traits and in-memory stores. Last release: v0.
 
 ## Next
 
-TM-2: a write-side config trait in `orchestrator-core`; `cmd/config.rs` on `&dyn`.
+TM-3: lift the ConfigStore contract (`orchestrator-store` `config_source::contract`) into an exported conformance suite covering every store trait.
 
 ## Open questions
 
