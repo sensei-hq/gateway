@@ -523,9 +523,31 @@ impl Gateway {
     /// model declares an explicit zero price, which this returns as `Some`.
     pub async fn worst_case_pricing(
         &self,
-        _chain: &str,
+        chain: &str,
     ) -> Option<kernel::types::config::ModelPricing> {
-        None
+        let cfg = self.config.read().await;
+        let chain = cfg.chains.get(chain)?;
+        let mut worst: Option<kernel::types::config::ModelPricing> = None;
+        for model in chain
+            .models
+            .iter()
+            .filter_map(|entry| cfg.models.get(&entry.model))
+        {
+            // One unpriced entry ⇒ the whole chain is unpriced (see the doc above).
+            let p = model.pricing.as_ref()?;
+            worst = Some(match worst {
+                None => p.clone(),
+                Some(w) => kernel::types::config::ModelPricing {
+                    input_per_1k: w.input_per_1k.max(p.input_per_1k),
+                    output_per_1k: w.output_per_1k.max(p.output_per_1k),
+                    per_request: match (w.per_request, p.per_request) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        (a, b) => a.or(b),
+                    },
+                },
+            });
+        }
+        worst
     }
 
     /// Attach a readiness probe (the local engine's provisioning supervisor).
