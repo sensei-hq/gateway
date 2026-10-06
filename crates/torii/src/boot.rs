@@ -10,10 +10,17 @@ use orchestrator::agent::tools::{
     FsReadTool, FsWriteReconciler, FsWriteTool, ReconcileRegistry, ShellTool, ToolRegistry,
 };
 use orchestrator::{Executor, Scheduler};
-use orchestrator_core::{Clock, PatternRedactor, RegistryHandle, RulePlannerSelector, SystemClock};
+use orchestrator_core::{
+    Clock, ConfigSource, ConfigStore, ContentStore, ContextStore, ExecutionJournal,
+    PatternRedactor, RegistryHandle, RulePlannerSelector, SchedulerStore, SystemClock,
+};
 use orchestrator_store::postgres::{
     PostgresConfigSource, PostgresContentStore, PostgresContextStore, PostgresJournal,
     PostgresSchedulerStore, connect_with_max,
+};
+use orchestrator_store::{
+    FilesystemConfigSource, InMemoryConfigStore, InMemoryContentStore, InMemoryContextStore,
+    InMemoryJournal, InMemorySchedulerStore,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,6 +28,8 @@ use std::sync::Arc;
 pub const ENV_DATABASE_URL: &str = "DATABASE_URL";
 pub const ENV_FENCE_VERSION: &str = "TORII_FENCE_VERSION";
 pub const ENV_POOL_SIZE: &str = "TORII_POOL_SIZE";
+pub const ENV_BACKEND: &str = "TORII_BACKEND";
+pub const ENV_REGISTRY_DIR: &str = "TORII_REGISTRY_DIR";
 
 /// [`connect_with_max`]'s own default, restated here as the fallback when
 /// `TORII_POOL_SIZE` is unset — see that function's doc comment for why 8.
@@ -37,10 +46,23 @@ const DEFAULT_POOL_SIZE: u32 = 8;
 /// certain-mistake without trying to enforce a capacity policy this code cannot know.
 const MAX_POOL_SIZE: u32 = 1000;
 
-/// The validated environment. `fence_version` is only required by the heavy tier.
+/// Where every store lives (TM-5, gateway#81). Chosen by `TORII_BACKEND`.
+#[derive(PartialEq)]
+pub enum Backend {
+    /// The default: one Postgres pool behind every store. Needs `DATABASE_URL`.
+    Postgres { database_url: String },
+    /// Every store in this process's memory — no database at all. For development and
+    /// tests: nothing survives the process, so a run submitted here can be observed or
+    /// woken only by the same process. The registry is seeded at boot from
+    /// `TORII_REGISTRY_DIR` (the same `agents/ skills/ tools/` layout `config push` reads).
+    Memory { registry_dir: Option<PathBuf> },
+}
+
+/// The validated environment. `fence_version` is only required by the heavy tier;
+/// `pool_size` only by the Postgres backend.
 #[derive(PartialEq)]
 pub struct EnvConfig {
-    pub database_url: String,
+    pub backend: Backend,
     pub fence_version: Option<String>,
     pub pool_size: u32,
 }
@@ -52,8 +74,12 @@ pub struct EnvConfig {
 /// sure it never prints the secret.
 impl std::fmt::Debug for EnvConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let backend = match &self.backend {
+            Backend::Postgres { database_url } => format!("postgres({})", redact_url(database_url)),
+            Backend::Memory { registry_dir } => format!("memory({registry_dir:?})"),
+        };
         f.debug_struct("EnvConfig")
-            .field("database_url", &redact_url(&self.database_url))
+            .field("backend", &backend)
             .field("fence_version", &self.fence_version)
             .field("pool_size", &self.pool_size)
             .finish()
@@ -89,25 +115,41 @@ fn parse_pool_size(s: &str) -> Result<u32, String> {
 /// Validate the environment through an injected getter, so tests never mutate
 /// process env (which is `unsafe` in edition 2024 and racy across parallel tests).
 pub fn env_config_from(get: impl Fn(&str) -> Option<String>) -> Result<EnvConfig, CliError> {
-    let database_url = get(ENV_DATABASE_URL)
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| {
-            CliError::error(format!(
-                "{ENV_DATABASE_URL} is not set.\n\
-                 torii reads the Postgres connection string from the environment only — a flag \
-                 would put the password in `ps` output and shell history."
-            ))
-        })?;
+    let non_empty = |k: &str| get(k).filter(|s| !s.trim().is_empty());
+    let backend = match non_empty(ENV_BACKEND).map(|s| s.trim().to_ascii_lowercase()) {
+        None => postgres_backend(&non_empty)?,
+        Some(b) if b == "postgres" => postgres_backend(&non_empty)?,
+        Some(b) if b == "memory" => Backend::Memory {
+            registry_dir: non_empty(ENV_REGISTRY_DIR).map(PathBuf::from),
+        },
+        Some(other) => {
+            return Err(CliError::error(format!(
+                "unknown {ENV_BACKEND} {other:?}: expected `postgres` (the default) or `memory`"
+            )));
+        }
+    };
     let fence_version = get(ENV_FENCE_VERSION).filter(|s| !s.trim().is_empty());
     let pool_size = match get(ENV_POOL_SIZE).filter(|s| !s.trim().is_empty()) {
         Some(raw) => parse_pool_size(&raw).map_err(CliError::error)?,
         None => DEFAULT_POOL_SIZE,
     };
     Ok(EnvConfig {
-        database_url,
+        backend,
         fence_version,
         pool_size,
     })
+}
+
+fn postgres_backend(non_empty: &impl Fn(&str) -> Option<String>) -> Result<Backend, CliError> {
+    let database_url = non_empty(ENV_DATABASE_URL).ok_or_else(|| {
+        CliError::error(format!(
+            "{ENV_DATABASE_URL} is not set.\n\
+             torii reads the Postgres connection string from the environment only — a flag \
+             would put the password in `ps` output and shell history. (For a run with no \
+             database at all, set {ENV_BACKEND}=memory.)"
+        ))
+    })?;
+    Ok(Backend::Postgres { database_url })
 }
 
 pub fn env_config() -> Result<EnvConfig, CliError> {
@@ -389,29 +431,65 @@ fn require_agents(
 /// operator must be able to inspect AND raise a run's budget on a box with no
 /// model credentials.
 pub struct LightDeps {
-    pub scheduler_store: Arc<PostgresSchedulerStore>,
-    pub journal: Arc<PostgresJournal>,
-    pub config_source: PostgresConfigSource,
+    pub scheduler_store: Arc<dyn SchedulerStore>,
+    pub journal: Arc<dyn ExecutionJournal>,
+    pub config_source: Arc<dyn ConfigStore>,
 }
 
-/// The light tier over an ALREADY-connected pool. Split out so `heavy()` can
-/// share its ONE pool with the light-tier adapters instead of opening a second
-/// one — `light()` below keeps its own single-connect path for standalone
-/// light-tier commands (`run status`, `config diff`, …), which never call
-/// `heavy()` at all.
-fn light_from_pool(pool: sqlx::PgPool) -> LightDeps {
-    LightDeps {
-        scheduler_store: Arc::new(PostgresSchedulerStore::new(pool.clone())),
-        journal: Arc::new(PostgresJournal::new(pool.clone())),
-        config_source: PostgresConfigSource::new(pool),
+/// Every store one backend provides — the light tier's three plus the heavy tier's CAS and
+/// blackboard — built in ONE place, so no tier names a backend type (TM-5).
+struct Stores {
+    light: LightDeps,
+    content: Arc<dyn ContentStore>,
+    context: Arc<dyn ContextStore>,
+}
+
+async fn open_stores(env: &EnvConfig) -> Result<Stores, CliError> {
+    match &env.backend {
+        Backend::Postgres { database_url } => {
+            // ONE pool for every store: cloning a `PgPool` is an `Arc::clone`, not a new
+            // connection, so the whole process is capped at `TORII_POOL_SIZE` connections
+            // (see `connect_with_max`'s doc comment for why 8 is the default).
+            let pool = connect_with_max(database_url, env.pool_size)
+                .await
+                .map_err(|e| CliError::error(connect_failure(database_url, &e.to_string())))?;
+            Ok(Stores {
+                light: LightDeps {
+                    scheduler_store: Arc::new(PostgresSchedulerStore::new(pool.clone())),
+                    journal: Arc::new(PostgresJournal::new(pool.clone())),
+                    config_source: Arc::new(PostgresConfigSource::new(pool.clone())),
+                },
+                content: Arc::new(PostgresContentStore::new(pool.clone())),
+                context: Arc::new(PostgresContextStore::new(pool)),
+            })
+        }
+        Backend::Memory { registry_dir } => {
+            let config = InMemoryConfigStore::new();
+            if let Some(dir) = registry_dir {
+                let cfg = FilesystemConfigSource::new(dir).load().await.map_err(|e| {
+                    CliError::error(format!(
+                        "{ENV_REGISTRY_DIR}={}: cannot load the registry: {e}",
+                        dir.display()
+                    ))
+                })?;
+                config.store_and_bump(&cfg).await?;
+            }
+            let content: Arc<dyn ContentStore> = Arc::new(InMemoryContentStore::new());
+            Ok(Stores {
+                light: LightDeps {
+                    scheduler_store: Arc::new(InMemorySchedulerStore::new()),
+                    journal: Arc::new(InMemoryJournal::default()),
+                    config_source: Arc::new(config),
+                },
+                context: Arc::new(InMemoryContextStore::new(content.clone())),
+                content,
+            })
+        }
     }
 }
 
 pub async fn light(env: &EnvConfig) -> Result<LightDeps, CliError> {
-    let pool = connect_with_max(&env.database_url, env.pool_size)
-        .await
-        .map_err(|e| CliError::error(connect_failure(&env.database_url, &e.to_string())))?;
-    Ok(light_from_pool(pool))
+    Ok(open_stores(env).await?.light)
 }
 
 /// Heavy tier: a full Executor behind a Scheduler. Adds the gateway config file
@@ -440,26 +518,19 @@ pub async fn heavy(
     let gw_config = gateway_config.load().await?;
     let gw_source = gateway_config.describe();
 
-    // ONE shared pool for the whole heavy tier: `PgPool` is `Pool<DB>(Arc<PoolInner>)`,
-    // so cloning it is an `Arc::clone`, not a new connection. One `connect_with_max()`
-    // + N clones caps the whole tier at its single `max_connections(env.pool_size)`;
-    // four separate `connect()` calls (this function's original shape) would each
-    // hold their own, up to 4x as many backends per worker process. Tradeoff: the
-    // four Postgres adapters contend over `env.pool_size` connections total instead
-    // of that many each — with the executor's default concurrency of 8 and
-    // short-lived journal/CAS acquires, the default of 8 should be fine for most
-    // workers. If it ever isn't, the lever is `TORII_POOL_SIZE` (see
-    // `env_config_from` / `orchestrator_store::postgres::connect`'s doc comment for
-    // why 8 was the original default and what a shared-pool worker should weigh).
-    let url = &env.database_url;
-    let pool = connect_with_max(url, env.pool_size)
-        .await
-        .map_err(|e| CliError::error(connect_failure(url, &e.to_string())))?;
-    let light = light_from_pool(pool.clone());
+    // Every store from ONE backend (TM-5): for Postgres, one shared pool; for memory, this
+    // process's heap. The journal the Executor writes is the SAME one the Scheduler reads, so
+    // `tick`'s pause-deadline read sees what `run` wrote.
+    let Stores {
+        light,
+        content,
+        context,
+    } = open_stores(env).await?;
 
     // One atomic (config, generation) read — the fence generation must match the
     // config it was computed from.
-    let handle = RegistryHandle::from_source(&light.config_source).await?;
+    let handle =
+        RegistryHandle::from_source(light.config_source.as_ref() as &dyn ConfigSource).await?;
     // `snapshot()`, not `.current()` + `.generation()` as two separate lock
     // acquisitions: those release the lock in between, which is exactly the torn
     // -read shape SP-DATA-2 eliminated. Not reachable today (boot is sequential
@@ -494,13 +565,6 @@ pub async fn heavy(
     let facade = builder.build().await;
     require_adapters(&registered.list().await, &configured_routers, &gw_source)?;
     let gateway = Arc::new(facade.gateway);
-
-    // SP-DATA-5 Task 5: reuse `light.journal` rather than opening a second
-    // `PostgresJournal` over another pool clone — `light_from_pool` already built
-    // one over this exact pool, and the Scheduler needs the SAME journal the
-    // Executor writes to (so `tick`'s pause-deadline read sees what `run` wrote).
-    let content = Arc::new(PostgresContentStore::new(pool.clone()));
-    let context = Arc::new(PostgresContextStore::new(pool));
 
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let mut executor = Executor::new(gateway, light.journal.clone(), fence)
@@ -599,6 +663,13 @@ mod tests {
     // unused import.
     use orchestrator_store::postgres::connect;
 
+    fn pg_url(e: &EnvConfig) -> &str {
+        match &e.backend {
+            Backend::Postgres { database_url } => database_url,
+            Backend::Memory { .. } => panic!("expected the postgres backend"),
+        }
+    }
+
     fn getter<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |k| {
             pairs
@@ -606,6 +677,50 @@ mod tests {
                 .find(|(key, _)| *key == k)
                 .map(|(_, v)| v.to_string())
         }
+    }
+
+    /// TM-5: the memory backend needs no DATABASE_URL, and takes its registry dir.
+    #[test]
+    fn the_memory_backend_needs_no_database_url_and_reads_its_registry_dir() {
+        let e = env_config_from(getter(&[(ENV_BACKEND, "memory")])).expect("memory boots bare");
+        assert!(matches!(e.backend, Backend::Memory { registry_dir: None }));
+        let e = env_config_from(getter(&[
+            (ENV_BACKEND, " Memory "),
+            (ENV_REGISTRY_DIR, "/tmp/reg"),
+            (ENV_DATABASE_URL, "postgres://ignored"),
+        ]))
+        .expect("ok");
+        assert!(
+            matches!(&e.backend, Backend::Memory { registry_dir: Some(d) } if d == &PathBuf::from("/tmp/reg")),
+            "case-insensitive, trimmed, and DATABASE_URL does not override the choice"
+        );
+    }
+
+    /// TM-5: an explicit `postgres` is the default backend, and still needs DATABASE_URL;
+    /// anything else is refused naming the choices.
+    #[test]
+    fn the_backend_choice_is_explicit_and_validated() {
+        let e = env_config_from(getter(&[
+            (ENV_BACKEND, "postgres"),
+            (ENV_DATABASE_URL, "postgres://h/db"),
+        ]))
+        .expect("ok");
+        assert_eq!(pg_url(&e), "postgres://h/db");
+        assert!(env_config_from(getter(&[(ENV_BACKEND, "postgres")])).is_err());
+        let err = env_config_from(getter(&[(ENV_BACKEND, "sqlite")])).expect_err("unknown");
+        assert!(
+            err.message.contains("sqlite") && err.message.contains("memory"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// The Debug impl still never prints a database password, now through the backend.
+    #[test]
+    fn env_config_debug_redacts_the_postgres_password() {
+        let e =
+            env_config_from(getter(&[(ENV_DATABASE_URL, "postgres://u:hunter2@h/db")])).unwrap();
+        assert!(!format!("{e:?}").contains("hunter2"), "{e:?}");
     }
 
     #[test]
@@ -618,7 +733,7 @@ mod tests {
     #[test]
     fn the_light_tier_needs_only_a_database_url() {
         let e = env_config_from(getter(&[(ENV_DATABASE_URL, "postgres://h/db")])).expect("ok");
-        assert_eq!(e.database_url, "postgres://h/db");
+        assert_eq!(pg_url(&e), "postgres://h/db");
         assert_eq!(e.fence_version, None);
     }
 
@@ -736,7 +851,7 @@ mod tests {
         let url = format!("postgres://u:{pw}@h:5432/db");
         let e = env_config_from(getter(&[(ENV_DATABASE_URL, &url)])).expect("ok");
         // The redaction helper is what every message uses.
-        assert!(!redact_url(&e.database_url).contains(&pw));
+        assert!(!redact_url(pg_url(&e)).contains(&pw));
     }
 
     /// FIX 6: `{:?}` on `EnvConfig` must never print the plaintext password —
@@ -1102,7 +1217,9 @@ mod tests {
         )
         .expect("write gateway config");
         let env = EnvConfig {
-            database_url: url.clone(),
+            backend: Backend::Postgres {
+                database_url: url.clone(),
+            },
             fence_version: Some("torii-unbound-probe-fence".to_string()),
             pool_size: DEFAULT_POOL_SIZE,
         };
@@ -1173,7 +1290,9 @@ mod tests {
         .expect("write gateway config");
 
         let env = EnvConfig {
-            database_url: url.clone(),
+            backend: Backend::Postgres {
+                database_url: url.clone(),
+            },
             fence_version: Some("torii-selector-probe-fence".to_string()),
             pool_size: DEFAULT_POOL_SIZE,
         };
@@ -1270,7 +1389,9 @@ mod tests {
         let tag = format!("torii-boot-probe-{}", uuid::Uuid::new_v4());
         let sep = if url.contains('?') { '&' } else { '?' };
         let env = EnvConfig {
-            database_url: format!("{url}{sep}application_name={tag}"),
+            backend: Backend::Postgres {
+                database_url: format!("{url}{sep}application_name={tag}"),
+            },
             fence_version: Some("torii-boot-probe-fence".to_string()),
             pool_size: DEFAULT_POOL_SIZE,
         };

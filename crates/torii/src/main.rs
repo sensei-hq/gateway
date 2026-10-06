@@ -646,7 +646,7 @@ async fn dispatch(cli: Cli) -> Result<Outcome, CliError> {
             let d = boot::light(&env).await?;
             match action {
                 ConfigAction::Version { json } => {
-                    cmd::config::version(&d.config_source, json).await
+                    cmd::config::version(d.config_source.as_ref(), json).await
                 }
                 ConfigAction::Push {
                     dir,
@@ -664,7 +664,7 @@ async fn dispatch(cli: Cli) -> Result<Outcome, CliError> {
                     // `push` reads it to disclose how much paused work a generation
                     // bump would strand.
                     cmd::config::push(
-                        &d.config_source,
+                        d.config_source.as_ref(),
                         d.scheduler_store.as_ref(),
                         &dir,
                         gateway_config.as_deref(),
