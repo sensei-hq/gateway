@@ -34,11 +34,12 @@ toolkit does not yet do something, it says so rather than describing an intentio
 `ollama` is convenient for a first boot because it registers without credentials. A real
 deployment adds `models` and named `chains`.
 
-> **Know this before you author agents.** An agent's `chain` (or its `(area, kind)` chain binding)
-> is a **string**. `Registry::validate` only checks that the string is present — the id is resolved
-> later, in the gateway, against *this* file's `chains` map, which `torii config push` never reads.
-> If they disagree, selection yields no candidates and the node fails terminally with a message
-> naming neither cause nor remedy. Keep the two in step by hand; nothing checks it for you yet.
+> **Know this before you author agents.** An agent's `chain`, its per-phase `chains`, and every
+> `(area, kind)` chain binding are **strings** resolved against *this* file's `chains` map. Two
+> checks keep them in step: `torii config push --gateway-config <file>` refuses a registry that
+> names a chain the file lacks (opt-in, at push time), and `run submit` / `worker serve` **always**
+> refuse to boot on one — naming each missing chain and the agent, phase or binding that names it
+> — rather than letting every run that reaches it fail with no candidates.
 
 ## The registry directory
 
