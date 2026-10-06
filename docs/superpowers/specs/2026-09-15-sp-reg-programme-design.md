@@ -25,7 +25,7 @@ is recorded so it can be re-opened deliberately rather than by accident.
 
 | slice | what | blocked on |
 |---|---|---|
-| **SP-REG-2** | Discovery tools, composed per-run from the pinned registry | code: nothing. **Done gate: the tool SPECS** — see §3 |
+| **SP-REG-2** | Discovery tools, composed per-run from the pinned registry | ✅ **code SHIPPED** — AG-1, gateway#85 (`Executor::pinned`). Done gate 1 still needs the tool SPECS shipped — torii#46 (SP-REG-4) |
 | **SP-REG-3** | Designating which planner wins | ✅ **SHIPPED** — PR #66 (`e6658d6`, 2026-09-16) |
 | **SP-REG-4** | `config init` + embedded defaults + the shipped content | **TWO: the content list, AND the un-designed `dispatch()` restructure (§6)** |
 | **SP-REG-5** | Cross-check agent chain ids against the gateway config at push | ✅ **SHIPPED** — PR #65 (`15688a5`) |
@@ -39,6 +39,11 @@ SP-REG-1 a programme in the first place.
 `ListAgents`, `ListSkills`, `ListTools`, `ListChains`, `ValidatePlan` are `pub` production types so
 a planner can introspect the registry and self-validate a draft plan. **Nothing in production wires
 them** — zero references anywhere in `crates/torii`.
+
+> **✅ Shipped (AG-1, gateway#85):** `Executor::pinned` now composes all five per run, exactly as
+> §"Resolved design" below, with done gates 1–4 as tests (`executor/tests.rs`,
+> `mod discovery_tools_per_run`, each mutation-checked). The paragraph above describes the
+> pre-AG-1 baseline. What still gates usefulness is the tool SPECS in a pushed registry (§6, torii#46).
 
 They are not unproven, though, and that de-risks the slice: a live test at
 `executor/tests.rs:9358-9465` composes a real `ToolRegistry` with `ValidatePlan` + `ListAgents` over
