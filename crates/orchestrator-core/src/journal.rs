@@ -896,10 +896,29 @@ mod tests {
             seq: 0,
         };
         let s = serde_json::to_string(&intent).unwrap();
-        assert!(matches!(
-            serde_json::from_str::<JournalEvent>(&s).unwrap(),
-            JournalEvent::EffectIntent { .. }
-        ));
+        let back: JournalEvent = serde_json::from_str(&s).unwrap();
+        assert!(matches!(back, JournalEvent::EffectIntent { .. }));
+        // EVERY field survives, not just the variant: a durable journal (torii's PgJournal)
+        // stores this as JSON, and in-doubt reconcile on resume keys on `effect_id` +
+        // `idempotency_key` read back from it — a field lost here double-applies a mutation
+        // across a process boundary. Compared field by field against the ORIGINALS: comparing
+        // two serialized forms would pass a field dropped on serialization, since both sides
+        // would drop it.
+        let JournalEvent::EffectIntent {
+            node,
+            effect_id: eid,
+            idempotency_key,
+            args_hash,
+            seq,
+        } = back
+        else {
+            unreachable!()
+        };
+        assert_eq!(node, NodeId("n1".into()));
+        assert_eq!(eid, effect_id("n1", 0, 1));
+        assert_eq!(idempotency_key, "k");
+        assert_eq!(args_hash, "h");
+        assert_eq!(seq, 0);
 
         let obs = ObservationMeta {
             fetched_at: chrono::Utc::now(),
