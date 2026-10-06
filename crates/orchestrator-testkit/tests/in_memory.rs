@@ -1,5 +1,5 @@
-//! The gateway's in-memory stores keep the conformance contract (TM-3). The Postgres stores run
-//! the same suite in `orchestrator-store`'s Postgres tests; torii's stores run it after the move.
+//! The gateway's in-memory stores keep the conformance contract (TM-3). torii's tenant-scoped
+//! Postgres stores run the same suite in sensei-hq/torii (`crates/orchestrator-store/tests`).
 
 use orchestrator_store::{
     InMemoryConfigStore, InMemoryContentStore, InMemoryContextStore, InMemoryJournal,
