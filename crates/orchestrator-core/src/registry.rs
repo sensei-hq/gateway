@@ -426,6 +426,13 @@ impl Registry {
         }
         set.into_iter().collect()
     }
+    /// Every `(area, kind) → chain` binding, as `(area, kind, chain)`. Lets a caller that must
+    /// say WHICH binding references a missing chain attribute it (`chain_names` is a set).
+    pub fn chain_bindings(&self) -> impl Iterator<Item = (&str, &str, &str)> {
+        self.chain_bindings
+            .iter()
+            .map(|((area, kind), chain)| (area.as_str(), kind.as_str(), chain.as_str()))
+    }
     pub fn with_chain_binding(mut self, b: ChainBinding) -> Self {
         self.chain_bindings.insert((b.area, b.kind), b.chain);
         self

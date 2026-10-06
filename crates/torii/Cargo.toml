@@ -35,6 +35,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
 # `test-support` on top of the plain `postgres` dependency above: it exposes
 # `orchestrator_store::test_guard`, the ONE DB-test isolation guard, which this crate's
 # tests take instead of the private copy they used to carry. Dev-only — the binary links

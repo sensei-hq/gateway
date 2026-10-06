@@ -602,7 +602,12 @@ async fn dispatch(cli: Cli) -> Result<Outcome, CliError> {
                 let g: Graph = serde_json::from_str(&raw).map_err(|e| {
                     CliError::error(format!("{} is not a valid graph: {e}", graph.display()))
                 })?;
-                let d = boot::heavy(&env, &gateway_config, workspace_root.as_deref()).await?;
+                let d = boot::heavy(
+                    &env,
+                    &boot::FileGatewayConfigSource::new(&gateway_config),
+                    workspace_root.as_deref(),
+                )
+                .await?;
                 let budget = budget_tokens
                     .map(|total_tokens| orchestrator_core::TokenBudget { total_tokens });
                 // Print the id BEFORE driving: an operator who loses the terminal
@@ -622,7 +627,12 @@ async fn dispatch(cli: Cli) -> Result<Outcome, CliError> {
                 gateway_config,
                 workspace_root,
             } => {
-                let d = boot::heavy(&env, &gateway_config, workspace_root.as_deref()).await?;
+                let d = boot::heavy(
+                    &env,
+                    &boot::FileGatewayConfigSource::new(&gateway_config),
+                    workspace_root.as_deref(),
+                )
+                .await?;
                 let shutdown = shutdown_signal()?;
                 cmd::worker::serve(
                     &d.scheduler,

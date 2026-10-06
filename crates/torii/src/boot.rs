@@ -15,7 +15,7 @@ use orchestrator_store::postgres::{
     PostgresConfigSource, PostgresContentStore, PostgresContextStore, PostgresJournal,
     PostgresSchedulerStore, connect_with_max,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub const ENV_DATABASE_URL: &str = "DATABASE_URL";
@@ -180,6 +180,99 @@ fn connect_failure(database_url: &str, err: &str) -> String {
     )
 }
 
+/// Where the heavy tier gets its [`GatewayConfig`](kernel::types::config::GatewayConfig) — the
+/// routers, models and chains (TM-4, gateway#80). Boot consumes this seam instead of reading a
+/// file itself, so the same boot runs against a JSON file (the gateway CLI's
+/// `--gateway-config`) or, after the move to torii, torii's own `catalog` schema.
+#[async_trait::async_trait]
+pub trait GatewayConfigSource: Send + Sync {
+    /// Load and parse the whole config. Errors must never echo its contents: it holds
+    /// provider API keys.
+    async fn load(&self) -> Result<kernel::types::config::GatewayConfig, CliError>;
+    /// Names the source in operator messages (a path, a database) — never its contents.
+    fn describe(&self) -> String;
+}
+
+/// The `--gateway-config <file>` source: a JSON `GatewayConfig`.
+pub struct FileGatewayConfigSource {
+    path: PathBuf,
+}
+
+impl FileGatewayConfigSource {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+}
+
+#[async_trait::async_trait]
+impl GatewayConfigSource for FileGatewayConfigSource {
+    async fn load(&self) -> Result<kernel::types::config::GatewayConfig, CliError> {
+        // The file holds provider API keys: report its PATH on failure, never its contents.
+        let raw = std::fs::read_to_string(&self.path)
+            .map_err(|e| CliError::error(format!("cannot read {}: {e}", self.path.display())))?;
+        serde_json::from_str(&raw).map_err(|e| gateway_config_parse_error(&self.path, &e))
+    }
+    fn describe(&self) -> String {
+        self.path.display().to_string()
+    }
+}
+
+/// Every chain id the registry references — agent `chain`, per-phase `chains`, `(area, kind)`
+/// bindings — that the gateway config does not define, attributed to who referenced it.
+/// Shared by `config push --gateway-config` (push time) and the heavy tier (boot time).
+pub(crate) fn unresolved_chain_refs<'a>(
+    agents: impl Iterator<Item = &'a orchestrator_core::AgentDefinition>,
+    bindings: impl Iterator<Item = (&'a str, &'a str, &'a str)>,
+    chains: &std::collections::HashMap<String, kernel::types::config::FallbackChainConfig>,
+) -> Vec<(String, String)> {
+    let mut out = std::collections::BTreeSet::new();
+    for a in agents {
+        if let Some(c) = &a.chain
+            && !chains.contains_key(c)
+        {
+            out.insert((format!("agent {:?}", a.name), c.clone()));
+        }
+        // Per-phase overrides too: a check that walks only `agent.chain` passes every obvious
+        // test while missing the collection a real config is most likely to drift in.
+        for (phase, c) in &a.chains {
+            if !chains.contains_key(c) {
+                out.insert((format!("agent {:?} phase {:?}", a.name, phase), c.clone()));
+            }
+        }
+    }
+    for (area, kind, c) in bindings {
+        if !chains.contains_key(c) {
+            out.insert((format!("chain binding {area:?}/{kind:?}"), c.to_string()));
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// The always-on boot check (TM-4): a registry bound to a chain the gateway config does not
+/// define refuses to boot, naming every missing id and who referenced it. Without it the
+/// mismatch surfaces only at run time, as an empty candidate set and a terminal `NodeFailed`
+/// naming neither the cause nor the remedy.
+pub(crate) fn require_chains_resolve(
+    registry: &orchestrator_core::Registry,
+    gw: &kernel::types::config::GatewayConfig,
+    source: &str,
+) -> Result<(), CliError> {
+    let missing = unresolved_chain_refs(registry.agents(), registry.chain_bindings(), &gw.chains);
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let list = missing
+        .iter()
+        .map(|(who, chain)| format!("{who} → chain {chain:?}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(CliError::error(format!(
+        "the registry references chains the gateway config ({source}) does not define: {list}. \
+         Every run reaching one of them would fail with no candidates. Add the chains to the \
+         gateway config, or push a registry that uses ones it defines."
+    )))
+}
+
 /// A gateway-config parse failure reports the serde error's LOCATION ONLY — never its
 /// `Display`, which echoes the offending VALUE (`invalid type: string "sk-live-…",
 /// expected struct RouterConfig`). This file is the one that holds provider API keys, and
@@ -240,7 +333,7 @@ pub fn init_tracing() {
 fn require_adapters(
     registered: &[String],
     configured_routers: &[String],
-    gateway_config: &Path,
+    gateway_config: &str,
 ) -> Result<(), CliError> {
     if registered.is_empty() {
         let detail = if configured_routers.is_empty() {
@@ -255,9 +348,8 @@ fn require_adapters(
             )
         };
         return Err(CliError::error(format!(
-            "{} registered no provider adapters: {detail}. Every model call would fail, and a \
-             worker would terminally fail every run it wakes.",
-            gateway_config.display()
+            "{gateway_config} registered no provider adapters: {detail}. Every model call would \
+             fail, and a worker would terminally fail every run it wakes."
         )));
     }
     Ok(())
@@ -337,19 +429,16 @@ pub struct HeavyDeps {
 
 pub async fn heavy(
     env: &EnvConfig,
-    gateway_config: &Path,
+    gateway_config: &dyn GatewayConfigSource,
     workspace_root: Option<&Path>,
 ) -> Result<HeavyDeps, CliError> {
     let fence = require_fence(env)?.to_string();
 
-    // Read + parse the gateway config file FIRST (pure, no network): the most
-    // likely operator typo — a bad `--gateway-config` path — is caught instantly
-    // instead of only after a TCP connect and auth handshake. The file holds
-    // provider API keys: report its PATH on failure, never its contents.
-    let raw = std::fs::read_to_string(gateway_config)
-        .map_err(|e| CliError::error(format!("cannot read {}: {e}", gateway_config.display())))?;
-    let gw_config: kernel::types::config::GatewayConfig =
-        serde_json::from_str(&raw).map_err(|e| gateway_config_parse_error(gateway_config, &e))?;
+    // Load the gateway config FIRST: for a file source that is pure and offline, so the most
+    // likely operator typo — a bad `--gateway-config` path — is caught instantly instead of
+    // only after a TCP connect and auth handshake.
+    let gw_config = gateway_config.load().await?;
+    let gw_source = gateway_config.describe();
 
     // ONE shared pool for the whole heavy tier: `PgPool` is `Pool<DB>(Arc<PoolInner>)`,
     // so cloning it is an `Arc::clone`, not a new connection. One `connect_with_max()`
@@ -388,6 +477,9 @@ pub async fn heavy(
         "registry loaded"
     );
     require_agents(agents_n, skills_n, tools_n, generation)?;
+    // TM-4: always on — a registry bound to a chain this gateway config lacks refuses to
+    // boot, rather than failing every run that reaches the chain.
+    require_chains_resolve(&registry, &gw_config, &gw_source)?;
 
     // `Gateway::new` is the low-level, hand-wired constructor (an empty adapter
     // registry). `FacadeBuilder` is the composition root that actually registers a
@@ -400,11 +492,7 @@ pub async fn heavy(
     let builder = gateway::FacadeBuilder::new(gw_config);
     let registered = builder.registry().clone();
     let facade = builder.build().await;
-    require_adapters(
-        &registered.list().await,
-        &configured_routers,
-        gateway_config,
-    )?;
+    require_adapters(&registered.list().await, &configured_routers, &gw_source)?;
     let gateway = Arc::new(facade.gateway);
 
     // SP-DATA-5 Task 5: reuse `light.journal` rather than opening a second
@@ -753,13 +841,129 @@ mod tests {
         );
     }
 
+    fn chain(id: &str) -> kernel::types::config::FallbackChainConfig {
+        kernel::types::config::FallbackChainConfig {
+            id: id.into(),
+            capability: kernel::types::capability::Capability::TextChat,
+            models: vec![],
+            fallback_triggers: vec![],
+        }
+    }
+
+    fn registry_with(
+        agent_chain: &str,
+        phase_chain: &str,
+        binding_chain: &str,
+    ) -> orchestrator_core::Registry {
+        let cfg: orchestrator_core::RegistryConfig = serde_json::from_value(serde_json::json!({
+            "agents": [{
+                "name": "researcher", "area": "research", "kind": "lead",
+                "chain": agent_chain, "chains": {"draft": phase_chain},
+                "tools": [], "skills": [], "system_prompt": "x"
+            }],
+            "skills": [], "tools": [],
+            "chain_bindings": [{"area": "research", "kind": "worker", "chain": binding_chain}]
+        }))
+        .expect("registry config");
+        orchestrator_core::Registry::from_config(cfg).expect("registry")
+    }
+
+    fn gw_with(chains: &[&str]) -> kernel::types::config::GatewayConfig {
+        kernel::types::config::GatewayConfig {
+            chains: chains.iter().map(|c| (c.to_string(), chain(c))).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// TM-4: the boot check is ALWAYS on. A registry whose chains all resolve boots.
+    #[test]
+    fn boot_accepts_a_registry_whose_chains_all_resolve() {
+        let reg = registry_with("deep", "fast", "cheap");
+        assert!(
+            require_chains_resolve(&reg, &gw_with(&["deep", "fast", "cheap"]), "gw.json").is_ok()
+        );
+    }
+
+    /// TM-4: a registry bound to a chain the gateway does not define refuses to boot, naming
+    /// every missing id AND who referenced it — agent, per-phase override, and binding.
+    #[test]
+    fn boot_refuses_a_registry_bound_to_chains_the_gateway_lacks() {
+        let reg = registry_with("deep", "nope-phase", "nope-binding");
+        let err = require_chains_resolve(&reg, &gw_with(&["deep"]), "gw.json")
+            .expect_err("unresolved chains must refuse to boot");
+        for needle in [
+            "nope-phase",
+            "nope-binding",
+            "agent \"researcher\" phase \"draft\"",
+            "chain binding \"research\"/\"worker\"",
+            "gw.json",
+        ] {
+            assert!(
+                err.message.contains(needle),
+                "missing {needle:?} in: {}",
+                err.message
+            );
+        }
+        assert!(
+            !err.message.contains("\"deep\""),
+            "a resolved chain is not reported: {}",
+            err.message
+        );
+    }
+
+    /// TM-4: the file source parses a JSON GatewayConfig and names itself by path.
+    #[tokio::test]
+    async fn the_file_gateway_config_source_loads_and_describes_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gw.json");
+        std::fs::write(
+            &path,
+            r#"{"routers":{"ollama":{"url":"http://127.0.0.1:11434"}}}"#,
+        )
+        .unwrap();
+        let src = FileGatewayConfigSource::new(&path);
+        let gw = src.load().await.expect("a valid file loads");
+        assert!(gw.routers.contains_key("ollama"));
+        assert!(src.describe().contains("gw.json"), "{}", src.describe());
+    }
+
+    /// TM-4: the file source keeps boot's existing error contract — a missing file names the
+    /// path; a bad file names the path and location but NEVER echoes a value (it holds keys).
+    #[tokio::test]
+    async fn the_file_gateway_config_source_errors_name_the_path_never_the_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = FileGatewayConfigSource::new(dir.path().join("absent.json"));
+        let err = missing
+            .load()
+            .await
+            .expect_err("a missing file is an error");
+        assert!(err.message.contains("absent.json"), "{}", err.message);
+
+        let key = "sk-live-NEVER-PRINT-ME";
+        let bad = dir.path().join("bad.json");
+        std::fs::write(&bad, format!(r#"{{"routers":{{"openai":"{key}"}}}}"#)).unwrap();
+        let err = FileGatewayConfigSource::new(&bad)
+            .load()
+            .await
+            .expect_err("a string where a router belongs does not parse");
+        assert!(
+            !err.message.contains(key),
+            "the key must never reach stderr: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("bad.json") && err.message.contains("line 1"),
+            "{}",
+            err.message
+        );
+    }
+
     /// FIX 1: `FacadeBuilder::build` never fails on a bad router — this is the only
     /// place a completely misconfigured gateway is caught. No live provider needed:
     /// the check is pure over the already-registered adapter ids.
     #[test]
     fn heavy_refuses_a_gateway_config_that_registered_no_adapters() {
-        let err =
-            require_adapters(&[], &[], Path::new("/tmp/gateway.json")).expect_err("must refuse");
+        let err = require_adapters(&[], &[], "/tmp/gateway.json").expect_err("must refuse");
         assert_eq!(err.code, crate::errors::EXIT_ERROR);
         assert!(err.message.contains("gateway.json"), "{}", err.message);
         assert!(
@@ -780,12 +984,8 @@ mod tests {
     /// operator's names and keys may already be correct for a case torii can't wire.
     #[test]
     fn heavy_names_the_configured_routers_that_produced_no_adapter() {
-        let err = require_adapters(
-            &[],
-            &["bedrock".to_string()],
-            Path::new("/tmp/gateway.json"),
-        )
-        .expect_err("must refuse");
+        let err = require_adapters(&[], &["bedrock".to_string()], "/tmp/gateway.json")
+            .expect_err("must refuse");
         assert!(
             err.message.contains("bedrock"),
             "must name the skipped router: {}",
@@ -798,7 +998,7 @@ mod tests {
         require_adapters(
             &["anthropic".to_string()],
             &["anthropic".to_string()],
-            Path::new("/tmp/gateway.json"),
+            "/tmp/gateway.json",
         )
         .expect("at least one adapter is enough");
     }
@@ -862,6 +1062,62 @@ mod tests {
     /// seed away between the write and `heavy()`'s read. `config_guard` now
     /// serializes every durable-config writer in this crate, which closes that
     /// race at the source; the retry below is kept as the backstop for any
+    /// TM-4 at the boot path: `heavy()` itself refuses a registry bound to a chain the
+    /// gateway config does not define, naming the chain — the unit tests prove the check,
+    /// this proves `heavy()` runs it, against a real database.
+    #[cfg_attr(
+        not(have_database_url),
+        ignore = "needs a Postgres at $DATABASE_URL; see README, Postgres-backed tests"
+    )]
+    #[tokio::test]
+    async fn heavy_refuses_a_registry_bound_to_a_chain_the_gateway_config_lacks() {
+        let Some(url) = crate::test_guard::db_url() else {
+            return;
+        };
+        let _guard = crate::test_guard::config_guard().await;
+        let config_source = PostgresConfigSource::new(connect(&url).await.expect("connect"));
+        let seed = orchestrator_core::RegistryConfig {
+            agents: vec![orchestrator_core::AgentDefinition {
+                default_planner: false,
+                name: "torii-unbound-probe-agent".to_string(),
+                area: "test".to_string(),
+                kind: "test".to_string(),
+                chain: Some("torii-chain-nobody-defined".to_string()),
+                chains: Default::default(),
+                grants: Default::default(),
+                tools: vec![],
+                skills: vec![],
+                system_prompt: "probe".to_string(),
+                backed_by: Default::default(),
+            }],
+            ..Default::default()
+        };
+        config_source.store_and_bump(&seed).await.expect("seed");
+
+        let gw_dir = tempfile::tempdir().expect("tmp dir");
+        let gw_path = gw_dir.path().join("gateway.json");
+        std::fs::write(
+            &gw_path,
+            r#"{"routers":{"ollama":{"url":"http://127.0.0.1:11434"}}}"#,
+        )
+        .expect("write gateway config");
+        let env = EnvConfig {
+            database_url: url.clone(),
+            fence_version: Some("torii-unbound-probe-fence".to_string()),
+            pool_size: DEFAULT_POOL_SIZE,
+        };
+        let err = match heavy(&env, &FileGatewayConfigSource::new(&gw_path), None).await {
+            Ok(_) => panic!("heavy() must refuse a registry bound to an undefined chain"),
+            Err(e) => e,
+        };
+        assert!(
+            err.message.contains("torii-chain-nobody-defined")
+                && err.message.contains("torii-unbound-probe-agent"),
+            "{}",
+            err.message
+        );
+    }
+
     /// **SP-REG-0 — the production executor must have a planner selector wired.**
     ///
     /// `PlannerRef::Select` fails for TWO independent reasons, and only the first is
@@ -912,7 +1168,7 @@ mod tests {
         let gw_path = gw_dir.join("gateway.json");
         std::fs::write(
             &gw_path,
-            r#"{"routers":{"ollama":{"url":"http://127.0.0.1:11434"}}}"#,
+            r#"{"routers":{"ollama":{"url":"http://127.0.0.1:11434"}},"chains":{"torii-selector-probe-chain":{"id":"torii-selector-probe-chain","capability":"text_chat","models":[],"fallback_triggers":[]}}}"#,
         )
         .expect("write gateway config");
 
@@ -930,7 +1186,7 @@ mod tests {
                 .store_and_bump(&seed)
                 .await
                 .expect("seed the probe agent");
-            match heavy(&env, &gw_path, None).await {
+            match heavy(&env, &FileGatewayConfigSource::new(&gw_path), None).await {
                 Ok(d) => {
                     deps = Some(d);
                     break;
@@ -1004,7 +1260,7 @@ mod tests {
         // a real `heavy()` boot with no live provider.
         std::fs::write(
             &gw_path,
-            r#"{"routers":{"ollama":{"url":"http://127.0.0.1:11434"}}}"#,
+            r#"{"routers":{"ollama":{"url":"http://127.0.0.1:11434"}},"chains":{"torii-boot-probe-chain":{"id":"torii-boot-probe-chain","capability":"text_chat","models":[],"fallback_triggers":[]}}}"#,
         )
         .expect("write gateway config");
 
@@ -1038,7 +1294,7 @@ mod tests {
                 .await
                 .expect("seed the probe agent");
             let before = backend_count(&probe_pool, &tag).await;
-            match heavy(&env, &gw_path, None).await {
+            match heavy(&env, &FileGatewayConfigSource::new(&gw_path), None).await {
                 Ok(deps) => {
                     let after = backend_count(&probe_pool, &tag).await;
                     outcome = Some((deps, before, after));
