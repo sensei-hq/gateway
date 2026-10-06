@@ -16,19 +16,18 @@ The orchestrator stack builds **on top of** the routing engine above. `gateway` 
 it — no dependency, and no notion of agents, skills or tools — so the five crates above are usable
 entirely on their own.
 
-> **Moving to torii.** The gateway is a library; persistence belongs to the product that runs it
-> (torii `docs/DECISIONS.md` §11). The Postgres backends and the `torii` CLI are being moved into
-> [`sensei-hq/torii`](https://github.com/sensei-hq/torii) — tenant-scoped there — and will be
-> removed from this repo in a later release. The traits, the executor, the in-memory stores and the
-> conformance suite stay here.
+> **Persistence lives in torii.** The gateway is a library; persistence belongs to the product that
+> runs it (torii `docs/DECISIONS.md` §11). The tenant-scoped Postgres stores, their schema and the
+> `torii` operator CLI are in [`sensei-hq/torii`](https://github.com/sensei-hq/torii)
+> (`crates/orchestrator-store`, `crates/cli`, `database/`). This repo ships the traits, the
+> executor, the in-memory stores and the conformance suite every backend is held to.
 
 | Crate | What it is |
 |---|---|
 | [`orchestrator-core`](crates/orchestrator-core) (`sensei-orchestrator-core`) | The domain types and the seams: `Graph`/`NodeKind`, the registry vocabulary (`AgentDefinition`, `SkillDef`, `ToolSpec`, `Activation`), and the traits a backend implements — `ExecutionJournal`, `ContentStore`, `ContextStore`, `ConfigSource` + its write side `ConfigStore`, `SchedulerStore`. No I/O. |
 | [`orchestrator`](crates/orchestrator) (`sensei-orchestrator`) | The durable, resumable executor: journal-and-fold replay, effect classes (Pure / Observation / Mutation with two-phase in-doubt reconcile), hierarchical nodes (`Subgraph`, `Branch`, `Expand`, `Loop`), permission enforcement, secret redaction, workspace and subprocess isolation, human-in-the-loop gates, and context budgeting. |
-| [`orchestrator-store`](crates/orchestrator-store) (`sensei-orchestrator-store`) | Postgres backends for those seams (`postgres` feature), plus in-memory ones (including a writable, versioned `InMemoryConfigStore`). A run journaled in one process resumes in another with no token re-spend. |
-| [`orchestrator-testkit`](crates/orchestrator-testkit) (`sensei-orchestrator-testkit`) | The store conformance suite: one function per persistence trait, each its documented contract. Every backend runs it — the in-memory stores, the Postgres stores, and torii's tenant-scoped stores. |
-| [`torii`](crates/torii) (`sensei-torii`) | **The operator CLI** — submit and observe runs, intervene on human-gated ones, drive due wakes, manage durable config, on a Postgres or an in-memory backend (`TORII_BACKEND`). See [its README](crates/torii/README.md) for a quickstart, including what you must set up by hand and the gaps it does not yet cover. |
+| [`orchestrator-store`](crates/orchestrator-store) (`sensei-orchestrator-store`) | The in-memory implementations of those seams (including a writable, versioned `InMemoryConfigStore`) and `FilesystemConfigSource`, the registry-directory reader. Durable stores implement the same traits elsewhere — torii's are Postgres, tenant-scoped. |
+| [`orchestrator-testkit`](crates/orchestrator-testkit) (`sensei-orchestrator-testkit`) | The store conformance suite: one function per persistence trait, each its documented contract. Every backend runs it — the in-memory stores here, torii's tenant-scoped Postgres stores there. |
 
 `local-providers` features (all off by default — each pulls heavyweight native deps):
 
@@ -73,51 +72,15 @@ cargo test --workspace
 
 That is the whole default suite and it needs no database, no Docker and no network.
 
-### Postgres-backed tests
-
-The orchestrator's durable half — the Postgres journal, CAS, context store, config source
-and scheduler, plus torii's cross-process operator e2e — can only be exercised against a
-real database. Those tests are **conditionally ignored**: with no `DATABASE_URL` they are
-reported as `ignored`, not as passed, so the number `cargo test` prints is true either way.
-
-Bring up a throwaway database, apply the schema, and run them:
-
-```bash
-docker run -d --name gw-pg -e POSTGRES_PASSWORD=postgres -p 55432:5432 postgres:16
-sleep 12
-docker exec -i gw-pg psql -U postgres -v ON_ERROR_STOP=1 < database/_apply_all.sql
-
-export DATABASE_URL=postgres://postgres:postgres@127.0.0.1:55432/postgres
-
-cargo test --workspace                                    # the 48 conditional tests now RUN
-cargo test -p sensei-torii --test e2e_pg                  # the cross-process operator loop
-cargo test -p sensei-orchestrator --features postgres-tests postgres_e2e
-
-docker rm -f gw-pg
-```
-
-Pick a port that is actually free (`lsof -i :55432`) — the suite talks to whatever
-`DATABASE_URL` names, so pointing it at a database you care about will write to it.
-
-**How the gate works.** Each package with database tests has a five-line `build.rs` that
-emits `cargo::rustc-cfg=have_database_url` when the variable is set, and every such test
-carries `#[cfg_attr(not(have_database_url), ignore = "...")]`. It is a build-time cfg rather
-than a plain `#[ignore]` or a cargo feature because both of those are static: a plain
-`#[ignore]` would need `-- --ignored` even when a database IS configured, and a
-`required-features` test target would make `cargo test -p sensei-torii --test e2e_pg` fail
-outright. `cargo::rerun-if-env-changed=DATABASE_URL` is what makes exporting the variable
-take effect on the next build. The runtime `db_url()` guard remains as a second layer, for
-the case where the variable is set at build time and absent at run time.
-
-**This is not wired into CI.** `.github/workflows/ci.yml`'s `build · test` job sets no
-`DATABASE_URL`, so it now reports these tests as `ignored` — honestly — rather than as
-passing. Adding a `services: postgres:16` container to that job plus a step applying
-`database/_apply_all.sql` would close the gap; that is an outward-facing CI change and has
-not been made here.
+The orchestrator's durable half — Postgres stores, cross-process resume against a real database,
+the `torii` operator CLI's end-to-end suites — moved to
+[`sensei-hq/torii`](https://github.com/sensei-hq/torii) with the stores (see its
+`crates/cli/README.md`, "Tests"). What stays here is checked against the in-memory stores and the
+shared conformance suite (`sensei-orchestrator-testkit`), which torii's stores run too.
 
 ## Versioning
 
-This repo versions **independently** of its consumers. Tag releases with semver (`vMAJOR.MINOR.PATCH`); all five crates currently share version `0.3.1`.
+This repo versions **independently** of its consumers. Tag releases with semver (`vMAJOR.MINOR.PATCH`); every crate in the workspace shares one version (`Cargo.toml`).
 
 ## License
 

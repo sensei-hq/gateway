@@ -1,5 +1,5 @@
 //! SP-DATA-3: the in-memory [`SchedulerStore`] — the reference impl + parity target for
-//! `PostgresSchedulerStore`. `Clone` shares one `Arc`-backed map (the crash/resume seam, like
+//! durable stores (torii's tenant-scoped `PgSchedulerStore`). `Clone` shares one `Arc`-backed map (the crash/resume seam, like
 //! [`InMemoryJournal`](crate::InMemoryJournal)).
 
 use chrono::{DateTime, Duration, Utc};
@@ -235,7 +235,7 @@ impl SchedulerStore for InMemorySchedulerStore {
 /// makes a live run eligible.
 ///
 /// PARITY NOTE: this store stamps `updated_at` only at `enqueue`/`claim_due` — its transition
-/// methods take no `now` and cannot read a clock — whereas `PostgresSchedulerStore` sets
+/// methods take no `now` and cannot read a clock — whereas torii's `PgSchedulerStore` sets
 /// `updated_at = now()` on every transition. So an in-memory row's age is measured from its
 /// last enqueue/claim rather than from the moment it went terminal, which can make it
 /// eligible slightly sooner. That gap is confined to the non-durable reference store (torii
