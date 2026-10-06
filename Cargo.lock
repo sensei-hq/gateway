@@ -3872,8 +3872,22 @@ dependencies = [
  "async-trait",
  "chrono",
  "sensei-orchestrator-core",
+ "sensei-orchestrator-testkit",
  "serde_json",
  "sqlx",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "sensei-orchestrator-testkit"
+version = "0.8.0"
+dependencies = [
+ "chrono",
+ "sensei-orchestrator-core",
+ "sensei-orchestrator-store",
+ "serde",
+ "serde_json",
  "tokio",
  "uuid",
 ]
