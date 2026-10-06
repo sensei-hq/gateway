@@ -985,8 +985,36 @@ impl Executor {
     /// A per-run clone with the registry + fence version pinned from a
     /// `RegistryHandle` snapshot (handle cleared, so the pinned copy resolves the
     /// fixed registry directly — no double-pin).
+    ///
+    /// SP-REG-2 (AG-1, gateway#85): the planner discovery tools — `list_agents`,
+    /// `list_skills`, `list_tools`, `list_chains`, `validate_plan` — are composed HERE, over
+    /// the registry this run is pinned to, never at boot: `with_tools` is set once for the
+    /// executor's life, while the registry is re-pinned per run, so a boot snapshot would let a
+    /// planner introspect a registry its own run is not pinned to.
+    ///
+    /// Composing them widens nothing: the s1 gate only lets an agent call a tool it DECLARES,
+    /// and all five are `Pure`, so registering them changes no effect class or memo behaviour
+    /// for an agent that does not (spec `2026-09-15-sp-reg-programme-design.md` §3).
+    ///
+    /// Only this, the handle path, composes them. A `with_registry` executor (tests only — boot
+    /// uses `with_registry_handle`) does not: an agent there that declares `list_agents` fails
+    /// `UnknownTool` — a deliberate trade, because only the pinned path's `#cfg` fence makes a
+    /// FRESH discovery call refuse a drifted config instead of silently answering differently.
     fn pinned(mut self, registry: Arc<Registry>, generation: u64) -> Self {
+        use crate::agent::tools::{ListAgents, ListChains, ListSkills, ListTools, ValidatePlan};
         self.version = format!("{}#cfg{}", self.version, generation);
+        self.tools = Arc::new(
+            (*self.tools)
+                .clone()
+                .with_tool(Arc::new(ListAgents(registry.clone())))
+                .with_tool(Arc::new(ListSkills(registry.clone())))
+                .with_tool(Arc::new(ListTools(registry.clone())))
+                .with_tool(Arc::new(ListChains(registry.clone())))
+                .with_tool(Arc::new(ValidatePlan {
+                    registry: registry.clone(),
+                    max_nodes: self.max_nodes,
+                })),
+        );
         self.registry = registry;
         self.handle = None;
         self
