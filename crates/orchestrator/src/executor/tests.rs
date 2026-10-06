@@ -97,6 +97,10 @@ fn intent_key(events: &[(Seq, JournalEvent)], eid: &EffectId) -> Option<String> 
 fn agent_def(chain: &str) -> AgentDefinition {
     AgentDefinition {
         default_planner: false,
+        tool_limits: Default::default(),
+        confirm_tools: Vec::new(),
+        confirm_timeout: None,
+        escalate_to: None,
         name: "a".into(),
         area: "research".into(),
         kind: "reasoning".into(),
@@ -340,6 +344,10 @@ async fn agent_routes_via_area_kind_binding_end_to_end() {
     // Agent omits chain; the (research,reasoning) binding maps it to "c".
     let agent = AgentDefinition {
         default_planner: false,
+        tool_limits: Default::default(),
+        confirm_tools: Vec::new(),
+        confirm_timeout: None,
+        escalate_to: None,
         name: "a".into(),
         area: "research".into(),
         kind: "reasoning".into(),
@@ -395,6 +403,10 @@ async fn phase_override_wins_over_base_route_through_from_config() {
     chains.insert("plan".to_string(), "c".to_string());
     let agent = AgentDefinition {
         default_planner: false,
+        tool_limits: Default::default(),
+        confirm_tools: Vec::new(),
+        confirm_timeout: None,
+        escalate_to: None,
         name: "a".into(),
         area: "research".into(),
         kind: "reasoning".into(),
@@ -3625,6 +3637,10 @@ async fn agent_node_drives_real_reference_chain_to_local_fallover() {
     let journal = InMemoryJournal::new();
     let registry = Arc::new(Registry::default().with_agent(AgentDefinition {
         default_planner: false,
+        tool_limits: Default::default(),
+        confirm_tools: Vec::new(),
+        confirm_timeout: None,
+        escalate_to: None,
         name: "researcher".into(),
         area: "research".into(),
         kind: "reasoning".into(),
@@ -4208,6 +4224,10 @@ async fn map_of_agents_then_consolidate_drives_the_real_reference_chain_to_local
     let journal = InMemoryJournal::new();
     let mk_agent = |name: &str| AgentDefinition {
         default_planner: false,
+        tool_limits: Default::default(),
+        confirm_tools: Vec::new(),
+        confirm_timeout: None,
+        escalate_to: None,
         name: name.into(),
         area: "research".into(),
         kind: "reasoning".into(),
@@ -4328,6 +4348,10 @@ async fn e2e_map_observation_agents_plus_mutation_agent_through_the_real_gateway
 
     let mk_agent = |name: &str, tools: Vec<String>| AgentDefinition {
         default_planner: false,
+        tool_limits: Default::default(),
+        confirm_tools: Vec::new(),
+        confirm_timeout: None,
+        escalate_to: None,
         name: name.into(),
         area: "research".into(),
         kind: "reasoning".into(),
@@ -4487,6 +4511,10 @@ async fn in_doubt_mutation_in_a_map_child_pauses_the_whole_run() {
     let mk_recorder = |sink: Arc<std::sync::Mutex<Vec<String>>>| {
         let recorder = AgentDefinition {
             default_planner: false,
+            tool_limits: Default::default(),
+            confirm_tools: Vec::new(),
+            confirm_timeout: None,
+            escalate_to: None,
             name: "recorder".into(),
             area: "research".into(),
             kind: "reasoning".into(),
@@ -4896,6 +4924,10 @@ async fn agent_prompt_includes_its_dependency_output_from_the_blackboard() {
     let (gw, _c) = echo_system_gateway().await;
     let mk = |name: &str, sys: &str| AgentDefinition {
         default_planner: false,
+        tool_limits: Default::default(),
+        confirm_tools: Vec::new(),
+        confirm_timeout: None,
+        escalate_to: None,
         name: name.into(),
         area: "research".into(),
         kind: "reasoning".into(),
@@ -5670,6 +5702,10 @@ async fn loop_subgraph_body_pause_pauses_the_loop() {
     let mk_recorder = |sink: Arc<std::sync::Mutex<Vec<String>>>| {
         let recorder = AgentDefinition {
             default_planner: false,
+            tool_limits: Default::default(),
+            confirm_tools: Vec::new(),
+            confirm_timeout: None,
+            escalate_to: None,
             name: "recorder".into(),
             area: "research".into(),
             kind: "reasoning".into(),
@@ -6136,6 +6172,10 @@ async fn coordinator_loop_expand_body_with_gate_agent_converges() {
         Registry::default()
             .with_agent(AgentDefinition {
                 default_planner: false,
+                tool_limits: Default::default(),
+                confirm_tools: Vec::new(),
+                confirm_timeout: None,
+                escalate_to: None,
                 name: "planner".into(),
                 area: "planning".into(),
                 kind: "reasoning".into(),
@@ -6149,6 +6189,10 @@ async fn coordinator_loop_expand_body_with_gate_agent_converges() {
             })
             .with_agent(AgentDefinition {
                 default_planner: false,
+                tool_limits: Default::default(),
+                confirm_tools: Vec::new(),
+                confirm_timeout: None,
+                escalate_to: None,
                 name: "gate".into(),
                 area: "gating".into(),
                 kind: "reasoning".into(),
@@ -7661,6 +7705,10 @@ async fn an_in_doubt_mutation_in_a_subgraph_pauses_the_run() {
     let mk_recorder = |sink: Arc<std::sync::Mutex<Vec<String>>>| {
         let recorder = AgentDefinition {
             default_planner: false,
+            tool_limits: Default::default(),
+            confirm_tools: Vec::new(),
+            confirm_timeout: None,
+            escalate_to: None,
             name: "recorder".into(),
             area: "research".into(),
             kind: "reasoning".into(),
@@ -8177,6 +8225,10 @@ async fn an_in_doubt_mutation_in_a_branch_arm_pauses_the_run() {
     let mk_recorder = |sink: Arc<std::sync::Mutex<Vec<String>>>| {
         let recorder = AgentDefinition {
             default_planner: false,
+            tool_limits: Default::default(),
+            confirm_tools: Vec::new(),
+            confirm_timeout: None,
+            escalate_to: None,
             name: "recorder".into(),
             area: "research".into(),
             kind: "reasoning".into(),
@@ -8946,6 +8998,10 @@ async fn an_in_doubt_mutation_in_an_expand_plan_pauses_the_run() {
     let mk_recorder = |sink: Arc<std::sync::Mutex<Vec<String>>>| {
         let recorder = AgentDefinition {
             default_planner: false,
+            tool_limits: Default::default(),
+            confirm_tools: Vec::new(),
+            confirm_timeout: None,
+            escalate_to: None,
             name: "recorder".into(),
             area: "research".into(),
             kind: "reasoning".into(),
@@ -9118,6 +9174,10 @@ async fn on_plan_expanded_fires_with_the_plan() {
 fn planner_registry() -> Arc<Registry> {
     Arc::new(Registry::default().with_agent(AgentDefinition {
         default_planner: false,
+        tool_limits: Default::default(),
+        confirm_tools: Vec::new(),
+        confirm_timeout: None,
+        escalate_to: None,
         name: "planner".into(),
         area: "planning".into(),
         kind: "reasoning".into(),
@@ -9485,6 +9545,10 @@ async fn planner_agent_determinism_violation_in_the_plan_sub_run_halts() {
     let planner_reg = |sys: &str| {
         Arc::new(Registry::default().with_agent(AgentDefinition {
             default_planner: false,
+            tool_limits: Default::default(),
+            confirm_tools: Vec::new(),
+            confirm_timeout: None,
+            escalate_to: None,
             name: "planner".into(),
             area: "planning".into(),
             kind: "reasoning".into(),
@@ -9556,6 +9620,10 @@ async fn planner_agent_uses_validate_plan_then_emits_a_single_agent_plan() {
     // Registry: a `planner` agent granted validate_plan + list_agents, and a `worker` agent.
     let worker = AgentDefinition {
         default_planner: false,
+        tool_limits: Default::default(),
+        confirm_tools: Vec::new(),
+        confirm_timeout: None,
+        escalate_to: None,
         name: "worker".into(),
         area: "research".into(),
         kind: "reasoning".into(),
@@ -9569,6 +9637,10 @@ async fn planner_agent_uses_validate_plan_then_emits_a_single_agent_plan() {
     };
     let planner = AgentDefinition {
         default_planner: false,
+        tool_limits: Default::default(),
+        confirm_tools: Vec::new(),
+        confirm_timeout: None,
+        escalate_to: None,
         name: "planner".into(),
         area: "planning".into(),
         kind: "reasoning".into(),
@@ -9760,6 +9832,10 @@ fn two_planner_agents_marking(marked: Option<&str>) -> Vec<AgentDefinition> {
         .into_iter()
         .map(|name| AgentDefinition {
             default_planner: marked == Some(name),
+            tool_limits: Default::default(),
+            confirm_tools: Vec::new(),
+            confirm_timeout: None,
+            escalate_to: None,
             name: name.into(),
             area: "planning".into(),
             kind: "reasoning".into(),
@@ -9799,6 +9875,10 @@ fn expand_select_node(id: &str, deps: Vec<Dep>) -> Node {
 async fn planner_candidates_orders_the_marked_agent_first() {
     let mk = |name: &str, marked: bool| AgentDefinition {
         default_planner: marked,
+        tool_limits: Default::default(),
+        confirm_tools: Vec::new(),
+        confirm_timeout: None,
+        escalate_to: None,
         name: name.into(),
         area: "planning".into(),
         kind: "reasoning".into(),
@@ -10030,6 +10110,10 @@ async fn select_with_no_candidates_fails_the_node() {
     // registry has an agent but NOT area=="planning".
     let reg = Arc::new(Registry::default().with_agent(AgentDefinition {
         default_planner: false,
+        tool_limits: Default::default(),
+        confirm_tools: Vec::new(),
+        confirm_timeout: None,
+        escalate_to: None,
         name: "coder".into(),
         area: "coding".into(),
         kind: "exec".into(),
@@ -19655,6 +19739,10 @@ mod human_agent {
     pub(super) fn reviewer(timeout: Option<Duration>, skills: Vec<String>) -> AgentDefinition {
         AgentDefinition {
             default_planner: false,
+            tool_limits: Default::default(),
+            confirm_tools: Vec::new(),
+            confirm_timeout: None,
+            escalate_to: None,
             name: "reviewer".into(),
             area: "review".into(),
             kind: "human".into(),

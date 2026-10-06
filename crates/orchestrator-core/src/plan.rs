@@ -267,6 +267,10 @@ mod tests {
     fn agent_reg() -> Registry {
         Registry::default().with_agent(AgentDefinition {
             default_planner: false,
+            tool_limits: Default::default(),
+            confirm_tools: Vec::new(),
+            confirm_timeout: None,
+            escalate_to: None,
             name: "researcher".into(),
             area: "research".into(),
             kind: "reasoning".into(),
