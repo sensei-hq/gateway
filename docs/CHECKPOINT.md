@@ -13,22 +13,22 @@ keeps the engine, the persistence traits and in-memory stores. Last release: v0.
 - [x] **TM-4** #80 — `GatewayConfig` source seam + always-on registry↔chain cross-check
 - [x] **TM-5** #81 — backend-selectable boot (memory | postgres)
 - [x] **TM-6** torii#24 — tenant-scoped orchestrator schema + RLS + per-tenant config versions (torii PR #27, `a5f6b4d`)
-- [ ] **TM-7** torii#25 — store traits over that schema (passes TM-3)
+- [x] **TM-7** torii#25 — store traits over that schema (passes TM-3) (torii PR #28, `e9dbe59`)
 - [ ] **TM-8** torii#26 — move the CLI/worker into torii
 - [ ] **TM-9** #82 — delete `crates/torii`, Postgres adapters, `database/`; release (breaking)
 
 ## Next
 
-TM-7 (torii#25): port the Postgres store adapters onto `registry.*`/`runs.*` (every query
-`WHERE tenant_id = $1`; status binds as `runs.run_status`; generation via `registry.generation` /
-`registry.bump_generation(tenant, expected)` in the replace-all txn) and pass the TM-3 testkit.
-Needs torii `[patch]` entries for the orchestrator crates (`../gateway/crates/*`). Work in a fresh
-torii worktree off `develop`. Scratch Supabase `tm6-supa` (:55460, `supabase_admin`) has the schema.
+TM-8 (torii#26), decided: FIRST bump torii `services/gateway` to the current gateway API (7 compile
+errors: new `routing`/`catalog` fields) and extract `config_loader` into a lib crate shared by
+`services/gateway` and the CLI — own PR. Then move `crates/torii` onto `torii-orchestrator-store`
+(tenant flag/env) + that loader as its `GatewayConfigSource`; keep the memory backend; port tests
+(e2e_pg.rs → per-tenant). torii pins gateway crates by `branch = "develop"` until a release.
 
 ## Open questions
 
-None. Torii repo has uncommitted local changes (`bun.lock`, two SVGs) that are not this work — work
-there in a worktree.
+Cut gateway v0.9.0 (TM-2..TM-5 + testkit) so torii can pin ONE tag? (asked 2026-10-06)
+Torii's main checkout has others' uncommitted changes — always work in a torii worktree.
 
 ## Known-broken / carry-forwards
 
