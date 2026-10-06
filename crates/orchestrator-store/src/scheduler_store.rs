@@ -197,7 +197,7 @@ impl SchedulerStore for InMemorySchedulerStore {
     async fn begin_wake_attempt(
         &self,
         run: RunId,
-        retry_at: DateTime<Utc>,
+        retry_at: &(dyn Fn(u32) -> DateTime<Utc> + Send + Sync),
     ) -> Result<Option<WakeAttempt>, OrchestratorError> {
         let mut m = self.lock();
         let Some(r) = m.get_mut(&run) else {
@@ -207,7 +207,7 @@ impl SchedulerStore for InMemorySchedulerStore {
             return Ok(None);
         }
         r.attempts = r.attempts.saturating_add(1);
-        r.next_wake = Some(retry_at);
+        r.next_wake = Some(retry_at(r.attempts));
         Ok(Some(WakeAttempt {
             attempt: r.attempts,
             last_error: r.last_wake_error.take(),

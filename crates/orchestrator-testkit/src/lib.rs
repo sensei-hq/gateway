@@ -671,6 +671,11 @@ fn claimed_runs(v: Vec<(RunId, Graph)>) -> Vec<RunId> {
     v.into_iter().map(|(r, _)| r).collect()
 }
 
+/// A retry schedule that ignores the attempt number — the deadline is fixed by the clause.
+fn at(t: DateTime<Utc>) -> impl Fn(u32) -> DateTime<Utc> + Send + Sync {
+    move |_| t
+}
+
 fn attempt(n: u32, last_error: Option<&str>) -> Option<WakeAttempt> {
     Some(WakeAttempt {
         attempt: n,
@@ -687,7 +692,7 @@ async fn wake_attempts(s: &dyn SchedulerStore, ta: DateTime<Utc>, lease: Duratio
     let secs = Duration::seconds;
     let w = fresh_run();
     assert_eq!(
-        s.begin_wake_attempt(w, ta)
+        s.begin_wake_attempt(w, &at(ta))
             .await
             .expect("begin_wake_attempt"),
         None,
@@ -698,13 +703,13 @@ async fn wake_attempts(s: &dyn SchedulerStore, ta: DateTime<Utc>, lease: Duratio
         .await
         .unwrap();
     assert_eq!(
-        s.begin_wake_attempt(w, ta + secs(10)).await.unwrap(),
+        s.begin_wake_attempt(w, &at(ta + secs(10))).await.unwrap(),
         None,
         "scheduler: begin_wake_attempt is conditional on waking (a paused row is not a wake)"
     );
     assert!(claimed_runs(s.claim_due(ta + secs(10), lease, 100).await.unwrap()).contains(&w));
     assert_eq!(
-        s.begin_wake_attempt(w, ta + secs(40)).await.unwrap(),
+        s.begin_wake_attempt(w, &at(ta + secs(40))).await.unwrap(),
         attempt(1, None),
         "scheduler: the first wake after a successful drive is attempt 1, with no prior error"
     );
@@ -730,7 +735,7 @@ async fn wake_attempts(s: &dyn SchedulerStore, ta: DateTime<Utc>, lease: Duratio
     );
     let r2 = r1 + secs(120);
     assert_eq!(
-        s.begin_wake_attempt(w, r2).await.unwrap(),
+        s.begin_wake_attempt(w, &at(r2)).await.unwrap(),
         attempt(2, Some("boom 1")),
         "scheduler: a failed attempt is counted and its error handed to the next attempt"
     );
@@ -743,14 +748,17 @@ async fn wake_attempts(s: &dyn SchedulerStore, ta: DateTime<Utc>, lease: Duratio
 
     // A LOST drive (no record at all): reclaimed only past BOTH its lease and its armed retry.
     let r3 = r2 + secs(240);
+    // The schedule is keyed off the attempt number: 80s per attempt, so attempt 3 arms r3.
+    let per_attempt = move |n: u32| r2 + secs(80 * i64::from(n));
     assert_eq!(
-        s.begin_wake_attempt(w, r3).await.unwrap(),
+        s.begin_wake_attempt(w, &per_attempt).await.unwrap(),
         attempt(3, Some("boom 2"))
     );
     assert_eq!(
         s.status(w).await.unwrap().unwrap().next_wake,
         Some(r3),
-        "scheduler: begin_wake_attempt arms next_wake = the retry deadline on the waking row"
+        "scheduler: begin_wake_attempt arms next_wake = the schedule applied to the NEW attempt \
+         number"
     );
     assert!(
         !claimed_runs(s.claim_due(r2 + lease + secs(1), lease, 100).await.unwrap()).contains(&w),
@@ -762,7 +770,7 @@ async fn wake_attempts(s: &dyn SchedulerStore, ta: DateTime<Utc>, lease: Duratio
     );
     let r4 = r3 + secs(480);
     assert_eq!(
-        s.begin_wake_attempt(w, r4).await.unwrap(),
+        s.begin_wake_attempt(w, &at(r4)).await.unwrap(),
         attempt(4, None),
         "scheduler: a lost attempt is counted, and the error it never recorded is not invented \
          (the previous error was taken by the attempt that saw it)"
@@ -776,7 +784,7 @@ async fn wake_attempts(s: &dyn SchedulerStore, ta: DateTime<Utc>, lease: Duratio
         "scheduler: force_wake makes a backed-off wake due now"
     );
     assert_eq!(
-        s.begin_wake_attempt(w, r4).await.unwrap(),
+        s.begin_wake_attempt(w, &at(r4)).await.unwrap(),
         attempt(5, Some("boom 4")),
         "scheduler: force_wake does not reset the attempt count"
     );
@@ -785,7 +793,7 @@ async fn wake_attempts(s: &dyn SchedulerStore, ta: DateTime<Utc>, lease: Duratio
     s.record_paused(w, Some(r4), "quota").await.unwrap();
     assert!(claimed_runs(s.claim_due(r4, lease, 100).await.unwrap()).contains(&w));
     assert_eq!(
-        s.begin_wake_attempt(w, r4 + secs(30)).await.unwrap(),
+        s.begin_wake_attempt(w, &at(r4 + secs(30))).await.unwrap(),
         attempt(1, None),
         "scheduler: a successful drive (record_paused) resets the attempt count and the error"
     );
@@ -802,7 +810,7 @@ async fn wake_attempts(s: &dyn SchedulerStore, ta: DateTime<Utc>, lease: Duratio
         "scheduler: record_wake_failed never resurrects a cancelled run"
     );
     assert_eq!(
-        s.begin_wake_attempt(w, r4 + secs(60)).await.unwrap(),
+        s.begin_wake_attempt(w, &at(r4 + secs(60))).await.unwrap(),
         None,
         "scheduler: begin_wake_attempt on a terminal row → None"
     );
@@ -816,7 +824,7 @@ async fn wake_attempts(s: &dyn SchedulerStore, ta: DateTime<Utc>, lease: Duratio
         "scheduler: a submit lost mid-drive (NULL next_wake) is reclaimed after its lease"
     );
     assert_eq!(
-        s.begin_wake_attempt(x, tx + lease + secs(31))
+        s.begin_wake_attempt(x, &at(tx + lease + secs(31)))
             .await
             .unwrap(),
         attempt(2, None),

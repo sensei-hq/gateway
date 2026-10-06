@@ -177,8 +177,9 @@ pub trait SchedulerStore: Send + Sync {
     ///
     /// The store keeps a per-run count of consecutive attempts:
     /// - `enqueue` starts it at `1` — `submit`'s inline drive is the run's first attempt;
-    /// - this method adds one, arms `next_wake = retry_at` (the stale-`waking` reclaim deadline,
-    ///   see [`claim_due`](Self::claim_due)), and TAKES the previous attempt's recorded error
+    /// - this method adds one, arms `next_wake = retry_at(new_attempt)` (the stale-`waking` reclaim
+    ///   deadline, see [`claim_due`](Self::claim_due) — `retry_at` is the driver's backoff schedule,
+    ///   called once with the NEW attempt number), and TAKES the previous attempt's recorded error
     ///   (returning it, and clearing it so the next call can tell a lost attempt from a failed one);
     /// - a successful drive — [`record_paused`](Self::record_paused) — resets it to `0`;
     /// - [`force_wake`](Self::force_wake) and [`cancel`](Self::cancel) leave it alone (an operator's
@@ -190,7 +191,7 @@ pub trait SchedulerStore: Send + Sync {
     async fn begin_wake_attempt(
         &self,
         _run: RunId,
-        _retry_at: DateTime<Utc>,
+        _retry_at: &(dyn Fn(u32) -> DateTime<Utc> + Send + Sync),
     ) -> Result<Option<WakeAttempt>, OrchestratorError> {
         Ok(None)
     }
