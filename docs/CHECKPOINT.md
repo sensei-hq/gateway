@@ -34,7 +34,6 @@ there in a worktree.
 
 - torii `database/tests/authz.sql` declassify case fails on unmodified develop (pre-existing);
   `run.sh` stops there, so later suites only run individually.
-
 - Out of the epic's scope (agentic execution): SP-REG-2 discovery tools, a results command, SP-REG-4
   shipped content (needs a product decision).
 - From SP-DEC-2: Cloudflare never run live; engine counts caller-caused errors against the breaker;
