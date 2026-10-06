@@ -1,6 +1,6 @@
 [package]
 name = "sensei-orchestrator-store"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 description = "In-memory stores and the registry-directory reader for the sensei orchestrator (persistence lives in torii)"
 license = "MIT"
