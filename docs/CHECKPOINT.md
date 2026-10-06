@@ -7,7 +7,7 @@ torii#37–#44; see the epic). Follows epic #76 (done; gateway v0.10.0, torii pi
 
 ## Todo — Phase 1, this repo (then release + torii re-pin)
 
-- [ ] **AG-1** #85 — planner discovery tools (SP-REG-2) per run in `Executor::pinned`
+- [x] **AG-1** #85 — planner discovery tools (SP-REG-2) per run in `Executor::pinned`
 - [ ] **AG-2** #86 — `OrchestratorHooks` for HITL events (feeds torii's SSE stream)
 - [ ] **AG-3** #87 — scheduler wake backoff / jitter / `max_attempts` (+ testkit)
 - [ ] **AG-12** #89 — money-denominated run budget (torii derives the cap; the engine enforces)
@@ -20,9 +20,9 @@ Phase 3 (torii): #51 API + retire X2 design · #50 seiki publishing · #48 per-t
 
 ## Next
 
-AG-1 (#85): read `docs/superpowers/specs/2026-09-15-sp-reg-programme-design.md` §SP-REG-2, then
-red-first in `crates/orchestrator` (in-memory). Feature branch; `make clean` after any release;
-torii work in a torii worktree (the main checkout has the user's uncommitted changes).
+AG-2 (#86): `OrchestratorHooks` for HITL events — add no-op-default hooks for signal / gate /
+agent-answer / loop-gate awaited+decided(+settled), fired at the journal write they mirror and never
+on replay; red-first in `crates/orchestrator` (in-memory). AG-1 done (`7433d0d`, unreleased).
 
 ## Open questions
 
