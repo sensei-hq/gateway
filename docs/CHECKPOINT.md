@@ -3,7 +3,7 @@
 **Torii move — epic [#76](https://github.com/sensei-hq/gateway/issues/76): "Gateway is a library; torii
 owns persistence"** (torii `docs/DECISIONS.md` §11, ratified 2026-09-17). Move `crates/torii`, the
 orchestrator Postgres store adapters and the `orchestrator` schema to `sensei-hq/torii`; the gateway
-keeps the engine, the persistence traits and in-memory stores. Last release: v0.9.0 (on main, 2026-10-06).
+keeps the engine, the persistence traits and in-memory stores. Last release: v0.10.0 (on main, 2026-10-06). **Epic #76 COMPLETE.**
 
 ## Todo (the epic's checklist, in order)
 
@@ -15,14 +15,14 @@ keeps the engine, the persistence traits and in-memory stores. Last release: v0.
 - [x] **TM-6** torii#24 — tenant-scoped orchestrator schema + RLS + per-tenant config versions (torii PR #27, `a5f6b4d`)
 - [x] **TM-7** torii#25 — store traits over that schema (passes TM-3) (torii PR #28, `e9dbe59`)
 - [x] **TM-8** torii#26 — move the CLI/worker into torii (torii PR #30, `73a5a0e`; v0.9.0 released)
-- [ ] **TM-9** #82 — delete `crates/torii`, Postgres adapters, `database/`; release (breaking)
+- [x] **TM-9** #82 — delete `crates/torii`, Postgres adapters, `database/`; release (v0.10.0, PR #84)
 
 ## Next
 
-TM-9 (#82) built + reviewed on develop (2 reviewers; HIGH Ref round-trip + MEDIUM graph guard +
-3 doc MEDIUMs fixed; LOW: EffectIntent fixture seq=0 equals the default). Release v0.10.0 (breaking):
-open develop→main PR, ask the user whether to merge, then tag + GitHub Release; re-pin torii to
-v0.10.0 (one_gateway_ref guards it) and confirm torii CI; tick #82 + epic #76 (closes the epic).
+Epic #76 is done: torii owns persistence; torii pins v0.10.0 (torii#31). One verification left:
+the DB-gated torii suites against the PUBLISHED v0.10.0 tag (Docker was down — a privileged
+helper prompt) — CI-shape without a DB passed 427/0; pre-tag with a DB 486/0. Follow-ups:
+torii API should refuse UUID-shaped org slugs at write time; LOW: EffectIntent fixture seq=0.
 
 ## Open questions
 
