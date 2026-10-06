@@ -5,7 +5,7 @@
 use chrono::{DateTime, Duration, Utc};
 use orchestrator_core::graph::Graph;
 use orchestrator_core::ids::RunId;
-use orchestrator_core::{OrchestratorError, RunStatus, ScheduledRun, SchedulerStore};
+use orchestrator_core::{OrchestratorError, RunStatus, ScheduledRun, SchedulerStore, WakeAttempt};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -17,6 +17,11 @@ struct Row {
     claimed_at: Option<DateTime<Utc>>,
     reason: Option<String>,
     updated_at: DateTime<Utc>,
+    /// AG-3: consecutive wake attempts since the last successful drive (see
+    /// [`SchedulerStore::begin_wake_attempt`]).
+    attempts: u32,
+    /// AG-3: the error the latest attempt recorded, taken by the next `begin_wake_attempt`.
+    last_wake_error: Option<String>,
 }
 
 /// In-memory durable-scheduler store. `Clone` shares one Arc-backed map.
@@ -113,6 +118,9 @@ impl SchedulerStore for InMemorySchedulerStore {
                 claimed_at: Some(now),
                 reason: None,
                 updated_at: now,
+                // `submit`'s inline drive is the run's first attempt.
+                attempts: 1,
+                last_wake_error: None,
             },
         );
         Ok(())
@@ -132,6 +140,9 @@ impl SchedulerStore for InMemorySchedulerStore {
             r.next_wake = next_wake;
             r.claimed_at = None;
             r.reason = Some(reason.to_string());
+            // A drive that recorded a pause SUCCEEDED: the consecutive-failure count restarts.
+            r.attempts = 0;
+            r.last_wake_error = None;
         }
         Ok(())
     }
@@ -168,8 +179,11 @@ impl SchedulerStore for InMemorySchedulerStore {
             }
             let due_paused =
                 r.status == RunStatus::Paused && r.next_wake.map(|w| w <= now).unwrap_or(false);
+            // AG-3: on a `waking` row `next_wake` is the retry deadline `begin_wake_attempt`
+            // armed — a lost drive is reclaimed only past BOTH its lease and its backoff.
             let stale_waking = r.status == RunStatus::Waking
-                && r.claimed_at.map(|c| now - c > lease).unwrap_or(false);
+                && r.claimed_at.map(|c| now - c > lease).unwrap_or(false)
+                && r.next_wake.map(|w| w <= now).unwrap_or(true);
             if due_paused || stale_waking {
                 r.status = RunStatus::Waking;
                 r.claimed_at = Some(now);
@@ -178,6 +192,45 @@ impl SchedulerStore for InMemorySchedulerStore {
             }
         }
         Ok(out)
+    }
+
+    async fn begin_wake_attempt(
+        &self,
+        run: RunId,
+        retry_at: DateTime<Utc>,
+    ) -> Result<Option<WakeAttempt>, OrchestratorError> {
+        let mut m = self.lock();
+        let Some(r) = m.get_mut(&run) else {
+            return Ok(None);
+        };
+        if r.status != RunStatus::Waking {
+            return Ok(None);
+        }
+        r.attempts = r.attempts.saturating_add(1);
+        r.next_wake = Some(retry_at);
+        Ok(Some(WakeAttempt {
+            attempt: r.attempts,
+            last_error: r.last_wake_error.take(),
+        }))
+    }
+
+    async fn record_wake_failed(
+        &self,
+        run: RunId,
+        retry_at: DateTime<Utc>,
+        error: &str,
+    ) -> Result<(), OrchestratorError> {
+        let mut m = self.lock();
+        if let Some(r) = m.get_mut(&run)
+            && r.status == RunStatus::Waking
+        {
+            r.status = RunStatus::Paused;
+            r.next_wake = Some(retry_at);
+            r.claimed_at = None;
+            r.reason = Some(error.to_string());
+            r.last_wake_error = Some(error.to_string());
+        }
+        Ok(())
     }
 
     async fn status(&self, run: RunId) -> Result<Option<ScheduledRun>, OrchestratorError> {
