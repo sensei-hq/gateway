@@ -373,11 +373,17 @@ pub(super) enum Refusal {
     /// model bound did, on a money-only run). `floor_cost` is the micro-dollars the
     /// refusing call needed beyond `spent` to clear the floor (its per-request fee and
     /// input estimate plus a floor-sized reply), so the message can name a raise.
+    ///
+    /// `output_limit` is `Some(limit)` when the chain's smallest declared
+    /// `max_output_tokens` — not the money — is what landed under the floor (a model-bound
+    /// `BelowFloor` with no binding window, on a money-only run). No money raise can move
+    /// that term, so the message names the limit instead of a cap figure (AG-12 review).
     MoneyExhausted {
         spent: u64,
         budget: u64,
         cause: BudgetRefusal,
         floor_cost: u64,
+        output_limit: Option<u32>,
     },
     /// AG-12: a money cap is set but the chain cannot be priced — an entry has
     /// `pricing: None` (or there is no chain to price). The call is refused BEFORE
@@ -446,6 +452,11 @@ pub(super) enum BudgetRefusal {
     /// different one again (drop the entry, or raise its declared limit) — and inventing
     /// that wording is a change the serving-window review did not ask for and no test
     /// currently pins. The spec's deferred list carries it.
+    ///
+    /// (AG-12: on a MONEY-only run that third arm exists — `Refusal::MoneyExhausted`'s
+    /// `output_limit` routes this case to an `output limit: ` message naming the declared
+    /// limit, because the money arm's wording would quote an "affordable" figure the cap
+    /// already satisfies. The token arm above is unchanged and still misdirects.)
     ///
     /// A TIE goes to the window (`term == c` holds when both terms are equal), which is
     /// the least-misdirecting answer available: both terms are cap-blind, and only the
@@ -611,6 +622,7 @@ impl Executor {
                 budget: mcap,
                 cause: BudgetRefusal::Spent,
                 floor_cost: 0,
+                output_limit: None,
             }));
         }
         // AG-12: a money cap needs a PRICE for whatever entry will serve this call, and the
@@ -852,6 +864,7 @@ impl Executor {
                                 budget: mcap,
                                 cause: BudgetRefusal::Spent,
                                 floor_cost,
+                                output_limit: None,
                             }));
                         };
                         // A reservation larger than what is left affords NOTHING —
@@ -873,6 +886,7 @@ impl Executor {
                                     output_limit_ties: false,
                                 },
                                 floor_cost,
+                                output_limit: None,
                             }));
                         }
                         Some((affordable, mcap, floor_cost))
@@ -1080,12 +1094,22 @@ impl Executor {
                     // before AG-12 — and against the money cap only on a money-only run.
                     // The `(cap, _)` arm's `unwrap_or(0)` is unreachable for the reason
                     // given at `allowance` above.
+                    //
+                    // On a money-only run with NO binding window the ceiling is the
+                    // chain's output limit itself (`ceiling = min(out, window)` and the
+                    // window did not bind), and the refusal says so rather than quoting a
+                    // money figure a raise could already satisfy.
+                    let output_limit = match binding_window {
+                        None => ceiling,
+                        Some(_) => None,
+                    };
                     return Ok(Err(match (meter.budget(), money) {
                         (None, Some((_, mcap, floor_cost))) => Refusal::MoneyExhausted {
                             spent: money_spent,
                             budget: mcap,
                             cause,
                             floor_cost,
+                            output_limit,
                         },
                         (cap, _) => Refusal::BudgetExhausted {
                             spent,
@@ -1400,11 +1424,30 @@ impl Executor {
                 budget,
                 cause,
                 floor_cost,
+                output_limit,
             } => {
                 let floor = orchestrator_core::MIN_OUTPUT_TOKENS;
                 let ledger = format!("{} of {}", usd(spent), usd(budget));
-                let reason = match cause {
-                    BudgetRefusal::Spent => format!(
+                let reason = match (cause, output_limit) {
+                    // The OUTPUT LIMIT bound, not the money: the same durable pause, but
+                    // not a `budget: ` one — the prefix says what the pause is about, and
+                    // a money raise cannot release it (cf. `window_reason`).
+                    (
+                        BudgetRefusal::BelowFloor {
+                            window: None,
+                            est_input,
+                            ..
+                        },
+                        Some(limit),
+                    ) => format!(
+                        "output limit: this chain's smallest declared `max_output_tokens` is \
+                         {limit} tokens, below the {floor}-token floor, so no reply worth this \
+                         call's input ({est_input} tokens estimated) fits; the run's money \
+                         cap ({ledger} spent) is not the binding term and raising it cannot \
+                         release this call — raise that entry's declared limit, or drop the \
+                         entry from the chain, then wake the run"
+                    ),
+                    (BudgetRefusal::Spent, _) => format!(
                         "budget: {ledger} spent against the run's money cap; raise the money \
                          cap above {} — and far enough above it that the next call's input \
                          estimate and a {floor}-token reply at this chain's worst-case price \
@@ -1412,18 +1455,24 @@ impl Executor {
                          `MoneyBudgetRaised` and wake the run",
                         usd(spent)
                     ),
-                    BudgetRefusal::BelowFloor {
-                        allowance,
-                        est_input,
-                        window: Some(window),
-                        output_limit_ties,
-                    } => window_reason(est_input, window, allowance, output_limit_ties, &ledger),
-                    BudgetRefusal::BelowFloor {
-                        allowance,
-                        est_input,
-                        window: None,
-                        output_limit_ties: _,
-                    } => format!(
+                    (
+                        BudgetRefusal::BelowFloor {
+                            allowance,
+                            est_input,
+                            window: Some(window),
+                            output_limit_ties,
+                        },
+                        _,
+                    ) => window_reason(est_input, window, allowance, output_limit_ties, &ledger),
+                    (
+                        BudgetRefusal::BelowFloor {
+                            allowance,
+                            est_input,
+                            window: None,
+                            output_limit_ties: _,
+                        },
+                        None,
+                    ) => format!(
                         "budget: only {allowance} output tokens are affordable after this \
                          call's input estimate ({est_input} tokens) at this chain's \
                          worst-case price, below the {floor}-token floor ({ledger} spent \
