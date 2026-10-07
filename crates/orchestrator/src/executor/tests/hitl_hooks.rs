@@ -751,3 +751,23 @@ async fn the_loop_gate_decided_hook_receives_a_redacted_actor() {
         "loop_gate_decided(lp/0/__gate__,ship,",
     );
 }
+
+/// AG-2 review: a decision naming an option the published menu does not contain is
+/// never honoured — the gate fails — so no decided hook reports it, on that drive or any
+/// later one. Moving the claim above the menu check would show observers a decision the
+/// executor rejected.
+#[tokio::test]
+async fn an_off_menu_decision_is_never_reported() {
+    let mut h = Harness::new(None);
+    let graph = gate_graph();
+    h.drive(&graph).await;
+
+    h.append(gate_decided("bogus", None)).await;
+    let fired = h.drive(&graph).await;
+    assert!(
+        fired.contains(&"node_failed(release)".to_string())
+            && !fired.iter().any(|e| e.starts_with("gate_decided(")),
+        "the rejection is reported, the off-menu decision is not: {fired:?}"
+    );
+    assert_eq!(h.drive_hitl(&graph).await, Vec::<String>::new());
+}
