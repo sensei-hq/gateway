@@ -17196,9 +17196,13 @@ mod scheduler_driver {
         Backend,
         /// The worker dies mid-drive: nothing is ever recorded, the lease must reclaim it.
         Panic,
+        /// A transient fault on `append` instead of `load`: the pre-drive watermark load
+        /// succeeds, so the fault fires INSIDE `Executor::start` — the drive's own I/O.
+        AppendBackend,
     }
 
-    /// Fails `load` for ONE run, `remaining` times (then heals), and counts every failure.
+    /// Fails `load` (or `append`, for [`Fault::AppendBackend`]) for ONE run, `remaining` times
+    /// (then heals), and counts every failure.
     struct FaultyJournal {
         inner: Arc<InMemoryJournal>,
         poisoned: RunId,
@@ -17220,21 +17224,8 @@ mod scheduler_driver {
         fn failures(&self) -> usize {
             self.failures.load(std::sync::atomic::Ordering::SeqCst)
         }
-    }
-
-    #[async_trait::async_trait]
-    impl ExecutionJournal for FaultyJournal {
-        async fn append(
-            &self,
-            run: RunId,
-            event: JournalEvent,
-        ) -> Result<Seq, orchestrator_core::JournalError> {
-            self.inner.append(run, event).await
-        }
-        async fn load(
-            &self,
-            run: RunId,
-        ) -> Result<Vec<(Seq, JournalEvent)>, orchestrator_core::JournalError> {
+        /// Consume one failure for `run` if it is the poisoned run and failures remain.
+        fn take_failure(&self, run: RunId) -> bool {
             let fail = run == self.poisoned && {
                 let mut left = self.remaining.lock().unwrap();
                 let fail = *left > 0;
@@ -17244,14 +17235,39 @@ mod scheduler_driver {
             if fail {
                 self.failures
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                match self.fault {
-                    Fault::Backend => {
-                        return Err(orchestrator_core::JournalError::Backend(
-                            "disk on fire".into(),
-                        ));
-                    }
-                    Fault::Panic => panic!("poison pill: the worker dies mid-drive"),
+            }
+            fail
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutionJournal for FaultyJournal {
+        async fn append(
+            &self,
+            run: RunId,
+            event: JournalEvent,
+        ) -> Result<Seq, orchestrator_core::JournalError> {
+            if matches!(self.fault, Fault::AppendBackend) && self.take_failure(run) {
+                return Err(orchestrator_core::JournalError::Backend(
+                    "append on fire".into(),
+                ));
+            }
+            self.inner.append(run, event).await
+        }
+        async fn load(
+            &self,
+            run: RunId,
+        ) -> Result<Vec<(Seq, JournalEvent)>, orchestrator_core::JournalError> {
+            match self.fault {
+                Fault::Backend if self.take_failure(run) => {
+                    return Err(orchestrator_core::JournalError::Backend(
+                        "disk on fire".into(),
+                    ));
                 }
+                Fault::Panic if self.take_failure(run) => {
+                    panic!("poison pill: the worker dies mid-drive")
+                }
+                _ => {}
             }
             self.inner.load(run).await
         }
@@ -17479,6 +17495,53 @@ mod scheduler_driver {
             "attempt 3 of 3 succeeded"
         );
         assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    /// A retryable fault from the DRIVE ITSELF — not the pre-drive watermark load — is backed
+    /// off too. Every other AG-3 test faults `load`, which `Scheduler::watermark` hits before
+    /// `Executor::start` runs, so only this one reaches the post-drive classification: filing
+    /// the drive's result with plain `record` instead of `record_wake` would turn a database
+    /// blip mid-drive (most of the drive's I/O) into an immediate terminal `Failed`.
+    #[tokio::test]
+    async fn a_retryable_error_from_the_drive_itself_is_backed_off_then_capped() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let store = Arc::new(InMemorySchedulerStore::new());
+        seed_due(store.as_ref(), run).await;
+        let journal = FaultyJournal::new(run, Fault::AppendBackend, usize::MAX);
+        let clock = FakeClock::new(t0());
+        let (gw, _calls) = recording_gateway().await;
+        let sched = sched_over(store.clone(), journal.clone(), clock.clone(), gw)
+            .with_wake_retry(retry(3, 10));
+        let secs = Duration::seconds;
+
+        assert_eq!(sched.tick().await.unwrap(), 1, "attempt 1");
+        assert_eq!(journal.failures(), 1, "the fault fired inside the drive");
+        let st = store.status(run).await.unwrap().unwrap();
+        assert_eq!(
+            (st.status, st.next_wake),
+            (RunStatus::Paused, Some(t0() + secs(10))),
+            "a retryable fault inside Executor::start is backed off, not terminal: {:?}",
+            st.reason
+        );
+        assert!(
+            st.reason.as_deref().unwrap().contains("append on fire"),
+            "the backed-off row names the drive's error: {:?}",
+            st.reason
+        );
+
+        clock.set(t0() + secs(10));
+        assert_eq!(sched.tick().await.unwrap(), 1, "attempt 2 at +10s");
+        clock.set(t0() + secs(30));
+        assert_eq!(sched.tick().await.unwrap(), 1, "attempt 3 at +30s");
+        let st = store.status(run).await.unwrap().unwrap();
+        assert_eq!(st.status, RunStatus::Failed, "the cap ends the run");
+        let reason = st.reason.unwrap();
+        assert!(
+            reason.contains("gave up after 3 failed wake attempts")
+                && reason.contains("append on fire"),
+            "the terminal reason names the count and the drive's error: {reason}"
+        );
+        assert_eq!(journal.failures(), 3, "exactly max_attempts drives");
     }
 
     /// A store that implements none of AG-3 — the trait defaults. The scheduler must behave
