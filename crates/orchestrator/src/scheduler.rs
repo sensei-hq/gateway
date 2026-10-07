@@ -78,6 +78,19 @@ impl WakeRetryPolicy {
     fn cap(&self) -> u32 {
         self.max_attempts.max(1)
     }
+
+    /// `now + backoff(run, attempt)`, SATURATING at the end of `DateTime<Utc>`'s range: an
+    /// overflow panic here would fire inside `tick` on every claim of the run — a poison pill
+    /// of its own. A saturated deadline parks the run; `force_wake` still reaches it.
+    fn retry_at(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        run: RunId,
+        attempt: u32,
+    ) -> chrono::DateTime<chrono::Utc> {
+        now.checked_add_signed(self.backoff(run, attempt))
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+    }
 }
 
 /// A deterministic value in `[0, 1)` keyed by `(seed, run, attempt)` — SplitMix64 finalisers
@@ -230,7 +243,7 @@ impl Scheduler {
             // AG-3: count the attempt and arm its retry BEFORE any drive work, so a drive that
             // takes its worker down is already counted and already spaced out.
             let now = self.clock.now();
-            let schedule = |attempt: u32| now + self.retry.backoff(run, attempt);
+            let schedule = |attempt: u32| self.retry.retry_at(now, run, attempt);
             let attempt = match self.store.begin_wake_attempt(run, &schedule).await {
                 Ok(a) => a,
                 Err(e) => {
@@ -332,7 +345,7 @@ impl Scheduler {
                     .record_terminal(run, RunStatus::Failed, Some(&reason))
                     .await;
             }
-            let retry_at = self.clock.now() + self.retry.backoff(run, a.attempt);
+            let retry_at = self.retry.retry_at(self.clock.now(), run, a.attempt);
             let error = format!(
                 "wake attempt {} of {cap} failed (retrying at {retry_at}): {e}",
                 a.attempt
