@@ -502,3 +502,55 @@ async fn a_money_only_run_refused_by_a_model_bound_reports_against_the_money_cap
         pause.reason
     );
 }
+
+/// With BOTH caps set, the tighter one clamps — in either direction. Money binds the first
+/// case (about 500 affordable tokens against a token allowance near a million); the token
+/// cap binds the second (exactly 300 tokens left after the estimate, against ~50 000
+/// affordable).
+#[tokio::test]
+async fn with_both_caps_the_tighter_one_clamps() {
+    for money_binds in [true, false] {
+        let (gateway, seen, ests) = window_watching_clamp_gateway(1, 5_000).await;
+        price_single_chain(&gateway, IN_PER_1K, OUT_PER_1K).await;
+        let journal = InMemoryJournal::new();
+        let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+        // An unbudgeted probe of the same one-node graph records the gateway's estimate of
+        // its prompt, so the token cap can sit exactly 300 above it.
+        exec.run(RunId(uuid::Uuid::new_v4()), &chain_of(1))
+            .await
+            .expect("probe");
+        let est = u64::from(ests.lock().unwrap()[0]);
+        let (token_cap, micro) = if money_binds {
+            (1_000_000, 100_000)
+        } else {
+            (est + 300, 10_000_000)
+        };
+        let out = exec
+            .run_with_budget(
+                RunId(uuid::Uuid::new_v4()),
+                &chain_of(1),
+                RunBudget {
+                    tokens: Some(orchestrator_core::TokenBudget {
+                        total_tokens: token_cap,
+                    }),
+                    money: Some(MoneyBudget {
+                        total_micro_usd: micro,
+                    }),
+                },
+            )
+            .await
+            .expect("drives");
+        assert!(out.paused.is_none() && out.failed.is_none(), "{out:?}");
+        let sent = seen.lock().unwrap()[1].expect("a capped Chat is clamped");
+        let expected = if money_binds {
+            (micro - est * IN_MICRO) / OUT_MICRO
+        } else {
+            300
+        };
+        assert_eq!(
+            u64::from(sent),
+            expected,
+            "money_binds={money_binds}: the tighter cap's allowance is what is sent"
+        );
+    }
+}
