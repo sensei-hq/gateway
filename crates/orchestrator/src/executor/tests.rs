@@ -28696,6 +28696,37 @@ mod human_escalation {
         assert_eq!(escalations(&journal.load(run).await.unwrap()).len(), 1);
     }
 
+    /// The same refusal for a cycle that loops back to a MID-chain agent, not the node's
+    /// original one (reviewer -> lead -> director -> lead): the check must cover every agent
+    /// that already held the question, or `director`'s expiry appends a hop the fold drops
+    /// and the run re-pauses on a past deadline forever.
+    #[tokio::test]
+    async fn an_unvalidated_mid_chain_escalation_cycle_fails_loudly() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let reg = Arc::new(
+            Registry::default()
+                .with_agent(role("reviewer", 1, Some("lead")))
+                .with_agent(role("lead", 1, Some("director")))
+                .with_agent(role("director", 1, Some("lead"))),
+        );
+        let (ex, clock, _calls) = exec_at(&journal, reg, at(1_000)).await;
+        for t in [1_000, 1_000 + 3_600, 1_000 + 7_200] {
+            clock.set(at(t));
+            let o = ex.start(run, &graph()).await.expect("drive");
+            assert!(o.paused.is_some(), "t={t}: {o:?}");
+        }
+        clock.set(at(1_000 + 10_800));
+        let o = ex.start(run, &graph()).await.expect("drive");
+        let (_node, message) = o.failed.expect("a mid-chain cycle fails the node");
+        assert!(message.contains("cycle"), "{message}");
+        assert_eq!(
+            escalations(&journal.load(run).await.unwrap()).len(),
+            2,
+            "reviewer -> lead and lead -> director, and no hop back to lead"
+        );
+    }
+
     /// Escalation never pre-empts an answer: the human-agent ordering reads the answer
     /// BEFORE the expiry, so an answer that landed is honoured and nobody is escalated to.
     #[tokio::test]
