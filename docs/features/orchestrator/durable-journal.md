@@ -142,6 +142,17 @@ graph, which is why the journal is the *only* record that anything is waiting th
 
 All three are **new variants of an existing enum**, so `FORMAT_VERSION` stays **1**.
 
+## AG-2 — `DecisionHookFired { node }`
+
+Hooks bookkeeping, not an audit fact. Written **only when `OrchestratorHooks` are wired**, by
+the drive that first honours an `AwaitSignal`/`HumanGate`/human-`Agent` answer, just before
+it fires that node's decided hook; folded as a set so every later drive — which re-completes
+the node from the fold — fires nothing. Nothing else reads it: execution, the memo, outputs
+and determinism checks are blind to it, and an unhooked executor never writes one (so its
+absence does NOT mean an answer was never honoured). A loop gate needs none —
+`LoopGateSettled` already marks its honouring drive. Additive: `FORMAT_VERSION` stays **1**.
+See [hooks](hooks.md#human-in-the-loop-hooks-ag-2).
+
 ```gherkin
 Feature: The human loop gate's journal (SP-6 s4)
   Scenario: A settled gate replays instead of re-expiring
