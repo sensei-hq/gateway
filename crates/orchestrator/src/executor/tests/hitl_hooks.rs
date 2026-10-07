@@ -52,6 +52,8 @@ struct Harness {
     registry: Option<Arc<Registry>>,
     clock: Arc<FakeClock>,
     seen: usize,
+    /// Wire `PatternRedactor::default()` on every drive.
+    redacted: bool,
 }
 
 impl Harness {
@@ -63,6 +65,7 @@ impl Harness {
             registry,
             clock: FakeClock::new(at(1_000_000)),
             seen: 0,
+            redacted: false,
         }
     }
 
@@ -76,6 +79,9 @@ impl Harness {
             .with_clock(self.clock.clone());
         if let Some(r) = &self.registry {
             ex = ex.with_registry(r.clone());
+        }
+        if self.redacted {
+            ex = ex.with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()));
         }
         ex.start(self.run, graph)
             .await
@@ -633,5 +639,34 @@ async fn a_failed_marker_write_still_fires_the_decided_hook_and_never_fails_the_
         fired.contains(&"gate_decided(release,ship,alice,None)".to_string()),
         "the honouring drive reports the decision even though its marker was not \
          written — no later drive ever reaches the claim: {fired:?}"
+    );
+}
+
+// ------------------------------------------------------------------- redaction
+
+/// A string `PatternRedactor::default()` scrubs.
+const SECRET: &str = "sk-abcdefghijklmnopqrstuvwx";
+
+/// AG-2 review: every string a HITL hook hands an observer is redacted — the awaited
+/// gate's MENU included. `HumanGate` journals its graph-authored options as-is (a
+/// planner-emitted graph carries model-derived text), and `on_gate_awaited` used to hand
+/// them straight to the SSE consumer, while `on_gate_decided` delivered the redacted name
+/// for the same option.
+#[tokio::test]
+async fn the_awaited_gate_menu_is_redacted_like_the_decided_option() {
+    let mut h = Harness::new(None);
+    h.redacted = true;
+    let mut graph = gate_graph();
+    if let NodeKind::HumanGate { options, .. } = &mut graph.nodes[0].kind {
+        options[0].name = format!("ship {SECRET}");
+    }
+    let fired = h.drive_hitl(&graph).await;
+    assert!(
+        fired.iter().any(|e| e.starts_with("gate_awaited(release,")),
+        "the ask fires: {fired:?}"
+    );
+    assert!(
+        !fired.iter().any(|e| e.contains(SECRET)),
+        "no hook entry carries the secret: {fired:?}"
     );
 }
