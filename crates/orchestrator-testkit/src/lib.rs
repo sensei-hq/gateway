@@ -905,6 +905,38 @@ async fn wake_attempts(s: &dyn SchedulerStore, ta: DateTime<Utc>, lease: Duratio
          (the previous error was taken by the attempt that saw it)"
     );
 
+    // The LEASE half of the same reclaim: a lost drive whose armed retry has already passed
+    // is still NOT reclaimed while its lease is live. Without this a store that reclaimed a
+    // `waking` row on `next_wake <= now` alone — ignoring the lease — would hand a drive
+    // that is merely slow (its worker alive, its lock held) to a second worker, since every
+    // claimed wake arms its retry short of the lease whenever the backoff is shorter.
+    let y = fresh_run();
+    let ty = ta + Duration::days(1);
+    let lease60 = secs(60);
+    s.enqueue(y, &empty_graph(), ty).await.unwrap();
+    s.record_paused(y, Some(ty), "due").await.unwrap();
+    assert!(
+        claimed_runs(s.claim_due(ty, lease60, 100).await.unwrap()).contains(&y),
+        "scheduler: a due paused row is claimed"
+    );
+    assert_eq!(
+        s.begin_wake_attempt(y, &at(ty + secs(30))).await.unwrap(),
+        attempt(1, None)
+    );
+    assert!(
+        !claimed_runs(s.claim_due(ty + secs(31), lease60, 100).await.unwrap()).contains(&y),
+        "scheduler: a waking row past its armed retry but INSIDE its lease is not reclaimed"
+    );
+    assert!(
+        claimed_runs(
+            s.claim_due(ty + lease60 + secs(1), lease60, 100)
+                .await
+                .unwrap()
+        )
+        .contains(&y),
+        "scheduler: a waking row past BOTH its lease and its armed retry is reclaimed"
+    );
+
     // force_wake is an operator's "wake now": it skips the backoff, NOT the count.
     s.record_wake_failed(w, r4, "boom 4").await.unwrap();
     s.force_wake(w, r3 + secs(10)).await.unwrap();
