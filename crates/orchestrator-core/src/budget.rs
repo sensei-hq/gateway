@@ -40,7 +40,8 @@ pub struct TokenBudget {
 /// AG-12: a per-run cap on MONEY, in integer micro-dollars (1 USD = 1 000 000).
 ///
 /// Journaled on `RunStarted.money_budget` beside (or instead of) the token cap, and
-/// moved by `JournalEvent::MoneyBudgetRaised`. torii derives the figure from its
+/// moved by `JournalEvent::MoneyBudgetRaised` — which can move a money cap but never
+/// introduce one: a run has a money cap only if it STARTED with one. torii derives the figure from its
 /// individual/group/org caps (torii#41); the engine only enforces it.
 ///
 /// Integer, never `f64`: this value and the spend it is compared against live in the

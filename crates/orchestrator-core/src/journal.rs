@@ -248,10 +248,15 @@ pub enum JournalEvent {
     },
     /// AG-12: an operator (or torii, re-deriving a run's limit from its caps) moved the
     /// run's MONEY cap. The money twin of [`BudgetRaised`](Self::BudgetRaised), with the
-    /// same semantics: latest value wins, lowering below current spend halts the run,
-    /// and on a run that started without a money cap it introduces one — counting only
-    /// spend journaled from then on, because cost is ledgered only while a money cap is
-    /// in force (see `TokenUsage::cost_micro_usd`).
+    /// same semantics: latest value wins, and lowering below current spend halts the run.
+    ///
+    /// **It moves a money cap; it never introduces one.** On a run whose
+    /// `RunStarted.money_budget` is `None` the fold ignores it. Cost is ledgered only
+    /// while a money cap is in force (see `TokenUsage::cost_micro_usd`), and a drive
+    /// already in flight when the raise is appended folded "no cap" at its start, so
+    /// every call it makes journals no cost — spend no later fold can recover. A cap
+    /// introduced that way would be reported over spend it never counted. A run that
+    /// needs a money cap must be submitted with one.
     ///
     /// Its own variant rather than an optional field on `BudgetRaised`, because the two
     /// caps are independent: `BudgetRaised.new_total_tokens` is required, so a money-only

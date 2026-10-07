@@ -406,10 +406,20 @@ pub(crate) fn fold_journal(
                 fold.budget = Some(*new_total_tokens);
             }
             // AG-12: the money twin — latest wins, EXPLICIT arm for the same reason.
+            //
+            // But it only MOVES a money cap; it never introduces one. A run that started
+            // without a money cap ledgers no cost, and a drive in flight when the raise is
+            // appended (cross-process, by torii or an operator) folded "no cap" at its
+            // start and keeps journaling `cost_micro_usd: None` for every call it makes —
+            // uncountable by any later fold. Honouring the raise would report a cap over
+            // spend the ledger never counted (AG-12 review, HIGH). `RunStarted` precedes
+            // every raise, so `is_some()` here is exactly "the run started with a cap".
             JournalEvent::MoneyBudgetRaised {
                 new_total_micro_usd,
             } => {
-                fold.money_budget = Some(*new_total_micro_usd);
+                if fold.money_budget.is_some() {
+                    fold.money_budget = Some(*new_total_micro_usd);
+                }
             }
             // SP-7b: the `## Context` byte budget a turn was cut to. FIRST wins —
             // `entry().or_insert()`, NOT `insert`. A budget a later record could move is not
