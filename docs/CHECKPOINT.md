@@ -12,9 +12,10 @@ torii#37–#44; see the epic). Follows epic #76 (done; gateway v0.10.0, torii pi
 - [x] **AG-3** #87 — scheduler wake backoff / jitter / `max_attempts` (+ testkit)
 - [x] **AG-12** #89 — money-denominated run budget; unrecorded paid spend = `SpendUnrecorded`
 - [x] **AG-15** #90 — per-tool call limit, confirm-before-run, escalation
-- [ ] release v0.11.0 (needs the user's OK for develop→main); then torii#53 AG-18 re-pin + adopt
+- [x] release **v0.11.0** — PR #91, tag on main `0211bed`, CI green, tag verified from a scratch consumer
+- [ ] torii#53 AG-18 — re-pin all 13 deps to `v0.11.0` and adopt (store / CLI / SSE follow-ups)
 
-All on develop `38fa404` (integrated slice; whole-slice review + 3 fix rounds; 1815 passed).
+Code `38fa404` (integrated slice; whole-slice review + 3 fix rounds; 1815 passed), shipped in v0.11.0.
 
 Phase 2 (torii): #53 adopt v0.11.0 · #34 boot seams · #33 run results · #35 config show/pull ·
 #46 config init + defaults · #47 gate authz · #49 budgets from caps · #36 slugs + authz.sql.
@@ -22,14 +23,14 @@ Phase 3 (torii): #51 API + retire X2 design · #50 seiki publishing · #48 per-t
 
 ## Next
 
-Ask the user to approve the v0.11.0 release (PR develop→main, CHANGELOG, docs sync, `make clean`),
-then torii#53 in a torii worktree: re-pin all 13 deps to `v0.11.0` and implement the store/CLI/SSE
-follow-ups listed there.
+torii#53 in a torii **worktree** (main checkout has the user's uncommitted files): re-pin all 13
+sensei-* deps to `tag = "v0.11.0"` (`one_gateway_ref`), then the follow-ups listed on #53 —
+journal arms + testkit, PgSchedulerStore AG-3 columns/methods, `--budget-usd`, tool approve/reject,
+HITL hooks → SSE. DB-gated tests need Docker + a scratch Supabase (never 54322/5432).
 
 ## Open questions
 
-- Same gate option resubmitted by a different actor fires the decided hook again (attribution
-  semantics) — documented; confirm with the user if it matters for the SSE UI.
+None — the user confirmed a different actor re-submitting the same gate option re-fires the hook.
 
 ## Known-broken / carry-forwards
 
