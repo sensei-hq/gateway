@@ -805,6 +805,42 @@ pub enum JournalEvent {
         to: String,
         deadline: Option<chrono::DateTime<chrono::Utc>>,
     },
+    /// AG-2: a drive with `OrchestratorHooks` wired fired the "decided" hook for this
+    /// human-in-the-loop node — `on_signal_received`, `on_gate_decided` or
+    /// `on_agent_answered` — and every later drive must not fire it again.
+    ///
+    /// **Hooks bookkeeping, not an audit fact.** It is written ONLY when hooks are wired,
+    /// so an executor with no hooks journals exactly what it did before, and its absence
+    /// does NOT mean the node's answer was never honoured. Nothing but the hook dispatch
+    /// reads it: execution, the memo, the outputs and every determinism check are blind
+    /// to it.
+    ///
+    /// It exists because those three node kinds journal nothing when they complete on an
+    /// answer (no `NodeCompleted`, no `EffectRecorded` — the fold IS their memo), so every
+    /// later drive of a still-live run re-completes them from the fold, and the decision
+    /// row itself (`SignalReceived`/`GateDecided`/`AgentAnswered`) was appended by another
+    /// process and says nothing about which drive first acted on it. A loop gate needs no
+    /// such row: the executor's own [`JournalEvent::LoopGateSettled`] already marks the
+    /// honouring drive.
+    ///
+    /// `decision` is the journal `Seq` of the decision row the hook REPORTED. It is what
+    /// makes the marker per-decision rather than per-node: the decision rows fold
+    /// LAST-wins and none of the three kinds journals a durable completion, so a
+    /// correction appended after a hooked drive honoured the first decision is honoured
+    /// AGAIN by the next drive of a still-live run (a `Fail` option then fails a gate that
+    /// had completed). That drive sees a marker for a different row and reports the
+    /// decision it actually honoured — unless the two rows have IDENTICAL content (a
+    /// redelivery), which decides nothing new and reports nothing. LAST wins per node; a
+    /// duplicate is harmless.
+    /// `#[serde(default)]`: a row without it (`None`) counts as covering whatever
+    /// decision the node holds.
+    ///
+    /// Additive: `FORMAT_VERSION` stays 1.
+    DecisionHookFired {
+        node: NodeId,
+        #[serde(default)]
+        decision: Option<Seq>,
+    },
 }
 
 /// A round-boundary checkpoint of a run's state (§7.4). Written to the journal's

@@ -709,6 +709,15 @@ impl Executor {
                 "text": answer.text,
                 "actor": answer.actor,
             }));
+            // AG-2: the drive that FIRST honours the answer reports it, from the same
+            // redacted value the node outputs — once across resumes, since every later
+            // drive re-completes this node from the fold and `claim_decided_hook` reads its
+            // bookkeeping row back.
+            if let Some(h) = self.claim_decided_hook(run, node_id, fold).await {
+                let text = output["text"].as_str().unwrap_or_default();
+                let actor = output["actor"].as_str().unwrap_or_default();
+                h.on_agent_answered(run, node_id, text, actor).await;
+            }
             return Ok(NodeExec::Completed(output));
         }
 
@@ -1277,6 +1286,20 @@ impl Executor {
                     },
                 )
                 .await?;
+
+                // AG-2: THIS is the drive that honours the decision, and `LoopGateSettled`
+                // — written at most once, read back FIRST by every later drive (the
+                // `loop_gate_settled_with` arm above, which fires nothing) — is the durable
+                // marker that makes both hooks exactly-once across resumes. No extra
+                // bookkeeping row is needed. Decided, then settled; the actor is attribution
+                // nothing upstream scrubbed (see `LoopGateDecided`), so it is redacted here
+                // on its way to an observer.
+                if let Some(h) = &self.hooks {
+                    let actor = self.redact_text(decision.actor.clone());
+                    h.on_loop_gate_decided(run, node_id, &decision.option, &actor)
+                        .await;
+                    h.on_loop_gate_settled(run, node_id, &decision.option).await;
+                }
 
                 // The pure part, recomputed from the journaled option NAME rather than
                 // carried in the fold — which is what makes a resume reach the identical

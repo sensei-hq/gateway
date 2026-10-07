@@ -293,6 +293,26 @@ struct Fold {
     /// decision *before the run resumes*: this row is the line after which "before" has
     /// passed.
     loop_gate_settlements: HashMap<NodeId, String>,
+    /// AG-2: the human-in-the-loop nodes whose "decided" hook a hooked drive has already
+    /// fired (`JournalEvent::DecisionHookFired`), each with the `Seq` of the decision row
+    /// it reported (LAST wins; `None` = a marker that covers any decision). Read by
+    /// exactly one consumer, [`Executor::claim_decided_hook`], and by nothing that affects
+    /// execution.
+    decided_hooks_fired: HashMap<NodeId, Option<Seq>>,
+    /// AG-2: the `Seq` of each node's CURRENT decision row — the `SignalReceived`,
+    /// `GateDecided` or `AgentAnswered` that the LAST-wins fold of
+    /// [`Fold::signals`]/[`Fold::gate_decisions`]/[`Fold::agent_answers`] honours. Read
+    /// only by [`Executor::claim_decided_hook`], to tell a replay of the decision already
+    /// reported from a correction honoured after it.
+    decision_seqs: HashMap<NodeId, Seq>,
+    /// AG-2 re-review: what every decision row SAID, by its `Seq` — so a marker for one
+    /// row can be compared by content with the row the fold honours now. Without it, an
+    /// identical redelivery (a retrying webhook, a double-submitted option) is a new `Seq`
+    /// and re-fired the decided hook for a decision that changed nothing. Keyed by `Seq`
+    /// rather than by node because the reported row need not be the node's current one:
+    /// a correction can land between the drive's fold and its marker write. Read only by
+    /// [`Fold::decided_hook_fired`].
+    decision_rows: HashMap<Seq, DecisionContent>,
     /// SP-6 s1 (whole-slice review): each node's journaled `NodeFailed` message, FIRST
     /// wins. Read through exactly ONE consumer — [`gate_precheck`](Executor::gate_precheck),
     /// the shared arm 0 of the WAITING node kinds, for which a failure is TERMINAL (an
@@ -461,6 +481,15 @@ struct AgentAnswer {
     text: String,
     /// ATTRIBUTION, NOT AUTHENTICATION — see `JournalEvent::AgentAnswered`.
     actor: String,
+}
+
+/// AG-2 re-review: the content of one decision row — exactly what its decided hook
+/// reports. Two rows with equal content are the same decision, delivered twice.
+#[derive(Debug, Clone, PartialEq)]
+enum DecisionContent {
+    Signal(serde_json::Value),
+    Gate(GateDecision),
+    Agent(AgentAnswer),
 }
 
 /// SP-6 s2: a folded `GateDecided`.
@@ -807,6 +836,33 @@ impl Fold {
             .get(node)
             .map(Vec::as_slice)
             .unwrap_or_default()
+    }
+
+    /// AG-2: has an earlier hooked drive already fired this node's "decided" hook for the
+    /// decision the fold holds NOW? The marker counts when it names the current decision
+    /// row, or a row with IDENTICAL content (an identical redelivery decides nothing new,
+    /// so it reports nothing). A marker for a row that said something else does not
+    /// count: a correction appended after it is honoured again, and is reported again.
+    fn decided_hook_fired(&self, node: &NodeId) -> bool {
+        match self.decided_hooks_fired.get(node) {
+            None => false,
+            Some(None) => true,
+            Some(Some(reported)) => match self.decision_seqs.get(node) {
+                None => false,
+                Some(current) => {
+                    current == reported
+                        || matches!(
+                            (self.decision_rows.get(reported), self.decision_rows.get(current)),
+                            (Some(was), Some(now)) if was == now
+                        )
+                }
+            },
+        }
+    }
+
+    /// AG-2: the `Seq` of the decision row this node currently honours, if any.
+    fn decision_seq(&self, node: &NodeId) -> Option<Seq> {
+        self.decision_seqs.get(node).copied()
     }
 }
 
@@ -1904,10 +1960,115 @@ impl Executor {
                 JournalEvent::PlannerSelected { node, agent } => {
                     h.on_planner_selected(run, node, agent).await
                 }
+                // AG-2: the four ASKS. Each waiting kind journals its ask exactly once in
+                // the node's life (folded first-wins; a resume re-pauses without
+                // re-asking), so firing here is once-per-ask and replay-suppressed for
+                // free, like every arm above. The DECISIONS have no executor write to
+                // mirror (another process appends them) and are fired at the honouring
+                // site instead — see `claim_decided_hook`; `LoopGateSettled` is fired
+                // there too, after the decision it settles, so it is deliberately not here.
+                JournalEvent::SignalAwaited { node, deadline } => {
+                    h.on_signal_awaited(run, node, *deadline).await
+                }
+                // The one ask whose journaled payload is NOT already redacted: a
+                // `HumanGate` journals its graph-authored menu as-is (that row is the menu
+                // a decision is validated against, so it is not rewritten here). A
+                // planner-emitted graph carries model-derived text, and every string a
+                // hook hands an observer goes through the redactor — so the HOOK gets the
+                // scrubbed names, the same ones `on_gate_decided`'s `option` carries.
+                JournalEvent::GateAwaited {
+                    node,
+                    deadline,
+                    options,
+                } => {
+                    let shown: Vec<orchestrator_core::GateOption> = options
+                        .iter()
+                        .map(|o| orchestrator_core::GateOption {
+                            name: self.redact_text(o.name.clone()),
+                            outcome: o.outcome,
+                        })
+                        .collect();
+                    h.on_gate_awaited(run, node, *deadline, &shown).await
+                }
+                JournalEvent::AgentAwaited {
+                    node,
+                    deadline,
+                    prompt,
+                } => h.on_agent_awaited(run, node, *deadline, prompt).await,
+                JournalEvent::LoopGateAwaited {
+                    node,
+                    deadline,
+                    prompt,
+                    menu,
+                } => {
+                    h.on_loop_gate_awaited(run, node, *deadline, prompt, menu)
+                        .await
+                }
                 _ => {}
             }
         }
         Ok(seq)
+    }
+
+    /// AG-2: claim THIS drive's right to fire a human-in-the-loop node's "decided" hook
+    /// (`on_signal_received`/`on_gate_decided`/`on_agent_answered`), returning the hooks
+    /// to fire it on — or `None`, in which case the caller fires nothing.
+    ///
+    /// Called by `run_await_signal`, `run_human_gate` and `run_human_agent` at the moment
+    /// they HONOUR an answer. Those kinds journal nothing when they complete, so every
+    /// later drive of a still-live run re-completes them from the fold and reaches the same
+    /// call; the decision row was appended by another process and cannot say which drive
+    /// first acted on it. So the first hooked drive journals `DecisionHookFired { node,
+    /// decision }` and every later drive, folding it, gets `None` while the fold still
+    /// holds that decision — exactly once across resumes. A correction appended after it
+    /// is a different row; the drive that honours it claims again, unless the row repeats
+    /// the reported decision's content verbatim (an identical redelivery claims nothing).
+    ///
+    /// `None` when no hooks are wired, BEFORE any write: an unhooked executor journals
+    /// exactly what it did before (`an_unhooked_run_journals_exactly_what_it_did_before`).
+    ///
+    /// Best-effort, deliberately bypassing [`append`](Self::append)'s strict error mapping:
+    /// a hook must never affect execution, so a failed bookkeeping write never fails the
+    /// node. It still RETURNS the hooks: the drive fires anyway, because skipping would
+    /// LOSE the callback whenever no later drive reaches this claim — the honouring drive
+    /// also finished the run, or honoured a `Fail` option that `gate_precheck` reads back
+    /// from then on. The cost is a possible duplicate: with no marker, a later drive of a
+    /// still-live run reports the same decision again (at-least-once on that edge). The
+    /// row is written BEFORE the hook fires, matching every other hook's "after a
+    /// successful journal write" — a crash between the two loses the callback rather than
+    /// repeating it.
+    async fn claim_decided_hook(
+        &self,
+        run: RunId,
+        node: &NodeId,
+        fold: &Fold,
+    ) -> Option<&Arc<dyn OrchestratorHooks>> {
+        let hooks = self.hooks.as_ref()?;
+        if fold.decided_hook_fired(node) {
+            return None;
+        }
+        match self
+            .journal
+            .append(
+                run,
+                JournalEvent::DecisionHookFired {
+                    node: node.clone(),
+                    decision: fold.decision_seq(node),
+                },
+            )
+            .await
+        {
+            Ok(_) => Some(hooks),
+            Err(error) => {
+                tracing::warn!(
+                    node = %node.0,
+                    %error,
+                    "could not journal DecisionHookFired; firing the decided hook anyway \
+                     (a later drive of a still-live run may report it again)"
+                );
+                Some(hooks)
+            }
+        }
     }
 
     /// Publish a completed node's output to the blackboard (§8): `put` it under
