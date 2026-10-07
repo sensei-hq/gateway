@@ -760,6 +760,27 @@ pub enum JournalEvent {
         actor: String,
         note: Option<String>,
     },
+    /// AG-15: a human-backed `Agent` node's question was ESCALATED — the agent currently
+    /// holding it (`from`) let its SLA expire unanswered, and the question now waits on
+    /// `from`'s [`escalate_to`](crate::registry::AgentDefinition::escalate_to) agent `to`,
+    /// until `deadline` (`to`'s own SLA, measured from the escalation; `None` waits
+    /// indefinitely).
+    ///
+    /// The question itself is NOT re-journaled: the escalation target is asked the SAME
+    /// question the node's `AgentAwaited` recorded, and the answer arrives as the same
+    /// node-keyed `AgentAnswered` — so an operator answering an escalated question uses the
+    /// verb they always did, and `actor` records who did. The original `AgentAwaited`
+    /// deadline is left untouched (it is first-wins and has passed); the CURRENT deadline
+    /// is the last escalation's.
+    ///
+    /// Appended at most once per target per node: the fold keeps the FIRST row for a given
+    /// `to`, and the executor refuses to escalate to an agent already in the node's chain.
+    AgentEscalated {
+        node: NodeId,
+        from: String,
+        to: String,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+    },
 }
 
 /// A round-boundary checkpoint of a run's state (§7.4). Written to the journal's
@@ -1470,10 +1491,10 @@ mod tests {
         );
     }
 
-    /// AG-15 — the two tool-confirmation events round-trip whole, and the fence stays at 1.
+    /// AG-15 — the tool-confirmation and escalation events round-trip whole; the fence stays 1.
     /// Compared as whole `Debug` renderings for the reason `ContextBudgeted`'s test gives.
     #[test]
-    fn the_tool_confirmation_events_round_trip() {
+    fn the_ag15_events_round_trip() {
         let at = chrono::DateTime::from_timestamp(1_000, 0).expect("valid");
         for ev in [
             JournalEvent::ToolConfirmAwaited {
@@ -1498,6 +1519,12 @@ mod tests {
                 approved: false,
                 actor: "alice".into(),
                 note: Some("use staging".into()),
+            },
+            JournalEvent::AgentEscalated {
+                node: NodeId("review".into()),
+                from: "reviewer".into(),
+                to: "lead".into(),
+                deadline: Some(at),
             },
         ] {
             let json = serde_json::to_string(&ev).expect("serialises");

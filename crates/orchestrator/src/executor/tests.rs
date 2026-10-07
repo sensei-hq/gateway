@@ -2866,6 +2866,9 @@ fn label(event: &JournalEvent) -> String {
         JournalEvent::ToolConfirmDecided { node, .. } => {
             format!("ToolConfirmDecided({})", node.0)
         }
+        JournalEvent::AgentEscalated { node, to, .. } => {
+            format!("AgentEscalated({}->{})", node.0, to)
+        }
     }
 }
 
@@ -28384,6 +28387,256 @@ mod agent_tool_policy {
             &*writes.lock().unwrap(),
             &["/workspace/1".to_string(), "/workspace/2".to_string()],
             "each invocation has its own ceiling of one"
+        );
+    }
+}
+
+/// AG-15 (#90): ESCALATION of a human-backed `Agent` node whose SLA expires unanswered.
+/// Built on `mod human_agent`'s shared fixtures — the human-backed `reviewer` role, its
+/// question, and an executor over a caller-owned journal with a settable clock.
+mod human_escalation {
+    use super::human_agent::{QUESTION, exec_at, failures, journaled_prompts, reviewer};
+    use super::human_gate::{at, paused_resume_afters};
+    use super::*;
+    use chrono::{DateTime, Duration, Utc};
+
+    fn review() -> NodeId {
+        NodeId("review".into())
+    }
+
+    fn graph() -> Graph {
+        Graph {
+            nodes: vec![agent_node("review", "reviewer", "the Acme MSA")],
+        }
+    }
+
+    /// A human-backed role named `name`, answering `QUESTION`, with an SLA of `hours`, that
+    /// escalates to `to`.
+    fn role(name: &str, hours: i64, to: Option<&str>) -> AgentDefinition {
+        AgentDefinition {
+            name: name.into(),
+            escalate_to: to.map(str::to_string),
+            ..reviewer(Some(Duration::hours(hours)), vec![])
+        }
+    }
+
+    fn registry(agents: Vec<AgentDefinition>) -> Arc<Registry> {
+        let mut r = Registry::default();
+        for a in agents {
+            r = r.with_agent(a);
+        }
+        r.validate().expect("the fixture registry is valid");
+        Arc::new(r)
+    }
+
+    /// Every `AgentEscalated` for the node, as `(from, to, deadline)`.
+    fn escalations(events: &[(Seq, JournalEvent)]) -> Vec<(String, String, Option<DateTime<Utc>>)> {
+        events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                JournalEvent::AgentEscalated {
+                    node,
+                    from,
+                    to,
+                    deadline,
+                } if node == &review() => Some((from.clone(), to.clone(), *deadline)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The headline, across resumes: the reviewer's SLA expires → the node is NOT failed but
+    /// escalated to `lead` on lead's own SLA (from the escalation instant), with the SAME
+    /// question and no re-ask; a re-drive inside lead's SLA neither escalates again nor moves
+    /// the deadline; and an answer then completes the node — all at zero gateway spend.
+    #[tokio::test]
+    async fn an_expired_human_agent_escalates_and_the_target_answers_after_a_resume() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let reg = registry(vec![
+            role("reviewer", 1, Some("lead")),
+            role("lead", 2, None),
+        ]);
+        let (ex, clock, calls) = exec_at(&journal, reg, at(1_000)).await;
+
+        assert!(ex.start(run, &graph()).await.unwrap().paused.is_some());
+
+        // The reviewer's hour passes unanswered.
+        clock.set(at(1_000 + 3_600));
+        let o = ex.start(run, &graph()).await.expect("drive 2");
+        assert!(
+            o.failed.is_none(),
+            "an escalating role does not fail: {o:?}"
+        );
+        let paused = o.paused.expect("it waits on the escalation target");
+        assert!(paused.reason.contains("lead"), "{}", paused.reason);
+        let events = journal.load(run).await.unwrap();
+        let lead_deadline = at(1_000 + 3_600 + 7_200);
+        assert_eq!(
+            escalations(&events),
+            vec![("reviewer".into(), "lead".into(), Some(lead_deadline))]
+        );
+        assert_eq!(
+            paused_resume_afters(&events).last().copied().flatten(),
+            Some(lead_deadline),
+            "the scheduler wakes the run at the TARGET's deadline"
+        );
+        assert_eq!(
+            journaled_prompts(&events).len(),
+            1,
+            "the escalation target is asked the SAME journaled question, not a new one"
+        );
+        assert!(journaled_prompts(&events)[0].contains(QUESTION));
+        assert!(failures(&journal, run, &review()).await.is_empty());
+
+        // A resume inside lead's SLA: no second escalation, no moved deadline.
+        clock.set(at(1_000 + 3_600 + 60));
+        let o = ex.start(run, &graph()).await.expect("drive 3");
+        assert!(o.paused.is_some(), "{o:?}");
+        let events = journal.load(run).await.unwrap();
+        assert_eq!(escalations(&events).len(), 1, "escalated exactly once");
+        assert_eq!(
+            paused_resume_afters(&events).last().copied().flatten(),
+            Some(lead_deadline)
+        );
+
+        // The lead answers.
+        journal
+            .append(
+                run,
+                JournalEvent::AgentAnswered {
+                    node: review(),
+                    text: "Yes — clause 7.2.".into(),
+                    actor: "carol".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let o = ex.start(run, &graph()).await.expect("drive 4");
+        assert!(o.paused.is_none() && o.failed.is_none(), "{o:?}");
+        assert_eq!(o.outputs[&review()]["text"], "Yes — clause 7.2.");
+        assert_eq!(o.outputs[&review()]["actor"], "carol");
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            0,
+            "a human chain spends nothing"
+        );
+    }
+
+    /// Chainable, and ends LOUDLY: reviewer → lead → director, each on its own SLA, and only
+    /// the LAST agent in the chain expiring fails the node — naming the chain it walked.
+    #[tokio::test]
+    async fn an_escalation_chain_is_walked_and_only_its_last_expiry_fails_the_node() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let reg = registry(vec![
+            role("reviewer", 1, Some("lead")),
+            role("lead", 2, Some("director")),
+            role("director", 1, None),
+        ]);
+        let (ex, clock, _calls) = exec_at(&journal, reg, at(1_000)).await;
+        assert!(ex.start(run, &graph()).await.unwrap().paused.is_some());
+
+        let lead_at = 1_000 + 3_600;
+        clock.set(at(lead_at));
+        assert!(ex.start(run, &graph()).await.unwrap().paused.is_some());
+        let director_at = lead_at + 7_200;
+        clock.set(at(director_at));
+        assert!(ex.start(run, &graph()).await.unwrap().paused.is_some());
+        let events = journal.load(run).await.unwrap();
+        assert_eq!(
+            escalations(&events),
+            vec![
+                ("reviewer".into(), "lead".into(), Some(at(director_at))),
+                (
+                    "lead".into(),
+                    "director".into(),
+                    Some(at(director_at + 3_600))
+                ),
+            ]
+        );
+
+        clock.set(at(director_at + 3_600));
+        let o = ex.start(run, &graph()).await.expect("last expiry");
+        let (node, message) = o.failed.expect("the end of the chain fails the node");
+        assert_eq!(node, review());
+        assert!(message.contains("director"), "{message}");
+        assert!(message.contains("escalat"), "names the walk: {message}");
+        assert_eq!(failures(&journal, run, &review()).await.len(), 1);
+    }
+
+    /// Escalation never pre-empts an answer: the human-agent ordering reads the answer
+    /// BEFORE the expiry, so an answer that landed is honoured and nobody is escalated to.
+    #[tokio::test]
+    async fn an_answer_that_landed_is_honoured_and_never_escalated() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let reg = registry(vec![
+            role("reviewer", 1, Some("lead")),
+            role("lead", 2, None),
+        ]);
+        let (ex, clock, _calls) = exec_at(&journal, reg, at(1_000)).await;
+        assert!(ex.start(run, &graph()).await.unwrap().paused.is_some());
+        journal
+            .append(
+                run,
+                JournalEvent::AgentAnswered {
+                    node: review(),
+                    text: "No.".into(),
+                    actor: "alice".into(),
+                },
+            )
+            .await
+            .unwrap();
+        clock.set(at(1_000 + 3_600 * 5));
+        let o = ex.start(run, &graph()).await.expect("drive");
+        assert!(o.paused.is_none() && o.failed.is_none(), "{o:?}");
+        assert!(escalations(&journal.load(run).await.unwrap()).is_empty());
+    }
+
+    /// A `GateSpec::Human` loop gate does NOT escalate — the minimal scope of AG-15 — and
+    /// says so LOUDLY when its role declares `escalate_to`, rather than letting an author
+    /// believe the escalation they configured applies there too.
+    #[tokio::test]
+    async fn a_loop_gate_whose_role_escalates_says_it_does_not_on_expiry() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let reg = registry(vec![
+            role("reviewer", 1, Some("lead")),
+            role("lead", 2, None),
+        ]);
+        let (ex, clock, _calls) = exec_at(&journal, reg, at(1_000)).await;
+        let graph = Graph {
+            nodes: vec![Node {
+                id: NodeId("lp".into()),
+                kind: NodeKind::Loop {
+                    body: LoopBody::ModelCall { chain: "c".into() },
+                    input: serde_json::json!({ "prompt": "draft it" }),
+                    gate: GateSpec::Human {
+                        agent: AgentRef("reviewer".into()),
+                        menu: vec![
+                            orchestrator_core::LoopGateOption {
+                                name: "revise".into(),
+                                stops: false,
+                            },
+                            orchestrator_core::LoopGateOption {
+                                name: "ship".into(),
+                                stops: true,
+                            },
+                        ],
+                    },
+                    max_iters: 2,
+                },
+                deps: vec![],
+            }],
+        };
+        assert!(ex.start(run, &graph).await.unwrap().paused.is_some());
+        clock.set(at(1_000 + 3_600));
+        let o = ex.start(run, &graph).await.expect("expiry");
+        let (_node, message) = o.failed.expect("the loop gate still fails on its deadline");
+        assert!(
+            message.contains("does not escalate"),
+            "the configured escalation is named as not applying: {message}"
         );
     }
 }
