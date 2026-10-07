@@ -27487,3 +27487,6 @@ async fn a_budget_the_renderer_under_spends_is_refused_on_the_measured_cut() {
          must re-decide rather than replay a budget that was never used"
     );
 }
+
+// AG-12 (#89): the money-denominated run budget.
+mod money_budget;
