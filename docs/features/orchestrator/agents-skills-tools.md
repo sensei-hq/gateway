@@ -247,7 +247,11 @@ source: crates/orchestrator*
 >   is read, the `HumanGate` ordering) or arguments over `MAX_HUMAN_TEXT_BYTES` become a terse
 >   Pure `{"error":"not_confirmed"}` for the model. Unlike a gate, a refusal does not fail the
 >   node: the model is told and carries on. The pause reason names the tool, the node and the
->   call's effect id — the key an operator answers with.
+>   call's effect id — the key an operator answers with. **An approval is never re-judged once
+>   it has been acted on:** a call with a standing `EffectIntent` (journaled only after an
+>   approval) is IN DOUBT, and a resume sends it straight to the §7.3 reconcile — even past the
+>   deadline or after a later corrective rejection — instead of recording `not_confirmed` over a
+>   side effect that may already have happened.
 > - **Escalation** (`escalate_to`, human-backed agents only): when the asked agent's SLA
 >   expires unanswered, the SAME journaled question is handed to the escalation agent on ITS
 >   OWN SLA from that instant (`AgentEscalated`), and the run pauses on that deadline. Chains
