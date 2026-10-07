@@ -52,6 +52,8 @@ struct AgentRun<'a> {
     /// how long that decision may take (`None` waits indefinitely). See `tool_policy.rs`.
     confirm_tools: Vec<String>,
     confirm_timeout: Option<chrono::Duration>,
+    /// AG-15: per-tool call ceilings for this invocation (tool → most calls).
+    tool_limits: std::collections::HashMap<String, u32>,
     /// SP-7b: the MEASURED cut this node's `system` half was rendered under, or `None` when
     /// the prompt was dispatched whole.
     ///
@@ -611,6 +613,7 @@ impl Executor {
             agent_grants: agent.grants.clone(),
             confirm_tools: agent.confirm_tools.clone(),
             confirm_timeout: agent.confirm_timeout,
+            tool_limits: agent.tool_limits.clone(),
             context_cut,
         };
 
@@ -624,6 +627,15 @@ impl Executor {
             h.on_agent_started(run, node_id, &agent_ref.0, &ar.chain)
                 .await;
         }
+
+        // AG-15: how many times the model has asked for each tool so far in THIS invocation,
+        // in transcript order. Rebuilt from zero on every drive and advanced over every turn
+        // — the memoized ones the journal replays as well as live ones — so it is a function
+        // of the journal alone, never of what this process happened to see. That is the
+        // replay-safety the call ceiling rests on: a fresh worker resuming the run counts the
+        // same calls. Pinned by `the_call_ceiling_survives_a_resume_on_a_fresh_executor`.
+        let mut tool_calls_made: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
 
         for turn in 0..self.max_steps {
             // Produce this turn's model output — memoized replay or a live call.
@@ -648,7 +660,10 @@ impl Executor {
 
             // Not a final answer → execute this turn's tool calls and extend the
             // transcript. A tool failure ends the node (already journaled).
-            match self.run_agent_tools(&ar, turn, &turn_output).await? {
+            match self
+                .run_agent_tools(&ar, turn, &turn_output, &mut tool_calls_made)
+                .await?
+            {
                 ToolOutcome::Ok(turn_messages) => messages.extend(turn_messages),
                 ToolOutcome::Failed(failure) => return Ok(AgentStep::Failed(failure)),
                 ToolOutcome::Paused(reason) => return Ok(AgentStep::Paused(reason)),
@@ -926,11 +941,16 @@ impl Executor {
     /// (no re-execution), a hash mismatch is a `DeterminismViolation` (fatal outer
     /// `Err`). The inner `Result` is the turn's messages, or a tool's failure
     /// message (already journaled `NodeFailed`) — the same shape as a Map child.
+    ///
+    /// `calls_made` is the invocation's per-tool request count so far (AG-15); every call
+    /// here advances it BEFORE it is executed or replayed, so the k-th request for a tool
+    /// sees `k − 1` prior requests whichever path it takes.
     async fn run_agent_tools(
         &self,
         ar: &AgentRun<'_>,
         turn: usize,
         turn_output: &serde_json::Value,
+        calls_made: &mut std::collections::HashMap<String, u32>,
     ) -> Result<ToolOutcome<Vec<Message>>, OrchestratorError> {
         let assistant_text = turn_output
             .get("text")
@@ -953,7 +973,13 @@ impl Executor {
         }];
         for (k, call) in tool_calls.iter().enumerate() {
             let teid = effect_id(&ar.node_id.0, turn as u64, k + 1);
-            let value = match self.execute_tool_effect(ar, &teid, call).await? {
+            let made = calls_made.entry(call.name.clone()).or_insert(0);
+            let calls_before = *made;
+            *made = made.saturating_add(1);
+            let value = match self
+                .execute_tool_effect(ar, &teid, call, calls_before)
+                .await?
+            {
                 ToolOutcome::Ok(value) => value,
                 ToolOutcome::Failed(failure) => return Ok(ToolOutcome::Failed(failure)),
                 ToolOutcome::Paused(reason) => return Ok(ToolOutcome::Paused(reason)),
@@ -976,11 +1002,15 @@ impl Executor {
     /// - **Mutation** — a memo hit (Intent+Recorded) replays; a miss executes and
     ///   records `class: Mutation`. The two-phase Intent and in-doubt reconcile
     ///   land in slice-4 Tasks 8–9.
+    ///
+    /// `calls_before` is how many times this invocation's model asked for `call.name`
+    /// before this call (AG-15's call ceiling — see `run_agent_tools`).
     async fn execute_tool_effect(
         &self,
         ar: &AgentRun<'_>,
         teid: &EffectId,
         call: &ToolCall,
+        calls_before: u32,
     ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
         // Unparseable `arguments` degrade to `Null` (a deliberate, currently-safe
         // posture): the gate then derives an EMPTY `need` (so it passes), but every
@@ -1041,6 +1071,24 @@ impl Executor {
             tracing::debug!(tool = %call.name, ?need, ?grant, listed, "tool permission denied");
             return self
                 .record_denied_effect(ar, teid, call, &tih, "permission_denied", detail)
+                .await;
+        }
+
+        // AG-15 call ceiling: once the model has asked for this tool `ceiling` times in this
+        // invocation, every further call is refused — terse, Pure, memoized, exactly like
+        // the s1 denial above (which it follows, so an unlisted tool is still reported as
+        // unavailable rather than as rate-limited). It precedes confirm-before-run, so a
+        // person is never asked to approve a call that would be refused anyway. The detail
+        // names no number: the model needs to know to stop, not how the limit is set.
+        if let Some(&ceiling) = ar.tool_limits.get(&call.name)
+            && calls_before >= ceiling
+        {
+            let detail = format!(
+                "tool '{}' has reached its call limit for this agent",
+                call.name
+            );
+            return self
+                .record_denied_effect(ar, teid, call, &tih, "call_limit_reached", detail)
                 .await;
         }
 
