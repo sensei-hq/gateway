@@ -668,3 +668,75 @@ async fn a_selector_cannot_swallow_an_unrecorded_spend() {
         "neither a journaled selection nor a soft failure: {events:?}"
     );
 }
+
+// ---- The Consolidate producer (`run_consolidate`'s `ModelCall` body).
+
+/// The Consolidate producer: a synthesis call whose `EffectRecorded` append fails is never
+/// re-bought by a retry. The Map child `m/0` journals its spend normally (its record is the
+/// memo every later drive replays), so every gateway call past the first two would be a
+/// second paid synthesis.
+#[tokio::test]
+async fn a_paid_consolidate_call_whose_spend_was_not_journaled_is_never_redispatched_by_a_retry() {
+    let (gateway, seen) = clamp_observing_gateway(10, 295).await;
+    price_single_chain(&gateway, 0.1, 0.2).await;
+    let journal = FailSpendOnce::new("cons");
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("m".into()),
+                kind: NodeKind::Map {
+                    body: MapBody::ModelCall { chain: "c".into() },
+                    over: map_items(["i0"]),
+                    concurrency: 4,
+                    aggregation: Aggregation::BestEffort,
+                },
+                deps: vec![],
+            },
+            Node {
+                id: NodeId("cons".into()),
+                kind: NodeKind::Consolidate {
+                    over: NodeId("m".into()),
+                    min_viable: 1,
+                    body: MapBody::ModelCall { chain: "c".into() },
+                },
+                deps: vec![Dep::hard("m")],
+            },
+        ],
+    };
+    let exec = Executor::new(Arc::new(gateway), journal.clone(), "v1");
+    let arm = journal.clone();
+
+    let (run, row) = wake_into_armed_faults(
+        exec,
+        journal.clone(),
+        move || arm.arm(),
+        graph,
+        ROOMY_CAP,
+        |_| {},
+    )
+    .await;
+
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        2,
+        "one Map-item call and exactly ONE synthesis call — a retry would pay for it again"
+    );
+    assert!(
+        journal
+            .load(run)
+            .await
+            .unwrap()
+            .iter()
+            .any(|(_, ev)| matches!(
+                ev,
+                JournalEvent::EffectRecorded { node, .. } if node.0 == "m/0"
+            )),
+        "the Map item's spend was journaled, so it cannot be the re-bought call"
+    );
+    assert_eq!(row.status, RunStatus::Failed, "{row:?}");
+    let reason = row.reason.unwrap_or_default();
+    assert!(
+        reason.contains("spend") && reason.contains("not recorded"),
+        "the terminal reason names the unrecorded spend: {reason}"
+    );
+}
