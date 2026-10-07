@@ -571,6 +571,112 @@ async fn a_corrected_signal_honoured_after_the_first_is_reported_once() {
     assert_eq!(h.drive_hitl(&graph).await, Vec::<String>::new());
 }
 
+// ---------------------------------------------- identical redeliveries
+
+fn signal(payload: &str) -> JournalEvent {
+    JournalEvent::SignalReceived {
+        node: NodeId("gate".into()),
+        payload: serde_json::json!(payload),
+    }
+}
+
+fn agent_answered(text: &str) -> JournalEvent {
+    JournalEvent::AgentAnswered {
+        node: NodeId("review".into()),
+        text: text.into(),
+        actor: "bob".into(),
+    }
+}
+
+/// AG-2 re-review: a retrying webhook redelivers the SAME signal after a hooked drive
+/// honoured it. The node's output does not change, so nothing new was decided and the
+/// decided hook must not fire again. A marker compared by the decision row's `Seq` alone
+/// re-fired it, because every redelivered row is a new `Seq`.
+#[tokio::test]
+async fn an_identical_signal_redelivery_is_not_reported_again() {
+    let mut h = Harness::new(None);
+    let graph = signal_graph();
+    h.drive(&graph).await;
+
+    h.append(signal("first")).await;
+    assert_eq!(
+        h.drive_hitl(&graph).await,
+        vec![r#"signal_received(gate,"first")"#]
+    );
+    h.append(signal("first")).await;
+    assert_eq!(
+        h.drive_hitl(&graph).await,
+        Vec::<String>::new(),
+        "a redelivery of the decision already reported changes nothing and reports nothing"
+    );
+}
+
+/// The same for a double-submitted gate option.
+#[tokio::test]
+async fn an_identical_gate_decision_redelivery_is_not_reported_again() {
+    let mut h = Harness::new(None);
+    let graph = gate_graph();
+    h.drive(&graph).await;
+
+    h.append(gate_decided("ship", None)).await;
+    assert_eq!(
+        h.drive_hitl(&graph).await,
+        vec!["gate_decided(release,ship,alice,None)"],
+    );
+    h.append(gate_decided("ship", None)).await;
+    assert_eq!(h.drive_hitl(&graph).await, Vec::<String>::new());
+}
+
+/// The same for a resubmitted human-agent answer.
+#[tokio::test]
+async fn an_identical_agent_answer_redelivery_is_not_reported_again() {
+    let mut h = Harness::new(Some(human_registry(None)));
+    let graph = agent_graph();
+    h.drive(&graph).await;
+
+    h.append(agent_answered("it does not")).await;
+    assert_eq!(
+        h.drive_hitl(&graph).await,
+        vec!["agent_answered(review,it does not,bob)"],
+    );
+    h.append(agent_answered("it does not")).await;
+    assert_eq!(h.drive_hitl(&graph).await, Vec::<String>::new());
+}
+
+/// A correction that is reverted before any drive honours it leaves the node honouring
+/// exactly the decision already reported, so nothing is reported: what counts is the
+/// content honoured, not how many rows were appended to reach it.
+#[tokio::test]
+async fn a_correction_reverted_before_any_drive_honoured_it_is_not_reported() {
+    let mut h = Harness::new(None);
+    let graph = signal_graph();
+    h.drive(&graph).await;
+
+    h.append(signal("first")).await;
+    h.drive(&graph).await;
+    h.append(signal("second")).await;
+    h.append(signal("first")).await;
+    assert_eq!(h.drive_hitl(&graph).await, Vec::<String>::new());
+}
+
+/// But a correction that WAS honoured, then reverted, is two real changes to what the
+/// node did, and each is reported: the comparison is against the decision LAST reported.
+#[tokio::test]
+async fn a_correction_honoured_then_reverted_reports_each_change() {
+    let mut h = Harness::new(None);
+    let graph = signal_graph();
+    h.drive(&graph).await;
+
+    for payload in ["first", "second", "first"] {
+        h.append(signal(payload)).await;
+        assert_eq!(
+            h.drive_hitl(&graph).await,
+            vec![format!(r#"signal_received(gate,"{payload}")"#)]
+        );
+    }
+    assert_eq!(h.drive_hitl(&graph).await, Vec::<String>::new());
+}
+
 // ------------------------------------------------- a failed bookkeeping write
 
 /// An `InMemoryJournal` that rejects every `DecisionHookFired` append and passes every
