@@ -142,7 +142,7 @@ graph, which is why the journal is the *only* record that anything is waiting th
 
 All three are **new variants of an existing enum**, so `FORMAT_VERSION` stays **1**.
 
-## AG-2 — `DecisionHookFired { node, decision }`
+## AG-2 — `DecisionHookFired { node, decision, effect_id }`
 
 Hooks bookkeeping, not an audit fact. Written **only when `OrchestratorHooks` are wired**, by
 the drive that first honours an `AwaitSignal`/`HumanGate`/human-`Agent` answer, just before
@@ -155,6 +155,16 @@ and determinism checks are blind to it, and an unhooked executor never writes on
 absence does NOT mean an answer was never honoured). A loop gate needs none —
 `LoopGateSettled` already marks its honouring drive. Additive: `FORMAT_VERSION` stays **1**.
 See [hooks](hooks.md#human-in-the-loop-hooks-ag-2).
+
+**`effect_id`** (AG-2 × AG-15, `#[serde(default, skip_serializing_if = "Option::is_none")]`):
+`Some` marks one confirm-before-run CALL's `on_tool_confirm_decided`, with `decision` the
+`Seq` of that call's `ToolConfirmDecided`, folded LAST-wins per call — not per node, since one
+node asks about several calls. It matters only for a call honoured and then left unrecorded
+(an approved tool that failed, re-attempted on resume): the same redelivery/correction rule
+applies. A node marker serializes exactly as before (the field is omitted), and reusing the
+variant leaves the journal's set of event kinds unchanged; a reader predating the field sees
+a node marker on an agent node that has no decided hook of its own, which is inert. See
+[hooks](hooks.md#confirm-before-run-and-escalation-hooks-ag-2--ag-15).
 
 ```gherkin
 Feature: The human loop gate's journal (SP-6 s4)
