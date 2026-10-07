@@ -98,9 +98,13 @@ pub trait OrchestratorHooks: Send + Sync {
     // either, so the honouring drive fires anyway and a later drive of a still-live run
     // reports the same decision again.
     //
-    // Every string handed to a decided hook has been through the executor's redactor
-    // (the same scrub the node's output gets); every awaited hook receives exactly what
-    // was journaled, which the executor already redacted before appending.
+    // Every string handed to a HITL hook has been through the executor's redactor. A
+    // decided hook gets the same scrub the node's output gets. The agent and loop-gate
+    // asks are redacted before they are journaled, so their awaited hooks receive exactly
+    // the journaled row. `HumanGate` journals its graph-authored menu as-is (that row is
+    // what a decision is validated against), so `on_gate_awaited` receives the option
+    // names redacted AT DISPATCH — the same scrubbed names `on_gate_decided` reports, which
+    // may differ from the journaled `GateAwaited.options`.
     // ------------------------------------------------------------------------------
 
     /// An `AwaitSignal` node began waiting (its `SignalAwaited` was just journaled), with
@@ -116,7 +120,7 @@ pub trait OrchestratorHooks: Send + Sync {
     /// output. Fires on the first drive that honours it, never on a replay.
     async fn on_signal_received(&self, _run: RunId, _node: &NodeId, _payload: &serde_json::Value) {}
     /// A `HumanGate` began asking (its `GateAwaited` was just journaled), with the
-    /// deadline and the menu the human is shown.
+    /// deadline and the menu the human is shown — option names redacted (see above).
     async fn on_gate_awaited(
         &self,
         _run: RunId,
