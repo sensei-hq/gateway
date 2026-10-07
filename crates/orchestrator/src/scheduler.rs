@@ -15,7 +15,8 @@
 //! leaves a call the durable ledger never saw and no memo to replay, so a re-drive would buy it
 //! again past every cap. The executor raises that as [`OrchestratorError::SpendUnrecorded`], which
 //! is NOT retryable: the run is filed `Failed` naming the unrecorded spend, for an operator. A fault
-//! before any paid dispatch stays retryable. What no classification can cover is a PROCESS crash in
+//! before any paid dispatch stays retryable. Where one drive fails several concurrent `Map` children
+//! at once, the `SpendUnrecorded` is what surfaces, ahead of any sibling's retryable fault. What no classification can cover is a PROCESS crash in
 //! the same window (between the provider's response and the append): the lost worker's lease is
 //! reclaimed and the re-drive re-buys that one call — the pre-existing at-least-once edge
 //! `durable-journal.md` states, bounded by `max_attempts` because every reclaim is a counted attempt.

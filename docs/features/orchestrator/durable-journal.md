@@ -303,6 +303,17 @@ scheduler does NOT retry it: the run is filed `Failed` with a reason that names 
 unrecorded spend, for an operator to reconcile before re-driving. A journal fault before
 any paid dispatch is still an ordinary retryable fault — nothing was bought.
 
+**It outranks every sibling's error, whatever their order.** A `Map` drives all its
+children to the end before folding their errors, so one round can hold several fatal
+errors — say `m/0`'s unpaid tool record blinking (retryable, it bought nothing) and
+`m/1`'s paid turn going unrecorded. The error that reaches the scheduler is the
+`SpendUnrecorded`, never the lowest-index one: surfacing the blink would get the run
+retried and `m/1`'s call bought twice. If several children's spends went unrecorded the
+reason names the first; the operator reconciles the provider's side for the whole round.
+The `Map` is the only place the executor runs children concurrently — a round's ready
+nodes, an agent's tool calls and `Loop` iterations all run in sequence and stop at the
+first error — so it is the only place this ordering is needed.
+
 **The remaining edge, stated honestly: a PROCESS crash in that same window.** If the
 worker dies between the provider's response and the append, nothing survives to classify
 the fault: the lease is reclaimed, the re-drive finds no record and no memo, and that one
