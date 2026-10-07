@@ -6,6 +6,26 @@ routing call path (build a request, `gateway.execute(&req).await`, read
 `InferenceResponse`) stays source-compatible across every step below; each section
 lists only what you must touch.
 
+## 0.10.x → 0.11.0 (agentic phase 1 — HITL hooks, wake retry, money budget, tool policy)
+
+The routing call path is unchanged. Everything here is in the orchestrator crates; the one
+gateway addition is `Gateway::worst_case_pricing`. Several public types gained fields or
+variants, so **exhaustive matches and struct literals break** — the table says what to add.
+
+| Area | Change | Action |
+|---|---|---|
+| `JournalEvent` | new variants `DecisionHookFired { node, decision, effect_id }` (written only when hooks are wired), `MoneyBudgetRaised`, `ToolConfirmAwaited`, `ToolConfirmDecided`, `AgentEscalated`; `RunStarted` gains `money_budget`. `FORMAT_VERSION` stays 1; every new field is serde-defaulted and skipped when unset, so a run that uses none of it journals byte-identically | add arms / `money_budget: None`; readers that decide what a run waits on should ignore `DecisionHookFired`; a reader must upgrade before it loads journals a 0.11 executor wrote |
+| `TokenUsage`, `Snapshot` | `TokenUsage.cost_micro_usd`; `Snapshot.spent_micro_usd`, `Snapshot.money_budget_micro_usd` | add the fields to literals, or `..Default::default()` |
+| `AgentDefinition` | `tool_limits`, `confirm_tools`, `confirm_timeout`, `escalate_to` (frontmatter keys of the same names); `Registry::validate` rejects malformed policy | add the fields to literals |
+| `OrchestratorError` | new `SpendUnrecorded { node, source }`: a paid model call whose spend could not be journaled. `Scheduler` never retries it — the run is filed `Failed` for an operator to reconcile provider-side spend before re-driving | handle the variant in exhaustive matches |
+| `OrchestratorHooks` | 12 new HITL callbacks, all with no-op defaults: `on_signal_awaited/received`, `on_gate_awaited/decided`, `on_agent_awaited/answered`, `on_loop_gate_awaited/decided/settled`, `on_tool_confirm_awaited/decided`, `on_agent_escalated` — each fires once per occurrence, never on replay, with redacted arguments | none; implement the ones you observe and wire hooks on every drive |
+| `SchedulerStore` | new default methods `begin_wake_attempt` and `record_wake_failed` (+ `WakeAttempt`); `claim_due` reclaims a stale `waking` row only past its lease **and** past its armed retry | durable stores: implement both and the new `claim_due` predicate — the extended `orchestrator_testkit::scheduler()` now fails a store that does not |
+| `Scheduler` | a retryable drive error (journal backend / store) backs off with deterministic jitter and stops at `max_attempts` instead of crash-looping; `Scheduler::with_wake_retry(WakeRetryPolicy)` | none (defaults apply); tune if needed |
+| Money budget | new `MoneyBudget`, `RunBudget`, `MICRO_USD_PER_USD`, `Executor::run_with_budget`, `Scheduler::submit_with_budget`, `money_spend_of`; `run_budgeted`/`submit_budgeted` unchanged. Under a money cap a model with `pricing: None` is **refused** | give free/local models an explicit zero price on chains a money-capped run uses |
+| Tool policy | per-agent call ceilings (`call_limit_reached`), confirm-before-run (`not_confirmed`, pauses on a `tool_confirm:` reason until a `ToolConfirmDecided`), escalation of an expired human-backed question along `escalate_to` | append `ToolConfirmDecided` then `force_wake` to answer a confirmation |
+| Planner discovery | `ListAgents`/`ListSkills`/`ListTools`/`ListChains`/`ValidatePlan` are composed per run from the pinned registry | none |
+| `orchestrator-testkit` | `journal` round-trips the money fields, the AG-15 events and `DecisionHookFired`; `scheduler` adds the wake-attempt clause | re-run it against your stores |
+
 ## 0.9.x → 0.10.0 (torii move, done — the gateway carries no persistence)
 
 **Breaking: crates and a feature are removed.** Persistence belongs to torii (torii
