@@ -28389,6 +28389,114 @@ mod agent_tool_policy {
             "each invocation has its own ceiling of one"
         );
     }
+
+    /// Drive a confirm-before-run `fs.write` to the point an APPROVED drive has journaled its
+    /// `EffectIntent` and then crashed before `EffectRecorded`: drive 1 pauses on the ask, an
+    /// approval lands, drive 2 runs the call to completion, and the journal is then cut back
+    /// to the intent. Returns the cut journal, the run, and the graph.
+    async fn approved_and_in_doubt(timeout: Option<Duration>) -> (InMemoryJournal, RunId, Graph) {
+        let full = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "write it")],
+        };
+        let writes = sink();
+        let call = write_args("/workspace/a.txt", "x");
+        let (ex, _clock) = build_executor(
+            &full,
+            registry_of(confirm_agent(timeout)),
+            vec![tool_call_response("t1", "fs.write", &call)],
+            &writes,
+            at(1_000),
+        )
+        .await;
+        assert!(ex.start(run, &graph).await.unwrap().paused.is_some());
+        full.append(run, decided(true, "alice", None))
+            .await
+            .unwrap();
+        let (ex, _clock) = build_executor(
+            &full,
+            registry_of(confirm_agent(timeout)),
+            vec![final_response("done")],
+            &writes,
+            at(2_000),
+        )
+        .await;
+        let o = ex.start(run, &graph).await.expect("approved drive");
+        assert!(o.paused.is_none() && o.failed.is_none(), "{o:?}");
+        assert_eq!(writes.lock().unwrap().len(), 1, "the approved call ran");
+
+        let events = full.load(run).await.unwrap();
+        let cut = events
+            .iter()
+            .position(|(_, e)| matches!(e, JournalEvent::EffectIntent { effect_id, .. } if *effect_id == teid()))
+            .expect("the approved Mutation journaled an intent");
+        let seeded = InMemoryJournal::new();
+        for (_, e) in &events[..=cut] {
+            seeded.append(run, e.clone()).await.unwrap();
+        }
+        (seeded, run, graph)
+    }
+
+    /// An approved call whose `EffectIntent` stands with no `EffectRecorded` is IN DOUBT — the
+    /// side effect may already have happened. The approval is settled; a resume after the
+    /// confirm deadline must reconcile it (here: no provider ⇒ `Indeterminate` ⇒ pause loud),
+    /// never re-judge it as expired and journal a `not_confirmed` refusal over the intent.
+    #[tokio::test]
+    async fn an_approved_in_doubt_confirm_mutation_reconciles_after_the_deadline() {
+        let (journal, run, graph) = approved_and_in_doubt(Some(Duration::hours(1))).await;
+        let writes = sink();
+        let (ex, _clock) = build_executor(
+            &journal,
+            registry_of(confirm_agent(Some(Duration::hours(1)))),
+            vec![final_response("done")],
+            &writes,
+            at(1_000 + 7_200),
+        )
+        .await;
+        let o = ex.start(run, &graph).await.expect("resume");
+        let events = journal.load(run).await.unwrap();
+        assert!(
+            o.paused.is_some(),
+            "an in-doubt approved Mutation pauses for reconcile: got {o:?}, recorded {:?}",
+            recorded_output(&events, &teid())
+        );
+        assert!(writes.lock().unwrap().is_empty(), "never blind re-run");
+        assert_eq!(
+            effect_recorded_count(&events, &teid()),
+            0,
+            "nothing is recorded over the standing intent"
+        );
+    }
+
+    /// The same in-doubt call with a later corrective REJECTION appended: the decision can no
+    /// longer un-run what may already have happened, so the resume still reconciles.
+    #[tokio::test]
+    async fn a_rejection_after_an_in_doubt_approved_mutation_still_reconciles() {
+        let (journal, run, graph) = approved_and_in_doubt(None).await;
+        journal
+            .append(run, decided(false, "bob", None))
+            .await
+            .unwrap();
+        let writes = sink();
+        let (ex, _clock) = build_executor(
+            &journal,
+            registry_of(confirm_agent(None)),
+            vec![final_response("done")],
+            &writes,
+            at(3_000),
+        )
+        .await;
+        let o = ex.start(run, &graph).await.expect("resume");
+        let events = journal.load(run).await.unwrap();
+        assert!(
+            o.paused.is_some(),
+            "an in-doubt approved Mutation pauses for reconcile: got {o:?}, recorded {:?}",
+            recorded_output(&events, &teid())
+        );
+        assert!(writes.lock().unwrap().is_empty(), "never blind re-run");
+        assert_eq!(effect_recorded_count(&events, &teid()), 0);
+    }
 }
 
 /// AG-15 (#90): ESCALATION of a human-backed `Agent` node whose SLA expires unanswered.
