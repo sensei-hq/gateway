@@ -502,3 +502,65 @@ async fn an_unhooked_run_journals_exactly_what_it_did_before() {
         ]
     );
 }
+
+// ------------------------------------------------ corrections after honouring
+
+/// AG-2 review: a `HumanGate`, `AwaitSignal` or human `Agent` journals no durable
+/// completion, so a decision row appended AFTER a hooked drive already honoured the
+/// first one is honoured by the next drive of a still-live run (the fold is LAST-wins).
+/// That drive changes what the node did — here a `Fail` option fails a gate that had
+/// completed — so it must report the decision it honoured. The node-keyed marker used
+/// to suppress it, and observers saw `node_failed(release)` with no decision before it.
+#[tokio::test]
+async fn a_correction_honoured_after_the_first_decision_is_reported_too() {
+    let mut h = Harness::new(None);
+    let graph = gate_graph();
+    h.drive(&graph).await;
+
+    h.append(gate_decided("ship", None)).await;
+    assert_eq!(
+        h.drive_hitl(&graph).await,
+        vec!["gate_decided(release,ship,alice,None)"],
+    );
+
+    h.append(gate_decided("reject", Some("changed mind"))).await;
+    let fired = h.drive(&graph).await;
+    let decided = fired
+        .iter()
+        .position(|e| e == r#"gate_decided(release,reject,alice,Some("changed mind"))"#);
+    let failed = fired.iter().position(|e| e == "node_failed(release)");
+    assert!(
+        failed.is_some() && decided.is_some() && decided < failed,
+        "the honoured correction is reported before the failure it causes: {fired:?}"
+    );
+    assert_eq!(h.drive_hitl(&graph).await, Vec::<String>::new());
+}
+
+/// The same for a signal: a corrected payload honoured by a later drive changes the
+/// node's output, so it is reported — once.
+#[tokio::test]
+async fn a_corrected_signal_honoured_after_the_first_is_reported_once() {
+    let mut h = Harness::new(None);
+    let graph = signal_graph();
+    h.drive(&graph).await;
+
+    h.append(JournalEvent::SignalReceived {
+        node: NodeId("gate".into()),
+        payload: serde_json::json!("first"),
+    })
+    .await;
+    assert_eq!(
+        h.drive_hitl(&graph).await,
+        vec![r#"signal_received(gate,"first")"#]
+    );
+    h.append(JournalEvent::SignalReceived {
+        node: NodeId("gate".into()),
+        payload: serde_json::json!("second"),
+    })
+    .await;
+    assert_eq!(
+        h.drive_hitl(&graph).await,
+        vec![r#"signal_received(gate,"second")"#]
+    );
+    assert_eq!(h.drive_hitl(&graph).await, Vec::<String>::new());
+}
