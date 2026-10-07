@@ -134,6 +134,11 @@ pub enum JournalEvent {
         /// gate never fires — byte-identical to before.
         #[serde(default)]
         budget: Option<crate::budget::TokenBudget>,
+        /// AG-12: the run's MONEY cap, in micro-dollars, alongside (or instead of) the
+        /// token cap. `None` (and every pre-AG-12 journal) ⇒ no money cap. Skipped when
+        /// `None`, so a run without one serializes byte-identically to before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        money_budget: Option<crate::budget::MoneyBudget>,
     },
     NodeStarted {
         node: NodeId,
@@ -240,6 +245,25 @@ pub enum JournalEvent {
     /// value wins; lowering below current spend is a legitimate way to halt a run.
     BudgetRaised {
         new_total_tokens: u64,
+    },
+    /// AG-12: an operator (or torii, re-deriving a run's limit from its caps) moved the
+    /// run's MONEY cap. The money twin of [`BudgetRaised`](Self::BudgetRaised), with the
+    /// same semantics: latest value wins, and lowering below current spend halts the run.
+    ///
+    /// **It moves a money cap; it never introduces one.** On a run whose
+    /// `RunStarted.money_budget` is `None` the fold ignores it. Cost is ledgered only
+    /// while a money cap is in force (see `TokenUsage::cost_micro_usd`), and a drive
+    /// already in flight when the raise is appended folded "no cap" at its start, so
+    /// every call it makes journals no cost — spend no later fold can recover. A cap
+    /// introduced that way would be reported over spend it never counted. A run that
+    /// needs a money cap must be submitted with one.
+    ///
+    /// Its own variant rather than an optional field on `BudgetRaised`, because the two
+    /// caps are independent: `BudgetRaised.new_total_tokens` is required, so a money-only
+    /// raise expressed there would have to restate (or invent) a token cap, and a
+    /// money-only run would acquire one.
+    MoneyBudgetRaised {
+        new_total_micro_usd: u64,
     },
     /// SP-6 s1: an `AwaitSignal` node began waiting, recording its ABSOLUTE deadline.
     ///
@@ -714,6 +738,125 @@ pub enum JournalEvent {
         dropped_deps: u32,
         dropped_tools: Vec<String>,
     },
+    /// AG-15: an agent's call of a CONFIRM-BEFORE-RUN tool
+    /// ([`AgentDefinition::confirm_tools`](crate::registry::AgentDefinition::confirm_tools))
+    /// has begun waiting for a human decision. Appended BEFORE the tool executes and before
+    /// any `EffectIntent`, so the tool has done nothing yet.
+    ///
+    /// Keyed by the CALL's `effect_id` (`effect_id(node, turn, k+1)`), not by the node — one
+    /// agent node can ask about several calls over its life, and the node-keyed waiting
+    /// machinery (`SignalAwaited`/`GateAwaited`/`AgentAwaited`) keys "has this begun
+    /// asking?" by node. `node` rides along so an operator surface can name the node.
+    ///
+    /// `arguments` is what the human approves, so it is carried — REDACTED by the
+    /// executor's redactor before the append, the obligation every human-facing journal
+    /// write in this enum carries. A call whose arguments exceed
+    /// [`MAX_HUMAN_TEXT_BYTES`] is refused to the model rather than truncated: approving a
+    /// call whose arguments were cut is approving something nobody saw. `args_hash` is the
+    /// call's tool input hash, so a decision can be checked against the exact call.
+    ///
+    /// The deadline is ABSOLUTE and FIRST record wins when folded, exactly as for the
+    /// node-keyed waiting events — recomputing `now + timeout` on every resume is the
+    /// never-expires bug. `None` waits indefinitely.
+    ToolConfirmAwaited {
+        node: NodeId,
+        effect_id: EffectId,
+        tool: String,
+        arguments: String,
+        args_hash: String,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    /// AG-15: a human approved or rejected a confirm-before-run tool call.
+    ///
+    /// LAST record wins when folded (an operator may correct a decision before the run
+    /// resumes), as for `GateDecided`. The deadline is checked BEFORE the decision is read,
+    /// so an approval landing after the deadline never runs the tool — the `HumanGate`
+    /// ordering. A rejection (or an expiry) is fed back to the model as a terse
+    /// `not_confirmed` refusal; `note` is journaled for the audit and is NOT shown to the
+    /// model.
+    ///
+    /// `actor` is ATTRIBUTION, NOT AUTHENTICATION, as on `GateDecided`: who may answer is the
+    /// operator surface's concern (`torii`), not the engine's.
+    ToolConfirmDecided {
+        node: NodeId,
+        effect_id: EffectId,
+        approved: bool,
+        actor: String,
+        note: Option<String>,
+    },
+    /// AG-15: a human-backed `Agent` node's question was ESCALATED — the agent currently
+    /// holding it (`from`) let its SLA expire unanswered, and the question now waits on
+    /// `from`'s [`escalate_to`](crate::registry::AgentDefinition::escalate_to) agent `to`,
+    /// until `deadline` (`to`'s own SLA, measured from the escalation; `None` waits
+    /// indefinitely).
+    ///
+    /// The question itself is NOT re-journaled: the escalation target is asked the SAME
+    /// question the node's `AgentAwaited` recorded, and the answer arrives as the same
+    /// node-keyed `AgentAnswered` — so an operator answering an escalated question uses the
+    /// verb they always did, and `actor` records who did. The original `AgentAwaited`
+    /// deadline is left untouched (it is first-wins and has passed); the CURRENT deadline
+    /// is the last escalation's.
+    ///
+    /// Appended at most once per target per node: the fold keeps the FIRST row for a given
+    /// `to`, and the executor refuses to escalate to an agent already in the node's chain.
+    AgentEscalated {
+        node: NodeId,
+        from: String,
+        to: String,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    /// AG-2: a drive with `OrchestratorHooks` wired fired the "decided" hook for this
+    /// human-in-the-loop node — `on_signal_received`, `on_gate_decided` or
+    /// `on_agent_answered` — and every later drive must not fire it again.
+    ///
+    /// **Hooks bookkeeping, not an audit fact.** It is written ONLY when hooks are wired,
+    /// so an executor with no hooks journals exactly what it did before, and its absence
+    /// does NOT mean the node's answer was never honoured. Nothing but the hook dispatch
+    /// reads it: execution, the memo, the outputs and every determinism check are blind
+    /// to it.
+    ///
+    /// It exists because those three node kinds journal nothing when they complete on an
+    /// answer (no `NodeCompleted`, no `EffectRecorded` — the fold IS their memo), so every
+    /// later drive of a still-live run re-completes them from the fold, and the decision
+    /// row itself (`SignalReceived`/`GateDecided`/`AgentAnswered`) was appended by another
+    /// process and says nothing about which drive first acted on it. A loop gate needs no
+    /// such row: the executor's own [`JournalEvent::LoopGateSettled`] already marks the
+    /// honouring drive.
+    ///
+    /// `decision` is the journal `Seq` of the decision row the hook REPORTED. It is what
+    /// makes the marker per-decision rather than per-node: the decision rows fold
+    /// LAST-wins and none of the three kinds journals a durable completion, so a
+    /// correction appended after a hooked drive honoured the first decision is honoured
+    /// AGAIN by the next drive of a still-live run (a `Fail` option then fails a gate that
+    /// had completed). That drive sees a marker for a different row and reports the
+    /// decision it actually honoured — unless the two rows have IDENTICAL content (a
+    /// redelivery), which decides nothing new and reports nothing. LAST wins per node; a
+    /// duplicate is harmless.
+    /// `#[serde(default)]`: a row without it (`None`) counts as covering whatever
+    /// decision the node holds.
+    ///
+    /// **`effect_id`** (AG-2 × AG-15): `Some` marks the `on_tool_confirm_decided` hook of
+    /// ONE confirm-before-run call — `decision` is then the `Seq` of that call's
+    /// `ToolConfirmDecided` — and the marker is keyed by the call, not the node, because
+    /// one agent node can ask about several calls. A memoized call is never re-judged, but
+    /// a call honoured and then left unrecorded (the approved tool failed and the node
+    /// re-attempts on resume; a stale Observation re-read) reads the same decision again,
+    /// and this row is what keeps that drive from reporting it twice. The same rules as
+    /// above apply per call: identical content is a redelivery, a different decision is
+    /// reported. `None` (and absent — `skip_serializing_if`, so a node marker's bytes are
+    /// exactly what AG-2 shipped) is the node-keyed marker. Reusing the variant rather than
+    /// adding one keeps the journal's set of event KINDS unchanged for a backend that
+    /// enumerates them; a reader that predates the field reads the row as a node marker
+    /// for an agent node that has no decided hook of its own, which is inert.
+    ///
+    /// Additive: `FORMAT_VERSION` stays 1.
+    DecisionHookFired {
+        node: NodeId,
+        #[serde(default)]
+        decision: Option<Seq>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effect_id: Option<EffectId>,
+    },
 }
 
 /// A round-boundary checkpoint of a run's state (§7.4). Written to the journal's
@@ -759,6 +902,20 @@ pub struct Snapshot {
     pub spent: u64,
     #[serde(default)]
     pub budget: Option<u64>,
+    /// AG-12: micro-dollars spent at `seq`, and the money cap in force there — the money
+    /// half of the ledger, carried for exactly the reason `spent`/`budget` are. Default
+    /// and skipped when zero/`None`, so a snapshot of a run without a money cap is
+    /// byte-identical to before.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub spent_micro_usd: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub money_budget_micro_usd: Option<u64>,
+}
+
+/// `skip_serializing_if` predicate for the snapshot's money spend: zero is the
+/// pre-AG-12 shape, so it is omitted rather than written.
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 /// The durable-journal seam. This repo ships the in-memory implementation; torii's
@@ -856,6 +1013,7 @@ mod tests {
             budget: Some(crate::budget::TokenBudget {
                 total_tokens: 50_000,
             }),
+            money_budget: None,
         };
         let s = serde_json::to_string(&e).expect("serializes");
         let back: JournalEvent = serde_json::from_str(&s).expect("round-trips");
@@ -867,6 +1025,119 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    /// AG-12: a run WITHOUT a money cap must journal byte-identically to before the money
+    /// fields existed — not merely deserialize. The literals are what the pre-AG-12 types
+    /// serialized to (serde emits fields in declaration order, and these are the field sets
+    /// the types had at c121984); a durable journal that hashes or diffs rows, and every
+    /// golden file downstream, sees no change unless a money cap is actually set.
+    #[test]
+    fn a_run_without_a_money_cap_journals_byte_identically() {
+        let started = JournalEvent::RunStarted {
+            version: "v1".into(),
+            budget: Some(crate::budget::TokenBudget {
+                total_tokens: 50_000,
+            }),
+            money_budget: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&started).unwrap(),
+            r#"{"RunStarted":{"version":"v1","budget":{"total_tokens":50000}}}"#
+        );
+        let usage = crate::budget::TokenUsage {
+            input_tokens: 1,
+            output_tokens: 2,
+            total_tokens: 3,
+            cost_micro_usd: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&usage).unwrap(),
+            r#"{"input_tokens":1,"output_tokens":2,"total_tokens":3}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&super::Snapshot::default()).unwrap(),
+            r#"{"seq":0,"completed":[],"skipped":[],"outputs":[],"spent":0,"budget":null}"#
+        );
+    }
+
+    /// AG-12: an old journal (no money fields anywhere) loads as "no money cap, no cost".
+    #[test]
+    fn an_old_journal_loads_with_no_money_cap_and_no_cost() {
+        let e: JournalEvent =
+            serde_json::from_str(r#"{"RunStarted":{"version":"v1","budget":{"total_tokens":9}}}"#)
+                .expect("old RunStarted still loads");
+        match e {
+            JournalEvent::RunStarted { money_budget, .. } => assert!(money_budget.is_none()),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let u: crate::budget::TokenUsage =
+            serde_json::from_str(r#"{"input_tokens":1,"output_tokens":2,"total_tokens":3}"#)
+                .expect("old usage still loads");
+        assert_eq!(u.cost_micro_usd, None);
+        let snap: super::Snapshot = serde_json::from_str(
+            r#"{"seq":4,"completed":[],"skipped":[],"outputs":[],"spent":7,"budget":null}"#,
+        )
+        .expect("old snapshot still loads");
+        assert_eq!(
+            (snap.spent_micro_usd, snap.money_budget_micro_usd),
+            (0, None)
+        );
+    }
+
+    /// AG-12: the money cap, a call's cost, the money raise and the snapshot's money half
+    /// all round-trip — the fence stays at 1 because every one of them is additive.
+    #[test]
+    fn the_money_budget_round_trips_through_the_journal() {
+        assert_eq!(FORMAT_VERSION, 1);
+        let started = JournalEvent::RunStarted {
+            version: "v1".into(),
+            budget: None,
+            money_budget: Some(crate::budget::MoneyBudget {
+                total_micro_usd: 2_500_000,
+            }),
+        };
+        let back: JournalEvent =
+            serde_json::from_str(&serde_json::to_string(&started).unwrap()).unwrap();
+        match back {
+            JournalEvent::RunStarted {
+                budget: None,
+                money_budget: Some(m),
+                ..
+            } => assert_eq!(m.total_micro_usd, 2_500_000),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let raised = JournalEvent::MoneyBudgetRaised {
+            new_total_micro_usd: 7_000_000,
+        };
+        let back: JournalEvent =
+            serde_json::from_str(&serde_json::to_string(&raised).unwrap()).unwrap();
+        assert!(matches!(
+            back,
+            JournalEvent::MoneyBudgetRaised {
+                new_total_micro_usd: 7_000_000
+            }
+        ));
+        let usage = crate::budget::TokenUsage {
+            input_tokens: 1,
+            output_tokens: 2,
+            total_tokens: 3,
+            cost_micro_usd: Some(42),
+        };
+        let back: crate::budget::TokenUsage =
+            serde_json::from_str(&serde_json::to_string(&usage).unwrap()).unwrap();
+        assert_eq!(back, usage);
+        let snap = super::Snapshot {
+            spent_micro_usd: 11,
+            money_budget_micro_usd: Some(99),
+            ..Default::default()
+        };
+        let back: super::Snapshot =
+            serde_json::from_str(&serde_json::to_string(&snap).unwrap()).unwrap();
+        assert_eq!(
+            (back.spent_micro_usd, back.money_budget_micro_usd),
+            (11, Some(99))
+        );
     }
 
     /// An over-threshold output is journaled as a `Ref` into the CAS, and a durable journal
@@ -1418,6 +1689,98 @@ mod tests {
         );
         let back: JournalEvent = serde_json::from_str(&json).expect("deserialises");
         assert_eq!(format!("{back:?}"), format!("{ev:?}"));
+        assert_eq!(
+            FORMAT_VERSION, 1,
+            "an additive variant must not bump the format fence"
+        );
+    }
+
+    /// AG-2's node-keyed `DecisionHookFired` serializes exactly as it shipped — the bytes a
+    /// hooked journal already holds — and a row written before `decision` existed still
+    /// reads back as covering any decision.
+    #[test]
+    fn the_node_decision_hook_marker_keeps_its_shipped_bytes() {
+        let ev = JournalEvent::DecisionHookFired {
+            node: NodeId("gate".into()),
+            decision: Some(3),
+            effect_id: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&ev).expect("serialises"),
+            r#"{"DecisionHookFired":{"node":"gate","decision":3}}"#
+        );
+        let old: JournalEvent =
+            serde_json::from_str(r#"{"DecisionHookFired":{"node":"gate"}}"#).expect("reads");
+        assert_eq!(
+            format!("{old:?}"),
+            format!(
+                "{:?}",
+                JournalEvent::DecisionHookFired {
+                    node: NodeId("gate".into()),
+                    decision: None,
+                    effect_id: None,
+                }
+            )
+        );
+    }
+
+    /// AG-2 × AG-15: a confirm-call marker carries its `effect_id` and round-trips whole.
+    #[test]
+    fn the_tool_confirm_decision_hook_marker_round_trips() {
+        let ev = JournalEvent::DecisionHookFired {
+            node: NodeId("n1".into()),
+            decision: Some(7),
+            effect_id: Some(EffectId("eid-2".into())),
+        };
+        let json = serde_json::to_string(&ev).expect("serialises");
+        assert_eq!(
+            json,
+            r#"{"DecisionHookFired":{"node":"n1","decision":7,"effect_id":"eid-2"}}"#
+        );
+        let back: JournalEvent = serde_json::from_str(&json).expect("deserialises");
+        assert_eq!(format!("{back:?}"), format!("{ev:?}"));
+    }
+
+    /// AG-15 — the tool-confirmation and escalation events round-trip whole; the fence stays 1.
+    /// Compared as whole `Debug` renderings for the reason `ContextBudgeted`'s test gives.
+    #[test]
+    fn the_ag15_events_round_trip() {
+        let at = chrono::DateTime::from_timestamp(1_000, 0).expect("valid");
+        for ev in [
+            JournalEvent::ToolConfirmAwaited {
+                node: NodeId("n1".into()),
+                effect_id: EffectId("eid-1".into()),
+                tool: "deploy".into(),
+                arguments: "{\"env\":\"prod\"}".into(),
+                args_hash: "h".into(),
+                deadline: Some(at),
+            },
+            JournalEvent::ToolConfirmAwaited {
+                node: NodeId("n1".into()),
+                effect_id: EffectId("eid-2".into()),
+                tool: "deploy".into(),
+                arguments: String::new(),
+                args_hash: "h".into(),
+                deadline: None,
+            },
+            JournalEvent::ToolConfirmDecided {
+                node: NodeId("n1".into()),
+                effect_id: EffectId("eid-1".into()),
+                approved: false,
+                actor: "alice".into(),
+                note: Some("use staging".into()),
+            },
+            JournalEvent::AgentEscalated {
+                node: NodeId("review".into()),
+                from: "reviewer".into(),
+                to: "lead".into(),
+                deadline: Some(at),
+            },
+        ] {
+            let json = serde_json::to_string(&ev).expect("serialises");
+            let back: JournalEvent = serde_json::from_str(&json).expect("deserialises");
+            assert_eq!(format!("{back:?}"), format!("{ev:?}"));
+        }
         assert_eq!(
             FORMAT_VERSION, 1,
             "an additive variant must not bump the format fence"

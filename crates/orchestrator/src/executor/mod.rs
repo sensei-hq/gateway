@@ -9,7 +9,7 @@ use orchestrator_core::{
     AgentRef, Clock, ContentStore, ContextKey, ContextRef, ContextStore, EffectClass, EffectId,
     EffectOutput, ExecutionJournal, Graph, JournalEvent, NodeId, NodeKind, ObservationMeta,
     OrchestratorError, OrchestratorHooks, PLANNER_AREA, Planner, PlannerSelector, Registry,
-    RegistryHandle, RunId, Scope, Seq, SystemClock, TokenBudget, effect_id,
+    RegistryHandle, RunBudget, RunId, Scope, Seq, SystemClock, TokenBudget, effect_id,
 };
 
 use crate::agent::tools::{ReconcileRegistry, ToolRegistry};
@@ -19,6 +19,7 @@ mod branch;
 mod content;
 mod dispatch;
 mod durability;
+mod escalation;
 mod expand;
 mod fanout;
 mod gate;
@@ -27,6 +28,7 @@ pub(crate) mod selector;
 mod signal;
 mod subgraph;
 mod support;
+mod tool_policy;
 use support::{
     GatewayDisposition, build_request, classify_gateway_error, consolidate_compaction_target,
     fold_journal, input_hash, project_agent_outputs, ready_nodes,
@@ -291,6 +293,26 @@ struct Fold {
     /// decision *before the run resumes*: this row is the line after which "before" has
     /// passed.
     loop_gate_settlements: HashMap<NodeId, String>,
+    /// AG-2: the human-in-the-loop nodes whose "decided" hook a hooked drive has already
+    /// fired (`JournalEvent::DecisionHookFired`), each with the `Seq` of the decision row
+    /// it reported (LAST wins; `None` = a marker that covers any decision). Read by
+    /// exactly one consumer, [`Executor::claim_decided_hook`], and by nothing that affects
+    /// execution.
+    decided_hooks_fired: HashMap<NodeId, Option<Seq>>,
+    /// AG-2: the `Seq` of each node's CURRENT decision row — the `SignalReceived`,
+    /// `GateDecided` or `AgentAnswered` that the LAST-wins fold of
+    /// [`Fold::signals`]/[`Fold::gate_decisions`]/[`Fold::agent_answers`] honours. Read
+    /// only by [`Executor::claim_decided_hook`], to tell a replay of the decision already
+    /// reported from a correction honoured after it.
+    decision_seqs: HashMap<NodeId, Seq>,
+    /// AG-2 re-review: what every decision row SAID, by its `Seq` — so a marker for one
+    /// row can be compared by content with the row the fold honours now. Without it, an
+    /// identical redelivery (a retrying webhook, a double-submitted option) is a new `Seq`
+    /// and re-fired the decided hook for a decision that changed nothing. Keyed by `Seq`
+    /// rather than by node because the reported row need not be the node's current one:
+    /// a correction can land between the drive's fold and its marker write. Read only by
+    /// [`Fold::decided_hook_fired`].
+    decision_rows: HashMap<Seq, DecisionContent>,
     /// SP-6 s1 (whole-slice review): each node's journaled `NodeFailed` message, FIRST
     /// wins. Read through exactly ONE consumer — [`gate_precheck`](Executor::gate_precheck),
     /// the shared arm 0 of the WAITING node kinds, for which a failure is TERMINAL (an
@@ -359,6 +381,15 @@ struct Fold {
     /// The effective cap: `RunStarted.budget`, then the latest `BudgetRaised` (latest
     /// wins). `None` for an unbudgeted run — the gate never fires.
     budget: Option<u64>,
+    /// AG-12: the effective MONEY cap in micro-dollars — `RunStarted.money_budget`, then
+    /// the latest `MoneyBudgetRaised`. Independent of `budget`: either, both or neither.
+    /// The spend it is compared against is NOT a separate ledger — it is the
+    /// `cost_micro_usd` riding on each entry of `usage` above, so it is keyed by effect
+    /// id and inherits every idempotency property of the token ledger.
+    money_budget: Option<u64>,
+    /// AG-12: micro-dollars dispatched by THIS drive, not yet visible in `usage` — the
+    /// money twin of `live_spend`, for the same reason.
+    live_money: Arc<std::sync::atomic::AtomicU64>,
     /// SP-DATA-5: tokens dispatched by THIS drive, not yet visible in `usage`.
     ///
     /// A `Fold` is built once per drive (from the journal on resume, or empty-but-for-
@@ -401,6 +432,35 @@ struct Fold {
     /// (`agent.rs`) computes it on the line before `agent_input_hash` — so the budget that
     /// shapes the prompt can be looked up by a key that does not depend on the prompt.
     context_budgets: HashMap<EffectId, ContextBudget>,
+    /// AG-15: each confirm-before-run CALL's recorded deadline, from `ToolConfirmAwaited`,
+    /// keyed by the call's effect id. FIRST wins — the never-expires rule every waiting
+    /// record follows. Presence answers "has this call begun asking?".
+    tool_confirm_asks: HashMap<EffectId, Option<chrono::DateTime<chrono::Utc>>>,
+    /// AG-15: each confirm-before-run call's decision (`approved`), from
+    /// `ToolConfirmDecided`. LAST wins, like `gate_decisions`, so an operator can correct a
+    /// decision before the run resumes.
+    tool_confirm_decisions: HashMap<EffectId, bool>,
+    /// AG-2 × AG-15: the `Seq` of each call's CURRENT `ToolConfirmDecided` (LAST wins, in
+    /// step with [`Fold::tool_confirm_decisions`]); the row's content is in
+    /// [`Fold::decision_rows`]. The per-call twin of [`Fold::decision_seqs`], read only by
+    /// the hook dispatch.
+    tool_confirm_decision_seqs: HashMap<EffectId, Seq>,
+    /// AG-2 × AG-15: the calls whose `on_tool_confirm_decided` a hooked drive already
+    /// fired (`DecisionHookFired` with an `effect_id`), each with the `Seq` of the decision
+    /// it reported (LAST wins). The per-call twin of [`Fold::decided_hooks_fired`], read
+    /// only by [`Executor::claim_tool_confirm_hook`].
+    tool_confirm_hooks_fired: HashMap<EffectId, Option<Seq>>,
+    /// AG-15: each human-backed agent node's escalation chain, from `AgentEscalated`, in
+    /// journal order. The FIRST row for a given target wins (a re-appended hop is ignored),
+    /// so the chain — and the deadline of its last hop — never moves once recorded.
+    agent_escalations: HashMap<NodeId, Vec<AgentEscalation>>,
+}
+
+/// AG-15: one folded `AgentEscalated` hop.
+#[derive(Debug, Clone, PartialEq)]
+struct AgentEscalation {
+    to: String,
+    deadline: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// SP-7b: a folded `ContextBudgeted` — the two fields a later drive must REPRODUCE a cut
@@ -431,6 +491,25 @@ struct AgentAnswer {
     text: String,
     /// ATTRIBUTION, NOT AUTHENTICATION — see `JournalEvent::AgentAnswered`.
     actor: String,
+}
+
+/// AG-2 re-review: the content of one decision row — exactly what its decided hook
+/// reports. Two rows with equal content are the same decision, delivered twice.
+#[derive(Debug, Clone, PartialEq)]
+enum DecisionContent {
+    Signal(serde_json::Value),
+    Gate(GateDecision),
+    Agent(AgentAnswer),
+    ToolConfirm(ToolConfirmDecision),
+}
+
+/// AG-2 × AG-15: a folded `ToolConfirmDecided` — what `on_tool_confirm_decided` reports.
+#[derive(Debug, Clone, PartialEq)]
+struct ToolConfirmDecision {
+    approved: bool,
+    /// ATTRIBUTION, NOT AUTHENTICATION — see `JournalEvent::ToolConfirmDecided`.
+    actor: String,
+    note: Option<String>,
 }
 
 /// SP-6 s2: a folded `GateDecided`.
@@ -497,6 +576,30 @@ impl Fold {
         self.budget
     }
 
+    /// AG-12: micro-dollars this run had spent as of the journal this fold was built from.
+    ///
+    /// The same keyed sum as [`journaled_spend`](Self::journaled_spend), over the same
+    /// map, reading the other field — so a duplicate record or a re-folded compaction
+    /// manifest counts once here for exactly the reason it counts once there. Saturating
+    /// HIGH for the same reason too: it pauses the run rather than resetting the ledger.
+    fn journaled_money(&self) -> u64 {
+        self.usage
+            .values()
+            .filter_map(|u| u.cost_micro_usd)
+            .fold(0u64, |acc, m| acc.saturating_add(m))
+    }
+
+    /// AG-12: total micro-dollars this run has spent: journaled + in-flight this drive.
+    fn money_spent(&self) -> u64 {
+        self.journaled_money()
+            .saturating_add(self.live_money.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// AG-12: the run's effective money cap in micro-dollars, or `None`.
+    fn money_budget(&self) -> Option<u64> {
+        self.money_budget
+    }
+
     /// This fold's ledger as the metered-dispatch chokepoint consumes it. Borrowing the
     /// live counter (rather than copying two scalars out) is what lets spend accumulate
     /// WITHIN a drive — see [`dispatch::Meter`].
@@ -507,6 +610,23 @@ impl Fold {
             &self.live_spend,
             &self.serial_gate,
         )
+        .with_money(self.journaled_money(), self.money_budget, &self.live_money)
+    }
+
+    /// AG-12: the usage a producer journals on its `EffectRecorded` — the provider's
+    /// token counts, plus the gateway's priced cost in micro-dollars when (and only when)
+    /// this run has a money cap in force.
+    ///
+    /// The ONE conversion every producer uses. It lives on the fold because whether cost
+    /// is ledgered is a property of the RUN, and a per-site flag would be five chances to
+    /// journal tokens and silently drop the money; there is no other converter left to
+    /// call. Gating on the cap rather than recording cost always is what keeps an
+    /// unbudgeted or token-only run's journal byte-identical to before AG-12.
+    fn recorded_usage(
+        &self,
+        response: &kernel::types::request::InferenceResponse,
+    ) -> Option<orchestrator_core::TokenUsage> {
+        content::recorded_usage(response, self.money_budget.is_some())
     }
 
     /// SP-6 s1: the folded signal for an `AwaitSignal` node, if one has been delivered
@@ -716,6 +836,85 @@ impl Fold {
     fn loop_gate_settled_with(&self, node: &NodeId) -> Option<&str> {
         self.loop_gate_settlements.get(node).map(String::as_str)
     }
+
+    /// AG-15: `None` ⇒ this call has not begun asking; `Some(deadline)` ⇒ it has, with the
+    /// deadline it recorded.
+    fn tool_confirm_deadline(
+        &self,
+        eid: &EffectId,
+    ) -> Option<Option<chrono::DateTime<chrono::Utc>>> {
+        self.tool_confirm_asks.get(eid).copied()
+    }
+
+    fn tool_confirm_decision(&self, eid: &EffectId) -> Option<bool> {
+        self.tool_confirm_decisions.get(eid).copied()
+    }
+
+    /// AG-15: the node's escalation hops so far, oldest first (empty if never escalated).
+    fn escalations_for(&self, node: &NodeId) -> &[AgentEscalation] {
+        self.agent_escalations
+            .get(node)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// AG-2: has an earlier hooked drive already fired this node's "decided" hook for the
+    /// decision the fold holds NOW? The marker counts when it names the current decision
+    /// row, or a row with IDENTICAL content (an identical redelivery decides nothing new,
+    /// so it reports nothing). A marker for a row that said something else does not
+    /// count: a correction appended after it is honoured again, and is reported again.
+    fn decided_hook_fired(&self, node: &NodeId) -> bool {
+        self.marker_covers(
+            self.decided_hooks_fired.get(node),
+            self.decision_seqs.get(node),
+        )
+    }
+
+    /// AG-2 × AG-15: the per-CALL twin of [`decided_hook_fired`](Self::decided_hook_fired)
+    /// for a confirm-before-run call's `on_tool_confirm_decided` — the same rule, keyed by
+    /// the call's effect id, because one agent node can ask about several calls and two of
+    /// them may well be decided with identical content.
+    fn tool_confirm_hook_fired(&self, eid: &EffectId) -> bool {
+        self.marker_covers(
+            self.tool_confirm_hooks_fired.get(eid),
+            self.tool_confirm_decision_seqs.get(eid),
+        )
+    }
+
+    /// AG-2: does a folded marker (`None` = none; `Some(None)` = a marker that covers any
+    /// decision; `Some(Some(seq))` = the row it reported) cover the decision row the fold
+    /// holds NOW (`current`)? Yes when it names that row, or a row with IDENTICAL content.
+    fn marker_covers(&self, marker: Option<&Option<Seq>>, current: Option<&Seq>) -> bool {
+        match marker {
+            None => false,
+            Some(None) => true,
+            Some(Some(reported)) => match current {
+                None => false,
+                Some(current) => {
+                    current == reported
+                        || matches!(
+                            (self.decision_rows.get(reported), self.decision_rows.get(current)),
+                            (Some(was), Some(now)) if was == now
+                        )
+                }
+            },
+        }
+    }
+
+    /// AG-2 × AG-15: the `ToolConfirmDecided` row this call currently honours — its `Seq`
+    /// and content — if any.
+    fn tool_confirm_row(&self, eid: &EffectId) -> Option<(Seq, &ToolConfirmDecision)> {
+        let seq = *self.tool_confirm_decision_seqs.get(eid)?;
+        match self.decision_rows.get(&seq)? {
+            DecisionContent::ToolConfirm(row) => Some((seq, row)),
+            _ => None,
+        }
+    }
+
+    /// AG-2: the `Seq` of the decision row this node currently honours, if any.
+    fn decision_seq(&self, node: &NodeId) -> Option<Seq> {
+        self.decision_seqs.get(node).copied()
+    }
 }
 
 /// SP-DATA-5 Task 5: a run's folded `(spent, budget)`, exposed so `torii run status`
@@ -734,6 +933,18 @@ impl Fold {
 pub fn spend_of(events: &[(Seq, JournalEvent)]) -> (u64, Option<u64>) {
     let (fold, _, _) = fold_journal(events);
     (fold.spent(), fold.budget())
+}
+
+/// AG-12: a run's folded MONEY `(spent_micro_usd, money_budget_micro_usd)` — the money
+/// twin of [`spend_of`], routed through the same `fold_journal` for the same reason, so
+/// `torii run status` can display dollars spent without re-deriving them.
+///
+/// Spend counts only calls made while a money cap was in force (cost is ledgered only
+/// then — see `TokenUsage::cost_micro_usd`), so on a run that never had one this is
+/// `(0, None)`.
+pub fn money_spend_of(events: &[(Seq, JournalEvent)]) -> (u64, Option<u64>) {
+    let (fold, _, _) = fold_journal(events);
+    (fold.money_spent(), fold.money_budget())
 }
 
 /// Run-scoped tallies for the expansion caps (§4.5). Only ever mutated from the
@@ -985,8 +1196,36 @@ impl Executor {
     /// A per-run clone with the registry + fence version pinned from a
     /// `RegistryHandle` snapshot (handle cleared, so the pinned copy resolves the
     /// fixed registry directly — no double-pin).
+    ///
+    /// SP-REG-2 (AG-1, gateway#85): the planner discovery tools — `list_agents`,
+    /// `list_skills`, `list_tools`, `list_chains`, `validate_plan` — are composed HERE, over
+    /// the registry this run is pinned to, never at boot: `with_tools` is set once for the
+    /// executor's life, while the registry is re-pinned per run, so a boot snapshot would let a
+    /// planner introspect a registry its own run is not pinned to.
+    ///
+    /// Composing them widens nothing: the s1 gate only lets an agent call a tool it DECLARES,
+    /// and all five are `Pure`, so registering them changes no effect class or memo behaviour
+    /// for an agent that does not (spec `2026-09-15-sp-reg-programme-design.md` §3).
+    ///
+    /// Only this, the handle path, composes them. A `with_registry` executor (tests only — boot
+    /// uses `with_registry_handle`) does not: an agent there that declares `list_agents` fails
+    /// `UnknownTool` — a deliberate trade, because only the pinned path's `#cfg` fence makes a
+    /// FRESH discovery call refuse a drifted config instead of silently answering differently.
     fn pinned(mut self, registry: Arc<Registry>, generation: u64) -> Self {
+        use crate::agent::tools::{ListAgents, ListChains, ListSkills, ListTools, ValidatePlan};
         self.version = format!("{}#cfg{}", self.version, generation);
+        self.tools = Arc::new(
+            (*self.tools)
+                .clone()
+                .with_tool(Arc::new(ListAgents(registry.clone())))
+                .with_tool(Arc::new(ListSkills(registry.clone())))
+                .with_tool(Arc::new(ListTools(registry.clone())))
+                .with_tool(Arc::new(ListChains(registry.clone())))
+                .with_tool(Arc::new(ValidatePlan {
+                    registry: registry.clone(),
+                    max_nodes: self.max_nodes,
+                })),
+        );
         self.registry = registry;
         self.handle = None;
         self
@@ -1029,6 +1268,33 @@ impl Executor {
         graph: &Graph,
         budget: Option<TokenBudget>,
     ) -> Result<RunOutcome, OrchestratorError> {
+        self.run_with_budget(
+            run,
+            graph,
+            RunBudget {
+                tokens: budget,
+                money: None,
+            },
+        )
+        .await
+    }
+
+    /// AG-12: like [`run_budgeted`](Self::run_budgeted), with a token cap, a MONEY cap,
+    /// both or neither. The money cap is journaled on `RunStarted.money_budget` and
+    /// enforced by the same metered-dispatch chokepoint as the token cap: a call is
+    /// refused once the folded money spend reaches the cap, each call's `max_tokens` is
+    /// clamped to what the remaining dollars afford at the chain's worst-case price, and
+    /// exhaustion is the same durable `RunPaused` an operator lifts with
+    /// `MoneyBudgetRaised` + a wake.
+    ///
+    /// `RunBudget::default()` is exactly [`run`](Self::run), and a token-only budget is
+    /// exactly [`run_budgeted`](Self::run_budgeted) — byte-identical journals.
+    pub async fn run_with_budget(
+        &self,
+        run: RunId,
+        graph: &Graph,
+        budget: RunBudget,
+    ) -> Result<RunOutcome, OrchestratorError> {
         if let Some(h) = &self.handle {
             let (registry, generation) = h.snapshot();
             return self
@@ -1044,7 +1310,7 @@ impl Executor {
         &self,
         run: RunId,
         graph: &Graph,
-        budget: Option<TokenBudget>,
+        budget: RunBudget,
     ) -> Result<RunOutcome, OrchestratorError> {
         graph.validate_dag()?;
         let this = self.clone().with_expansion_seed(0, 0);
@@ -1052,7 +1318,8 @@ impl Executor {
             run,
             JournalEvent::RunStarted {
                 version: this.version.clone(),
-                budget,
+                budget: budget.tokens,
+                money_budget: budget.money,
             },
         )
         .await?;
@@ -1062,7 +1329,8 @@ impl Executor {
         // however small the cap. (A resume gets the same value from `fold_journal`
         // reading the `RunStarted` this call just appended, plus any `BudgetRaised`.)
         let fold = Fold {
-            budget: budget.map(|b| b.total_tokens),
+            budget: budget.tokens.map(|b| b.total_tokens),
+            money_budget: budget.money.map(|m| m.total_micro_usd),
             ..Default::default()
         };
         // The RUN's own graph: a human-backed `Agent` node here is at the one
@@ -1119,7 +1387,7 @@ impl Executor {
             // branch only fires for a run id that was never submitted at all, which is
             // not a product path `Scheduler::tick` reaches (it only re-drives runs its
             // own `submit` already journaled `RunStarted` for).
-            return self.run_inner(run, graph, None).await;
+            return self.run_inner(run, graph, RunBudget::default()).await;
         }
 
         // Version fence: the first recorded `RunStarted.version` must match ours.
@@ -1128,7 +1396,11 @@ impl Executor {
         // The fence compares the executor version string only; `budget` is
         // deliberately not fenced (a config-only change, not a code-version change).
         if let Some(recorded) = events.iter().find_map(|(_, e)| match e {
-            JournalEvent::RunStarted { version, budget: _ } => Some(version.clone()),
+            JournalEvent::RunStarted {
+                version,
+                budget: _,
+                money_budget: _,
+            } => Some(version.clone()),
             _ => None,
         }) && recorded != self.version
         {
@@ -1532,9 +1804,9 @@ impl Executor {
                         // events by that outer `(Seq, event)` from `load` — never by
                         // this in-event field — so it is set to 0 rather than the
                         // (circular) value `append` would return.
-                        let recorded = self.split_output(&output).await?;
-                        self.append(
-                            run,
+                        // AG-3 × AG-12: a failure to journal this PAID call is
+                        // `SpendUnrecorded`, never a retryable journal fault.
+                        self.record_paid_effect(run, &node.id, &output, |recorded| {
                             JournalEvent::EffectRecorded {
                                 node: node.id.clone(),
                                 effect_id: eid,
@@ -1545,9 +1817,9 @@ impl Executor {
                                 observation: None,
                                 // SP-DATA-5: the ModelCall producer — the real usage the
                                 // provider reported, converted at the boundary.
-                                usage: response.usage.map(content::convert_usage),
-                            },
-                        )
+                                usage: fold.recorded_usage(&response),
+                            }
+                        })
                         .await?;
                         self.append(
                             run,
@@ -1739,10 +2011,186 @@ impl Executor {
                 JournalEvent::PlannerSelected { node, agent } => {
                     h.on_planner_selected(run, node, agent).await
                 }
+                // AG-2: the four ASKS. Each waiting kind journals its ask exactly once in
+                // the node's life (folded first-wins; a resume re-pauses without
+                // re-asking), so firing here is once-per-ask and replay-suppressed for
+                // free, like every arm above. The DECISIONS have no executor write to
+                // mirror (another process appends them) and are fired at the honouring
+                // site instead — see `claim_decided_hook`; `LoopGateSettled` is fired
+                // there too, after the decision it settles, so it is deliberately not here.
+                JournalEvent::SignalAwaited { node, deadline } => {
+                    h.on_signal_awaited(run, node, *deadline).await
+                }
+                // The one ask whose journaled payload is NOT already redacted: a
+                // `HumanGate` journals its graph-authored menu as-is (that row is the menu
+                // a decision is validated against, so it is not rewritten here). A
+                // planner-emitted graph carries model-derived text, and every string a
+                // hook hands an observer goes through the redactor — so the HOOK gets the
+                // scrubbed names, the same ones `on_gate_decided`'s `option` carries.
+                JournalEvent::GateAwaited {
+                    node,
+                    deadline,
+                    options,
+                } => {
+                    let shown: Vec<orchestrator_core::GateOption> = options
+                        .iter()
+                        .map(|o| orchestrator_core::GateOption {
+                            name: self.redact_text(o.name.clone()),
+                            outcome: o.outcome,
+                        })
+                        .collect();
+                    h.on_gate_awaited(run, node, *deadline, &shown).await
+                }
+                JournalEvent::AgentAwaited {
+                    node,
+                    deadline,
+                    prompt,
+                } => h.on_agent_awaited(run, node, *deadline, prompt).await,
+                JournalEvent::LoopGateAwaited {
+                    node,
+                    deadline,
+                    prompt,
+                    menu,
+                } => {
+                    h.on_loop_gate_awaited(run, node, *deadline, prompt, menu)
+                        .await
+                }
+                // AG-2 × AG-15: a confirm-before-run CALL's ask — journaled once per call
+                // (first-wins, keyed by its effect id), so once per ask like the four above.
+                // `arguments` was redacted before it was journaled; the tool name was not
+                // (it is the row an operator matches a decision against), so it is
+                // scrubbed here, as `GateAwaited`'s menu is.
+                JournalEvent::ToolConfirmAwaited {
+                    node,
+                    effect_id,
+                    tool,
+                    arguments,
+                    deadline,
+                    ..
+                } => {
+                    let tool = self.redact_text(tool.clone());
+                    h.on_tool_confirm_awaited(run, node, effect_id, &tool, arguments, *deadline)
+                        .await
+                }
+                // AG-2 × AG-15: an escalation hop — journaled at most once per target per
+                // node (the executor never re-escalates to an agent already in the chain),
+                // so once per occurrence. The agent names pass through the same redactor.
+                JournalEvent::AgentEscalated {
+                    node,
+                    from,
+                    to,
+                    deadline,
+                } => {
+                    let from = self.redact_text(from.clone());
+                    let to = self.redact_text(to.clone());
+                    h.on_agent_escalated(run, node, &from, &to, *deadline).await
+                }
                 _ => {}
             }
         }
         Ok(seq)
+    }
+
+    /// AG-2: claim THIS drive's right to fire a human-in-the-loop node's "decided" hook
+    /// (`on_signal_received`/`on_gate_decided`/`on_agent_answered`), returning the hooks
+    /// to fire it on — or `None`, in which case the caller fires nothing.
+    ///
+    /// Called by `run_await_signal`, `run_human_gate` and `run_human_agent` at the moment
+    /// they HONOUR an answer. Those kinds journal nothing when they complete, so every
+    /// later drive of a still-live run re-completes them from the fold and reaches the same
+    /// call; the decision row was appended by another process and cannot say which drive
+    /// first acted on it. So the first hooked drive journals `DecisionHookFired { node,
+    /// decision }` and every later drive, folding it, gets `None` while the fold still
+    /// holds that decision — exactly once across resumes. A correction appended after it
+    /// is a different row; the drive that honours it claims again, unless the row repeats
+    /// the reported decision's content verbatim (an identical redelivery claims nothing).
+    ///
+    /// `None` when no hooks are wired, BEFORE any write: an unhooked executor journals
+    /// exactly what it did before (`an_unhooked_run_journals_exactly_what_it_did_before`).
+    ///
+    /// Best-effort, deliberately bypassing [`append`](Self::append)'s strict error mapping:
+    /// a hook must never affect execution, so a failed bookkeeping write never fails the
+    /// node. It still RETURNS the hooks: the drive fires anyway, because skipping would
+    /// LOSE the callback whenever no later drive reaches this claim — the honouring drive
+    /// also finished the run, or honoured a `Fail` option that `gate_precheck` reads back
+    /// from then on. The cost is a possible duplicate: with no marker, a later drive of a
+    /// still-live run reports the same decision again (at-least-once on that edge). The
+    /// row is written BEFORE the hook fires, matching every other hook's "after a
+    /// successful journal write" — a crash between the two loses the callback rather than
+    /// repeating it.
+    async fn claim_decided_hook(
+        &self,
+        run: RunId,
+        node: &NodeId,
+        fold: &Fold,
+    ) -> Option<&Arc<dyn OrchestratorHooks>> {
+        let hooks = self.hooks.as_ref()?;
+        if fold.decided_hook_fired(node) {
+            return None;
+        }
+        self.mark_decided_hook(run, node, fold.decision_seq(node), None)
+            .await;
+        Some(hooks)
+    }
+
+    /// AG-2 × AG-15: [`claim_decided_hook`](Self::claim_decided_hook) for ONE
+    /// confirm-before-run call's `on_tool_confirm_decided`, keyed by the call's effect id.
+    ///
+    /// Called by `confirm_tool_call` at the moment it HONOURS a decision — inside the
+    /// deadline, about to run the approved call or refuse the rejected one. A memoized call
+    /// never gets there again, but a call honoured and then left unrecorded does (the
+    /// approved tool failed and the node re-attempts on resume; a stale Observation
+    /// re-read), and it reads the same decision: the `DecisionHookFired { effect_id }` row
+    /// written here is what keeps that drive from reporting it twice. Every rule of
+    /// `claim_decided_hook` holds as written there — `None` with no hooks and before any
+    /// write, an identical redelivery claims nothing, a correction claims again, and a
+    /// failed write still fires.
+    async fn claim_tool_confirm_hook(
+        &self,
+        run: RunId,
+        node: &NodeId,
+        eid: &EffectId,
+        fold: &Fold,
+    ) -> Option<&Arc<dyn OrchestratorHooks>> {
+        let hooks = self.hooks.as_ref()?;
+        if fold.tool_confirm_hook_fired(eid) {
+            return None;
+        }
+        let decision = fold.tool_confirm_row(eid).map(|(seq, _)| seq);
+        self.mark_decided_hook(run, node, decision, Some(eid.clone()))
+            .await;
+        Some(hooks)
+    }
+
+    /// AG-2: journal the `DecisionHookFired` bookkeeping row, best-effort — deliberately
+    /// bypassing [`append`](Self::append)'s strict error mapping (see `claim_decided_hook`
+    /// for why a failed write is logged and the hook fired anyway).
+    async fn mark_decided_hook(
+        &self,
+        run: RunId,
+        node: &NodeId,
+        decision: Option<Seq>,
+        effect_id: Option<EffectId>,
+    ) {
+        if let Err(error) = self
+            .journal
+            .append(
+                run,
+                JournalEvent::DecisionHookFired {
+                    node: node.clone(),
+                    decision,
+                    effect_id,
+                },
+            )
+            .await
+        {
+            tracing::warn!(
+                node = %node.0,
+                %error,
+                "could not journal DecisionHookFired; firing the decided hook anyway \
+                 (a later drive of a still-live run may report it again)"
+            );
+        }
     }
 
     /// Publish a completed node's output to the blackboard (§8): `put` it under

@@ -59,6 +59,20 @@ pub struct ScheduledRun {
     pub updated_at: DateTime<Utc>,
 }
 
+/// What [`SchedulerStore::begin_wake_attempt`] reports about the wake it just started (AG-3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeAttempt {
+    /// 1-based count of CONSECUTIVE wake attempts, this one included: every attempt since the
+    /// run's last successful drive (a drive that recorded a pause or a terminal outcome). `1` is
+    /// the first attempt after a success; `n > 1` means the `n - 1` before it all failed.
+    pub attempt: u32,
+    /// The error the PREVIOUS attempt recorded via
+    /// [`record_wake_failed`](SchedulerStore::record_wake_failed). `None` with `attempt > 1`
+    /// means the previous attempt never recorded anything — its worker was lost mid-drive and
+    /// its lease was reclaimed. Always `None` when `attempt == 1`.
+    pub last_error: Option<String>,
+}
+
 /// An exclusive hold on one run's drive (SP-OPS-1.4).
 ///
 /// The lease alone could not provide this. `claimed_at` is stamped once at claim and never
@@ -141,15 +155,67 @@ pub trait SchedulerStore: Send + Sync {
     ) -> Result<(), OrchestratorError>;
 
     /// Atomically claim up to `limit` due wakes — `(paused AND next_wake<=now)` OR a stale
-    /// `(waking AND claimed_at < now-lease)` — flipping each to `waking`, stamping `claimed_at=now`,
-    /// returning `(run, graph)`. A NULL `next_wake` is never claimed by the timer. This is both the
-    /// exactly-once gate vs a fleet AND the crash-mid-wake reclaim.
+    /// `(waking AND claimed_at < now-lease AND (next_wake IS NULL OR next_wake<=now))` — flipping
+    /// each to `waking`, stamping `claimed_at=now`, returning `(run, graph)`. A NULL `next_wake` on a
+    /// PAUSED row is never claimed by the timer. This is both the exactly-once gate vs a fleet AND
+    /// the crash-mid-wake reclaim.
+    ///
+    /// AG-3: on a `waking` row `next_wake` is the retry deadline
+    /// [`begin_wake_attempt`](Self::begin_wake_attempt) armed, so a drive whose worker was lost is
+    /// reclaimed only once BOTH its lease and its backoff have passed — a crash-looping run is
+    /// spaced out exactly like one whose drive returned an error.
     async fn claim_due(
         &self,
         now: DateTime<Utc>,
         lease: Duration,
         limit: usize,
     ) -> Result<Vec<(RunId, Graph)>, OrchestratorError>;
+
+    /// AG-3: a claimed wake is about to be driven — count it. Called by the driver right after it
+    /// takes the run's [`RunLock`], before any drive work. Conditional on `waking`; returns
+    /// `Ok(None)` for a run that is not `waking` (or unknown).
+    ///
+    /// The store keeps a per-run count of consecutive attempts:
+    /// - `enqueue` starts it at `1` — `submit`'s inline drive is the run's first attempt;
+    /// - this method adds one, arms `next_wake = retry_at(new_attempt)` (the stale-`waking` reclaim
+    ///   deadline, see [`claim_due`](Self::claim_due) — `retry_at` is the driver's backoff schedule,
+    ///   called once with the NEW attempt number), and TAKES the previous attempt's recorded error
+    ///   (returning it, and clearing it so the next call can tell a lost attempt from a failed one);
+    /// - a successful drive — [`record_paused`](Self::record_paused) — resets it to `0`;
+    /// - [`force_wake`](Self::force_wake) and [`cancel`](Self::cancel) leave it alone (an operator's
+    ///   "wake now" skips the backoff, not the cap).
+    ///
+    /// Defaulted to `Ok(None)` — "this store does not count attempts" — which the driver treats as
+    /// the pre-AG-3 behaviour (no cap, no backoff, every drive error terminal), so a third-party
+    /// backend keeps compiling and behaves exactly as before. The in-memory store overrides it;
+    /// torii's `PgSchedulerStore` must too (with the rest of the delta the testkit's `scheduler`
+    /// suite checks) — until it does, production keeps the pre-AG-3 crash loop.
+    async fn begin_wake_attempt(
+        &self,
+        _run: RunId,
+        _retry_at: &(dyn Fn(u32) -> DateTime<Utc> + Send + Sync),
+    ) -> Result<Option<WakeAttempt>, OrchestratorError> {
+        Ok(None)
+    }
+
+    /// AG-3: a wake's drive FAILED with a retryable error: `waking` → `paused` with
+    /// `next_wake = retry_at`, `reason = error`, and `error` kept as the attempt's recorded error
+    /// (handed back by the next [`begin_wake_attempt`](Self::begin_wake_attempt)). The attempt
+    /// count is NOT changed — `begin_wake_attempt` already counted this attempt. Conditional on
+    /// `waking`, so a concurrent `cancel` wins.
+    ///
+    /// Only called for a run whose `begin_wake_attempt` returned `Some`. The default files the run
+    /// terminal-`Failed` (the pre-AG-3 treatment of a drive error), so a store that overrides only
+    /// `begin_wake_attempt` fails loud rather than looping; override both together.
+    async fn record_wake_failed(
+        &self,
+        run: RunId,
+        _retry_at: DateTime<Utc>,
+        error: &str,
+    ) -> Result<(), OrchestratorError> {
+        self.record_terminal(run, RunStatus::Failed, Some(error))
+            .await
+    }
 
     /// Observe: the current record for `run`, if any.
     async fn status(&self, run: RunId) -> Result<Option<ScheduledRun>, OrchestratorError>;

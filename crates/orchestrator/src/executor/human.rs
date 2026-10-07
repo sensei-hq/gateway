@@ -486,6 +486,7 @@ impl Executor {
         &self,
         run: RunId,
         node_id: &NodeId,
+        agent_ref: &AgentRef,
         question: &HumanQuestion,
         timeout: Option<chrono::Duration>,
         fold: &Fold,
@@ -708,6 +709,15 @@ impl Executor {
                 "text": answer.text,
                 "actor": answer.actor,
             }));
+            // AG-2: the drive that FIRST honours the answer reports it, from the same
+            // redacted value the node outputs — once across resumes, since every later
+            // drive re-completes this node from the fold and `claim_decided_hook` reads its
+            // bookkeeping row back.
+            if let Some(h) = self.claim_decided_hook(run, node_id, fold).await {
+                let text = output["text"].as_str().unwrap_or_default();
+                let actor = output["actor"].as_str().unwrap_or_default();
+                h.on_agent_answered(run, node_id, text, actor).await;
+            }
             return Ok(NodeExec::Completed(output));
         }
 
@@ -725,16 +735,13 @@ impl Executor {
         //    become the node's OUTPUT and flow into every downstream model prompt.
         let deadline = match state {
             WaitState::NotYetAsking(fresh) => fresh,
+            // AG-15: the asked agent's SLA passed with no answer. If it (or the agent the
+            // question was last escalated to) declares `escalate_to`, the question moves on
+            // instead of failing; only the END of the chain expiring fails the node, with
+            // the pre-AG-15 message verbatim when no escalation was configured.
             WaitState::Expired(d) => {
                 return self
-                    .fail_human_agent(
-                        run,
-                        node_id,
-                        format!(
-                            "human_agent: node {} passed its deadline {d} with no answer",
-                            node_id.0
-                        ),
-                    )
+                    .escalate_or_expire(run, node_id, agent_ref, d, fold)
                     .await;
             }
             WaitState::Waiting(d) => d,
@@ -932,13 +939,30 @@ impl Executor {
             // decision DID land "no decision" would send them hunting a delivery bug that
             // does not exist, in a durable message every later drive re-emits.
             Ok(WaitState::Expired(deadline)) => {
+                // AG-15: escalation applies to a top-level human-backed `Agent` node only. A
+                // role that declares `escalate_to` and is used here would otherwise fail
+                // silently un-escalated, so the message says so — and is byte-identical to
+                // the pre-AG-15 one for every role that declares nothing.
+                let not_escalated = self
+                    .registry
+                    .agent(&agent_ref.0)
+                    .and_then(|a| a.escalate_to.as_deref())
+                    .map(|to| {
+                        format!(
+                            " (its role {:?} declares escalate_to {to:?}, but a loop gate \
+                             does not escalate — escalation applies to a top-level \
+                             human-backed Agent node only)",
+                            agent_ref.0
+                        )
+                    })
+                    .unwrap_or_default();
                 self.fail_loop_gate(
                     run,
                     node_id,
                     format!(
                         "loop_gate: node {} passed its deadline {deadline}; the gate fails \
                          on the deadline BEFORE any decision is read, so a decision that \
-                         had already landed does not authorize another iteration",
+                         had already landed does not authorize another iteration{not_escalated}",
                         node_id.0
                     ),
                 )
@@ -1262,6 +1286,20 @@ impl Executor {
                     },
                 )
                 .await?;
+
+                // AG-2: THIS is the drive that honours the decision, and `LoopGateSettled`
+                // — written at most once, read back FIRST by every later drive (the
+                // `loop_gate_settled_with` arm above, which fires nothing) — is the durable
+                // marker that makes both hooks exactly-once across resumes. No extra
+                // bookkeeping row is needed. Decided, then settled; the actor is attribution
+                // nothing upstream scrubbed (see `LoopGateDecided`), so it is redacted here
+                // on its way to an observer.
+                if let Some(h) = &self.hooks {
+                    let actor = self.redact_text(decision.actor.clone());
+                    h.on_loop_gate_decided(run, node_id, &decision.option, &actor)
+                        .await;
+                    h.on_loop_gate_settled(run, node_id, &decision.option).await;
+                }
 
                 // The pure part, recomputed from the journaled option NAME rather than
                 // carried in the fold — which is what makes a resume reach the identical

@@ -187,6 +187,31 @@ that re-arms at `resume_after`~~ **shipped in SP-DATA-3** — `Scheduler` over a
 `scheduled_runs` `SchedulerStore` wakes a paused run at its deadline in any
 process, exactly-once.)
 
+**Wake retries (AG-3, #87).** A wake whose drive fails is not re-claimed on every
+tick. `Scheduler::tick` counts each claimed wake before driving it
+(`SchedulerStore::begin_wake_attempt`, which also arms the stale-lease reclaim
+deadline), so a drive that kills its worker is counted too. A **retryable** drive
+error — a journal or store *backend* fault, by allowlist — re-schedules the run at
+`now + base·2^(attempt-1)` (clamped, less a deterministic jitter keyed by
+`(seed, run, attempt)`); a lost drive is reclaimed only once both its lease and that
+backoff have passed. The attempt that would exceed `max_attempts` is never driven: the
+run is recorded `Failed` — "gave up after N failed wake attempts; last error: …".
+A successful drive (a recorded pause) resets the count. Every other drive error
+(config or `format_version` fence, determinism violation, …) is deterministic and
+stays terminal at once, as before; `submit`'s inline drive is unchanged.
+One backend fault is deliberately NOT retryable: a journal/CAS failure AFTER a paid
+model call, before its `EffectRecorded { usage }` is durable, surfaces as
+`OrchestratorError::SpendUnrecorded` and files the run `Failed` naming the unrecorded
+spend — a retry would dispatch and pay for that call again, past any cap. A process
+crash in the same window is the pre-existing at-least-once edge: the reclaimed re-drive
+re-buys that one call (see [durable journal § AG-12](durable-journal.md#ag-12--the-money-cap)).
+`force_wake` skips the backoff but **not** the count — an operator waking a
+poison run gets the attempts it has left, not a fresh budget; `cancel` is unchanged.
+Configure with `Scheduler::with_wake_retry(WakeRetryPolicy { .. })` (defaults: 5
+attempts, 30s base, 1h cap, 0.2 jitter). A store that does not override
+`begin_wake_attempt` (the trait default returns `None`) keeps the pre-AG-3
+behaviour exactly.
+
 ## Deferred
 
 Held off to later SP-1 slices (and beyond); slice 1 ships none of these:

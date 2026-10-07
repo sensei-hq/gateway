@@ -116,9 +116,9 @@ impl Executor {
                         Ok(Ok(response)) => {
                             // SP-4 s2: scrub the synthesis text via the shared chokepoint.
                             let output = self.model_output(&response);
-                            let recorded = self.split_output(&output).await?;
-                            self.append(
-                                run,
+                            // AG-3 × AG-12: a failure to journal this PAID call is
+                            // `SpendUnrecorded`, never a retryable journal fault.
+                            self.record_paid_effect(run, &node.id, &output, |recorded| {
                                 JournalEvent::EffectRecorded {
                                     node: node.id.clone(),
                                     effect_id: eid,
@@ -129,9 +129,9 @@ impl Executor {
                                     observation: None,
                                     // SP-DATA-5: the Consolidate producer — the real usage
                                     // the provider reported, converted at the boundary.
-                                    usage: response.usage.map(super::content::convert_usage),
-                                },
-                            )
+                                    usage: fold.recorded_usage(&response),
+                                }
+                            })
                             .await?;
                             output
                         }
@@ -315,6 +315,7 @@ impl Executor {
         let mut ok = 0usize;
         let mut failed = 0usize;
         let mut paused: Option<String> = None;
+        let mut fatals = Vec::new();
         for (i, child) in collected {
             match child {
                 Ok(Ok(value)) => {
@@ -328,8 +329,15 @@ impl Executor {
                 Err(OrchestratorError::MapChildPaused { reason, .. }) => {
                     paused.get_or_insert(reason);
                 }
-                Err(fatal) => return Err(fatal),
+                Err(fatal) => fatals.push(fatal),
             }
+        }
+        // Every child was driven to the end under `join_all`, so several can have failed
+        // fatally in one round. Which error reaches the scheduler is NOT "the lowest
+        // index": a child whose paid call went unrecorded outranks a sibling's retryable
+        // blink, or the scheduler would back the run off and the retry re-buy the call.
+        if let Some(fatal) = super::dispatch::most_severe_fatal(fatals) {
+            return Err(fatal);
         }
         // A paused child means the Map cannot complete this round: return `Paused`
         // (marks the Map terminal-for-now + sets `RunOutcome.paused`, suppressing
@@ -761,11 +769,12 @@ impl Executor {
             Ok(Ok(response)) => {
                 // SP-4 s2: scrub the Map-item model text via the shared chokepoint.
                 let output = self.model_output(&response);
-                let recorded = self.split_output(&output).await?;
-                self.append(
-                    run,
+                // AG-3 × AG-12: a failure to journal this PAID call is
+                // `SpendUnrecorded`, never a retryable journal fault.
+                let node = NodeId(path.to_string());
+                self.record_paid_effect(run, &node, &output, |recorded| {
                     JournalEvent::EffectRecorded {
-                        node: NodeId(path.to_string()),
+                        node: node.clone(),
                         effect_id: eid,
                         class: EffectClass::Pure,
                         input_hash: ih,
@@ -774,9 +783,9 @@ impl Executor {
                         observation: None,
                         // SP-DATA-5: the Map-item producer — the real usage the
                         // provider reported, converted at the boundary.
-                        usage: response.usage.map(super::content::convert_usage),
-                    },
-                )
+                        usage: fold.recorded_usage(&response),
+                    }
+                })
                 .await?;
                 Ok(Ok(output))
             }

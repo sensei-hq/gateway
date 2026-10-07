@@ -20,7 +20,10 @@ pub mod redact;
 pub mod registry;
 pub mod scheduler;
 
-pub use budget::{CONTEXT_FLOOR_FRACTION, MIN_OUTPUT_TOKENS, TokenBudget, TokenUsage};
+pub use budget::{
+    CONTEXT_FLOOR_FRACTION, MICRO_USD_PER_USD, MIN_OUTPUT_TOKENS, MoneyBudget, RunBudget,
+    TokenBudget, TokenUsage,
+};
 pub use clock::{Clock, SystemClock};
 pub use content::{ContentRef, ContentStore, Digest, EffectOutput, digest_of};
 pub use context::{ContextKey, ContextRef, ContextStore, Scope};
@@ -50,4 +53,6 @@ pub use registry::{
     NetworkPolicy, Permissions, Registry, RegistryConfig, RegistryHandle, ResourceCaps, SkillDef,
     ToolSpec,
 };
-pub use scheduler::{RunLock, RunStatus, ScheduledRun, SchedulerStore, UncontendedRunLock};
+pub use scheduler::{
+    RunLock, RunStatus, ScheduledRun, SchedulerStore, UncontendedRunLock, WakeAttempt,
+};
