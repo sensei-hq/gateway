@@ -507,12 +507,47 @@ pub async fn price_single_chain_with_output_limit(
     output_per_1k: f64,
     max_output_tokens: u32,
 ) {
+    price_single_chain_full(
+        gateway,
+        input_per_1k,
+        output_per_1k,
+        None,
+        max_output_tokens,
+    )
+    .await;
+}
+
+/// [`price_single_chain`] with a flat `per_request` fee (USD) on every model — the term
+/// the money clamp reserves before it sizes `max_tokens` (AG-12).
+pub async fn price_single_chain_with_fee(
+    gateway: &Gateway,
+    input_per_1k: f64,
+    output_per_1k: f64,
+    per_request: f64,
+) {
+    price_single_chain_full(
+        gateway,
+        input_per_1k,
+        output_per_1k,
+        Some(per_request),
+        FIXTURE_MAX_OUTPUT_TOKENS,
+    )
+    .await;
+}
+
+async fn price_single_chain_full(
+    gateway: &Gateway,
+    input_per_1k: f64,
+    output_per_1k: f64,
+    per_request: Option<f64>,
+    max_output_tokens: u32,
+) {
     let mut config = single_chain_config_with_output_limit(max_output_tokens);
     for model in config.models.values_mut() {
         model.pricing = Some(kernel::types::config::ModelPricing {
             input_per_1k,
             output_per_1k,
-            per_request: None,
+            per_request,
         });
     }
     gateway.update_config(config).await;

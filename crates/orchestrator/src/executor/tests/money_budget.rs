@@ -7,7 +7,9 @@
 //! micro-dollars.
 
 use super::*;
-use crate::test_support::{price_single_chain, price_single_chain_with_output_limit};
+use crate::test_support::{
+    price_single_chain, price_single_chain_with_fee, price_single_chain_with_output_limit,
+};
 use orchestrator_core::{MoneyBudget, RunBudget};
 
 /// `$0.1 / 1k` input — 100 micro-dollars a token.
@@ -697,4 +699,50 @@ async fn an_uncosted_response_fails_the_node_under_a_money_cap() {
         "nothing uncosted is journaled as an effect"
     );
     assert_eq!(crate::money_spend_of(&events), (0, Some(1_000_000)));
+}
+
+/// MEDIUM (AG-12 review): the money clamp reserves the chain's flat `per_request` fee
+/// before converting what is left into output tokens. With a `$0.01` fee (10 000
+/// micro-dollars) against a `$0.10` cap, `max_tokens` is exactly
+/// `(cap − fee − est·IN) / OUT`; a clamp that forgot the fee would size the reply as if
+/// the fee were free and overshoot the remaining dollars by the whole fee.
+#[tokio::test]
+async fn the_money_clamp_reserves_the_per_request_fee() {
+    let (gateway, seen, ests) = window_watching_clamp_gateway(1, 100).await;
+    price_single_chain_with_fee(&gateway, IN_PER_1K, OUT_PER_1K, 0.01).await;
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1");
+    let cap = 100_000;
+    let fee = 10_000;
+    let out = exec
+        .run_with_budget(RunId(uuid::Uuid::new_v4()), &chain_of(1), money(cap))
+        .await
+        .expect("drives");
+    assert!(out.paused.is_none() && out.failed.is_none(), "{out:?}");
+    let est = u64::from(ests.lock().unwrap()[0]);
+    assert_eq!(
+        seen.lock().unwrap()[0],
+        Some(((cap - fee - est * IN_MICRO) / OUT_MICRO) as u32),
+        "max_tokens is what is left after the fee and the input estimate"
+    );
+}
+
+/// The fee's sibling: when the fee alone leaves fewer than `MIN_OUTPUT_TOKENS` affordable,
+/// the run pauses on the floor BEFORE dispatch. `$0.09` of a `$0.10` cap leaves under
+/// 10 000 micro-dollars — under 50 output tokens at 200 each — where ignoring the fee
+/// would afford ~495 and send the call.
+#[tokio::test]
+async fn a_per_request_fee_that_leaves_less_than_the_floor_pauses_before_dispatch() {
+    let (gateway, seen) = clamp_observing_gateway(1, 100).await;
+    price_single_chain_with_fee(&gateway, IN_PER_1K, OUT_PER_1K, 0.09).await;
+    let exec = Executor::new(Arc::new(gateway), Arc::new(InMemoryJournal::new()), "v1");
+    let out = exec
+        .run_with_budget(RunId(uuid::Uuid::new_v4()), &chain_of(1), money(100_000))
+        .await
+        .expect("drives");
+    assert!(seen.lock().unwrap().is_empty(), "nothing is dispatched");
+    let pause = out
+        .paused
+        .as_ref()
+        .expect("the fee leaves too little: pause");
+    assert!(pause.reason.starts_with("budget: "), "{}", pause.reason);
 }
