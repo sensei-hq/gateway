@@ -1805,11 +1805,26 @@ impl Executor {
                 JournalEvent::SignalAwaited { node, deadline } => {
                     h.on_signal_awaited(run, node, *deadline).await
                 }
+                // The one ask whose journaled payload is NOT already redacted: a
+                // `HumanGate` journals its graph-authored menu as-is (that row is the menu
+                // a decision is validated against, so it is not rewritten here). A
+                // planner-emitted graph carries model-derived text, and every string a
+                // hook hands an observer goes through the redactor — so the HOOK gets the
+                // scrubbed names, the same ones `on_gate_decided`'s `option` carries.
                 JournalEvent::GateAwaited {
                     node,
                     deadline,
                     options,
-                } => h.on_gate_awaited(run, node, *deadline, options).await,
+                } => {
+                    let shown: Vec<orchestrator_core::GateOption> = options
+                        .iter()
+                        .map(|o| orchestrator_core::GateOption {
+                            name: self.redact_text(o.name.clone()),
+                            outcome: o.outcome,
+                        })
+                        .collect();
+                    h.on_gate_awaited(run, node, *deadline, &shown).await
+                }
                 JournalEvent::AgentAwaited {
                     node,
                     deadline,

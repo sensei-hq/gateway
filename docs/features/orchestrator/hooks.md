@@ -104,8 +104,11 @@ decision row's `Seq` differs from the marker's. The early-signal
 race asks nobody: a signal folded before its `AwaitSignal` first ran fires
 `on_signal_received` with no `on_signal_awaited`. `on_gate_decided` for a `Fail` option fires
 **before** that node's `on_node_failed`. Decided-hook strings pass through the executor's
-redactor (the node output's scrub); awaited hooks receive exactly what was journaled, which
-was redacted before the append.
+redactor (the node output's scrub). The agent and loop-gate asks are redacted before they
+are journaled, so their awaited hooks receive exactly the journaled row; a `HumanGate`
+journals its graph-authored menu as-is (it is what a decision is validated against), so
+`on_gate_awaited` receives the option names **redacted at dispatch** — the same names
+`on_gate_decided` reports, which may differ from the journaled `GateAwaited.options`.
 
 **Three edges are not exactly-once**, all outside the hooks' control: a crash between the
 durable marker (`DecisionHookFired`/`LoopGateSettled`) and the callback **loses** the
