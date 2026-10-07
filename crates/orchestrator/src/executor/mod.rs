@@ -9,7 +9,7 @@ use orchestrator_core::{
     AgentRef, Clock, ContentStore, ContextKey, ContextRef, ContextStore, EffectClass, EffectId,
     EffectOutput, ExecutionJournal, Graph, JournalEvent, NodeId, NodeKind, ObservationMeta,
     OrchestratorError, OrchestratorHooks, PLANNER_AREA, Planner, PlannerSelector, Registry,
-    RegistryHandle, RunId, Scope, Seq, SystemClock, TokenBudget, effect_id,
+    RegistryHandle, RunBudget, RunId, Scope, Seq, SystemClock, TokenBudget, effect_id,
 };
 
 use crate::agent::tools::{ReconcileRegistry, ToolRegistry};
@@ -1074,6 +1074,33 @@ impl Executor {
         graph: &Graph,
         budget: Option<TokenBudget>,
     ) -> Result<RunOutcome, OrchestratorError> {
+        self.run_with_budget(
+            run,
+            graph,
+            RunBudget {
+                tokens: budget,
+                money: None,
+            },
+        )
+        .await
+    }
+
+    /// AG-12: like [`run_budgeted`](Self::run_budgeted), with a token cap, a MONEY cap,
+    /// both or neither. The money cap is journaled on `RunStarted.money_budget` and
+    /// enforced by the same metered-dispatch chokepoint as the token cap: a call is
+    /// refused once the folded money spend reaches the cap, each call's `max_tokens` is
+    /// clamped to what the remaining dollars afford at the chain's worst-case price, and
+    /// exhaustion is the same durable `RunPaused` an operator lifts with
+    /// `MoneyBudgetRaised` + a wake.
+    ///
+    /// `RunBudget::default()` is exactly [`run`](Self::run), and a token-only budget is
+    /// exactly [`run_budgeted`](Self::run_budgeted) — byte-identical journals.
+    pub async fn run_with_budget(
+        &self,
+        run: RunId,
+        graph: &Graph,
+        budget: RunBudget,
+    ) -> Result<RunOutcome, OrchestratorError> {
         if let Some(h) = &self.handle {
             let (registry, generation) = h.snapshot();
             return self
@@ -1089,7 +1116,7 @@ impl Executor {
         &self,
         run: RunId,
         graph: &Graph,
-        budget: Option<TokenBudget>,
+        budget: RunBudget,
     ) -> Result<RunOutcome, OrchestratorError> {
         graph.validate_dag()?;
         let this = self.clone().with_expansion_seed(0, 0);
@@ -1097,8 +1124,8 @@ impl Executor {
             run,
             JournalEvent::RunStarted {
                 version: this.version.clone(),
-                budget,
-                money_budget: None,
+                budget: budget.tokens,
+                money_budget: budget.money,
             },
         )
         .await?;
@@ -1108,7 +1135,7 @@ impl Executor {
         // however small the cap. (A resume gets the same value from `fold_journal`
         // reading the `RunStarted` this call just appended, plus any `BudgetRaised`.)
         let fold = Fold {
-            budget: budget.map(|b| b.total_tokens),
+            budget: budget.tokens.map(|b| b.total_tokens),
             ..Default::default()
         };
         // The RUN's own graph: a human-backed `Agent` node here is at the one
@@ -1165,7 +1192,7 @@ impl Executor {
             // branch only fires for a run id that was never submitted at all, which is
             // not a product path `Scheduler::tick` reaches (it only re-drives runs its
             // own `submit` already journaled `RunStarted` for).
-            return self.run_inner(run, graph, None).await;
+            return self.run_inner(run, graph, RunBudget::default()).await;
         }
 
         // Version fence: the first recorded `RunStarted.version` must match ours.

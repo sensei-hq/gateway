@@ -479,6 +479,27 @@ pub async fn two_window_scripted_window_watching_gateway(
     )
 }
 
+/// AG-12: re-price every single-chain fixture's models — chain `"c"`'s `"m"` and
+/// chain `"emb"`'s `"me"` — at `input_per_1k` / `output_per_1k` USD, in place.
+///
+/// Every gateway built over [`single_chain_config`] is UNPRICED (`pricing: None`), which a
+/// money cap refuses before dispatch. Rather than a priced twin of each fixture
+/// constructor, this swaps the config under an already-built gateway through the
+/// unchecked `update_config`, so any single-chain double — the clamp observer, the
+/// metered, latency and scripted adapters — can be run under a money cap with its
+/// behaviour otherwise untouched.
+pub async fn price_single_chain(gateway: &Gateway, input_per_1k: f64, output_per_1k: f64) {
+    let mut config = single_chain_config();
+    for model in config.models.values_mut() {
+        model.pricing = Some(kernel::types::config::ModelPricing {
+            input_per_1k,
+            output_per_1k,
+            per_request: None,
+        });
+    }
+    gateway.update_config(config).await;
+}
+
 /// Build a minimal gateway whose chain `"c"` resolves `TextChat` to the
 /// recording adapter (router `"r"`, model `"m"`), returning the gateway and the
 /// shared call log. `fail_after` is threaded into the adapter's crash injector.
