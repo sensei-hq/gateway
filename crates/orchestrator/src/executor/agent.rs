@@ -48,6 +48,10 @@ struct AgentRun<'a> {
     // call against these: the tool must be LISTED and its grant must COVER the need.
     agent_tools: Vec<String>,
     agent_grants: std::collections::HashMap<String, orchestrator_core::Permissions>,
+    /// AG-15: the tools whose every call pauses for a human decision before it runs, and
+    /// how long that decision may take (`None` waits indefinitely). See `tool_policy.rs`.
+    confirm_tools: Vec<String>,
+    confirm_timeout: Option<chrono::Duration>,
     /// SP-7b: the MEASURED cut this node's `system` half was rendered under, or `None` when
     /// the prompt was dispatched whole.
     ///
@@ -605,6 +609,8 @@ impl Executor {
             fold,
             agent_tools: agent.tools.clone(),
             agent_grants: agent.grants.clone(),
+            confirm_tools: agent.confirm_tools.clone(),
+            confirm_timeout: agent.confirm_timeout,
             context_cut,
         };
 
@@ -1034,7 +1040,7 @@ impl Executor {
             };
             tracing::debug!(tool = %call.name, ?need, ?grant, listed, "tool permission denied");
             return self
-                .record_denied_effect(ar, teid, call, &tih, detail)
+                .record_denied_effect(ar, teid, call, &tih, "permission_denied", detail)
                 .await;
         }
 
@@ -1056,8 +1062,39 @@ impl Executor {
                         call.name
                     );
                     return self
-                        .record_denied_effect(ar, teid, call, &tih, detail)
+                        .record_denied_effect(ar, teid, call, &tih, "permission_denied", detail)
                         .await;
+                }
+            }
+        }
+
+        // AG-15 confirm-before-run: LAST of the gates, so a person is only ever asked about
+        // a call the agent is permitted to make and that stays inside its workspace — and
+        // BEFORE the live path below, so nothing (not even a Mutation's `EffectIntent`)
+        // happens until a human has said yes. A rejection or expiry is recorded exactly like
+        // a permission denial (a Pure effect, replayed on resume); a pending decision pauses
+        // the run durably.
+        if ar.confirm_tools.iter().any(|t| t == &call.name) {
+            match self
+                .confirm_tool_call(
+                    ar.run,
+                    ar.node_id,
+                    ar.fold,
+                    teid,
+                    call,
+                    &tih,
+                    ar.confirm_timeout,
+                )
+                .await?
+            {
+                super::tool_policy::Confirmation::Approved => {}
+                super::tool_policy::Confirmation::Refused(detail) => {
+                    return self
+                        .record_denied_effect(ar, teid, call, &tih, "not_confirmed", detail)
+                        .await;
+                }
+                super::tool_policy::Confirmation::Paused(reason) => {
+                    return Ok(ToolOutcome::Paused(reason));
                 }
             }
         }
@@ -1242,16 +1279,22 @@ impl Executor {
     /// forever `EffectRecorded` with NO tool execution (and, for a Mutation, NO
     /// `EffectIntent`) — and feed it back to the agent. The decision is a pure fn of
     /// (config grant, call args) ⇒ a resume replays it from the memo, tool never run.
+    ///
+    /// `error` is the refusal's kind: `permission_denied` (the s1 gate and the workspace
+    /// jail), and since AG-15 `not_confirmed` (a confirm-before-run call rejected, expired
+    /// or too large to show) and `call_limit_reached` (the per-tool ceiling). Every kind is
+    /// the same terse, memoized shape, so the model handles all of them alike.
     async fn record_denied_effect(
         &self,
         ar: &AgentRun<'_>,
         teid: &EffectId,
         call: &ToolCall,
         tih: &str,
+        error: &str,
         detail: String,
     ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
         let denial = serde_json::json!({
-            "error": "permission_denied",
+            "error": error,
             "tool": call.name,
             "detail": detail,
         });
