@@ -507,8 +507,16 @@ impl Fold {
     }
 
     /// AG-12: micro-dollars this run had spent as of the journal this fold was built from.
+    ///
+    /// The same keyed sum as [`journaled_spend`](Self::journaled_spend), over the same
+    /// map, reading the other field — so a duplicate record or a re-folded compaction
+    /// manifest counts once here for exactly the reason it counts once there. Saturating
+    /// HIGH for the same reason too: it pauses the run rather than resetting the ledger.
     fn journaled_money(&self) -> u64 {
-        0
+        self.usage
+            .values()
+            .filter_map(|u| u.cost_micro_usd)
+            .fold(0u64, |acc, m| acc.saturating_add(m))
     }
 
     /// AG-12: total micro-dollars this run has spent: journaled + in-flight this drive.
