@@ -129,7 +129,7 @@ impl Executor {
                                     observation: None,
                                     // SP-DATA-5: the Consolidate producer — the real usage
                                     // the provider reported, converted at the boundary.
-                                    usage: response.usage.map(super::content::convert_usage),
+                                    usage: fold.recorded_usage(&response),
                                 },
                             )
                             .await?;
@@ -774,7 +774,7 @@ impl Executor {
                         observation: None,
                         // SP-DATA-5: the Map-item producer — the real usage the
                         // provider reported, converted at the boundary.
-                        usage: response.usage.map(super::content::convert_usage),
+                        usage: fold.recorded_usage(&response),
                     },
                 )
                 .await?;
