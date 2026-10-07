@@ -255,7 +255,9 @@ micro-dollars buy after the per-request fee and the pessimistic input estimate, 
 chain's **worst-case** price (`Gateway::worst_case_pricing`, the componentwise max over
 the chain — the clamp is set before selection), and below `MIN_OUTPUT_TOKENS` it pauses
 instead — including when the fee and input estimate alone exceed what is left, which a
-zero output price would otherwise read as unlimited output. The residual overshoot is the token clamp's, priced:
+zero output price would otherwise read as unlimited output. On a money-only run whose
+chain's declared `max_output_tokens` is itself under the floor, the pause says
+`output limit: ` and names that limit — no money raise can release it. The residual overshoot is the token clamp's, priced:
 `(actual_input − est_input) × input_price`, plus under one micro-dollar of rounding.
 
 **Fail closed.** A chain with ANY model lacking `pricing` is refused **before** dispatch
