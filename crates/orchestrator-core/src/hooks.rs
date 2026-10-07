@@ -69,8 +69,8 @@ pub trait OrchestratorHooks: Send + Sync {
     //   the decision row it reported — and a later drive skips the node while the fold
     //   still holds that same decision row. The row is written ONLY when hooks are wired — an executor
     //   with no hooks journals exactly what it did before — and best-effort: a failed
-    //   write skips the hook for that drive (the next drive retries) and never fails the
-    //   run.
+    //   write never fails the run, and the drive fires the hook anyway (skipping would
+    //   lose it whenever that drive also finished the run).
     // - A loop gate is settled by the executor's own `LoopGateSettled`, which it writes at
     //   most once; `on_loop_gate_decided` then `on_loop_gate_settled` fire right after
     //   that write, and a later drive that replays the settled gate fires neither.
@@ -89,12 +89,14 @@ pub trait OrchestratorHooks: Send + Sync {
     // it — its decision row's `Seq` differs from the one the marker recorded — so the hook
     // stream always names the decision behind what the node did.
     //
-    // Two edges are at-most-once / at-least-once rather than exactly-once, both outside
+    // Three edges are at-most-once / at-least-once rather than exactly-once, all outside
     // the hooks' control: a crash between the durable marker (`DecisionHookFired` or
-    // `LoopGateSettled`) and the callback loses the callback; and a decision honoured by a
+    // `LoopGateSettled`) and the callback loses the callback; a decision honoured by a
     // drive that had NO hooks wired leaves no marker, so a later hooked drive that replays
-    // the completed node reports it then. A deployment that wires hooks on every drive of
-    // a run never sees the second.
+    // the completed node reports it then (a deployment that wires hooks on every drive of
+    // a run never sees this one); and a FAILED `DecisionHookFired` write leaves no marker
+    // either, so the honouring drive fires anyway and a later drive of a still-live run
+    // reports the same decision again.
     //
     // Every string handed to a decided hook has been through the executor's redactor
     // (the same scrub the node's output gets); every awaited hook receives exactly what
