@@ -69,6 +69,11 @@ Nine no-op-default methods cover the four SP-6 waiting kinds. The contract is **
 per real occurrence, never on a resumed replay**; how each half achieves it differs, because
 only one half has an executor write to mirror.
 
+AG-15's human-in-the-loop events are **not** covered yet: a confirm-before-run tool call
+(`ToolConfirmAwaited`/`ToolConfirmDecided`) and a human-backed agent's escalation
+(`AgentEscalated`) fire no hook — an observer learns of an escalated question only by
+polling, and of its answer through the usual `on_agent_answered`. A carry-forward.
+
 | Hook | Fires when | Why it is exactly-once |
 |---|---|---|
 | `on_signal_awaited(node, deadline)` / `on_gate_awaited(node, deadline, options)` / `on_agent_awaited(node, deadline, prompt)` / `on_loop_gate_awaited(node, deadline, prompt, menu)` | right after the executor journals the node's ask, from inside `append` | a waiting node journals its ask once in its life (folded first-wins); a resume re-pauses without re-asking. A loop gate asks once per **iteration**, at `"{loop}/{i}/__gate__"` |
