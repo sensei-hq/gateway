@@ -67,7 +67,9 @@ pub trait OrchestratorHooks: Send + Sync {
     //   from the fold. So before firing, the honouring drive journals
     //   `JournalEvent::DecisionHookFired { node, decision }` — `decision` is the `Seq` of
     //   the decision row it reported — and a later drive skips the node while the fold
-    //   still holds that same decision row. The row is written ONLY when hooks are wired — an executor
+    //   still holds that same decision: that row, or a later row with IDENTICAL content (a
+    //   retrying webhook or a double-submitted option decides nothing new, so it reports
+    //   nothing). The row is written ONLY when hooks are wired — an executor
     //   with no hooks journals exactly what it did before — and best-effort: a failed
     //   write never fails the run, and the drive fires the hook anyway (skipping would
     //   lose it whenever that drive also finished the run).
@@ -86,8 +88,12 @@ pub trait OrchestratorHooks: Send + Sync {
     // the run is still live, IS honoured: those kinds journal no durable completion, the
     // decision rows fold LAST-wins, and the next drive re-completes the node on the new
     // decision (a `Fail` option then fails a gate that had completed). That drive reports
-    // it — its decision row's `Seq` differs from the one the marker recorded — so the hook
-    // stream always names the decision behind what the node did.
+    // it — its decision row says something other than the row the marker recorded — so the
+    // hook stream always names the decision behind what the node did. "Something other" is
+    // compared against the decision LAST reported: a correction reverted before any drive
+    // honoured it reports nothing, while one honoured and then reverted reports each change.
+    // Content is the whole row the hook reports (a gate's actor and note, an answer's
+    // actor), so the same option resubmitted by a different actor IS reported.
     //
     // Three edges are at-most-once / at-least-once rather than exactly-once, all outside
     // the hooks' control: a crash between the durable marker (`DecisionHookFired` or
@@ -96,7 +102,8 @@ pub trait OrchestratorHooks: Send + Sync {
     // the completed node reports it then (a deployment that wires hooks on every drive of
     // a run never sees this one); and a FAILED `DecisionHookFired` write leaves no marker
     // either, so the honouring drive fires anyway and a later drive of a still-live run
-    // reports the same decision again.
+    // reports the same decision again. An identical REDELIVERY of a reported decision is
+    // not a fourth edge: it fires nothing.
     //
     // Every string handed to a HITL hook has been through the executor's redactor. A
     // decided hook gets the same scrub the node's output gets. The agent and loop-gate

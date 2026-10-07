@@ -303,6 +303,14 @@ struct Fold {
     /// only by [`Executor::claim_decided_hook`], to tell a replay of the decision already
     /// reported from a correction honoured after it.
     decision_seqs: HashMap<NodeId, Seq>,
+    /// AG-2 re-review: what every decision row SAID, by its `Seq` — so a marker for one
+    /// row can be compared by content with the row the fold honours now. Without it, an
+    /// identical redelivery (a retrying webhook, a double-submitted option) is a new `Seq`
+    /// and re-fired the decided hook for a decision that changed nothing. Keyed by `Seq`
+    /// rather than by node because the reported row need not be the node's current one:
+    /// a correction can land between the drive's fold and its marker write. Read only by
+    /// [`Fold::decided_hook_fired`].
+    decision_rows: HashMap<Seq, DecisionContent>,
     /// SP-6 s1 (whole-slice review): each node's journaled `NodeFailed` message, FIRST
     /// wins. Read through exactly ONE consumer — [`gate_precheck`](Executor::gate_precheck),
     /// the shared arm 0 of the WAITING node kinds, for which a failure is TERMINAL (an
@@ -443,6 +451,15 @@ struct AgentAnswer {
     text: String,
     /// ATTRIBUTION, NOT AUTHENTICATION — see `JournalEvent::AgentAnswered`.
     actor: String,
+}
+
+/// AG-2 re-review: the content of one decision row — exactly what its decided hook
+/// reports. Two rows with equal content are the same decision, delivered twice.
+#[derive(Debug, Clone, PartialEq)]
+enum DecisionContent {
+    Signal(serde_json::Value),
+    Gate(GateDecision),
+    Agent(AgentAnswer),
 }
 
 /// SP-6 s2: a folded `GateDecided`.
@@ -730,13 +747,24 @@ impl Fold {
     }
 
     /// AG-2: has an earlier hooked drive already fired this node's "decided" hook for the
-    /// decision the fold holds NOW? A marker for an earlier decision row does not count:
-    /// a correction appended after it is honoured again, and is reported again.
+    /// decision the fold holds NOW? The marker counts when it names the current decision
+    /// row, or a row with IDENTICAL content (an identical redelivery decides nothing new,
+    /// so it reports nothing). A marker for a row that said something else does not
+    /// count: a correction appended after it is honoured again, and is reported again.
     fn decided_hook_fired(&self, node: &NodeId) -> bool {
         match self.decided_hooks_fired.get(node) {
             None => false,
             Some(None) => true,
-            Some(Some(reported)) => self.decision_seqs.get(node) == Some(reported),
+            Some(Some(reported)) => match self.decision_seqs.get(node) {
+                None => false,
+                Some(current) => {
+                    current == reported
+                        || matches!(
+                            (self.decision_rows.get(reported), self.decision_rows.get(current)),
+                            (Some(was), Some(now)) if was == now
+                        )
+                }
+            },
         }
     }
 
@@ -1855,8 +1883,9 @@ impl Executor {
     /// call; the decision row was appended by another process and cannot say which drive
     /// first acted on it. So the first hooked drive journals `DecisionHookFired { node,
     /// decision }` and every later drive, folding it, gets `None` while the fold still
-    /// holds that decision row — exactly once across resumes. A correction appended after
-    /// it is a different row (another `Seq`); the drive that honours it claims again.
+    /// holds that decision — exactly once across resumes. A correction appended after it
+    /// is a different row; the drive that honours it claims again, unless the row repeats
+    /// the reported decision's content verbatim (an identical redelivery claims nothing).
     ///
     /// `None` when no hooks are wired, BEFORE any write: an unhooked executor journals
     /// exactly what it did before (`an_unhooked_run_journals_exactly_what_it_did_before`).

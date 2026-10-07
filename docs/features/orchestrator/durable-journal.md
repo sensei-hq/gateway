@@ -148,8 +148,9 @@ Hooks bookkeeping, not an audit fact. Written **only when `OrchestratorHooks` ar
 the drive that first honours an `AwaitSignal`/`HumanGate`/human-`Agent` answer, just before
 it fires that node's decided hook. `decision` (`#[serde(default)]`) is the `Seq` of the
 decision row it reported; folded LAST-wins per node, so every later drive — which
-re-completes the node from the fold — fires nothing while the fold still holds that row,
-and a correction honoured after it (a newer `Seq`) is reported once more. Nothing else reads it: execution, the memo, outputs
+re-completes the node from the fold — fires nothing while the fold still holds that row or
+a later row with identical content (a redelivery), and a correction honoured after it (a
+row that says something else) is reported once more. Nothing else reads it: execution, the memo, outputs
 and determinism checks are blind to it, and an unhooked executor never writes one (so its
 absence does NOT mean an answer was never honoured). A loop gate needs none —
 `LoopGateSettled` already marks its honouring drive. Additive: `FORMAT_VERSION` stays **1**.
