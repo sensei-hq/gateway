@@ -17186,6 +17186,537 @@ mod scheduler_driver {
             "neither run is re-claimed once both are terminal"
         );
     }
+
+    // ---- AG-3 (#87): wake backoff, jitter and max_attempts -----------------------------
+
+    /// How [`FaultyJournal`] fails the poisoned run's `load`.
+    #[derive(Clone, Copy)]
+    enum Fault {
+        /// A transient infrastructure fault — the retryable class.
+        Backend,
+        /// The worker dies mid-drive: nothing is ever recorded, the lease must reclaim it.
+        Panic,
+        /// A transient fault on `append` instead of `load`: the pre-drive watermark load
+        /// succeeds, so the fault fires INSIDE `Executor::start` — the drive's own I/O.
+        AppendBackend,
+    }
+
+    /// Fails `load` (or `append`, for [`Fault::AppendBackend`]) for ONE run, `remaining` times
+    /// (then heals), and counts every failure.
+    struct FaultyJournal {
+        inner: Arc<InMemoryJournal>,
+        poisoned: RunId,
+        fault: Fault,
+        remaining: std::sync::Mutex<usize>,
+        failures: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FaultyJournal {
+        fn new(poisoned: RunId, fault: Fault, remaining: usize) -> Arc<Self> {
+            Arc::new(Self {
+                inner: Arc::new(InMemoryJournal::new()),
+                poisoned,
+                fault,
+                remaining: remaining.into(),
+                failures: 0.into(),
+            })
+        }
+        fn failures(&self) -> usize {
+            self.failures.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        /// Consume one failure for `run` if it is the poisoned run and failures remain.
+        fn take_failure(&self, run: RunId) -> bool {
+            let fail = run == self.poisoned && {
+                let mut left = self.remaining.lock().unwrap();
+                let fail = *left > 0;
+                *left = left.saturating_sub(1);
+                fail
+            };
+            if fail {
+                self.failures
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            fail
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ExecutionJournal for FaultyJournal {
+        async fn append(
+            &self,
+            run: RunId,
+            event: JournalEvent,
+        ) -> Result<Seq, orchestrator_core::JournalError> {
+            if matches!(self.fault, Fault::AppendBackend) && self.take_failure(run) {
+                return Err(orchestrator_core::JournalError::Backend(
+                    "append on fire".into(),
+                ));
+            }
+            self.inner.append(run, event).await
+        }
+        async fn load(
+            &self,
+            run: RunId,
+        ) -> Result<Vec<(Seq, JournalEvent)>, orchestrator_core::JournalError> {
+            match self.fault {
+                Fault::Backend if self.take_failure(run) => {
+                    return Err(orchestrator_core::JournalError::Backend(
+                        "disk on fire".into(),
+                    ));
+                }
+                Fault::Panic if self.take_failure(run) => {
+                    panic!("poison pill: the worker dies mid-drive")
+                }
+                _ => {}
+            }
+            self.inner.load(run).await
+        }
+        async fn load_since(
+            &self,
+            run: RunId,
+            since: Seq,
+        ) -> Result<Vec<(Seq, JournalEvent)>, orchestrator_core::JournalError> {
+            self.inner.load_since(run, since).await
+        }
+    }
+
+    fn t0() -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(1_000_000, 0).unwrap()
+    }
+
+    fn retry(max_attempts: u32, base_secs: i64) -> crate::WakeRetryPolicy {
+        crate::WakeRetryPolicy {
+            max_attempts,
+            base_backoff: Duration::seconds(base_secs),
+            max_backoff: Duration::hours(1),
+            jitter: 0.0,
+            jitter_seed: 0,
+        }
+    }
+
+    /// A run paused and due at `t0()`, seeded at the store level.
+    async fn seed_due(store: &dyn SchedulerStore, run: RunId) {
+        store.enqueue(run, &one_node_graph(), t0()).await.unwrap();
+        store.record_paused(run, Some(t0()), "due").await.unwrap();
+    }
+
+    fn sched_over(
+        store: Arc<dyn SchedulerStore>,
+        journal: Arc<FaultyJournal>,
+        clock: Arc<FakeClock>,
+        gw: gateway::Gateway,
+    ) -> Scheduler {
+        Scheduler::new(
+            store,
+            Executor::new(Arc::new(gw), journal.clone(), "v1").with_clock(clock.clone()),
+            journal,
+            clock,
+        )
+    }
+
+    /// THE poison pill, error shape: a wake whose drive fails every time is backed off
+    /// exponentially (10s, 20s — never re-claimed early), and after `max_attempts` it is
+    /// recorded terminal-`Failed` with a reason naming the attempt count and the last error,
+    /// and is never claimed again.
+    #[tokio::test]
+    async fn a_poison_pill_wake_backs_off_then_fails_after_max_attempts() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let store = Arc::new(InMemorySchedulerStore::new());
+        seed_due(store.as_ref(), run).await;
+        let journal = FaultyJournal::new(run, Fault::Backend, usize::MAX);
+        let clock = FakeClock::new(t0());
+        let (gw, calls) = recording_gateway().await;
+        let sched = sched_over(store.clone(), journal.clone(), clock.clone(), gw)
+            .with_wake_retry(retry(3, 10));
+        let secs = Duration::seconds;
+
+        assert_eq!(sched.tick().await.unwrap(), 1, "attempt 1");
+        let st = store.status(run).await.unwrap().unwrap();
+        assert_eq!(
+            (st.status, st.next_wake),
+            (RunStatus::Paused, Some(t0() + secs(10))),
+            "a failed wake is re-scheduled at now + base"
+        );
+        let reason = st.reason.unwrap();
+        assert!(
+            reason.contains("attempt 1 of 3") && reason.contains("disk on fire"),
+            "the backed-off row says why: {reason}"
+        );
+
+        clock.set(t0() + secs(9));
+        assert_eq!(sched.tick().await.unwrap(), 0, "not re-claimed before 10s");
+        clock.set(t0() + secs(10));
+        assert_eq!(sched.tick().await.unwrap(), 1, "attempt 2 at +10s");
+        assert_eq!(
+            store.status(run).await.unwrap().unwrap().next_wake,
+            Some(t0() + secs(30)),
+            "the second backoff doubles: +20s"
+        );
+        clock.set(t0() + secs(29));
+        assert_eq!(sched.tick().await.unwrap(), 0, "not re-claimed before +30s");
+        clock.set(t0() + secs(30));
+        assert_eq!(sched.tick().await.unwrap(), 1, "attempt 3 at +30s");
+
+        let st = store.status(run).await.unwrap().unwrap();
+        assert_eq!(st.status, RunStatus::Failed, "the cap ends the run");
+        let reason = st.reason.unwrap();
+        assert!(
+            reason.contains("3 failed wake attempts") && reason.contains("disk on fire"),
+            "the terminal reason names the attempt count and the last error: {reason}"
+        );
+        clock.set(t0() + Duration::days(1));
+        assert_eq!(
+            sched.tick().await.unwrap(),
+            0,
+            "a capped run is never re-claimed"
+        );
+        assert_eq!(journal.failures(), 3, "exactly max_attempts drives");
+        assert_eq!(calls.lock().unwrap().len(), 0);
+    }
+
+    /// THE poison pill, crash shape: the drive kills its worker, so nothing is ever recorded
+    /// and only the stale-lease reclaim finds the run again. The armed backoff spaces those
+    /// reclaims out even though the 5s lease has long expired, and once `max_attempts` drives
+    /// have been lost the next claim records it `Failed` WITHOUT driving it again.
+    #[tokio::test]
+    async fn a_crash_looping_wake_is_spaced_out_and_never_driven_past_max_attempts() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let store = Arc::new(InMemorySchedulerStore::new());
+        seed_due(store.as_ref(), run).await;
+        let journal = FaultyJournal::new(run, Fault::Panic, usize::MAX);
+        let clock = FakeClock::new(t0());
+        let (gw, _calls) = recording_gateway().await;
+        let sched = Arc::new(
+            sched_over(store.clone(), journal.clone(), clock.clone(), gw)
+                .with_lease(Duration::seconds(5))
+                .with_wake_retry(retry(3, 100)),
+        );
+        let tick_panics = |s: Arc<Scheduler>| async move {
+            tokio::spawn(async move { s.tick().await })
+                .await
+                .expect_err("the poison pill kills the tick")
+                .is_panic()
+        };
+        let secs = Duration::seconds;
+
+        assert!(tick_panics(sched.clone()).await, "attempt 1 dies");
+        clock.set(t0() + secs(99));
+        assert_eq!(
+            sched.tick().await.unwrap(),
+            0,
+            "past its 5s lease but inside its 100s backoff: not reclaimed"
+        );
+        clock.set(t0() + secs(100));
+        assert!(tick_panics(sched.clone()).await, "attempt 2 dies at +100s");
+        clock.set(t0() + secs(299));
+        assert_eq!(sched.tick().await.unwrap(), 0, "the backoff doubled: 200s");
+        clock.set(t0() + secs(300));
+        assert!(tick_panics(sched.clone()).await, "attempt 3 dies at +300s");
+
+        clock.set(t0() + secs(700));
+        assert_eq!(
+            sched.tick().await.expect("attempt 4 must not be driven"),
+            1,
+            "the over-cap claim is classified"
+        );
+        assert_eq!(
+            journal.failures(),
+            3,
+            "exactly max_attempts drives, no more"
+        );
+        let st = store.status(run).await.unwrap().unwrap();
+        assert_eq!(st.status, RunStatus::Failed);
+        let reason = st.reason.unwrap();
+        assert!(
+            reason.contains("3 failed wake attempts") && reason.contains("lost mid-drive"),
+            "the terminal reason names the count and that the drive was lost: {reason}"
+        );
+        clock.set(t0() + Duration::days(1));
+        assert_eq!(sched.tick().await.unwrap(), 0, "never re-claimed");
+    }
+
+    /// An operator-configured backoff so large that `now + backoff` leaves `DateTime<Utc>`'s
+    /// range must not panic: a panic inside `tick` is itself a poison pill (the SP-6 s1
+    /// `AwaitSignal` timeout shape). The deadline saturates instead — the run is parked, not
+    /// lost, and `force_wake` still reaches it.
+    #[tokio::test]
+    async fn an_overflowing_backoff_saturates_instead_of_panicking_the_tick() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let store = Arc::new(InMemorySchedulerStore::new());
+        seed_due(store.as_ref(), run).await;
+        let journal = FaultyJournal::new(run, Fault::Backend, usize::MAX);
+        let clock = FakeClock::new(t0());
+        let (gw, _calls) = recording_gateway().await;
+        let huge = Duration::milliseconds(i64::MAX);
+        let sched = sched_over(store.clone(), journal.clone(), clock.clone(), gw).with_wake_retry(
+            crate::WakeRetryPolicy {
+                base_backoff: huge,
+                max_backoff: huge,
+                ..retry(3, 10)
+            },
+        );
+
+        assert_eq!(
+            sched
+                .tick()
+                .await
+                .expect("an overflowing backoff must not fail the tick"),
+            1
+        );
+        let st = store.status(run).await.unwrap().unwrap();
+        assert_eq!(
+            (st.status, st.next_wake),
+            (RunStatus::Paused, Some(DateTime::<Utc>::MAX_UTC)),
+            "the retry deadline saturates at the end of time"
+        );
+    }
+
+    /// A run that recovers on its LAST allowed attempt completes — the cap is on failures,
+    /// not on drives.
+    #[tokio::test]
+    async fn a_wake_that_recovers_on_its_last_attempt_completes() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let store = Arc::new(InMemorySchedulerStore::new());
+        seed_due(store.as_ref(), run).await;
+        let journal = FaultyJournal::new(run, Fault::Backend, 2);
+        let clock = FakeClock::new(t0());
+        let (gw, calls) = recording_gateway().await;
+        let sched = sched_over(store.clone(), journal.clone(), clock.clone(), gw)
+            .with_wake_retry(retry(3, 10));
+
+        sched.tick().await.unwrap();
+        clock.set(t0() + Duration::seconds(10));
+        sched.tick().await.unwrap();
+        clock.set(t0() + Duration::seconds(30));
+        sched.tick().await.unwrap();
+        assert_eq!(
+            store.status(run).await.unwrap().unwrap().status,
+            RunStatus::Completed,
+            "attempt 3 of 3 succeeded"
+        );
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    /// A retryable fault from the DRIVE ITSELF — not the pre-drive watermark load — is backed
+    /// off too. Every other AG-3 test faults `load`, which `Scheduler::watermark` hits before
+    /// `Executor::start` runs, so only this one reaches the post-drive classification: filing
+    /// the drive's result with plain `record` instead of `record_wake` would turn a database
+    /// blip mid-drive (most of the drive's I/O) into an immediate terminal `Failed`.
+    #[tokio::test]
+    async fn a_retryable_error_from_the_drive_itself_is_backed_off_then_capped() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let store = Arc::new(InMemorySchedulerStore::new());
+        seed_due(store.as_ref(), run).await;
+        let journal = FaultyJournal::new(run, Fault::AppendBackend, usize::MAX);
+        let clock = FakeClock::new(t0());
+        let (gw, _calls) = recording_gateway().await;
+        let sched = sched_over(store.clone(), journal.clone(), clock.clone(), gw)
+            .with_wake_retry(retry(3, 10));
+        let secs = Duration::seconds;
+
+        assert_eq!(sched.tick().await.unwrap(), 1, "attempt 1");
+        assert_eq!(journal.failures(), 1, "the fault fired inside the drive");
+        let st = store.status(run).await.unwrap().unwrap();
+        assert_eq!(
+            (st.status, st.next_wake),
+            (RunStatus::Paused, Some(t0() + secs(10))),
+            "a retryable fault inside Executor::start is backed off, not terminal: {:?}",
+            st.reason
+        );
+        assert!(
+            st.reason.as_deref().unwrap().contains("append on fire"),
+            "the backed-off row names the drive's error: {:?}",
+            st.reason
+        );
+
+        clock.set(t0() + secs(10));
+        assert_eq!(sched.tick().await.unwrap(), 1, "attempt 2 at +10s");
+        clock.set(t0() + secs(30));
+        assert_eq!(sched.tick().await.unwrap(), 1, "attempt 3 at +30s");
+        let st = store.status(run).await.unwrap().unwrap();
+        assert_eq!(st.status, RunStatus::Failed, "the cap ends the run");
+        let reason = st.reason.unwrap();
+        assert!(
+            reason.contains("gave up after 3 failed wake attempts")
+                && reason.contains("append on fire"),
+            "the terminal reason names the count and the drive's error: {reason}"
+        );
+        assert_eq!(journal.failures(), 3, "exactly max_attempts drives");
+    }
+
+    /// `max_attempts: 0` is documented as `1`: a zero cap must still DRIVE each wake once.
+    /// Without the clamp, a first attempt (`1 > 0`) takes the over-cap branch, so an operator
+    /// who configured `0` would see every due paused run filed `Failed` without being driven.
+    #[tokio::test]
+    async fn a_zero_max_attempts_still_drives_each_wake_once() {
+        // Healthy journal: the single allowed attempt is driven and completes.
+        let run = RunId(uuid::Uuid::new_v4());
+        let store = Arc::new(InMemorySchedulerStore::new());
+        seed_due(store.as_ref(), run).await;
+        let journal = FaultyJournal::new(run, Fault::Backend, 0);
+        let clock = FakeClock::new(t0());
+        let (gw, calls) = recording_gateway().await;
+        let sched = sched_over(store.clone(), journal.clone(), clock.clone(), gw)
+            .with_wake_retry(retry(0, 10));
+        assert_eq!(sched.tick().await.unwrap(), 1);
+        let st = store.status(run).await.unwrap().unwrap();
+        assert_eq!(
+            st.status,
+            RunStatus::Completed,
+            "max_attempts 0 is treated as 1 — the wake is driven: {:?}",
+            st.reason
+        );
+        assert_eq!(calls.lock().unwrap().len(), 1, "exactly one drive");
+
+        // Failing journal: that one attempt is driven, fails, and is the last.
+        let run = RunId(uuid::Uuid::new_v4());
+        let store = Arc::new(InMemorySchedulerStore::new());
+        seed_due(store.as_ref(), run).await;
+        let journal = FaultyJournal::new(run, Fault::Backend, usize::MAX);
+        let (gw, _calls) = recording_gateway().await;
+        let sched = sched_over(store.clone(), journal.clone(), clock.clone(), gw)
+            .with_wake_retry(retry(0, 10));
+        assert_eq!(sched.tick().await.unwrap(), 1);
+        let st = store.status(run).await.unwrap().unwrap();
+        assert_eq!(st.status, RunStatus::Failed);
+        let reason = st.reason.unwrap();
+        assert!(
+            reason.contains("gave up after 1 failed wake attempts"),
+            "one attempt was made and failed: {reason}"
+        );
+        assert_eq!(journal.failures(), 1, "exactly one drive");
+    }
+
+    /// A store that implements none of AG-3 — the trait defaults. The scheduler must behave
+    /// exactly as before: a drive error is terminal at once, no backoff, no count.
+    struct LegacyStore(InMemorySchedulerStore);
+
+    #[async_trait::async_trait]
+    impl SchedulerStore for LegacyStore {
+        async fn try_lock_run(
+            &self,
+            run: RunId,
+        ) -> Result<Option<Box<dyn orchestrator_core::RunLock>>, OrchestratorError> {
+            self.0.try_lock_run(run).await
+        }
+        async fn enqueue(
+            &self,
+            run: RunId,
+            graph: &Graph,
+            now: DateTime<Utc>,
+        ) -> Result<(), OrchestratorError> {
+            self.0.enqueue(run, graph, now).await
+        }
+        async fn record_paused(
+            &self,
+            run: RunId,
+            next_wake: Option<DateTime<Utc>>,
+            reason: &str,
+        ) -> Result<(), OrchestratorError> {
+            self.0.record_paused(run, next_wake, reason).await
+        }
+        async fn record_terminal(
+            &self,
+            run: RunId,
+            status: RunStatus,
+            reason: Option<&str>,
+        ) -> Result<(), OrchestratorError> {
+            self.0.record_terminal(run, status, reason).await
+        }
+        async fn claim_due(
+            &self,
+            now: DateTime<Utc>,
+            lease: Duration,
+            limit: usize,
+        ) -> Result<Vec<(RunId, Graph)>, OrchestratorError> {
+            self.0.claim_due(now, lease, limit).await
+        }
+        async fn status(
+            &self,
+            run: RunId,
+        ) -> Result<Option<orchestrator_core::ScheduledRun>, OrchestratorError> {
+            self.0.status(run).await
+        }
+        async fn list_paused(
+            &self,
+        ) -> Result<Vec<orchestrator_core::ScheduledRun>, OrchestratorError> {
+            self.0.list_paused().await
+        }
+        async fn cancel(&self, run: RunId) -> Result<(), OrchestratorError> {
+            self.0.cancel(run).await
+        }
+        async fn force_wake(
+            &self,
+            run: RunId,
+            now: DateTime<Utc>,
+        ) -> Result<(), OrchestratorError> {
+            self.0.force_wake(run, now).await
+        }
+        async fn count_terminal_before(
+            &self,
+            before: DateTime<Utc>,
+        ) -> Result<u64, OrchestratorError> {
+            self.0.count_terminal_before(before).await
+        }
+        async fn prune_terminal(&self, before: DateTime<Utc>) -> Result<u64, OrchestratorError> {
+            self.0.prune_terminal(before).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_store_without_attempt_support_keeps_the_pre_ag3_behaviour() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let store = Arc::new(LegacyStore(InMemorySchedulerStore::new()));
+        seed_due(store.as_ref(), run).await;
+        let journal = FaultyJournal::new(run, Fault::Backend, usize::MAX);
+        let clock = FakeClock::new(t0());
+        let (gw, _calls) = recording_gateway().await;
+        let sched = sched_over(store.clone(), journal.clone(), clock.clone(), gw);
+
+        assert_eq!(sched.tick().await.unwrap(), 1);
+        let st = store.status(run).await.unwrap().unwrap();
+        assert_eq!(
+            (st.status, st.reason.as_deref()),
+            (
+                RunStatus::Failed,
+                Some("journal backend error: disk on fire")
+            ),
+            "without attempt support a drive error is terminal at once, reason unchanged"
+        );
+    }
+
+    /// A deterministic drive error is not retried: a retry cannot change its answer, so
+    /// backing it off would only delay the operator's signal by the whole backoff budget.
+    /// (`one_unloadable_journal_does_not_abort_the_claimed_batch` pins the same for the
+    /// journal `format_version` fence; this pins it for a config-fence mismatch.)
+    #[tokio::test]
+    async fn a_config_fence_mismatch_is_still_terminal_at_once() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let store = Arc::new(InMemorySchedulerStore::new());
+        seed_due(store.as_ref(), run).await;
+        let journal = FaultyJournal::new(run, Fault::Backend, 0);
+        journal
+            .append(
+                run,
+                JournalEvent::RunStarted {
+                    version: "v0-older-config".into(),
+                    budget: None,
+                },
+            )
+            .await
+            .unwrap();
+        let clock = FakeClock::new(t0());
+        let (gw, _calls) = recording_gateway().await;
+        let sched = sched_over(store.clone(), journal.clone(), clock.clone(), gw);
+
+        assert_eq!(sched.tick().await.unwrap(), 1);
+        let st = store.status(run).await.unwrap().unwrap();
+        assert_eq!(st.status, RunStatus::Failed);
+        assert!(
+            st.reason.unwrap().starts_with("stale: config changed"),
+            "the fence is classified exactly as before"
+        );
+    }
 }
 
 // ============================== SP-6 s1 AwaitSignal ============================
