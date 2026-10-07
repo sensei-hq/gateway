@@ -540,6 +540,23 @@ impl Fold {
             &self.live_spend,
             &self.serial_gate,
         )
+        .with_money(self.journaled_money(), self.money_budget, &self.live_money)
+    }
+
+    /// AG-12: the usage a producer journals on its `EffectRecorded` — the provider's
+    /// token counts, plus the gateway's priced cost in micro-dollars when (and only when)
+    /// this run has a money cap in force.
+    ///
+    /// The ONE conversion every producer uses. It lives on the fold because whether cost
+    /// is ledgered is a property of the RUN, and a per-site flag would be five chances to
+    /// journal tokens and silently drop the money; there is no other converter left to
+    /// call. Gating on the cap rather than recording cost always is what keeps an
+    /// unbudgeted or token-only run's journal byte-identical to before AG-12.
+    fn recorded_usage(
+        &self,
+        response: &kernel::types::request::InferenceResponse,
+    ) -> Option<orchestrator_core::TokenUsage> {
+        content::recorded_usage(response, self.money_budget.is_some())
     }
 
     /// SP-6 s1: the folded signal for an `AwaitSignal` node, if one has been delivered
@@ -1136,6 +1153,7 @@ impl Executor {
         // reading the `RunStarted` this call just appended, plus any `BudgetRaised`.)
         let fold = Fold {
             budget: budget.tokens.map(|b| b.total_tokens),
+            money_budget: budget.money.map(|m| m.total_micro_usd),
             ..Default::default()
         };
         // The RUN's own graph: a human-backed `Agent` node here is at the one
@@ -1622,7 +1640,7 @@ impl Executor {
                                 observation: None,
                                 // SP-DATA-5: the ModelCall producer — the real usage the
                                 // provider reported, converted at the boundary.
-                                usage: response.usage.map(content::convert_usage),
+                                usage: fold.recorded_usage(&response),
                             },
                         )
                         .await?;

@@ -93,8 +93,16 @@ pub(super) struct Meter<'a> {
     /// Tokens dispatched by this drive and not yet re-folded from the journal. Reset to
     /// zero by construction on the next drive, whose `journaled` base then includes them.
     live: &'a AtomicU64,
-    /// The per-run, per-drive serialisation gate. Acquired only when `budget` is `Some`.
+    /// The per-run, per-drive serialisation gate. Acquired only when a cap — token or
+    /// money — is set.
     gate: &'a tokio::sync::Mutex<()>,
+    /// AG-12: the money half — journaled micro-dollars (folded by effect id), the money
+    /// cap, and this drive's in-flight micro-dollars. Same shape and same reasons as the
+    /// token half above; a run with no money cap has `money_budget: None` and the three
+    /// are never read.
+    money_journaled: u64,
+    money_budget: Option<u64>,
+    live_money: Option<&'a AtomicU64>,
 }
 
 impl<'a> Meter<'a> {
@@ -109,7 +117,53 @@ impl<'a> Meter<'a> {
             budget,
             live,
             gate,
+            money_journaled: 0,
+            money_budget: None,
+            live_money: None,
         }
+    }
+
+    /// AG-12: attach the money half of the ledger.
+    pub(super) fn with_money(
+        mut self,
+        journaled: u64,
+        budget: Option<u64>,
+        live: &'a AtomicU64,
+    ) -> Self {
+        self.money_journaled = journaled;
+        self.money_budget = budget;
+        self.live_money = Some(live);
+        self
+    }
+
+    /// AG-12: every micro-dollar this run has spent: journaled + in-flight.
+    pub(super) fn money_spent(&self) -> u64 {
+        self.money_journaled.saturating_add(
+            self.live_money
+                .map_or(0, |live| live.load(Ordering::Relaxed)),
+        )
+    }
+
+    /// AG-12: the run's money cap in micro-dollars, or `None`.
+    pub(super) fn money_budget(&self) -> Option<u64> {
+        self.money_budget
+    }
+
+    /// AG-12: the usage record for a response dispatched under this meter — see
+    /// `Fold::recorded_usage`, which this mirrors for the one producer (the ReAct turn)
+    /// that is handed the meter rather than the fold. Both read the same `money_budget`.
+    pub(super) fn recorded_usage(
+        &self,
+        response: &InferenceResponse,
+    ) -> Option<orchestrator_core::TokenUsage> {
+        super::content::recorded_usage(response, self.money_budget.is_some())
+    }
+
+    /// Whether ANY cap is set — the condition for taking the serialisation gate and for
+    /// refusing an unmetered call. A money-only run serialises exactly like a
+    /// token-budgeted one, for exactly the reason [`Meter`]'s doc gives.
+    fn capped(&self) -> bool {
+        self.budget.is_some() || self.money_budget.is_some()
     }
 
     /// Everything this run has spent: journaled + in-flight.
@@ -140,6 +194,75 @@ impl<'a> Meter<'a> {
                 Some(t.saturating_add(tokens))
             });
     }
+
+    /// AG-12: add a completed call's micro-dollars to the in-drive tally. Saturating for
+    /// the same reason as [`record`](Self::record).
+    fn record_money(&self, micro_usd: u64) {
+        if let Some(live) = self.live_money {
+            let _ = live.try_update(Ordering::Relaxed, Ordering::Relaxed, |m| {
+                Some(m.saturating_add(micro_usd))
+            });
+        }
+    }
+}
+
+/// AG-12: a chain's worst-case price, converted once per call into the units the money
+/// clamp works in. Prices are `f64` USD per 1 000 tokens in the gateway's config, and a
+/// cheap model's input price is routinely a FRACTION of a micro-dollar per token, so the
+/// per-token rates stay `f64` here; every figure that leaves this struct is an integer,
+/// rounded toward refusing early. Nothing here is journaled.
+struct MoneyRates {
+    /// Micro-dollars per input token (`input_per_1k × 1000`).
+    input_per_token: f64,
+    /// Micro-dollars per output token (`output_per_1k × 1000`).
+    output_per_token: f64,
+    /// The flat per-request fee in micro-dollars, rounded UP.
+    per_request: u64,
+}
+
+impl MoneyRates {
+    fn from_pricing(p: &kernel::types::config::ModelPricing) -> Self {
+        let micro = orchestrator_core::MICRO_USD_PER_USD as f64;
+        Self {
+            input_per_token: p.input_per_1k * micro / 1000.0,
+            output_per_token: p.output_per_1k * micro / 1000.0,
+            per_request: p
+                .per_request
+                .map_or(0, |f| super::content::ceil_micro(f * micro)),
+        }
+    }
+
+    /// What a call costs BEFORE any output: the per-request fee plus the pessimistic input
+    /// estimate at the worst-case input price, rounded UP.
+    fn reserved(&self, est_input: u64) -> u64 {
+        let input = super::content::ceil_micro(est_input as f64 * self.input_per_token);
+        self.per_request.saturating_add(input)
+    }
+
+    /// How many output tokens `left` micro-dollars buy at the worst-case output price,
+    /// rounded DOWN. A zero output price buys unlimited output — the clamp then has no
+    /// money term on the output side and the model's own ceiling bounds the call.
+    fn affordable_output(&self, left: u64) -> u64 {
+        if self.output_per_token <= 0.0 {
+            return u64::MAX;
+        }
+        (left as f64 / self.output_per_token).floor() as u64
+    }
+
+    /// Micro-dollars a reply of exactly `MIN_OUTPUT_TOKENS` costs, rounded UP — the
+    /// output half of what the next call needs before it can dispatch at all.
+    fn floor_reply(&self) -> u64 {
+        super::content::ceil_micro(
+            orchestrator_core::MIN_OUTPUT_TOKENS as f64 * self.output_per_token,
+        )
+    }
+}
+
+/// AG-12: a micro-dollar figure as dollars for an operator, exactly — integer division,
+/// no float — e.g. `63000` → `$0.063000`.
+pub(super) fn usd(micro: u64) -> String {
+    let per = orchestrator_core::MICRO_USD_PER_USD;
+    format!("${}.{:06}", micro / per, micro % per)
 }
 
 // `est_input_tokens(system, messages, tools)` lived here until the serving-window
@@ -238,6 +361,28 @@ pub(super) enum Refusal {
     /// today it is unreachable in practice because nothing sets a budget until
     /// Task 5 wires `--budget-tokens`.)
     Unmetered { model: String },
+    /// AG-12: a MONEY-capped run may not make this call. `spent`/`budget` are
+    /// micro-dollars; `cause` says which check refused, with the same two meanings it has
+    /// for tokens (`Spent`: the ledger reached the cap; `BelowFloor`: what is left buys
+    /// fewer than `MIN_OUTPUT_TOKENS` of reply at the chain's worst-case price — or a
+    /// model bound did, on a money-only run). `floor_cost` is the micro-dollars the
+    /// refusing call needed beyond `spent` to clear the floor (its per-request fee and
+    /// input estimate plus a floor-sized reply), so the message can name a raise.
+    MoneyExhausted {
+        spent: u64,
+        budget: u64,
+        cause: BudgetRefusal,
+        floor_cost: u64,
+    },
+    /// AG-12: a money cap is set but the chain cannot be priced — an entry has
+    /// `pricing: None` (or there is no chain to price). The call is refused BEFORE
+    /// dispatch: the gateway would report no cost for such a model, so the cap could not
+    /// see what it spent. A node failure, like [`Unmetered`](Self::Unmetered).
+    Unpriced { chain: Option<String> },
+    /// AG-12: a money cap is set and the provider reported usage, but the gateway attached
+    /// no usable USD cost. Refused AFTER the call (its tokens are still charged to the
+    /// token meter) — the twin of [`Unmetered`](Self::Unmetered) for money.
+    Uncosted { model: String },
 }
 
 /// Which of the two budget checks refused, and therefore what the operator is being
@@ -430,10 +575,10 @@ impl Executor {
         meter: &Meter<'_>,
     ) -> Result<Result<InferenceResponse, Refusal>, GatewayError> {
         // Bound to a named local: it must live to the end of the function, and only a
-        // budgeted run acquires it at all.
-        let _serialised = match meter.budget() {
-            Some(_) => Some(meter.gate().lock().await),
-            None => None,
+        // budgeted run — token cap, money cap or both (AG-12) — acquires it at all.
+        let _serialised = match meter.capped() {
+            true => Some(meter.gate().lock().await),
+            false => None,
         };
         let spent = meter.spent();
         if let Some(cap) = meter.budget()
@@ -445,6 +590,49 @@ impl Executor {
                 cause: BudgetRefusal::Spent,
             }));
         }
+        // AG-12: the money gate — the same floor-trigger as the token gate above, against
+        // the money ledger. A run with both caps stops on whichever is reached first; the
+        // token gate is checked first so a run that has exhausted both reports the token
+        // cap exactly as it did before money existed.
+        let money_spent = meter.money_spent();
+        if let Some(mcap) = meter.money_budget()
+            && money_spent >= mcap
+        {
+            return Ok(Err(Refusal::MoneyExhausted {
+                spent: money_spent,
+                budget: mcap,
+                cause: BudgetRefusal::Spent,
+                floor_cost: 0,
+            }));
+        }
+        // AG-12: a money cap needs a PRICE for whatever entry will serve this call, and the
+        // clamp sets `max_tokens` before selection, so it takes the chain's worst case on
+        // every axis (`Gateway::worst_case_pricing`). `None` — an entry without `pricing`,
+        // an unknown chain, or no chain at all — FAILS CLOSED, before any money is spent:
+        // the gateway reports no cost for an unpriced model, so the cap would be blind to
+        // it. This is the pre-call twin of the post-call `Unmetered` refusal below, and a
+        // node failure for the same reason (re-driving the same chain refuses again). A
+        // free model declares an explicit zero price, which prices.
+        //
+        // Read for EVERY payload, not just `Chat`: the clamp below only applies to `Chat`,
+        // but an `Embed` against an unpriced chain is just as unmeasurable.
+        let rates = match meter.money_budget() {
+            None => None,
+            Some(_) => {
+                let pricing = match request.chain.as_deref() {
+                    Some(chain) => self.gateway.worst_case_pricing(chain).await,
+                    None => None,
+                };
+                match pricing {
+                    Some(p) => Some(MoneyRates::from_pricing(&p)),
+                    None => {
+                        return Ok(Err(Refusal::Unpriced {
+                            chain: request.chain.clone(),
+                        }));
+                    }
+                }
+            }
+        };
         // The SP-DATA-5 clamp. The gate immediately above is a FLOOR-TRIGGER — it
         // refuses only once `spent` has ALREADY passed the cap — so without this a
         // single call can overshoot by however much output the adapter allows when
@@ -524,8 +712,8 @@ impl Executor {
         // its memo rather than raising `DeterminismViolation`.
         let clamped;
         let mut clamp: Option<ClampRecord> = None;
-        let request = match (meter.budget(), &request.payload) {
-            (Some(cap), Payload::Chat { .. }) => {
+        let request = match (meter.capped(), &request.payload) {
+            (true, Payload::Chat { .. }) => {
                 // ONE estimate, computed by the GATEWAY's estimator over the very payload
                 // that is about to be dispatched — not a second one of the orchestrator's
                 // own. The tombstone above `ClampRecord` records the function this
@@ -576,46 +764,116 @@ impl Executor {
                 // `saturating_sub` here — a saturating subtraction would produce 0 and
                 // refuse too, but SILENTLY, in debug as well, and the gate's removal
                 // would then be invisible to the suite.
-                debug_assert!(
-                    spent <= cap,
-                    "the `spent >= cap` gate was bypassed or reordered: spent {spent} > cap {cap}"
-                );
-                let Some(remaining) = cap.checked_sub(spent) else {
-                    return Ok(Err(Refusal::BudgetExhausted {
-                        spent,
-                        budget: cap,
-                        cause: BudgetRefusal::Spent,
-                    }));
+                // (AG-12: the token half now sits under `match meter.budget()`, because a
+                // money-only run reaches this block with no token cap at all.)
+                let token_allowance = match meter.budget() {
+                    Some(cap) => {
+                        debug_assert!(
+                            spent <= cap,
+                            "the `spent >= cap` gate was bypassed or reordered: spent {spent} > cap {cap}"
+                        );
+                        let Some(remaining) = cap.checked_sub(spent) else {
+                            return Ok(Err(Refusal::BudgetExhausted {
+                                spent,
+                                budget: cap,
+                                cause: BudgetRefusal::Spent,
+                            }));
+                        };
+                        // `saturating_sub` on the ESTIMATE is a different matter and is
+                        // load-bearing: `est` genuinely can exceed what is left, for a long
+                        // prompt against a nearly spent budget, and a plain subtraction there
+                        // would wrap to an enormous allowance — a clamp WIDER than the cap,
+                        // which is worse than no clamp at all.
+                        let allowance = remaining.saturating_sub(est);
+                        if allowance < orchestrator_core::MIN_OUTPUT_TOKENS {
+                            // Below the floor, refuse rather than clamp — and refuse BEFORE the
+                            // call, so no input tokens are spent on a reply that would arrive
+                            // truncated mid-sentence and flow downstream as work product. This
+                            // is the EXISTING durable pause, not a new refusal kind: the
+                            // operator's recovery (`torii run wake --budget-tokens N`) is
+                            // already built and already documented.
+                            return Ok(Err(Refusal::BudgetExhausted {
+                                spent,
+                                budget: cap,
+                                cause: BudgetRefusal::BelowFloor {
+                                    allowance,
+                                    est_input: est,
+                                    // The BUDGET allowance alone fell under the floor — no model
+                                    // bound was consulted to reach this point, so there is no
+                                    // window to blame and a cap raise genuinely is the remedy.
+                                    window: None,
+                                    // Same reason: neither model bound has been read yet, so
+                                    // there is nothing here that could tie.
+                                    output_limit_ties: false,
+                                },
+                            }));
+                        }
+                        Some(allowance)
+                    }
+                    None => None,
                 };
-                // `saturating_sub` on the ESTIMATE is a different matter and is
-                // load-bearing: `est` genuinely can exceed what is left, for a long
-                // prompt against a nearly spent budget, and a plain subtraction there
-                // would wrap to an enormous allowance — a clamp WIDER than the cap,
-                // which is worse than no clamp at all.
-                let allowance = remaining.saturating_sub(est);
-                if allowance < orchestrator_core::MIN_OUTPUT_TOKENS {
-                    // Below the floor, refuse rather than clamp — and refuse BEFORE the
-                    // call, so no input tokens are spent on a reply that would arrive
-                    // truncated mid-sentence and flow downstream as work product. This
-                    // is the EXISTING durable pause, not a new refusal kind: the
-                    // operator's recovery (`torii run wake --budget-tokens N`) is
-                    // already built and already documented.
-                    return Ok(Err(Refusal::BudgetExhausted {
-                        spent,
-                        budget: cap,
-                        cause: BudgetRefusal::BelowFloor {
-                            allowance,
-                            est_input: est,
-                            // The BUDGET allowance alone fell under the floor — no model
-                            // bound was consulted to reach this point, so there is no
-                            // window to blame and a cap raise genuinely is the remedy.
-                            window: None,
-                            // Same reason: neither model bound has been read yet, so
-                            // there is nothing here that could tie.
-                            output_limit_ties: false,
-                        },
-                    }));
-                }
+                // AG-12: the MONEY half of the clamp — the token clamp's arithmetic, priced.
+                //
+                // `remaining` micro-dollars, less what the call costs before it emits
+                // anything (the per-request fee plus the pessimistic input estimate at the
+                // chain's worst-case input price, both rounded UP), buys
+                // `left / output_price` output tokens, rounded DOWN. So the call's real
+                // cost is at most `remaining` plus `(actual_input − est_input) × input_price`
+                // — the token clamp's own residual, priced — plus under one micro-dollar of
+                // rounding in the gateway's float total. Bounded and biased safe, exactly
+                // as the token clamp is; and it uses the SAME `est` the token half and the
+                // gateway's `ContextWindowGate` use.
+                //
+                // Below `MIN_OUTPUT_TOKENS` it refuses on the floor — the same durable
+                // pause, so a money-capped run can pause with `spent < cap` too.
+                let money = match (meter.money_budget(), &rates) {
+                    (Some(mcap), Some(rates)) => {
+                        debug_assert!(
+                            money_spent <= mcap,
+                            "the money gate was bypassed or reordered: spent {money_spent} > cap {mcap}"
+                        );
+                        let reserved = rates.reserved(est);
+                        let floor_cost = reserved.saturating_add(rates.floor_reply());
+                        // `checked_sub` fails CLOSED in release for the reason the token
+                        // half gives; `saturating_sub` on the reservation is load-bearing
+                        // (a long prompt can cost more than is left).
+                        let Some(remaining) = mcap.checked_sub(money_spent) else {
+                            return Ok(Err(Refusal::MoneyExhausted {
+                                spent: money_spent,
+                                budget: mcap,
+                                cause: BudgetRefusal::Spent,
+                                floor_cost,
+                            }));
+                        };
+                        let affordable =
+                            rates.affordable_output(remaining.saturating_sub(reserved));
+                        if affordable < orchestrator_core::MIN_OUTPUT_TOKENS {
+                            return Ok(Err(Refusal::MoneyExhausted {
+                                spent: money_spent,
+                                budget: mcap,
+                                cause: BudgetRefusal::BelowFloor {
+                                    allowance: affordable,
+                                    est_input: est,
+                                    window: None,
+                                    output_limit_ties: false,
+                                },
+                                floor_cost,
+                            }));
+                        }
+                        Some((affordable, mcap, floor_cost))
+                    }
+                    _ => None,
+                };
+                // The budget term the rest of the clamp works with: the tighter of the two
+                // caps. On a token-only run this IS the token allowance, unchanged. One of
+                // the two is always present here — the arm is entered only when a cap is
+                // set, and a money cap without a price already returned `Unpriced` — so the
+                // `u64::MAX` fallback is unreachable and would in any case be bounded by
+                // the model ceiling below rather than sent.
+                let allowance = match (token_allowance, money.map(|(a, ..)| a)) {
+                    (Some(t), Some(m)) => t.min(m),
+                    (t, m) => t.or(m).unwrap_or(u64::MAX),
+                };
                 // The MODEL's own output limit, which the allowance knows nothing
                 // about. `allowance` is a pure budget figure: for any realistic
                 // whole-run cap it is far larger than any model's maximum output, and
@@ -797,14 +1055,27 @@ impl Executor {
                 // run and fail the node with a window message, so this arm is now the
                 // only thing an over-window budgeted run ever sees.
                 if ceiling.is_some_and(|c| u64::from(c) < orchestrator_core::MIN_OUTPUT_TOKENS) {
-                    return Ok(Err(Refusal::BudgetExhausted {
-                        spent,
-                        budget: cap,
-                        cause: BudgetRefusal::BelowFloor {
-                            allowance: ceiling.map_or(allowance, u64::from),
-                            est_input: est,
-                            window: binding_window,
-                            output_limit_ties,
+                    let cause = BudgetRefusal::BelowFloor {
+                        allowance: ceiling.map_or(allowance, u64::from),
+                        est_input: est,
+                        window: binding_window,
+                        output_limit_ties,
+                    };
+                    // Reported against the TOKEN cap whenever there is one — exactly as
+                    // before AG-12 — and against the money cap only on a money-only run.
+                    // The `(cap, _)` arm's `unwrap_or(0)` is unreachable for the reason
+                    // given at `allowance` above.
+                    return Ok(Err(match (meter.budget(), money) {
+                        (None, Some((_, mcap, floor_cost))) => Refusal::MoneyExhausted {
+                            spent: money_spent,
+                            budget: mcap,
+                            cause,
+                            floor_cost,
+                        },
+                        (cap, _) => Refusal::BudgetExhausted {
+                            spent,
+                            budget: cap.unwrap_or(0),
+                            cause,
                         },
                     }));
                 }
@@ -844,7 +1115,7 @@ impl Executor {
         };
         let response = self.gateway.execute(request).await?;
         let Some(usage) = &response.usage else {
-            if meter.budget().is_some() {
+            if meter.capped() {
                 return Ok(Err(Refusal::Unmetered {
                     model: response
                         .model
@@ -914,6 +1185,28 @@ impl Executor {
             }
         }
         meter.record(u64::from(usage.total_tokens));
+        // AG-12: charge the call's priced cost to the money meter — the SAME integer the
+        // producer journals (`content::cost_micro_usd` via `Fold::recorded_usage`). No
+        // usable USD cost under a money cap fails closed, after the tokens above are
+        // charged: the provider has been paid, and the token ledger should know it even
+        // though the money ledger cannot.
+        if meter.money_budget().is_some() {
+            match response
+                .actual_cost
+                .as_ref()
+                .and_then(super::content::cost_micro_usd)
+            {
+                Some(micro) => meter.record_money(micro),
+                None => {
+                    return Ok(Err(Refusal::Uncosted {
+                        model: response
+                            .model
+                            .clone()
+                            .unwrap_or_else(|| "<unknown>".to_string()),
+                    }));
+                }
+            }
+        }
         Ok(Ok(response))
     }
 
@@ -1041,37 +1334,13 @@ impl Executor {
                         est_input,
                         window: Some(window),
                         output_limit_ties,
-                    } => {
-                        let floor = orchestrator_core::MIN_OUTPUT_TOKENS;
-                        // On a TIE the output limit sits on the same figure as the window
-                        // term — which `allowance` already is — so naming the co-cause
-                        // needs no extra number, only the sentence that stops an operator
-                        // clearing one term and hitting the other.
-                        let also_bound = if output_limit_ties {
-                            format!(
-                                " This chain's smallest declared `max_output_tokens` is \
-                                 the same {allowance} tokens, so it binds too: clearing \
-                                 the window alone will not release this call — raise that \
-                                 entry's declared limit, or drop the entry, as well."
-                            )
-                        } else {
-                            String::new()
-                        };
-                        format!(
-                            "context window: this call's input is estimated at {est_input} \
-                             tokens; the smallest model in this chain that can hold it has \
-                             a {window}-token context window, leaving {allowance} for \
-                             output — below the {floor}-token floor, so the reply would be \
-                             cut off mid-sentence. The budget is not the binding term \
-                             ({spent} of {budget} spent) and raising the cap does not move \
-                             this. What does: remove the {window}-token model from this \
-                             chain, or replace it with a wider one. Adding a larger model \
-                             ALONGSIDE it cannot help — this bound is the smallest window \
-                             that can hold the input, and adding to that set cannot raise \
-                             its minimum. Sending less input helps only while that same \
-                             model stays the smallest one that can hold it.{also_bound}"
-                        )
-                    }
+                    } => window_reason(
+                        est_input,
+                        window,
+                        allowance,
+                        output_limit_ties,
+                        &format!("{spent} of {budget}"),
+                    ),
                     BudgetRefusal::BelowFloor {
                         allowance,
                         est_input,
@@ -1109,6 +1378,93 @@ impl Executor {
                 .await?;
                 Ok(RefusalKind::Paused(reason))
             }
+            // AG-12: the money twin of the arm above — the same durable HOTL pause, with
+            // the same `budget: ` prefix (it IS about a cap), in dollars.
+            Refusal::MoneyExhausted {
+                spent,
+                budget,
+                cause,
+                floor_cost,
+            } => {
+                let floor = orchestrator_core::MIN_OUTPUT_TOKENS;
+                let ledger = format!("{} of {}", usd(spent), usd(budget));
+                let reason = match cause {
+                    BudgetRefusal::Spent => format!(
+                        "budget: {ledger} spent against the run's money cap; raise the money \
+                         cap above {} — and far enough above it that the next call's input \
+                         estimate and a {floor}-token reply at this chain's worst-case price \
+                         still fit, or it will refuse on the floor instead; raise it with a \
+                         `MoneyBudgetRaised` and wake the run",
+                        usd(spent)
+                    ),
+                    BudgetRefusal::BelowFloor {
+                        allowance,
+                        est_input,
+                        window: Some(window),
+                        output_limit_ties,
+                    } => window_reason(est_input, window, allowance, output_limit_ties, &ledger),
+                    BudgetRefusal::BelowFloor {
+                        allowance,
+                        est_input,
+                        window: None,
+                        output_limit_ties: _,
+                    } => format!(
+                        "budget: only {allowance} output tokens are affordable after this \
+                         call's input estimate ({est_input} tokens) at this chain's \
+                         worst-case price, below the {floor}-token floor ({ledger} spent \
+                         against the run's money cap); the money cap must exceed this run's \
+                         final spend by at least {} (≥ {} if nothing else in this drive \
+                         spends — independent nodes may still run after this pause and push \
+                         it higher); raise it with a `MoneyBudgetRaised` and wake the run",
+                        usd(floor_cost),
+                        usd(spent.saturating_add(floor_cost))
+                    ),
+                };
+                self.append(
+                    run,
+                    JournalEvent::RunPaused {
+                        reason: reason.clone(),
+                        resume_after: None,
+                    },
+                )
+                .await?;
+                Ok(RefusalKind::Paused(reason))
+            }
+            // AG-12: both money-measurement refusals are node failures, for the reason
+            // `Unmetered` is: re-driving the same chain refuses again, so a pause would
+            // only invite a wake that cannot succeed. The remedy is configuration.
+            Refusal::Unpriced { chain } => {
+                let chain = chain.as_deref().unwrap_or("<none>");
+                let error = format!(
+                    "unpriced model call: chain '{chain}' has a model with no pricing while a \
+                     money cap is set; refusing to spend unmeasured — declare `pricing` on \
+                     every model in the chain (an explicit zero for a free model)"
+                );
+                self.append(
+                    run,
+                    JournalEvent::NodeFailed {
+                        node: node.clone(),
+                        error: error.clone(),
+                    },
+                )
+                .await?;
+                Ok(RefusalKind::Failed(error))
+            }
+            Refusal::Uncosted { model } => {
+                let error = format!(
+                    "uncosted model call: '{model}' reported no USD cost while a money cap is \
+                     set; refusing to spend unmeasured"
+                );
+                self.append(
+                    run,
+                    JournalEvent::NodeFailed {
+                        node: node.clone(),
+                        error: error.clone(),
+                    },
+                )
+                .await?;
+                Ok(RefusalKind::Failed(error))
+            }
             Refusal::Unmetered { model } => {
                 // A node failure, not a pause: retrying the same unmetered provider
                 // would refuse again, so there is nothing for an operator to unblock.
@@ -1127,6 +1483,47 @@ impl Executor {
             }
         }
     }
+}
+
+/// The `context window: ` refusal — a `BelowFloor` whose ceiling was the serving WINDOW,
+/// not a cap. Shared by the token and the money refusal (AG-12) so the two cannot drift;
+/// `ledger` is the cap's own "spent of budget" figure, in that cap's unit.
+fn window_reason(
+    est_input: u64,
+    window: u32,
+    allowance: u64,
+    output_limit_ties: bool,
+    ledger: &str,
+) -> String {
+    let floor = orchestrator_core::MIN_OUTPUT_TOKENS;
+    // On a TIE the output limit sits on the same figure as the window
+    // term — which `allowance` already is — so naming the co-cause
+    // needs no extra number, only the sentence that stops an operator
+    // clearing one term and hitting the other.
+    let also_bound = if output_limit_ties {
+        format!(
+            " This chain's smallest declared `max_output_tokens` is \
+                                 the same {allowance} tokens, so it binds too: clearing \
+                                 the window alone will not release this call — raise that \
+                                 entry's declared limit, or drop the entry, as well."
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "context window: this call's input is estimated at {est_input} \
+                             tokens; the smallest model in this chain that can hold it has \
+                             a {window}-token context window, leaving {allowance} for \
+                             output — below the {floor}-token floor, so the reply would be \
+                             cut off mid-sentence. The budget is not the binding term \
+                             ({ledger} spent) and raising the cap does not move \
+                             this. What does: remove the {window}-token model from this \
+                             chain, or replace it with a wider one. Adding a larger model \
+                             ALONGSIDE it cannot help — this bound is the smallest window \
+                             that can hold the input, and adding to that set cannot raise \
+                             its minimum. Sending less input helps only while that same \
+                             model stays the smallest one that can hold it.{also_bound}"
+    )
 }
 
 /// The executor's [`ModelDispatch`]: the only provider access a
@@ -1354,7 +1751,7 @@ impl orchestrator_core::ModelDispatch for SelectorDispatch<'_> {
                     seq: 0,
                     output: recorded,
                     observation: None,
-                    usage: response.usage.map(super::content::convert_usage),
+                    usage: self.fold.recorded_usage(&response),
                 },
             )
             .await?;
