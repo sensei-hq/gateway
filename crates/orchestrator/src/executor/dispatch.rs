@@ -70,7 +70,8 @@ use super::Executor;
 /// serialising would have run. Recorded rather than deleted because "a reservation is
 /// impossible" is the wrong reason to carry forward if anyone revisits this.
 ///
-/// So a run WITH a budget takes [`gate`](Meter::gate) — a 1-permit `tokio::sync::Mutex`
+/// So a run WITH a budget — a token cap, a money cap (AG-12) or both — takes
+/// [`gate`](Meter::gate) — a 1-permit `tokio::sync::Mutex`
 /// held across the whole check → dispatch → charge sequence — and therefore has at most
 /// one model call in flight at a time. That is what makes §6.5's "overshoot bounded by
 /// at most one call" true under fan-out, and it does so with no estimation of its own —
@@ -81,8 +82,8 @@ use super::Executor;
 /// is the price of a cap that holds; a run that does not want it simply does not set a
 /// budget.
 ///
-/// An UNBUDGETED run takes no lock at all and keeps full concurrency — the additivity
-/// guarantee the pre-SP-DATA-5 suite depends on.
+/// An UNBUDGETED run (no cap of either kind) takes no lock at all and keeps full
+/// concurrency — the additivity guarantee the pre-SP-DATA-5 suite depends on.
 ///
 /// The counter stays `Relaxed`-atomic: under a budget the mutex already orders every
 /// read and write of it, and without one the counter is never gated on.
@@ -357,9 +358,9 @@ pub(super) enum Refusal {
     },
     /// A budget is set but the provider reported no usage, so this call's spend would
     /// be invisible to the ledger. Fail closed: a budget you cannot measure is not a
-    /// budget. (SP-DATA-5 Task 4 owns capturing usage and the tests for this arm;
-    /// today it is unreachable in practice because nothing sets a budget until
-    /// Task 5 wires `--budget-tokens`.)
+    /// budget. Fires under a token cap, a money cap or both — no usage means no cost
+    /// either (`an_unmetered_call_fails_the_node_when_a_budget_is_set`,
+    /// `an_unmetered_call_fails_the_node_under_a_money_only_cap`).
     Unmetered { model: String },
     /// AG-12: a MONEY-capped run may not make this call. `spent`/`budget` are
     /// micro-dollars; `cause` says which check refused, with the same two meanings it has
@@ -553,13 +554,16 @@ impl Executor {
     /// comment writes out the arithmetic.
     ///
     /// `budget: None` (every pre-SP-DATA-5 run) never gates and never clamps — the
-    /// additivity guarantee.
+    /// additivity guarantee. AG-12 adds a third and fourth check of the same two shapes
+    /// against the MONEY cap — `money_spent >= money_cap`, then a clamp converting the
+    /// remaining micro-dollars into a `max_tokens` at the chain's worst-case price — plus
+    /// a pre-call refusal of an unpriced chain; with no money cap none of them runs.
     ///
     /// Tokens are charged on a successful RESPONSE rather than after the caller
     /// journals its `EffectRecorded`: the provider has been paid either way, so a
     /// journal append that fails afterwards must not also lose the accounting.
     ///
-    /// A BUDGETED run holds the meter's 1-permit gate across this entire body, so the
+    /// A BUDGETED run (either cap) holds the meter's 1-permit gate across this entire body, so the
     /// check and the charge are atomic with respect to every other model call in the
     /// run and a concurrent `Map` fan-out cannot walk the gate en masse (see
     /// [`Meter`]). An unbudgeted run takes no lock. The lock is held across the
@@ -696,10 +700,11 @@ impl Executor {
         // unification — see the tombstone above `ClampRecord` — so this paragraph is the
         // one place that records the improvement it brought as a side effect.)
         //
-        // Only for a budgeted run, and only for `Chat`: `Embed`/`Stt` have no
-        // `max_tokens` to set, so they fall through to the pre-existing floor-trigger
-        // behaviour unchanged. `budget: None` never even computes the estimate — the
-        // additivity guarantee the whole pre-SP-DATA-5 suite rests on.
+        // Only for a budgeted run (a token cap, a money cap or both), and only for `Chat`:
+        // `Embed`/`Stt` have no `max_tokens` to set, so they fall through to the
+        // pre-existing floor-trigger behaviour unchanged. A run with neither cap never even
+        // computes the estimate — the additivity guarantee the whole pre-SP-DATA-5 suite
+        // rests on.
         //
         // The request is CLONED and the clone modified: `dispatch_metered` takes a
         // `&InferenceRequest` and the caller's copy must not change under it. That is
