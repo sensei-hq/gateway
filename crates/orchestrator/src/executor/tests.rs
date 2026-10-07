@@ -28390,6 +28390,69 @@ mod agent_tool_policy {
         );
     }
 
+    /// Drive a confirm-before-run `fs.write` to its pause, append `decisions` in order, then
+    /// resume; returns what the tool wrote and the call's recorded output.
+    async fn decide_in_order(decisions: &[bool]) -> (Vec<String>, Option<serde_json::Value>) {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "write it")],
+        };
+        let writes = sink();
+        let (ex, _clock) = build_executor(
+            &journal,
+            registry_of(confirm_agent(None)),
+            vec![tool_call_response(
+                "t1",
+                "fs.write",
+                &write_args("/workspace/1", "x"),
+            )],
+            &writes,
+            at(1_000),
+        )
+        .await;
+        assert!(ex.start(run, &graph).await.unwrap().paused.is_some());
+        for (i, approved) in decisions.iter().enumerate() {
+            journal
+                .append(run, decided(*approved, &format!("op{i}"), None))
+                .await
+                .unwrap();
+        }
+        let (ex, _clock) = build_executor(
+            &journal,
+            registry_of(confirm_agent(None)),
+            vec![final_response("done")],
+            &writes,
+            at(2_000),
+        )
+        .await;
+        let o = ex.start(run, &graph).await.expect("resume");
+        assert!(o.paused.is_none() && o.failed.is_none(), "{o:?}");
+        let recorded = recorded_output(&journal.load(run).await.unwrap(), &teid());
+        let written = writes.lock().unwrap().clone();
+        (written, recorded)
+    }
+
+    /// `ToolConfirmDecided` folds LAST-wins, like `GateDecided`: an operator can correct a
+    /// decision before the run resumes, in either direction.
+    #[tokio::test]
+    async fn the_last_confirmation_decision_wins() {
+        let (written, recorded) = decide_in_order(&[false, true]).await;
+        assert_eq!(
+            written,
+            vec!["/workspace/1".to_string()],
+            "the corrected approval runs the tool exactly once"
+        );
+        assert_eq!(recorded.expect("recorded")["written"], "/workspace/1");
+
+        let (written, recorded) = decide_in_order(&[true, false]).await;
+        assert!(
+            written.is_empty(),
+            "an approval corrected to a rejection never runs the tool"
+        );
+        assert_eq!(recorded.expect("recorded")["error"], "not_confirmed");
+    }
+
     /// The ceiling runs BEFORE confirm-before-run: a call over the ceiling is refused outright
     /// and never put to a human — nobody is asked to approve a call that would be refused
     /// anyway, and the run does not pause on it.
