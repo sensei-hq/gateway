@@ -80,8 +80,9 @@ only one half has an executor write to mirror.
 only sees one on its next drive, and the row itself cannot say which drive first acted on
 it. `AwaitSignal`, `HumanGate` and a human-backed `Agent` journal nothing when they complete
 on an answer, and every later drive of a still-live run re-completes them from the fold. So
-the honouring drive journals **`JournalEvent::DecisionHookFired { node }`** before firing,
-and every later drive, folding it, fires nothing. That row is:
+the honouring drive journals **`JournalEvent::DecisionHookFired { node, decision }`** before
+firing — `decision` is the `Seq` of the decision row it reported — and every later drive,
+folding it, fires nothing while the node still holds that decision. That row is:
 
 - written **only when hooks are wired** — an executor with no hooks journals exactly what it
   did before (pinned by `an_unhooked_run_journals_exactly_what_it_did_before`);
@@ -93,7 +94,12 @@ and every later drive, folding it, fires nothing. That row is:
 A decision that is **never honoured fires nothing**: one the deadline beat (the gate fails
 first; `on_node_failed` fires), one naming an option outside the published menu, one
 overwritten by a correction before any drive read it (only the honoured decision is
-reported), or one appended after the node already completed or failed. The early-signal
+reported), one appended after the node already failed, or one appended after the run
+finished. A correction appended after a **completed** `AwaitSignal`/`HumanGate`/human `Agent`
+while the run is still live **is** honoured — those kinds journal no durable completion and
+the decision rows fold LAST-wins, so the next drive re-completes the node on it (a `Fail`
+option then fails a gate that had completed) — and that drive reports it, because its
+decision row's `Seq` differs from the marker's. The early-signal
 race asks nobody: a signal folded before its `AwaitSignal` first ran fires
 `on_signal_received` with no `on_signal_awaited`. `on_gate_decided` for a `Fail` option fires
 **before** that node's `on_node_failed`. Decided-hook strings pass through the executor's

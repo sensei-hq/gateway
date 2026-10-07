@@ -65,8 +65,9 @@ pub trait OrchestratorHooks: Send + Sync {
     // - `AwaitSignal`, `HumanGate` and a human-backed `Agent` journal nothing when they
     //   complete on an answer, and every later drive of a still-live run re-completes them
     //   from the fold. So before firing, the honouring drive journals
-    //   `JournalEvent::DecisionHookFired { node }` and later drives skip any node the fold
-    //   has that row for. The row is written ONLY when hooks are wired — an executor
+    //   `JournalEvent::DecisionHookFired { node, decision }` — `decision` is the `Seq` of
+    //   the decision row it reported — and a later drive skips the node while the fold
+    //   still holds that same decision row. The row is written ONLY when hooks are wired — an executor
     //   with no hooks journals exactly what it did before — and best-effort: a failed
     //   write skips the hook for that drive (the next drive retries) and never fails the
     //   run.
@@ -78,7 +79,15 @@ pub trait OrchestratorHooks: Send + Sync {
     // deadline already expired it (the node fails; `on_node_failed` fires), one naming an
     // option the published menu does not contain (likewise), one overwritten by a
     // correction before any drive read it (only the decision actually honoured is
-    // reported), or one appended after the node had already completed or failed.
+    // reported), one appended after the node had already failed (a failed waiting node is
+    // terminal), or one appended after the run finished.
+    //
+    // A correction appended after a COMPLETED `AwaitSignal`/`HumanGate`/human `Agent`, while
+    // the run is still live, IS honoured: those kinds journal no durable completion, the
+    // decision rows fold LAST-wins, and the next drive re-completes the node on the new
+    // decision (a `Fail` option then fails a gate that had completed). That drive reports
+    // it — its decision row's `Seq` differs from the one the marker recorded — so the hook
+    // stream always names the decision behind what the node did.
     //
     // Two edges are at-most-once / at-least-once rather than exactly-once, both outside
     // the hooks' control: a crash between the durable marker (`DecisionHookFired` or

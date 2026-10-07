@@ -292,9 +292,17 @@ struct Fold {
     /// passed.
     loop_gate_settlements: HashMap<NodeId, String>,
     /// AG-2: the human-in-the-loop nodes whose "decided" hook a hooked drive has already
-    /// fired (`JournalEvent::DecisionHookFired`). Read by exactly one consumer,
-    /// [`Executor::claim_decided_hook`], and by nothing that affects execution.
-    decided_hooks_fired: std::collections::HashSet<NodeId>,
+    /// fired (`JournalEvent::DecisionHookFired`), each with the `Seq` of the decision row
+    /// it reported (LAST wins; `None` = a marker that covers any decision). Read by
+    /// exactly one consumer, [`Executor::claim_decided_hook`], and by nothing that affects
+    /// execution.
+    decided_hooks_fired: HashMap<NodeId, Option<Seq>>,
+    /// AG-2: the `Seq` of each node's CURRENT decision row — the `SignalReceived`,
+    /// `GateDecided` or `AgentAnswered` that the LAST-wins fold of
+    /// [`Fold::signals`]/[`Fold::gate_decisions`]/[`Fold::agent_answers`] honours. Read
+    /// only by [`Executor::claim_decided_hook`], to tell a replay of the decision already
+    /// reported from a correction honoured after it.
+    decision_seqs: HashMap<NodeId, Seq>,
     /// SP-6 s1 (whole-slice review): each node's journaled `NodeFailed` message, FIRST
     /// wins. Read through exactly ONE consumer — [`gate_precheck`](Executor::gate_precheck),
     /// the shared arm 0 of the WAITING node kinds, for which a failure is TERMINAL (an
@@ -721,9 +729,20 @@ impl Fold {
         self.loop_gate_settlements.get(node).map(String::as_str)
     }
 
-    /// AG-2: has an earlier hooked drive already fired this node's "decided" hook?
+    /// AG-2: has an earlier hooked drive already fired this node's "decided" hook for the
+    /// decision the fold holds NOW? A marker for an earlier decision row does not count:
+    /// a correction appended after it is honoured again, and is reported again.
     fn decided_hook_fired(&self, node: &NodeId) -> bool {
-        self.decided_hooks_fired.contains(node)
+        match self.decided_hooks_fired.get(node) {
+            None => false,
+            Some(None) => true,
+            Some(Some(reported)) => self.decision_seqs.get(node) == Some(reported),
+        }
+    }
+
+    /// AG-2: the `Seq` of the decision row this node currently honours, if any.
+    fn decision_seq(&self, node: &NodeId) -> Option<Seq> {
+        self.decision_seqs.get(node).copied()
     }
 }
 
@@ -1819,8 +1838,10 @@ impl Executor {
     /// they HONOUR an answer. Those kinds journal nothing when they complete, so every
     /// later drive of a still-live run re-completes them from the fold and reaches the same
     /// call; the decision row was appended by another process and cannot say which drive
-    /// first acted on it. So the first hooked drive journals `DecisionHookFired { node }`
-    /// and every later drive, folding it, gets `None` — exactly once across resumes.
+    /// first acted on it. So the first hooked drive journals `DecisionHookFired { node,
+    /// decision }` and every later drive, folding it, gets `None` while the fold still
+    /// holds that decision row — exactly once across resumes. A correction appended after
+    /// it is a different row (another `Seq`); the drive that honours it claims again.
     ///
     /// `None` when no hooks are wired, BEFORE any write: an unhooked executor journals
     /// exactly what it did before (`an_unhooked_run_journals_exactly_what_it_did_before`).
@@ -1842,7 +1863,13 @@ impl Executor {
         }
         match self
             .journal
-            .append(run, JournalEvent::DecisionHookFired { node: node.clone() })
+            .append(
+                run,
+                JournalEvent::DecisionHookFired {
+                    node: node.clone(),
+                    decision: fold.decision_seq(node),
+                },
+            )
             .await
         {
             Ok(_) => Some(hooks),
