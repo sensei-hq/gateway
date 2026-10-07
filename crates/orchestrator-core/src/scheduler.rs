@@ -187,7 +187,9 @@ pub trait SchedulerStore: Send + Sync {
     ///
     /// Defaulted to `Ok(None)` — "this store does not count attempts" — which the driver treats as
     /// the pre-AG-3 behaviour (no cap, no backoff, every drive error terminal), so a third-party
-    /// backend keeps compiling and behaves exactly as before. Both shipped stores override it.
+    /// backend keeps compiling and behaves exactly as before. The in-memory store overrides it;
+    /// torii's `PgSchedulerStore` must too (with the rest of the delta the testkit's `scheduler`
+    /// suite checks) — until it does, production keeps the pre-AG-3 crash loop.
     async fn begin_wake_attempt(
         &self,
         _run: RunId,
