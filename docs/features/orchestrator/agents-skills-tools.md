@@ -4,13 +4,13 @@ doctype: feature
 module: orchestrator
 status: partial
 phase: 3
-spec: SP-1, SP-2, SP-4, SP-6-3, SP-6-4, SP-7a, SP-7b
+spec: SP-1, SP-2, SP-4, SP-6-3, SP-6-4, SP-7a, SP-7b, AG-15
 source: crates/orchestrator*
 ---
 
 # Agents · Skills · Tools
 
-> **Status: Partial (Phase 3 · SP-1 slice 2 + SP-2 slice 1 + SP-2 slice 2 + SP-2 slice 3 + SP-2 slice 4 + SP-2 slice 5 (SP-2 complete) + SP-4 s1/s3/s4 + credential broker + SP-6-3 + SP-6-4 + SP-7a + SP-7b).** Design §6/§9;
+> **Status: Partial (Phase 3 · SP-1 slice 2 + SP-2 slice 1 + SP-2 slice 2 + SP-2 slice 3 + SP-2 slice 4 + SP-2 slice 5 (SP-2 complete) + SP-4 s1/s3/s4 + credential broker + SP-6-3 + SP-6-4 + SP-7a + SP-7b + AG-15).** Design §6/§9;
 > config-source design
 > [`../../superpowers/specs/2026-08-11-sp2-config-source-design.md`](../../superpowers/specs/2026-08-11-sp2-config-source-design.md).
 > **SP-2 slice 1 — pluggable config loading:** the `Registry` now loads from a
@@ -215,6 +215,60 @@ source: crates/orchestrator*
 > silence would let an author believe a person is in the loop while the run quietly decides for
 > itself. The seam returns `Err` rather than journaling, because its two callers differ on what
 > a failure means (s3 `?`-propagates; s4 turns it into a `NodeFailed` that fails the `Loop`).
+>
+> **AG-15 (#90) — engine-enforced agent tool policy and escalation.** Four `AgentDefinition`
+> fields, each `#[serde(default)]` and skipped when unused on serialize, so every existing
+> registry and `config_agents` row loads and re-serializes byte-identically, and a run that
+> uses none of them journals exactly what it did before. Frontmatter:
+> `tool_limits: [shell=3]`, `confirm_tools: [deploy]`, `confirm_timeout: 2h`,
+> `escalate_to: legal-lead` — every present-but-malformed spelling is a loud
+> `FrontmatterParse`. `Registry::validate` rejects, at load: a ceiling or confirmation on a
+> tool the agent does not list (it could never fire), a ceiling of 0 (remove the tool
+> instead), a `confirm_timeout` with no `confirm_tools` or outside `(0, MAX_AWAIT_SIGNAL_TIMEOUT]`,
+> and an `escalate_to` that cannot happen — on a model-backed agent or a human one with no
+> `timeout`, to itself, to a missing or model-backed agent, or round a cycle (reported in name
+> order so the message is stable).
+>
+> - **Call ceiling** (`tool_limits`): once the model has asked for a tool N times in ONE agent
+>   invocation (one ReAct loop — an `Agent` node, a `Map` child, a `Loop` iteration's body),
+>   every further call is refused with a terse Pure `{"error":"call_limit_reached"}` fed back
+>   to the model, exactly like an ungranted tool. **What counts is every call REQUESTED**, in
+>   transcript order, including ones denied by a grant, refused at confirmation or refused by
+>   the ceiling itself. The count is rebuilt on every drive from the memoized turns, so it is
+>   a function of the journal — a fresh worker resuming the run sees the same count. The scope
+>   is the invocation, not the run, because a run-wide count would race between concurrently
+>   driven `Map` children and decide differently on a resume.
+> - **Confirm-before-run** (`confirm_tools`, `confirm_timeout`): each call of a listed tool —
+>   after the s1 permission gate, the ceiling and the workspace jail, so nobody is asked to
+>   approve a call that would be refused anyway — journals `ToolConfirmAwaited` (redacted
+>   arguments, absolute deadline) and pauses the run (`RunPaused{resume_after: deadline}`).
+>   Nothing runs, not even a Mutation's `EffectIntent`, until `ToolConfirmDecided{approved:
+>   true}` is folded inside the deadline; a rejection, an expiry (checked BEFORE the decision
+>   is read, the `HumanGate` ordering) or arguments over `MAX_HUMAN_TEXT_BYTES` become a terse
+>   Pure `{"error":"not_confirmed"}` for the model. Unlike a gate, a refusal does not fail the
+>   node: the model is told and carries on. The pause reason names the tool, the node and the
+>   call's effect id — the key an operator answers with. **An approval is never re-judged once
+>   it has been acted on:** a call with a standing `EffectIntent` (journaled only after an
+>   approval) is IN DOUBT, and a resume sends it straight to the §7.3 reconcile — even past the
+>   deadline or after a later corrective rejection — instead of recording `not_confirmed` over a
+>   side effect that may already have happened.
+> - **Escalation** (`escalate_to`, human-backed agents only): when the asked agent's SLA
+>   expires unanswered, the SAME journaled question is handed to the escalation agent on ITS
+>   OWN SLA from that instant (`AgentEscalated`), and the run pauses on that deadline. Chains
+>   are followed one hop per wake; only the last agent in the chain expiring fails the node,
+>   naming the walk. The answer is the usual `AgentAnswered` (read before any expiry, so
+>   escalation never pre-empts an answer that landed). Applies to a top-level `Agent` node
+>   only: a `GateSpec::Human` loop gate does not escalate, and its expiry failure says so when
+>   its role declares `escalate_to`.
+>
+> **Hooks:** the new events fire AG-2's HITL hooks — `on_tool_confirm_awaited`,
+> `on_tool_confirm_decided` and `on_agent_escalated`, once per real occurrence and never on a
+> resumed replay; see [hooks](hooks.md#confirm-before-run-and-escalation-hooks-ag-2--ag-15).
+>
+> **Carry-forwards:** who may answer a confirmation or an escalated question is `torii`'s
+> (torii#47) — `actor` is attribution only; a stale `Observation` re-read of an already
+> APPROVED confirm tool past its confirm deadline is refused rather than re-read (the expiry is
+> checked before the decision for every live pass).
 
 Externally-configured **agents** (md+frontmatter: name, area, kind, chain(s),
 tools, skills, subagents, system-prompt body), **skills** (injectable

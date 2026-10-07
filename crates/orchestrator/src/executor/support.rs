@@ -13,7 +13,10 @@ use orchestrator_core::{
 };
 use sha2::{Digest, Sha256};
 
-use super::{AgentAnswer, ContextBudget, Fold, GateDecision, LoopGateAsk, LoopGateDecision};
+use super::{
+    AgentAnswer, ContextBudget, DecisionContent, Fold, GateDecision, LoopGateAsk, LoopGateDecision,
+    ToolConfirmDecision,
+};
 
 /// One scheduling round's **ready set** (§3.2): the not-yet-terminal nodes whose
 /// `Hard` deps have all completed and `Soft` deps are all terminal, in graph
@@ -70,7 +73,7 @@ pub(crate) fn fold_journal(
     let mut fold = Fold::default();
     let mut node_last_output: HashMap<NodeId, EffectOutput> = HashMap::new();
     let mut completed: Vec<NodeId> = Vec::new();
-    for (_, event) in events {
+    for (seq, event) in events {
         match event {
             JournalEvent::EffectRecorded {
                 node,
@@ -210,6 +213,9 @@ pub(crate) fn fold_journal(
             // so an operator can correct a mistaken decision before the run resumes.
             JournalEvent::SignalReceived { node, payload } => {
                 fold.signals.insert(node.clone(), payload.clone());
+                fold.decision_seqs.insert(node.clone(), *seq);
+                fold.decision_rows
+                    .insert(*seq, DecisionContent::Signal(payload.clone()));
             }
             // SP-6 s1: also EXPLICIT, for the same reason. FIRST wins —
             // `entry().or_insert()`, NOT `insert` — the opposite asymmetry from
@@ -265,14 +271,15 @@ pub(crate) fn fold_journal(
                 actor,
                 note,
             } => {
-                fold.gate_decisions.insert(
-                    node.clone(),
-                    GateDecision {
-                        option: option.clone(),
-                        actor: actor.clone(),
-                        note: note.clone(),
-                    },
-                );
+                let decision = GateDecision {
+                    option: option.clone(),
+                    actor: actor.clone(),
+                    note: note.clone(),
+                };
+                fold.decision_rows
+                    .insert(*seq, DecisionContent::Gate(decision.clone()));
+                fold.gate_decisions.insert(node.clone(), decision);
+                fold.decision_seqs.insert(node.clone(), *seq);
             }
             // SP-6 s3: the ask. EXPLICIT, never folded by a catch-all — a catch-all
             // silently absorbing a new variant is how this codebase has shipped fold bugs.
@@ -321,13 +328,14 @@ pub(crate) fn fold_journal(
             }
             // SP-6 s3: the answer. LAST wins (`insert` overwrites).
             JournalEvent::AgentAnswered { node, text, actor } => {
-                fold.agent_answers.insert(
-                    node.clone(),
-                    AgentAnswer {
-                        text: text.clone(),
-                        actor: actor.clone(),
-                    },
-                );
+                let answer = AgentAnswer {
+                    text: text.clone(),
+                    actor: actor.clone(),
+                };
+                fold.decision_rows
+                    .insert(*seq, DecisionContent::Agent(answer.clone()));
+                fold.agent_answers.insert(node.clone(), answer);
+                fold.decision_seqs.insert(node.clone(), *seq);
             }
             // SP-6 s4: the ask. EXPLICIT, never folded by a catch-all.
             //
@@ -385,12 +393,41 @@ pub(crate) fn fold_journal(
                     .entry(node.clone())
                     .or_insert_with(|| option.clone());
             }
+            // AG-2: hooks bookkeeping — the node whose "decided" hook already fired, and
+            // for WHICH decision row. An EXPLICIT arm, never the `_` catch-all: absorbed
+            // silently, every later drive of a still-live run would re-report a decision
+            // it is merely replaying, and it would compile perfectly. LAST wins, so the
+            // marker tracks the most recent decision reported; a duplicate changes nothing.
+            // The decision arms above record each row's content in `decision_rows`, which
+            // is what lets an identical redelivery count as the decision already reported.
+            //
+            // AG-2 × AG-15: a marker carrying an `effect_id` is a confirm-before-run CALL's,
+            // keyed by that call — never the node's, or it would cover whatever the node's
+            // own decided hook reports.
+            JournalEvent::DecisionHookFired {
+                node,
+                decision,
+                effect_id,
+            } => match effect_id {
+                Some(eid) => {
+                    fold.tool_confirm_hooks_fired.insert(eid.clone(), *decision);
+                }
+                None => {
+                    fold.decided_hooks_fired.insert(node.clone(), *decision);
+                }
+            },
             // SP-DATA-5: the run's original cap, set once at submit. An EXPLICIT
             // arm — not the `_` catch-all below — because a budget that silently
             // never folds is a bug the compiler cannot catch for us (`budget` stays
             // `Option`-shaped either way), so this must be deliberate, not implicit.
-            JournalEvent::RunStarted { budget, .. } => {
+            JournalEvent::RunStarted {
+                budget,
+                money_budget,
+                ..
+            } => {
                 fold.budget = budget.map(|b| b.total_tokens);
+                // AG-12: the money cap, independently of the token cap.
+                fold.money_budget = money_budget.map(|m| m.total_micro_usd);
             }
             // SP-DATA-5: an operator-issued raise (or lower). Latest value wins, so
             // this OVERWRITES rather than accumulates — also an EXPLICIT arm for the
@@ -398,6 +435,22 @@ pub(crate) fn fold_journal(
             // compile cleanly and silently make the budget un-raisable.
             JournalEvent::BudgetRaised { new_total_tokens } => {
                 fold.budget = Some(*new_total_tokens);
+            }
+            // AG-12: the money twin — latest wins, EXPLICIT arm for the same reason.
+            //
+            // But it only MOVES a money cap; it never introduces one. A run that started
+            // without a money cap ledgers no cost, and a drive in flight when the raise is
+            // appended (cross-process, by torii or an operator) folded "no cap" at its
+            // start and keeps journaling `cost_micro_usd: None` for every call it makes —
+            // uncountable by any later fold. Honouring the raise would report a cap over
+            // spend the ledger never counted (AG-12 review, HIGH). `RunStarted` precedes
+            // every raise, so `is_some()` here is exactly "the run started with a cap".
+            JournalEvent::MoneyBudgetRaised {
+                new_total_micro_usd,
+            } => {
+                if fold.money_budget.is_some() {
+                    fold.money_budget = Some(*new_total_micro_usd);
+                }
             }
             // SP-7b: the `## Context` byte budget a turn was cut to. FIRST wins —
             // `entry().or_insert()`, NOT `insert`. A budget a later record could move is not
@@ -423,6 +476,53 @@ pub(crate) fn fold_journal(
                         budget_bytes: *budget_bytes,
                         dropped_tools: dropped_tools.clone(),
                     });
+            }
+            // AG-15: the ask FIRST-wins (its deadline must never move), the decision
+            // LAST-wins (an operator may correct it before the run resumes).
+            JournalEvent::ToolConfirmAwaited {
+                effect_id,
+                deadline,
+                ..
+            } => {
+                fold.tool_confirm_asks
+                    .entry(effect_id.clone())
+                    .or_insert(*deadline);
+            }
+            //
+            // AG-2 × AG-15: the row's `Seq` and content too, so the hook dispatch can tell a
+            // redelivery of the decision it reported from a correction.
+            JournalEvent::ToolConfirmDecided {
+                effect_id,
+                approved,
+                actor,
+                note,
+                ..
+            } => {
+                fold.tool_confirm_decisions
+                    .insert(effect_id.clone(), *approved);
+                fold.tool_confirm_decision_seqs
+                    .insert(effect_id.clone(), *seq);
+                fold.decision_rows.insert(
+                    *seq,
+                    DecisionContent::ToolConfirm(ToolConfirmDecision {
+                        approved: *approved,
+                        actor: actor.clone(),
+                        note: note.clone(),
+                    }),
+                );
+            }
+            // AG-15: FIRST row per target wins, so a duplicated hop can neither move the
+            // chain's current deadline nor lengthen the chain.
+            JournalEvent::AgentEscalated {
+                node, to, deadline, ..
+            } => {
+                let chain = fold.agent_escalations.entry(node.clone()).or_default();
+                if !chain.iter().any(|hop| &hop.to == to) {
+                    chain.push(super::AgentEscalation {
+                        to: to.clone(),
+                        deadline: *deadline,
+                    });
+                }
             }
             _ => {}
         }
@@ -943,6 +1043,7 @@ mod tests {
             input_tokens: 100,
             output_tokens: 50,
             total_tokens: 150,
+            cost_micro_usd: None,
         };
         let ev = |seq: Seq| {
             (
@@ -985,6 +1086,7 @@ mod tests {
                         input_tokens: 0,
                         output_tokens: 0,
                         total_tokens: total,
+                        cost_micro_usd: None,
                     }),
                 },
             )
@@ -1011,6 +1113,7 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: total,
                 total_tokens: total,
+                cost_micro_usd: None,
             }),
         };
         let manifest = || JournalEvent::MapCompacted {
@@ -1031,6 +1134,7 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 100,
                 total_tokens: 100,
+                cost_micro_usd: None,
             }),
         };
         let (fold, _, _) = fold_journal(&[(0, manifest())]);
@@ -1080,6 +1184,7 @@ mod tests {
                     budget: Some(TokenBudget {
                         total_tokens: 1_000,
                     }),
+                    money_budget: None,
                 },
             ),
             (
@@ -1103,6 +1208,164 @@ mod tests {
         );
     }
 
+    /// AG-12: an `EffectRecorded` charging `micro` micro-dollars under effect id `id`.
+    fn priced_effect(id: &str, micro: u64, seq: Seq) -> (Seq, orchestrator_core::JournalEvent) {
+        use orchestrator_core::{EffectClass, EffectId, JournalEvent, NodeId, TokenUsage};
+        (
+            seq,
+            JournalEvent::EffectRecorded {
+                node: NodeId("n1".into()),
+                effect_id: EffectId(id.into()),
+                class: EffectClass::Pure,
+                input_hash: "h".into(),
+                seq,
+                output: EffectOutput::Inline(serde_json::Value::Null),
+                observation: None,
+                usage: Some(TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 10,
+                    total_tokens: 20,
+                    cost_micro_usd: Some(micro),
+                }),
+            },
+        )
+    }
+
+    /// AG-12: the money cap folds from `RunStarted.money_budget` and the latest
+    /// `MoneyBudgetRaised`, and the two caps never move each other.
+    #[test]
+    fn a_money_budget_is_folded_and_the_latest_money_raise_wins() {
+        use orchestrator_core::{JournalEvent, MoneyBudget, TokenBudget};
+        let evs = vec![
+            (
+                0,
+                JournalEvent::RunStarted {
+                    version: "v1".into(),
+                    budget: Some(TokenBudget { total_tokens: 900 }),
+                    money_budget: Some(MoneyBudget {
+                        total_micro_usd: 1_000,
+                    }),
+                },
+            ),
+            (
+                1,
+                JournalEvent::MoneyBudgetRaised {
+                    new_total_micro_usd: 5_000,
+                },
+            ),
+            (
+                2,
+                JournalEvent::BudgetRaised {
+                    new_total_tokens: 7_000,
+                },
+            ),
+            (
+                3,
+                JournalEvent::MoneyBudgetRaised {
+                    new_total_micro_usd: 3_000,
+                },
+            ),
+        ];
+        let (fold, _, _) = fold_journal(&evs);
+        assert_eq!(fold.money_budget(), Some(3_000), "latest money raise wins");
+        assert_eq!(
+            fold.budget(),
+            Some(7_000),
+            "a money raise never moves the token cap"
+        );
+        assert_eq!(crate::executor::money_spend_of(&evs), (0, Some(3_000)));
+
+        let (money_only, _, _) = fold_journal(&[(
+            0,
+            JournalEvent::RunStarted {
+                version: "v1".into(),
+                budget: None,
+                money_budget: Some(MoneyBudget {
+                    total_micro_usd: 42,
+                }),
+            },
+        )]);
+        assert_eq!(
+            (money_only.budget(), money_only.money_budget()),
+            (None, Some(42))
+        );
+    }
+
+    /// AG-12 review (HIGH): a money cap exists only if the run STARTED with one. A
+    /// `MoneyBudgetRaised` on a run whose `RunStarted.money_budget` is `None` moves
+    /// nothing — it can race a drive that folded "no cap" and so journals every call
+    /// uncosted, and a cap reported over spend it never counted is worse than no cap.
+    #[test]
+    fn a_money_raise_on_a_run_that_started_without_a_money_cap_introduces_none() {
+        use orchestrator_core::{JournalEvent, TokenBudget};
+        let evs = vec![
+            (
+                0,
+                JournalEvent::RunStarted {
+                    version: "v1".into(),
+                    budget: Some(TokenBudget { total_tokens: 900 }),
+                    money_budget: None,
+                },
+            ),
+            (
+                1,
+                JournalEvent::MoneyBudgetRaised {
+                    new_total_micro_usd: 5_000,
+                },
+            ),
+        ];
+        let (fold, _, _) = fold_journal(&evs);
+        assert_eq!(fold.money_budget(), None);
+        assert_eq!(crate::executor::money_spend_of(&evs), (0, None));
+    }
+
+    /// AG-12: money spend is keyed by effect id exactly like tokens — a duplicate record
+    /// (the two-phase `Confirmed` reconcile) counts ONCE, distinct effects sum, and a
+    /// compacted Map child's cost re-enters under its original id.
+    #[test]
+    fn money_spend_is_keyed_by_effect_id_and_survives_compaction() {
+        use orchestrator_core::{ChildStatus, CompactChild, JournalEvent, NodeId, TokenUsage};
+        let (fold, _, _) = fold_journal(&[
+            priced_effect("a", 300, 0),
+            priced_effect("a", 300, 1),
+            priced_effect("b", 50, 2),
+        ]);
+        assert_eq!(
+            fold.money_spent(),
+            350,
+            "dup counted once, distinct effects sum"
+        );
+
+        let manifest = (
+            3,
+            JournalEvent::MapCompacted {
+                node: NodeId("m".into()),
+                children: vec![CompactChild {
+                    index: 0,
+                    status: ChildStatus::Ok,
+                    digest: None,
+                    input_hash: None,
+                    usage: Some(TokenUsage {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        total_tokens: 2,
+                        cost_micro_usd: Some(1_000),
+                    }),
+                }],
+            },
+        );
+        let (fold, _, _) = fold_journal(&[manifest.clone(), manifest]);
+        assert_eq!(
+            fold.money_spent(),
+            1_000,
+            "a compacted child's cost counts once"
+        );
+        assert_eq!(
+            crate::executor::money_spend_of(&[priced_effect("x", 7, 0)]),
+            (7, None)
+        );
+    }
+
     #[test]
     fn an_unbudgeted_run_folds_no_budget_and_no_spend() {
         use orchestrator_core::JournalEvent;
@@ -1111,6 +1374,7 @@ mod tests {
             JournalEvent::RunStarted {
                 version: "v1".into(),
                 budget: None,
+                money_budget: None,
             },
         )];
         let (fold, _, _) = fold_journal(&evs);

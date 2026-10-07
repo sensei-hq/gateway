@@ -7,8 +7,10 @@ use serde::{Deserialize, Serialize};
 /// `BudgetRaised`.
 ///
 /// This caps CONSUMPTION, not spend: 50k tokens costs very different amounts across
-/// models. Money denomination is deferred (spec §8) because it needs durable,
-/// current per-model pricing, and a stale price would silently make the cap wrong.
+/// models. The money cap is its own type, [`MoneyBudget`] (AG-12), and a run may carry
+/// either or both: it is ledgered from the cost the GATEWAY reports per call (its config
+/// pricing × the provider's usage), so a stale price in the gateway's config makes the
+/// money cap wrong by exactly as much — the reason this token cap still exists beside it.
 ///
 /// It is not a hard ceiling, and the shape of the slack has TWO parts.
 ///
@@ -35,6 +37,37 @@ pub struct TokenBudget {
     pub total_tokens: u64,
 }
 
+/// AG-12: a per-run cap on MONEY, in integer micro-dollars (1 USD = 1 000 000).
+///
+/// Journaled on `RunStarted.money_budget` beside (or instead of) the token cap, and
+/// moved by `JournalEvent::MoneyBudgetRaised` — which can move a money cap but never
+/// introduce one: a run has a money cap only if it STARTED with one. torii derives the figure from its
+/// individual/group/org caps (torii#41); the engine only enforces it.
+///
+/// Integer, never `f64`: this value and the spend it is compared against live in the
+/// journal and the fold, and a float there would make "spent >= cap" depend on the
+/// summation ORDER of the ledger — a resume that folds the same effects in a different
+/// order could land either side of the cap. Prices are `f64` in the gateway's config;
+/// they are converted to micro-dollars once per call, rounding toward the safe side,
+/// and only the integer is ever stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MoneyBudget {
+    pub total_micro_usd: u64,
+}
+
+/// Micro-dollars per US dollar — the unit [`MoneyBudget`] and
+/// [`TokenUsage::cost_micro_usd`] are denominated in.
+pub const MICRO_USD_PER_USD: u64 = 1_000_000;
+
+/// AG-12: both run caps together, as a submitter hands them to
+/// `Executor::run_with_budget` / `Scheduler::submit_with_budget`. Either, both or
+/// neither may be set; `RunBudget::default()` is an unbudgeted run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunBudget {
+    pub tokens: Option<TokenBudget>,
+    pub money: Option<MoneyBudget>,
+}
+
 /// Mirrors `kernel::types::cost::TokenUsage`. Defined locally because
 /// `orchestrator-core` deliberately depends on nothing else in the workspace; the
 /// executor converts at the boundary. `Copy` for the same reason as `TokenBudget`:
@@ -44,6 +77,17 @@ pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub total_tokens: u32,
+    /// AG-12: what the gateway priced this call at (`InferenceResponse.actual_cost`),
+    /// in micro-dollars rounded UP. Rides on the usage — and therefore on
+    /// `EffectRecorded.usage` and `CompactChild.usage` — so the money ledger is keyed
+    /// by effect id exactly like the token ledger and inherits every idempotency
+    /// argument the token ledger already makes (duplicate `Confirmed` records, Map
+    /// compaction, resume).
+    ///
+    /// `Some` only on a run with a money cap in force when the call was made: an
+    /// unbudgeted or token-only run journals byte-identically to before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micro_usd: Option<u64>,
 }
 
 /// The smallest output allowance worth spending input tokens on (SP-DATA-5 clamp).

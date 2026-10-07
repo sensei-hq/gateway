@@ -6,27 +6,73 @@ use orchestrator_core::{ContentRef, EffectOutput, OrchestratorError};
 
 use super::Executor;
 
-/// SP-DATA-5: the single conversion from the gateway's reported usage
-/// (`kernel::types::cost::TokenUsage`) to the journal's local mirror
-/// (`orchestrator_core::TokenUsage`, defined without a `kernel` dependency —
-/// see Task 1). Lives beside `model_output`, the sibling OUTPUT-side
-/// chokepoint, because both exist so a new model-call producer picks up the
-/// conversion by construction rather than by remembering to copy it.
+/// SP-DATA-5 + AG-12: the single conversion from what the gateway reported on a
+/// response to the journal's usage record (`orchestrator_core::TokenUsage`, defined
+/// without a `kernel` dependency). Lives beside `model_output`, the sibling OUTPUT-side
+/// chokepoint, because both exist so a new model-call producer picks up the conversion
+/// by construction rather than by remembering to copy it. Producers reach it only through
+/// `Fold::recorded_usage`, which supplies `priced`.
 ///
-/// A free function, not a `From` impl: both types are foreign to this crate
-/// (`kernel::types::cost::TokenUsage` and `orchestrator_core::TokenUsage`), so
-/// `impl From<A> for B` here would violate the orphan rule — neither type is
-/// local to `orchestrator`. All four producers call
-/// `response.usage.map(convert_usage)`; a field added to the JOURNALED
-/// (`orchestrator_core`) side fails to compile HERE — one fix — instead of
-/// being silently dropped at three of the four call sites the way an inlined
-/// field-by-field copy would leave it.
-pub(super) fn convert_usage(u: kernel::types::cost::TokenUsage) -> orchestrator_core::TokenUsage {
-    orchestrator_core::TokenUsage {
+/// A free function, not a `From` impl: both types are foreign to this crate, so the
+/// orphan rule forbids one. A field added to the JOURNALED side fails to compile HERE —
+/// one fix — instead of being silently dropped at some of the producers.
+///
+/// `priced` is "this run has a money cap in force". Only then is the cost ledgered, so a
+/// run without one journals exactly what it did before AG-12. Under a cap a response
+/// without a usable cost still converts (with `cost_micro_usd: None`) — the chokepoint
+/// has already refused such a call before any producer journals it.
+pub(super) fn recorded_usage(
+    response: &kernel::types::request::InferenceResponse,
+    priced: bool,
+) -> Option<orchestrator_core::TokenUsage> {
+    let u = response.usage.as_ref()?;
+    Some(orchestrator_core::TokenUsage {
         input_tokens: u.input_tokens,
         output_tokens: u.output_tokens,
         total_tokens: u.total_tokens,
+        cost_micro_usd: if priced {
+            response.actual_cost.as_ref().and_then(cost_micro_usd)
+        } else {
+            None
+        },
+    })
+}
+
+/// AG-12: a gateway-reported [`Cost`](kernel::types::cost::Cost) in integer micro-dollars,
+/// rounded UP — or `None` when it cannot be trusted as a USD figure.
+///
+/// The ONE place a float price becomes a ledger integer, used by both the live meter and
+/// the journaled record so the two can never disagree about one call. Rounding up biases
+/// the ledger high: a cap can only be reached early, never overshot by accumulated
+/// truncation. `None` — a non-USD currency, or a non-finite or negative total — is
+/// treated by the chokepoint exactly like a missing cost: refused under a money cap.
+pub(super) fn cost_micro_usd(cost: &kernel::types::cost::Cost) -> Option<u64> {
+    if !cost.currency.eq_ignore_ascii_case("USD")
+        || !cost.total_cost.is_finite()
+        || cost.total_cost < 0.0
+    {
+        return None;
     }
+    Some(ceil_micro(
+        cost.total_cost * orchestrator_core::MICRO_USD_PER_USD as f64,
+    ))
+}
+
+/// AG-12: round a non-negative micro-dollar figure UP to an integer, ignoring float
+/// representation noise below a thousandth of a micro-dollar.
+///
+/// A plain `ceil` is wrong here in a way that matters: the gateway's `f64` total for a
+/// call priced at exactly 21 000 micro-dollars comes back as `21000.000000000004`, and
+/// `ceil` charges 21 001 — one phantom micro-dollar on EVERY call, which compounds across
+/// a run and makes the ledger disagree with arithmetic an operator can check. Rounding to
+/// the nearest nano-dollar first removes representation noise (relative error ~1e-16)
+/// while still charging any genuine sub-micro fraction of a nano-dollar or more as a
+/// whole micro-dollar — still biased high, just not by noise.
+///
+/// `as` saturates on an out-of-range float, so an absurd figure pins the result at
+/// `u64::MAX` (which pauses the run) rather than wrapping it toward zero.
+pub(super) fn ceil_micro(micro: f64) -> u64 {
+    ((micro * 1000.0).round() / 1000.0).ceil() as u64
 }
 
 impl Executor {
@@ -170,5 +216,57 @@ mod tests {
                 "no partial leak regardless of secret order: {order:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod cost_tests {
+    use super::{ceil_micro, cost_micro_usd};
+    use kernel::types::cost::Cost;
+
+    fn cost(total: f64, currency: &str) -> Cost {
+        Cost {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            input_cost: 0.0,
+            output_cost: total,
+            total_cost: total,
+            currency: currency.into(),
+        }
+    }
+
+    /// AG-12: the ledger integer is the gateway's float total rounded UP — but NOT by
+    /// float representation noise. `0.001 + 0.02` is `0.021000000000000001` in `f64`, and
+    /// a plain `ceil` charged 21 001 for a call worth exactly 21 000; a genuine fraction
+    /// of a micro-dollar is still charged as a whole one.
+    #[test]
+    fn a_cost_is_rounded_up_to_whole_micro_dollars_but_not_by_float_noise() {
+        // Built the way the gateway builds it (`Cost::from_usage`), which is where the
+        // noise comes from: `(100 / 1000) × 0.2` is `0.020000000000000004`.
+        let usage = kernel::types::cost::TokenUsage {
+            input_tokens: 10,
+            output_tokens: 100,
+            total_tokens: 110,
+        };
+        let priced = Cost::from_usage(&usage, 0.1, 0.2);
+        assert!(
+            priced.total_cost * 1e6 > 21_000.0,
+            "the fixture must carry the noise"
+        );
+        assert_eq!(cost_micro_usd(&priced), Some(21_000));
+        assert_eq!(cost_micro_usd(&cost(0.000_000_5, "USD")), Some(1));
+        assert_eq!(cost_micro_usd(&cost(0.0, "usd")), Some(0));
+        assert_eq!(ceil_micro(2.4), 3);
+    }
+
+    /// AG-12: a figure the money ledger cannot trust is refused, not guessed: a non-USD
+    /// currency (the cap is in dollars), a non-finite or a negative total.
+    #[test]
+    fn an_untrustworthy_cost_is_none() {
+        assert_eq!(cost_micro_usd(&cost(1.0, "EUR")), None);
+        assert_eq!(cost_micro_usd(&cost(f64::NAN, "USD")), None);
+        assert_eq!(cost_micro_usd(&cost(f64::INFINITY, "USD")), None);
+        assert_eq!(cost_micro_usd(&cost(-0.5, "USD")), None);
     }
 }

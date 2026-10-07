@@ -1464,6 +1464,10 @@ mod planner_tool_tests {
     fn agent_def(name: &str) -> AgentDefinition {
         AgentDefinition {
             default_planner: false,
+            tool_limits: Default::default(),
+            confirm_tools: Vec::new(),
+            confirm_timeout: None,
+            escalate_to: None,
             name: name.into(),
             area: "research".into(),
             kind: "reasoning".into(),

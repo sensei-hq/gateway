@@ -48,6 +48,12 @@ struct AgentRun<'a> {
     // call against these: the tool must be LISTED and its grant must COVER the need.
     agent_tools: Vec<String>,
     agent_grants: std::collections::HashMap<String, orchestrator_core::Permissions>,
+    /// AG-15: the tools whose every call pauses for a human decision before it runs, and
+    /// how long that decision may take (`None` waits indefinitely). See `tool_policy.rs`.
+    confirm_tools: Vec<String>,
+    confirm_timeout: Option<chrono::Duration>,
+    /// AG-15: per-tool call ceilings for this invocation (tool → most calls).
+    tool_limits: std::collections::HashMap<String, u32>,
     /// SP-7b: the MEASURED cut this node's `system` half was rendered under, or `None` when
     /// the prompt was dispatched whole.
     ///
@@ -271,7 +277,7 @@ impl Executor {
             // it is returned to `run_human_loop_gate` rather than re-read there.
             let (question, timeout) = self.human_question_for(agent_ref, input, context)?;
             return Ok(step(
-                self.run_human_agent(run, node_id, &question, timeout, fold)
+                self.run_human_agent(run, node_id, agent_ref, &question, timeout, fold)
                     .await?,
             ));
         }
@@ -605,6 +611,9 @@ impl Executor {
             fold,
             agent_tools: agent.tools.clone(),
             agent_grants: agent.grants.clone(),
+            confirm_tools: agent.confirm_tools.clone(),
+            confirm_timeout: agent.confirm_timeout,
+            tool_limits: agent.tool_limits.clone(),
             context_cut,
         };
 
@@ -618,6 +627,15 @@ impl Executor {
             h.on_agent_started(run, node_id, &agent_ref.0, &ar.chain)
                 .await;
         }
+
+        // AG-15: how many times the model has asked for each tool so far in THIS invocation,
+        // in transcript order. Rebuilt from zero on every drive and advanced over every turn
+        // — the memoized ones the journal replays as well as live ones — so it is a function
+        // of the journal alone, never of what this process happened to see. That is the
+        // replay-safety the call ceiling rests on: a fresh worker resuming the run counts the
+        // same calls. Pinned by `the_call_ceiling_survives_a_resume_on_a_fresh_executor`.
+        let mut tool_calls_made: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
 
         for turn in 0..self.max_steps {
             // Produce this turn's model output — memoized replay or a live call.
@@ -642,7 +660,10 @@ impl Executor {
 
             // Not a final answer → execute this turn's tool calls and extend the
             // transcript. A tool failure ends the node (already journaled).
-            match self.run_agent_tools(&ar, turn, &turn_output).await? {
+            match self
+                .run_agent_tools(&ar, turn, &turn_output, &mut tool_calls_made)
+                .await?
+            {
                 ToolOutcome::Ok(turn_messages) => messages.extend(turn_messages),
                 ToolOutcome::Failed(failure) => return Ok(AgentStep::Failed(failure)),
                 ToolOutcome::Paused(reason) => return Ok(AgentStep::Paused(reason)),
@@ -920,11 +941,16 @@ impl Executor {
     /// (no re-execution), a hash mismatch is a `DeterminismViolation` (fatal outer
     /// `Err`). The inner `Result` is the turn's messages, or a tool's failure
     /// message (already journaled `NodeFailed`) — the same shape as a Map child.
+    ///
+    /// `calls_made` is the invocation's per-tool request count so far (AG-15); every call
+    /// here advances it BEFORE it is executed or replayed, so the k-th request for a tool
+    /// sees `k − 1` prior requests whichever path it takes.
     async fn run_agent_tools(
         &self,
         ar: &AgentRun<'_>,
         turn: usize,
         turn_output: &serde_json::Value,
+        calls_made: &mut std::collections::HashMap<String, u32>,
     ) -> Result<ToolOutcome<Vec<Message>>, OrchestratorError> {
         let assistant_text = turn_output
             .get("text")
@@ -947,7 +973,13 @@ impl Executor {
         }];
         for (k, call) in tool_calls.iter().enumerate() {
             let teid = effect_id(&ar.node_id.0, turn as u64, k + 1);
-            let value = match self.execute_tool_effect(ar, &teid, call).await? {
+            let made = calls_made.entry(call.name.clone()).or_insert(0);
+            let calls_before = *made;
+            *made = made.saturating_add(1);
+            let value = match self
+                .execute_tool_effect(ar, &teid, call, calls_before)
+                .await?
+            {
                 ToolOutcome::Ok(value) => value,
                 ToolOutcome::Failed(failure) => return Ok(ToolOutcome::Failed(failure)),
                 ToolOutcome::Paused(reason) => return Ok(ToolOutcome::Paused(reason)),
@@ -970,11 +1002,15 @@ impl Executor {
     /// - **Mutation** — a memo hit (Intent+Recorded) replays; a miss executes and
     ///   records `class: Mutation`. The two-phase Intent and in-doubt reconcile
     ///   land in slice-4 Tasks 8–9.
+    ///
+    /// `calls_before` is how many times this invocation's model asked for `call.name`
+    /// before this call (AG-15's call ceiling — see `run_agent_tools`).
     async fn execute_tool_effect(
         &self,
         ar: &AgentRun<'_>,
         teid: &EffectId,
         call: &ToolCall,
+        calls_before: u32,
     ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
         // Unparseable `arguments` degrade to `Null` (a deliberate, currently-safe
         // posture): the gate then derives an EMPTY `need` (so it passes), but every
@@ -1034,7 +1070,25 @@ impl Executor {
             };
             tracing::debug!(tool = %call.name, ?need, ?grant, listed, "tool permission denied");
             return self
-                .record_denied_effect(ar, teid, call, &tih, detail)
+                .record_denied_effect(ar, teid, call, &tih, "permission_denied", detail)
+                .await;
+        }
+
+        // AG-15 call ceiling: once the model has asked for this tool `ceiling` times in this
+        // invocation, every further call is refused — terse, Pure, memoized, exactly like
+        // the s1 denial above (which it follows, so an unlisted tool is still reported as
+        // unavailable rather than as rate-limited). It precedes confirm-before-run, so a
+        // person is never asked to approve a call that would be refused anyway. The detail
+        // names no number: the model needs to know to stop, not how the limit is set.
+        if let Some(&ceiling) = ar.tool_limits.get(&call.name)
+            && calls_before >= ceiling
+        {
+            let detail = format!(
+                "tool '{}' has reached its call limit for this agent",
+                call.name
+            );
+            return self
+                .record_denied_effect(ar, teid, call, &tih, "call_limit_reached", detail)
                 .await;
         }
 
@@ -1056,8 +1110,45 @@ impl Executor {
                         call.name
                     );
                     return self
-                        .record_denied_effect(ar, teid, call, &tih, detail)
+                        .record_denied_effect(ar, teid, call, &tih, "permission_denied", detail)
                         .await;
+                }
+            }
+        }
+
+        // AG-15 confirm-before-run: LAST of the gates, so a person is only ever asked about
+        // a call the agent is permitted to make and that stays inside its workspace — and
+        // BEFORE the live path below, so nothing (not even a Mutation's `EffectIntent`)
+        // happens until a human has said yes. A rejection or expiry is recorded exactly like
+        // a permission denial (a Pure effect, replayed on resume); a pending decision pauses
+        // the run durably.
+        //
+        // A standing `EffectIntent` for this call settles the question: an intent is only
+        // ever journaled AFTER an approval, so the side effect may already have happened.
+        // That call is IN DOUBT and goes straight to `mutation_tool_effect`'s reconcile —
+        // re-judging it here (a resume past the deadline, or a later corrective rejection)
+        // would journal a `not_confirmed` refusal over a call that may have run.
+        if ar.confirm_tools.iter().any(|t| t == &call.name) && !ar.fold.intents.contains_key(teid) {
+            match self
+                .confirm_tool_call(
+                    ar.run,
+                    ar.node_id,
+                    ar.fold,
+                    teid,
+                    call,
+                    &tih,
+                    ar.confirm_timeout,
+                )
+                .await?
+            {
+                super::tool_policy::Confirmation::Approved => {}
+                super::tool_policy::Confirmation::Refused(detail) => {
+                    return self
+                        .record_denied_effect(ar, teid, call, &tih, "not_confirmed", detail)
+                        .await;
+                }
+                super::tool_policy::Confirmation::Paused(reason) => {
+                    return Ok(ToolOutcome::Paused(reason));
                 }
             }
         }
@@ -1242,16 +1333,22 @@ impl Executor {
     /// forever `EffectRecorded` with NO tool execution (and, for a Mutation, NO
     /// `EffectIntent`) — and feed it back to the agent. The decision is a pure fn of
     /// (config grant, call args) ⇒ a resume replays it from the memo, tool never run.
+    ///
+    /// `error` is the refusal's kind: `permission_denied` (the s1 gate and the workspace
+    /// jail), and since AG-15 `not_confirmed` (a confirm-before-run call rejected, expired
+    /// or too large to show) and `call_limit_reached` (the per-tool ceiling). Every kind is
+    /// the same terse, memoized shape, so the model handles all of them alike.
     async fn record_denied_effect(
         &self,
         ar: &AgentRun<'_>,
         teid: &EffectId,
         call: &ToolCall,
         tih: &str,
+        error: &str,
         detail: String,
     ) -> Result<ToolOutcome<serde_json::Value>, OrchestratorError> {
         let denial = serde_json::json!({
-            "error": "permission_denied",
+            "error": error,
             "tool": call.name,
             "detail": detail,
         });
@@ -1496,9 +1593,9 @@ impl Executor {
                 // its tools correctly. Same `{model, text, tool_calls}` shape as before.
                 let mut output = self.model_output(&response);
                 output["tool_calls"] = serde_json::json!(response.tool_calls);
-                let recorded = self.split_output(&output).await?;
-                self.append(
-                    run,
+                // AG-3 × AG-12: a failure to journal this PAID turn is
+                // `SpendUnrecorded`, never a retryable journal fault.
+                self.record_paid_effect(run, node_id, &output, |recorded| {
                     JournalEvent::EffectRecorded {
                         node: node_id.clone(),
                         effect_id: eid,
@@ -1509,9 +1606,9 @@ impl Executor {
                         observation: None,
                         // SP-DATA-5: the ReAct-turn producer — the real usage the
                         // provider reported on this turn, converted at the boundary.
-                        usage: response.usage.map(super::content::convert_usage),
-                    },
-                )
+                        usage: meter.recorded_usage(&response),
+                    }
+                })
                 .await?;
                 Ok(ToolOutcome::Ok(output))
             }

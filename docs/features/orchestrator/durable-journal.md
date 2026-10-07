@@ -4,13 +4,13 @@ doctype: feature
 module: orchestrator
 status: partial
 phase: 3
-spec: SP-1, SP-DATA-1, SP-DATA-5, SP-6-4, SP-7b
+spec: SP-1, SP-DATA-1, SP-DATA-5, SP-6-4, SP-7b, AG-12, AG-15
 source: orchestrator-core · orchestrator-store
 ---
 
 # Durable Journal
 
-> **Status: Partial (Phase 3 · SP-1 · SP-DATA-1 · SP-DATA-5 · SP-6-4 · SP-7b).** Design §7.
+> **Status: Partial (Phase 3 · SP-1 · SP-DATA-1 · SP-DATA-5 · SP-6-4 · SP-7b · AG-12 · AG-15).** Design §7.
 > This header said "Planned (SP-1)" long after the Postgres backend, the spend ledger
 > and the HITL waiting kinds had shipped; the [module README](README.md) row was
 > the only place that stayed current. It then said SP-6-3 through the whole of s4, while
@@ -142,6 +142,30 @@ graph, which is why the journal is the *only* record that anything is waiting th
 
 All three are **new variants of an existing enum**, so `FORMAT_VERSION` stays **1**.
 
+## AG-2 — `DecisionHookFired { node, decision, effect_id }`
+
+Hooks bookkeeping, not an audit fact. Written **only when `OrchestratorHooks` are wired**, by
+the drive that first honours an `AwaitSignal`/`HumanGate`/human-`Agent` answer, just before
+it fires that node's decided hook. `decision` (`#[serde(default)]`) is the `Seq` of the
+decision row it reported; folded LAST-wins per node, so every later drive — which
+re-completes the node from the fold — fires nothing while the fold still holds that row or
+a later row with identical content (a redelivery), and a correction honoured after it (a
+row that says something else) is reported once more. Nothing else reads it: execution, the memo, outputs
+and determinism checks are blind to it, and an unhooked executor never writes one (so its
+absence does NOT mean an answer was never honoured). A loop gate needs none —
+`LoopGateSettled` already marks its honouring drive. Additive: `FORMAT_VERSION` stays **1**.
+See [hooks](hooks.md#human-in-the-loop-hooks-ag-2).
+
+**`effect_id`** (AG-2 × AG-15, `#[serde(default, skip_serializing_if = "Option::is_none")]`):
+`Some` marks one confirm-before-run CALL's `on_tool_confirm_decided`, with `decision` the
+`Seq` of that call's `ToolConfirmDecided`, folded LAST-wins per call — not per node, since one
+node asks about several calls. It matters only for a call honoured and then left unrecorded
+(an approved tool that failed, re-attempted on resume): the same redelivery/correction rule
+applies. A node marker serializes exactly as before (the field is omitted), and reusing the
+variant leaves the journal's set of event kinds unchanged; a reader predating the field sees
+a node marker on an agent node that has no decided hook of its own, which is inert. See
+[hooks](hooks.md#confirm-before-run-and-escalation-hooks-ag-2--ag-15).
+
 ```gherkin
 Feature: The human loop gate's journal (SP-6 s4)
   Scenario: A settled gate replays instead of re-expiring
@@ -211,6 +235,167 @@ Feature: The context budget's journal (SP-7b)
   Scenario: The first budget wins
     Given two ContextBudgeted records for one effect id
     Then the fold keeps the FIRST — a later record cannot move a cut already hashed against
+```
+
+## AG-12 — the money cap
+
+A run's budget can be denominated in **money** as well as tokens — either, both or neither
+(`orchestrator_core::RunBudget`, submitted through `Executor::run_with_budget` /
+`Scheduler::submit_with_budget`). torii derives the dollar figure from its
+individual/group/org caps (torii#41); the engine only enforces it. Everything rides the
+SP-DATA-5 ledger rather than beside it:
+
+- **`RunStarted.money_budget: Option<MoneyBudget { total_micro_usd }>`** — the cap, in
+  INTEGER micro-dollars (1 USD = 1 000 000). Never `f64` in the journal or the fold: a
+  float ledger makes `spent >= cap` depend on the order the fold sums in.
+- **`TokenUsage.cost_micro_usd: Option<u64>`** on each `EffectRecorded.usage` (and so on
+  each `CompactChild.usage`) — the gateway's `InferenceResponse.actual_cost`, rounded UP to
+  whole micro-dollars (representation noise below a nano-dollar is not charged). Keyed by
+  effect id with the tokens, so a duplicate `Confirmed` record, a re-folded `MapCompacted`
+  or a resume counts it once — the token ledger's idempotency, inherited rather than
+  re-argued. **Recorded only while a money cap is in force**, so an unbudgeted or
+  token-only run journals byte-identically to before.
+- **`MoneyBudgetRaised { new_total_micro_usd }`** — the money twin of `BudgetRaised`: latest
+  wins, lowering below spend halts the run. Its own variant because the caps are independent
+  (`BudgetRaised.new_total_tokens` is required). It **moves** a money cap and never
+  introduces one: on a run that started WITHOUT a money cap the fold ignores it. A drive in
+  flight when such a raise lands folded "no cap" and journals every call uncosted, so a cap
+  introduced then would be reported over spend the ledger never counted. A run that needs a
+  money cap is submitted with one.
+- **`Snapshot.spent_micro_usd` / `money_budget_micro_usd`** — the money half of the
+  snapshot's ledger scalars, for the reason `spent`/`budget` are there.
+- **`money_spend_of(events)`** — the folded `(spent_micro_usd, cap)`, the money twin of
+  `spend_of`, for `torii run status`.
+
+Every new field is `#[serde(default)]` and skipped when unset; `MoneyBudgetRaised` is an
+additive variant. **`FORMAT_VERSION` stays 1** (pinned byte-for-byte by
+`a_run_without_a_money_cap_journals_byte_identically`).
+
+Enforcement is at the SAME metered-dispatch chokepoint as tokens (SP-DATA-5, see the
+[overview](../../superpowers/orchestrator-overview.md)): a money cap takes the run's 1-permit
+serialisation gate; `money_spent >= cap` pauses (the `budget: ` HOTL pause,
+`resume_after: None`); otherwise `max_tokens` is clamped to what the remaining
+micro-dollars buy after the per-request fee and the pessimistic input estimate, at the
+chain's **worst-case** price (`Gateway::worst_case_pricing`, the componentwise max over
+the chain — the clamp is set before selection), and below `MIN_OUTPUT_TOKENS` it pauses
+instead — including when the fee and input estimate alone exceed what is left, which a
+zero output price would otherwise read as unlimited output. On a money-only run whose
+chain's declared `max_output_tokens` is itself under the floor, the pause says
+`output limit: ` and names that limit — no money raise can release it. The residual overshoot is the token clamp's, priced:
+`(actual_input − est_input) × input_price`, plus under one micro-dollar of rounding.
+
+**Fail closed.** A chain with ANY model lacking `pricing` is refused **before** dispatch
+under a money cap (`NodeFailed`, "unpriced model call"): `pricing: None` means *free* to
+routing but *unmeasured* to a cap, since the gateway reports no cost for it. A free model
+declares an explicit zero price. A response with usage but no USD cost is refused after
+the call (`NodeFailed`, "uncosted"); one with no usage at all is the existing
+`Unmetered` failure. Known gap: the gateway's `actual_cost` omits a model's
+`per_request` fee, so the ledger under-counts it (the clamp reserves it per call).
+
+**A spend the journal never saw is never re-bought by a retry (AG-3 × AG-12).** The
+ledger is the `EffectRecorded { usage }` a producer appends AFTER the provider answers;
+the in-drive meter that counted the call dies with the drive. So if that append (or the
+CAS put before it) fails, the call is paid for, absent from the ledger and without a memo
+— and a re-drive would dispatch it again, under a cap that cannot see the first copy. The
+executor therefore raises that failure as `OrchestratorError::SpendUnrecorded`, at all
+five producers (ModelCall, ReAct turn, Map item, Consolidate, planner selector), and the
+scheduler does NOT retry it: the run is filed `Failed` with a reason that names the
+unrecorded spend, for an operator to reconcile before re-driving. A journal fault before
+any paid dispatch is still an ordinary retryable fault — nothing was bought.
+
+**It outranks every sibling's error, whatever their order.** A `Map` drives all its
+children to the end before folding their errors, so one round can hold several fatal
+errors — say `m/0`'s unpaid tool record blinking (retryable, it bought nothing) and
+`m/1`'s paid turn going unrecorded. The error that reaches the scheduler is the
+`SpendUnrecorded`, never the lowest-index one: surfacing the blink would get the run
+retried and `m/1`'s call bought twice. If several children's spends went unrecorded the
+reason names the first; the operator reconciles the provider's side for the whole round.
+Two places fold several fatal errors into one, and both apply this ordering: the `Map`,
+the only place the executor runs children concurrently, and the planner selector's error
+slot, which one `select()` can fill more than once (a selector that swallows an error and
+calls again must not let a later fault overwrite an unrecorded spend). A round's ready
+nodes, an agent's tool calls and `Loop` iterations all run in sequence and stop at the
+first error, so they need no ordering.
+
+**The remaining edge, stated honestly: a PROCESS crash in that same window.** If the
+worker dies between the provider's response and the append, nothing survives to classify
+the fault: the lease is reclaimed, the re-drive finds no record and no memo, and that one
+call is dispatched and paid for again. This at-least-once window predates AG-3 and AG-12
+(it is the window every crash-resume of a pure effect has always had); per crash it costs
+at most one call per in-flight producer — exactly one on a budgeted run, which serialises
+its calls — and the scheduler's `max_attempts` bounds how many crashes a run is re-driven
+through. "Pauses before exceeding $X" and "zero re-spend" hold for every drive that ends
+in a recorded outcome; they are not claims about a worker killed mid-call.
+
+```gherkin
+Feature: The money cap (AG-12)
+  Scenario: A run capped at $X pauses before exceeding it and resumes with zero re-spend
+    Given a run capped at $0.10 on a chain priced at $0.1/1k in and $0.2/1k out
+    When three $0.021 calls have been made
+    Then the fourth is refused before dispatch and the run pauses with spent $0.063
+    And after a MoneyBudgetRaised to $1 a wake runs only the remaining nodes
+
+  Scenario: An unpriced chain under a money cap
+    Given a money-capped run whose chain has a model with no pricing
+    Then the node fails closed and the provider is never called
+
+  Scenario: A token-only run on a priced chain
+    Then no money field appears anywhere on its journal
+
+  Scenario: A paid call whose spend cannot be journaled is not retried (AG-3 x AG-12)
+    Given a woken money-capped run whose model call succeeds at the provider
+    And the append of its EffectRecorded fails with a journal backend fault
+    Then the run is filed Failed with a reason naming the unrecorded spend
+    And no automatic retry dispatches the call again
+```
+
+## AG-15 — tool-confirmation and escalation events
+
+Three additive variants (sensei-hq/gateway#90), so `FORMAT_VERSION` stays **1**; a journal
+written before them folds unchanged.
+
+- **`ToolConfirmAwaited { node, effect_id, tool, arguments, args_hash, deadline }`** — a call of
+  a confirm-before-run tool (`AgentDefinition::confirm_tools`) has begun waiting for a human.
+  Keyed by the CALL's `effect_id` (`effect_id(node, turn, k+1)`), not the node, because one
+  agent node can ask about many calls. Appended before the tool does anything (before any
+  `EffectIntent`). `arguments` is what the human approves, **redacted** before the append; a
+  call whose redacted arguments exceed `MAX_HUMAN_TEXT_BYTES` is refused to the model instead
+  of asked (approving truncated arguments is approving something nobody saw). The `deadline`
+  is absolute and folded **FIRST-wins**, like every waiting record.
+- **`ToolConfirmDecided { node, effect_id, approved, actor, note }`** — the human's answer,
+  folded **LAST-wins** (correctable before the run resumes, like `GateDecided`). The deadline
+  is checked BEFORE it is read, so a late approval runs nothing. Once an approved Mutation has
+  journaled its `EffectIntent` the decision is settled: neither the deadline nor a later
+  correction is consulted again, and an intent with no `EffectRecorded` reconciles in doubt. A rejection or an expiry is
+  recorded as a Pure `EffectRecorded` carrying a terse `{"error":"not_confirmed"}` — the model
+  sees neither `note` nor `actor`. `actor` is attribution, not authentication; who may answer
+  is `torii`'s concern (torii#47).
+- **`AgentEscalated { node, from, to, deadline }`** — a human-backed `Agent` node's holder
+  (`from`) let its SLA expire unanswered and the question now waits on `from`'s `escalate_to`
+  agent `to` until `deadline` (`to`'s own SLA from the escalation instant). The question is NOT
+  re-journaled: `to` is asked the question `AgentAwaited` already holds, and answers with the
+  same node-keyed `AgentAnswered`. Folded FIRST-wins per `to`, so a duplicated hop moves
+  nothing; the current deadline is the last hop's.
+
+The per-tool **call ceiling** has no event of its own: its count is derived from the agent's
+own transcript, which the memoized turns replay, and a refused call is an ordinary Pure
+`EffectRecorded` with `{"error":"call_limit_reached"}`.
+
+```gherkin
+Feature: Agent tool policy and escalation in the journal (AG-15)
+  Scenario: A confirm-before-run call survives a resume
+    Given an agent whose tool requires confirmation calls it
+    Then ToolConfirmAwaited is journaled and the run pauses before the tool runs
+    When the run is re-driven with no decision
+    Then it pauses again without a second ask and with the same deadline
+    When ToolConfirmDecided{approved: true} is appended and the run resumes
+    Then the tool runs exactly once
+
+  Scenario: An escalation survives a resume
+    Given a human-backed agent with escalate_to whose SLA has passed
+    Then AgentEscalated is journaled and the run pauses on the target's deadline
+    When the run is re-driven inside that deadline
+    Then nothing new is journaled and the deadline does not move
 ```
 
 ## Notes

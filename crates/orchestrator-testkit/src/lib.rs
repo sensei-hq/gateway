@@ -30,7 +30,7 @@ use chrono::{DateTime, Duration, Utc};
 use orchestrator_core::{
     ConfigStore, ContentStore, ContextKey, ContextStore, ExecutionJournal, Graph, JournalEvent,
     NodeId, OrchestratorError, RegistryConfig, RunId, RunStatus, SchedulerStore, Scope, SkillDef,
-    Snapshot, digest_of,
+    Snapshot, WakeAttempt, digest_of,
 };
 
 fn fresh_run() -> RunId {
@@ -47,6 +47,7 @@ fn started(version: &str) -> JournalEvent {
     JournalEvent::RunStarted {
         version: version.into(),
         budget: None,
+        money_budget: None,
     }
 }
 
@@ -134,6 +135,8 @@ pub async fn journal(j: &dyn ExecutionJournal) {
                 seq,
                 completed: vec![NodeId(node.into())],
                 spent: 7,
+                spent_micro_usd: 21_000,
+                money_budget_micro_usd: Some(100_000),
                 ..Default::default()
             },
         )
@@ -153,12 +156,62 @@ pub async fn journal(j: &dyn ExecutionJournal) {
         snap.spent, 7,
         "journal: a snapshot round-trips the spend ledger"
     );
+    assert_eq!(
+        (snap.spent_micro_usd, snap.money_budget_micro_usd),
+        (21_000, Some(100_000)),
+        "journal: a snapshot round-trips the MONEY half of the ledger (AG-12)"
+    );
     assert!(
         j.latest_snapshot(b)
             .await
             .expect("latest_snapshot")
             .is_none(),
         "journal: snapshots are per run"
+    );
+
+    // AG-12: the money cap, a call's priced cost and a money raise round-trip EXACTLY — a
+    // backend that drops an unknown jsonb key, or writes `null` where the field was absent,
+    // either loses a run's dollar cap on resume or changes a money-free journal's bytes.
+    let m = fresh_run();
+    let money_events = [
+        JournalEvent::RunStarted {
+            version: "v1".into(),
+            budget: None,
+            money_budget: Some(orchestrator_core::MoneyBudget {
+                total_micro_usd: 100_000,
+            }),
+        },
+        JournalEvent::EffectRecorded {
+            node: NodeId("n1".into()),
+            effect_id: orchestrator_core::effect_id("n1", 0, 0),
+            class: orchestrator_core::EffectClass::Pure,
+            input_hash: "h".into(),
+            seq: 0,
+            output: orchestrator_core::EffectOutput::Inline(serde_json::json!("out")),
+            observation: None,
+            usage: Some(orchestrator_core::TokenUsage {
+                input_tokens: 10,
+                output_tokens: 100,
+                total_tokens: 110,
+                cost_micro_usd: Some(21_000),
+            }),
+        },
+        JournalEvent::MoneyBudgetRaised {
+            new_total_micro_usd: 1_000_000,
+        },
+    ];
+    for e in &money_events {
+        j.append(m, e.clone()).await.expect("append");
+    }
+    assert_eq!(
+        j.load(m)
+            .await
+            .expect("load")
+            .iter()
+            .map(|(_, e)| enc(e))
+            .collect::<Vec<_>>(),
+        money_events.iter().map(enc).collect::<Vec<_>>(),
+        "journal: the money cap, a call's cost and a money raise round-trip exactly (AG-12)"
     );
 
     // Compaction: remove exactly the named seqs, append the manifest after everything.
@@ -191,6 +244,81 @@ pub async fn journal(j: &dyn ExecutionJournal) {
         j.load(b).await.expect("load other run").len(),
         1,
         "journal: compaction never touches another run"
+    );
+
+    // AG-15 (gateway#90): the human-in-the-loop events the executor folds to resume a paused
+    // tool confirmation or an escalated question must come back exactly — a backend that maps
+    // event kinds to columns or a CHECK list must know these three (and AG-2's
+    // `DecisionHookFired`, below), or a paused run can never be answered.
+    let c = fresh_run();
+    let deadline = Some(base_time() + Duration::hours(1));
+    let hitl = [
+        JournalEvent::ToolConfirmAwaited {
+            node: NodeId("n1".into()),
+            effect_id: orchestrator_core::EffectId("eid-1".into()),
+            tool: "deploy".into(),
+            arguments: "{\"env\":\"prod\"}".into(),
+            args_hash: "h".into(),
+            deadline,
+        },
+        JournalEvent::ToolConfirmDecided {
+            node: NodeId("n1".into()),
+            effect_id: orchestrator_core::EffectId("eid-1".into()),
+            approved: true,
+            actor: "alice".into(),
+            note: Some("ok".into()),
+        },
+        JournalEvent::AgentEscalated {
+            node: NodeId("review".into()),
+            from: "reviewer".into(),
+            to: "lead".into(),
+            deadline,
+        },
+    ];
+    for e in &hitl {
+        j.append(c, e.clone()).await.expect("append an AG-15 event");
+    }
+    assert_eq!(
+        j.load(c)
+            .await
+            .expect("load")
+            .iter()
+            .map(|(_, e)| enc(e))
+            .collect::<Vec<_>>(),
+        hitl.iter().map(enc).collect::<Vec<_>>(),
+        "journal: the AG-15 tool-confirmation and escalation events round-trip exactly"
+    );
+
+    // AG-2 (gateway#86): the `DecisionHookFired` marker is what keeps a HITL hook firing
+    // ONCE across drives. A backend that rejects the kind makes every later drive re-fire the
+    // decided hooks; one that drops `effect_id` folds a confirm-call marker (AG-2 x AG-15) as
+    // a node marker, so `on_tool_confirm_decided` re-fires on every resume. Both shapes —
+    // node-keyed (`effect_id` absent) and call-keyed — must come back exactly.
+    let h = fresh_run();
+    let marks = [
+        JournalEvent::DecisionHookFired {
+            node: NodeId("g".into()),
+            decision: Some(3),
+            effect_id: None,
+        },
+        JournalEvent::DecisionHookFired {
+            node: NodeId("n1".into()),
+            decision: Some(7),
+            effect_id: Some(orchestrator_core::EffectId("eid-2".into())),
+        },
+    ];
+    for e in &marks {
+        j.append(h, e.clone()).await.expect("append a hooks marker");
+    }
+    assert_eq!(
+        j.load(h)
+            .await
+            .expect("load")
+            .iter()
+            .map(|(_, e)| enc(e))
+            .collect::<Vec<_>>(),
+        marks.iter().map(enc).collect::<Vec<_>>(),
+        "journal: AG-2's DecisionHookFired (node- and call-keyed) round-trips exactly"
     );
 }
 
@@ -369,8 +497,9 @@ async fn status_of(s: &dyn SchedulerStore, run: RunId) -> Option<RunStatus> {
     s.status(run).await.expect("status").map(|r| r.status)
 }
 
-/// [`SchedulerStore`] + [`RunLock`](orchestrator_core::RunLock). **Needs a fresh store with no
-/// rows** — `claim_due`, `list_paused` and pruning are store-wide.
+/// [`SchedulerStore`] + [`RunLock`](orchestrator_core::RunLock), including AG-3's wake-attempt
+/// counting and backoff (`begin_wake_attempt` / `record_wake_failed`). **Needs a fresh store with
+/// no rows** — `claim_due`, `list_paused` and pruning are store-wide.
 pub async fn scheduler(s: &dyn SchedulerStore) {
     let t0 = base_time();
     let lease = Duration::seconds(60);
@@ -662,6 +791,205 @@ pub async fn scheduler(s: &dyn SchedulerStore) {
             .expect("try_lock_run")
             .is_some(),
         "scheduler: dropping a lock without release() must also release it"
+    );
+
+    wake_attempts(s, t2 + Duration::days(30), lease).await;
+}
+
+fn claimed_runs(v: Vec<(RunId, Graph)>) -> Vec<RunId> {
+    v.into_iter().map(|(r, _)| r).collect()
+}
+
+/// A retry schedule that ignores the attempt number — the deadline is fixed by the clause.
+fn at(t: DateTime<Utc>) -> impl Fn(u32) -> DateTime<Utc> + Send + Sync {
+    move |_| t
+}
+
+fn attempt(n: u32, last_error: Option<&str>) -> Option<WakeAttempt> {
+    Some(WakeAttempt {
+        attempt: n,
+        last_error: last_error.map(str::to_string),
+    })
+}
+
+/// AG-3: consecutive wake attempts are counted, a failed wake is backed off to the deadline the
+/// driver chose, a lost drive is reclaimed no sooner than its armed retry, and a successful drive
+/// resets the count. The driver's `max_attempts` cap is only as exact as this count, so the count
+/// is asserted exactly. Runs at `ta`, long after every earlier row, and asserts claims by
+/// membership — the rows the earlier clauses left `waking` are legitimately reclaimable here.
+async fn wake_attempts(s: &dyn SchedulerStore, ta: DateTime<Utc>, lease: Duration) {
+    let secs = Duration::seconds;
+    let w = fresh_run();
+    assert_eq!(
+        s.begin_wake_attempt(w, &at(ta))
+            .await
+            .expect("begin_wake_attempt"),
+        None,
+        "scheduler: begin_wake_attempt on an unknown run → None"
+    );
+    s.enqueue(w, &empty_graph(), ta).await.unwrap();
+    s.record_paused(w, Some(ta + secs(10)), "gated")
+        .await
+        .unwrap();
+    assert_eq!(
+        s.begin_wake_attempt(w, &at(ta + secs(10))).await.unwrap(),
+        None,
+        "scheduler: begin_wake_attempt is conditional on waking (a paused row is not a wake)"
+    );
+    assert!(claimed_runs(s.claim_due(ta + secs(10), lease, 100).await.unwrap()).contains(&w));
+    assert_eq!(
+        s.begin_wake_attempt(w, &at(ta + secs(40))).await.unwrap(),
+        attempt(1, None),
+        "scheduler: the first wake after a successful drive is attempt 1, with no prior error"
+    );
+
+    // A failed wake is backed off to EXACTLY the retry deadline the driver chose.
+    let r1 = ta + secs(40);
+    s.record_wake_failed(w, r1, "boom 1")
+        .await
+        .expect("record_wake_failed");
+    let st = s.status(w).await.unwrap().unwrap();
+    assert_eq!(
+        (st.status, st.next_wake, st.reason.as_deref()),
+        (RunStatus::Paused, Some(r1), Some("boom 1")),
+        "scheduler: record_wake_failed → paused at the retry deadline, reason = the error"
+    );
+    assert!(
+        !claimed_runs(s.claim_due(r1 - secs(1), lease, 100).await.unwrap()).contains(&w),
+        "scheduler: a backed-off wake is not claimed before its retry deadline"
+    );
+    assert!(
+        claimed_runs(s.claim_due(r1, lease, 100).await.unwrap()).contains(&w),
+        "scheduler: a backed-off wake is claimed at its retry deadline"
+    );
+    let r2 = r1 + secs(120);
+    assert_eq!(
+        s.begin_wake_attempt(w, &at(r2)).await.unwrap(),
+        attempt(2, Some("boom 1")),
+        "scheduler: a failed attempt is counted and its error handed to the next attempt"
+    );
+    s.record_wake_failed(w, r2, "boom 2").await.unwrap();
+    assert!(
+        !claimed_runs(s.claim_due(r2 - secs(1), lease, 100).await.unwrap()).contains(&w),
+        "scheduler: the second backoff is honoured too"
+    );
+    assert!(claimed_runs(s.claim_due(r2, lease, 100).await.unwrap()).contains(&w));
+
+    // A LOST drive (no record at all): reclaimed only past BOTH its lease and its armed retry.
+    let r3 = r2 + secs(240);
+    // The schedule is keyed off the attempt number: 80s per attempt, so attempt 3 arms r3.
+    let per_attempt = move |n: u32| r2 + secs(80 * i64::from(n));
+    assert_eq!(
+        s.begin_wake_attempt(w, &per_attempt).await.unwrap(),
+        attempt(3, Some("boom 2"))
+    );
+    assert_eq!(
+        s.status(w).await.unwrap().unwrap().next_wake,
+        Some(r3),
+        "scheduler: begin_wake_attempt arms next_wake = the schedule applied to the NEW attempt \
+         number"
+    );
+    assert!(
+        !claimed_runs(s.claim_due(r2 + lease + secs(1), lease, 100).await.unwrap()).contains(&w),
+        "scheduler: a lost drive past its lease but before its armed retry is not reclaimed"
+    );
+    assert!(
+        claimed_runs(s.claim_due(r3, lease, 100).await.unwrap()).contains(&w),
+        "scheduler: a lost drive is reclaimed at its armed retry"
+    );
+    let r4 = r3 + secs(480);
+    assert_eq!(
+        s.begin_wake_attempt(w, &at(r4)).await.unwrap(),
+        attempt(4, None),
+        "scheduler: a lost attempt is counted, and the error it never recorded is not invented \
+         (the previous error was taken by the attempt that saw it)"
+    );
+
+    // The LEASE half of the same reclaim: a lost drive whose armed retry has already passed
+    // is still NOT reclaimed while its lease is live. Without this a store that reclaimed a
+    // `waking` row on `next_wake <= now` alone — ignoring the lease — would hand a drive
+    // that is merely slow (its worker alive, its lock held) to a second worker, since every
+    // claimed wake arms its retry short of the lease whenever the backoff is shorter.
+    let y = fresh_run();
+    let ty = ta + Duration::days(1);
+    let lease60 = secs(60);
+    s.enqueue(y, &empty_graph(), ty).await.unwrap();
+    s.record_paused(y, Some(ty), "due").await.unwrap();
+    assert!(
+        claimed_runs(s.claim_due(ty, lease60, 100).await.unwrap()).contains(&y),
+        "scheduler: a due paused row is claimed"
+    );
+    assert_eq!(
+        s.begin_wake_attempt(y, &at(ty + secs(30))).await.unwrap(),
+        attempt(1, None)
+    );
+    assert!(
+        !claimed_runs(s.claim_due(ty + secs(31), lease60, 100).await.unwrap()).contains(&y),
+        "scheduler: a waking row past its armed retry but INSIDE its lease is not reclaimed"
+    );
+    assert!(
+        claimed_runs(
+            s.claim_due(ty + lease60 + secs(1), lease60, 100)
+                .await
+                .unwrap()
+        )
+        .contains(&y),
+        "scheduler: a waking row past BOTH its lease and its armed retry is reclaimed"
+    );
+
+    // force_wake is an operator's "wake now": it skips the backoff, NOT the count.
+    s.record_wake_failed(w, r4, "boom 4").await.unwrap();
+    s.force_wake(w, r3 + secs(10)).await.unwrap();
+    assert!(
+        claimed_runs(s.claim_due(r3 + secs(10), lease, 100).await.unwrap()).contains(&w),
+        "scheduler: force_wake makes a backed-off wake due now"
+    );
+    assert_eq!(
+        s.begin_wake_attempt(w, &at(r4)).await.unwrap(),
+        attempt(5, Some("boom 4")),
+        "scheduler: force_wake does not reset the attempt count"
+    );
+
+    // A successful drive resets the count.
+    s.record_paused(w, Some(r4), "quota").await.unwrap();
+    assert!(claimed_runs(s.claim_due(r4, lease, 100).await.unwrap()).contains(&w));
+    assert_eq!(
+        s.begin_wake_attempt(w, &at(r4 + secs(30))).await.unwrap(),
+        attempt(1, None),
+        "scheduler: a successful drive (record_paused) resets the attempt count and the error"
+    );
+
+    // Conditional on waking: cancel wins; a terminal row is never touched.
+    s.cancel(w).await.unwrap();
+    s.record_wake_failed(w, r4 + secs(30), "late")
+        .await
+        .unwrap();
+    let st = s.status(w).await.unwrap().unwrap();
+    assert_eq!(
+        (st.status, st.next_wake),
+        (RunStatus::Cancelled, None),
+        "scheduler: record_wake_failed never resurrects a cancelled run"
+    );
+    assert_eq!(
+        s.begin_wake_attempt(w, &at(r4 + secs(60))).await.unwrap(),
+        None,
+        "scheduler: begin_wake_attempt on a terminal row → None"
+    );
+
+    // enqueue counts submit's inline drive as attempt 1, so a submit lost mid-drive is counted.
+    let x = fresh_run();
+    let tx = r4 + secs(1000);
+    s.enqueue(x, &empty_graph(), tx).await.unwrap();
+    assert!(
+        claimed_runs(s.claim_due(tx + lease + secs(1), lease, 100).await.unwrap()).contains(&x),
+        "scheduler: a submit lost mid-drive (NULL next_wake) is reclaimed after its lease"
+    );
+    assert_eq!(
+        s.begin_wake_attempt(x, &at(tx + lease + secs(31)))
+            .await
+            .unwrap(),
+        attempt(2, None),
+        "scheduler: enqueue starts the count at 1 — submit's drive was the first attempt"
     );
 }
 

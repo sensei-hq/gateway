@@ -1,39 +1,40 @@
 # Checkpoint
 
-**Torii move — epic [#76](https://github.com/sensei-hq/gateway/issues/76): "Gateway is a library; torii
-owns persistence"** (torii `docs/DECISIONS.md` §11, ratified 2026-09-17). Move `crates/torii`, the
-orchestrator Postgres store adapters and the `orchestrator` schema to `sensei-hq/torii`; the gateway
-keeps the engine, the persistence traits and in-memory stores. Last release: v0.9.0 (on main, 2026-10-06).
+**Agentic completion — epic [torii#45](https://github.com/sensei-hq/torii/issues/45).** Agents run
+end to end in the product: seiki (cloud) configures/publishes, torii (local app) submits/watches/
+answers, one runtime = the gateway orchestrator. All 8 product decisions made 2026-10-06 (C1–C8,
+torii#37–#44; see the epic). Follows epic #76 (done; gateway v0.10.0, torii pins it).
 
-## Todo (the epic's checklist, in order)
+## Todo — Phase 1, this repo (then release + torii re-pin)
 
-- [x] **TM-1** #77 — redirect data-tier docs to §11 (the extraction into the gateway is cancelled)
-- [x] **TM-2** #78 — config WRITE path behind a trait (`ConfigStore`)
-- [x] **TM-3** #79 — exported store conformance suite
-- [x] **TM-4** #80 — `GatewayConfig` source seam + always-on registry↔chain cross-check
-- [x] **TM-5** #81 — backend-selectable boot (memory | postgres)
-- [x] **TM-6** torii#24 — tenant-scoped orchestrator schema + RLS + per-tenant config versions (torii PR #27, `a5f6b4d`)
-- [x] **TM-7** torii#25 — store traits over that schema (passes TM-3) (torii PR #28, `e9dbe59`)
-- [x] **TM-8** torii#26 — move the CLI/worker into torii (torii PR #30, `73a5a0e`; v0.9.0 released)
-- [ ] **TM-9** #82 — delete `crates/torii`, Postgres adapters, `database/`; release (breaking)
+- [x] **AG-1** #85 — planner discovery tools (SP-REG-2) per run in `Executor::pinned`
+- [x] **AG-2** #86 — `OrchestratorHooks` for HITL events, incl. AG-15's confirm/escalation hooks
+- [x] **AG-3** #87 — scheduler wake backoff / jitter / `max_attempts` (+ testkit)
+- [x] **AG-12** #89 — money-denominated run budget; unrecorded paid spend = `SpendUnrecorded`
+- [x] **AG-15** #90 — per-tool call limit, confirm-before-run, escalation
+- [ ] release v0.11.0 (needs the user's OK for develop→main); then torii#53 AG-18 re-pin + adopt
+
+All on develop `38fa404` (integrated slice; whole-slice review + 3 fix rounds; 1815 passed).
+
+Phase 2 (torii): #53 adopt v0.11.0 · #34 boot seams · #33 run results · #35 config show/pull ·
+#46 config init + defaults · #47 gate authz · #49 budgets from caps · #36 slugs + authz.sql.
+Phase 3 (torii): #51 API + retire X2 design · #50 seiki publishing · #48 per-tenant workers · #52 UI.
 
 ## Next
 
-TM-9 (#82) built + reviewed on develop (2 reviewers; HIGH Ref round-trip + MEDIUM graph guard +
-3 doc MEDIUMs fixed; LOW: EffectIntent fixture seq=0 equals the default). Release v0.10.0 (breaking):
-open develop→main PR, ask the user whether to merge, then tag + GitHub Release; re-pin torii to
-v0.10.0 (one_gateway_ref guards it) and confirm torii CI; tick #82 + epic #76 (closes the epic).
+Ask the user to approve the v0.11.0 release (PR develop→main, CHANGELOG, docs sync, `make clean`),
+then torii#53 in a torii worktree: re-pin all 13 deps to `v0.11.0` and implement the store/CLI/SSE
+follow-ups listed there.
 
 ## Open questions
 
-None. (Decided 2026-10-06: cut v0.9.0; shared torii crate for CLI + API.)
-Torii's main checkout has others' uncommitted changes — always work in a torii worktree.
+- Same gate option resubmitted by a different actor fires the decided hook again (attribution
+  semantics) — documented; confirm with the user if it matters for the SSE UI.
 
 ## Known-broken / carry-forwards
 
-- `orchestrator` sandbox straggler test's 5s bound trips under full-suite load (passes alone).
-- torii `database/tests/authz.sql` declassify case fails on unmodified develop (pre-existing);
-  `run.sh` stops there, so later suites only run individually.
-- Out of the epic's scope: SP-REG-2 discovery tools, a results command, SP-REG-4 content.
-- From SP-DEC-2: Cloudflare never run live; engine counts caller-caused errors against the breaker;
-  LOW test gaps. Pre-existing: `OllamaAdapter`/`OpenAIAdapter::from_config` no default timeout.
+- Process crash between a paid response and its `EffectRecorded` still re-buys one call per crash
+  (pre-existing at-least-once window; documented in durable-journal.md).
+- Until torii#53 lands, torii's Pg scheduler still crash-loops poison runs (trait defaults).
+- Lower-priority engine follow-ons, incl. cancel-after-claim and hook timeouts: #88.
+- torii `authz.sql` declassify case fails on unmodified develop — torii#36.
