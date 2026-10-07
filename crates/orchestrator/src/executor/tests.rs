@@ -28203,4 +28203,187 @@ mod agent_tool_policy {
             "permission_denied"
         );
     }
+
+    /// Agent "a" LISTS `fs.write` (with a `/workspace` grant) under a call ceiling of
+    /// `limit`, and `calc`, which it must CONFIRM — the confirmation is only here to give a
+    /// resume test a durable pause in the middle of the ReAct loop.
+    fn limited_agent(limit: u32) -> AgentDefinition {
+        AgentDefinition {
+            tools: vec!["fs.write".into(), "calc".into()],
+            grants: std::collections::HashMap::from([(
+                "fs.write".to_string(),
+                path_grant(&["/workspace"]),
+            )]),
+            tool_limits: std::collections::HashMap::from([("fs.write".to_string(), limit)]),
+            confirm_tools: vec!["calc".into()],
+            ..agent_def("c")
+        }
+    }
+
+    fn limited_registry(limit: u32) -> Arc<Registry> {
+        Arc::new(
+            Registry::default()
+                .with_agent(limited_agent(limit))
+                .with_tool(ScopedWriter::new(sink()).spec())
+                .with_tool(Calc.spec()),
+        )
+    }
+
+    async fn limited_executor(
+        journal: &InMemoryJournal,
+        limit: u32,
+        script: Vec<kernel::types::io::ChatResponse>,
+        sink: &Sink,
+    ) -> Executor {
+        let (gw, _calls) = scripted_gateway(script).await;
+        Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_registry(limited_registry(limit))
+            .with_tools(Arc::new(
+                ToolRegistry::default()
+                    .with_tool(Arc::new(ScopedWriter::new(sink.clone())))
+                    .with_tool(Arc::new(Calc)),
+            ))
+            .with_clock(FakeClock::new(at(1_000)))
+    }
+
+    fn write(id: &str, path: &str) -> kernel::types::io::ChatResponse {
+        tool_call_response(id, "fs.write", &write_args(path, "x"))
+    }
+
+    /// The ceiling: calls up to it run, the call after it is refused with a terse
+    /// `call_limit_reached` fed back to the model (no tool run, no intent), and the agent
+    /// carries on to its answer.
+    #[tokio::test]
+    async fn the_call_after_the_ceiling_is_refused_and_never_runs() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "write three")],
+        };
+        let writes = sink();
+        let ex = limited_executor(
+            &journal,
+            2,
+            vec![
+                write("t1", "/workspace/1"),
+                write("t2", "/workspace/2"),
+                write("t3", "/workspace/3"),
+                final_response("done"),
+            ],
+            &writes,
+        )
+        .await;
+        let o = ex.start(run, &graph).await.expect("drive");
+        assert!(o.paused.is_none() && o.failed.is_none(), "{o:?}");
+        assert_eq!(o.outputs[&n1()]["text"], "done");
+        assert_eq!(
+            &*writes.lock().unwrap(),
+            &["/workspace/1".to_string(), "/workspace/2".to_string()],
+            "exactly the ceiling's worth of calls ran"
+        );
+        let events = journal.load(run).await.unwrap();
+        let third = effect_id("n1", 2, 1);
+        let refusal = recorded_output(&events, &third).expect("the refusal is recorded");
+        assert_eq!(refusal["error"], "call_limit_reached");
+        assert_eq!(refusal["tool"], "fs.write");
+        assert!(
+            !has_effect_intent(&events, &third),
+            "a refused Mutation has no intent"
+        );
+    }
+
+    /// REPLAY-SAFE: the count is derived from the journal, not from process memory. Drive 1
+    /// makes the ceiling's two calls and then pauses (on an unrelated confirmation); drive 2
+    /// is a FRESH executor over the same journal, and the model's next `fs.write` must still
+    /// be refused — a counter kept in memory, or one that counts only LIVE calls, starts
+    /// again at zero there and lets it run.
+    #[tokio::test]
+    async fn the_call_ceiling_survives_a_resume_on_a_fresh_executor() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "write, check, write")],
+        };
+        let first = sink();
+        let ex = limited_executor(
+            &journal,
+            2,
+            vec![
+                write("t1", "/workspace/1"),
+                write("t2", "/workspace/2"),
+                tool_call_response("t3", "calc", "{\"op\":\"add\",\"a\":1,\"b\":1}"),
+            ],
+            &first,
+        )
+        .await;
+        let o1 = ex.start(run, &graph).await.expect("drive 1");
+        assert!(o1.paused.is_some(), "the calc confirmation pauses: {o1:?}");
+        assert_eq!(first.lock().unwrap().len(), 2);
+
+        journal
+            .append(
+                run,
+                JournalEvent::ToolConfirmDecided {
+                    node: n1(),
+                    effect_id: effect_id("n1", 2, 1),
+                    approved: true,
+                    actor: "alice".into(),
+                    note: None,
+                },
+            )
+            .await
+            .unwrap();
+        let second = sink();
+        let ex = limited_executor(
+            &journal,
+            2,
+            vec![write("t4", "/workspace/3"), final_response("done")],
+            &second,
+        )
+        .await;
+        let o2 = ex.start(run, &graph).await.expect("drive 2");
+        assert!(o2.paused.is_none() && o2.failed.is_none(), "{o2:?}");
+        assert!(
+            second.lock().unwrap().is_empty(),
+            "the resumed run must not get a fresh ceiling"
+        );
+        let events = journal.load(run).await.unwrap();
+        assert_eq!(
+            recorded_output(&events, &effect_id("n1", 3, 1)).expect("recorded")["error"],
+            "call_limit_reached"
+        );
+    }
+
+    /// The documented SCOPE: one agent invocation. Two nodes driving the same agent each get
+    /// their own ceiling — the count is the invocation's transcript, not the run's.
+    #[tokio::test]
+    async fn the_call_ceiling_is_per_agent_invocation() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let mut second = agent_node("n2", "a", "write one more");
+        second.deps = vec![Dep::hard("n1")];
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "write one"), second],
+        };
+        let writes = sink();
+        let ex = limited_executor(
+            &journal,
+            1,
+            vec![
+                write("t1", "/workspace/1"),
+                final_response("one"),
+                write("t2", "/workspace/2"),
+                final_response("two"),
+            ],
+            &writes,
+        )
+        .await;
+        let o = ex.start(run, &graph).await.expect("drive");
+        assert!(o.paused.is_none() && o.failed.is_none(), "{o:?}");
+        assert_eq!(
+            &*writes.lock().unwrap(),
+            &["/workspace/1".to_string(), "/workspace/2".to_string()],
+            "each invocation has its own ceiling of one"
+        );
+    }
 }
