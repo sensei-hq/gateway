@@ -17,7 +17,9 @@ status: partial
 > **Implementing a store?** `sensei-orchestrator-testkit` is the contract: call
 > `journal`, `content`, `context`, `scheduler` and `config_store` from a `#[tokio::test]` with a
 > fresh, isolated store. The gateway's in-memory stores pass it; so do torii's tenant-scoped
-> Postgres stores (sensei-hq/torii).
+> Postgres stores (sensei-hq/torii) — except `scheduler`'s AG-3 wake-attempt clause
+> (#87), which torii's `PgSchedulerStore` passes once it overrides
+> `begin_wake_attempt`/`record_wake_failed`.
 
 The agentic execution framework that wraps the gateway: a hierarchical,
 runtime-expandable graph of agents on a durable step-journal, resumable without
