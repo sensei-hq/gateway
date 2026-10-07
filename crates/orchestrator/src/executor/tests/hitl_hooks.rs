@@ -12,7 +12,9 @@
 //! re-driving — which is precisely the case that CANNOT see a replay re-fire.
 
 use super::human_agent::human_registry;
+use super::human_gate::at;
 use super::*;
+use crate::test_support::FakeClock;
 use orchestrator_core::{GateOption, GateOutcome, LoopGateOption};
 
 /// The hook names this slice adds — the filter that separates them from the run/node
@@ -48,6 +50,7 @@ struct Harness {
     hooks: RecordingHooks,
     run: RunId,
     registry: Option<Arc<Registry>>,
+    clock: Arc<FakeClock>,
     seen: usize,
 }
 
@@ -58,6 +61,7 @@ impl Harness {
             hooks: RecordingHooks::default(),
             run: RunId(uuid::Uuid::new_v4()),
             registry,
+            clock: FakeClock::new(at(1_000_000)),
             seen: 0,
         }
     }
@@ -68,7 +72,8 @@ impl Harness {
     async fn drive(&mut self, graph: &Graph) -> Vec<String> {
         let (gw, _calls) = recording_gateway().await;
         let mut ex = Executor::new(Arc::new(gw), Arc::new(self.journal.clone()), "v1")
-            .with_hooks(Arc::new(self.hooks.clone()));
+            .with_hooks(Arc::new(self.hooks.clone()))
+            .with_clock(self.clock.clone());
         if let Some(r) = &self.registry {
             ex = ex.with_registry(r.clone());
         }
@@ -87,6 +92,17 @@ impl Harness {
             .await
             .into_iter()
             .filter(|e| is_hitl(e))
+            .collect()
+    }
+
+    /// The labels of every journaled row, in order.
+    async fn rows(&self) -> Vec<String> {
+        self.journal
+            .load(self.run)
+            .await
+            .unwrap()
+            .iter()
+            .map(|(_, e)| label(e))
             .collect()
     }
 
@@ -242,6 +258,55 @@ async fn gate_hooks_fire_once_per_occurrence_and_never_on_a_resumed_replay() {
         Vec::<String>::new(),
         "a resumed drive that replays the completed gate must not report the decision again"
     );
+    assert_eq!(
+        h.rows()
+            .await
+            .iter()
+            .filter(|r| *r == "DecisionHookFired(release)")
+            .count(),
+        1,
+        "the bookkeeping row is written once, by the honouring drive — a replay that \
+         re-wrote it would grow the journal on every wake"
+    );
+}
+
+/// A decision corrected before any drive read it (`GateDecided` folds LAST-wins) is
+/// reported as the decision actually honoured, and the superseded one never is.
+#[tokio::test]
+async fn only_the_decision_actually_honoured_is_reported() {
+    let mut h = Harness::new(None);
+    let graph = gate_graph();
+    h.drive(&graph).await;
+
+    h.append(gate_decided("reject", Some("oops"))).await;
+    h.append(gate_decided("ship", None)).await;
+    assert_eq!(
+        h.drive_hitl(&graph).await,
+        vec!["gate_decided(release,ship,alice,None)"],
+    );
+}
+
+/// A decision that lands after the gate's deadline is never honoured — the gate fails on
+/// the deadline BEFORE any decision is read — so nothing reports it, on that drive or any
+/// later one.
+#[tokio::test]
+async fn a_decision_the_deadline_beat_is_never_reported() {
+    let mut h = Harness::new(None);
+    let mut graph = gate_graph();
+    if let NodeKind::HumanGate { timeout, .. } = &mut graph.nodes[0].kind {
+        *timeout = Some(chrono::Duration::hours(1));
+    }
+    h.drive(&graph).await;
+
+    h.append(gate_decided("ship", None)).await;
+    h.clock.set(at(1_000_000 + 2 * 3600));
+    let fired = h.drive(&graph).await;
+    assert!(
+        fired.contains(&"node_failed(release)".to_string())
+            && !fired.iter().any(|e| e.starts_with("gate_decided(")),
+        "the expiry is reported, the late decision is not: {fired:?}"
+    );
+    assert_eq!(h.drive_hitl(&graph).await, Vec::<String>::new());
 }
 
 /// A `Fail` decision is honoured too — it is what the human chose — and is reported
