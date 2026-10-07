@@ -2846,6 +2846,9 @@ fn label(event: &JournalEvent) -> String {
         // is that the event is there and WHERE — a test that cares about the number reads the
         // event itself.
         JournalEvent::ContextBudgeted { node, .. } => format!("ContextBudgeted({})", node.0),
+        // AG-2: the hooked path's bookkeeping row. `mod hitl_hooks` pins that an unhooked
+        // run never journals one.
+        JournalEvent::DecisionHookFired { node } => format!("DecisionHookFired({})", node.0),
     }
 }
 
