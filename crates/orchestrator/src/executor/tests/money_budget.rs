@@ -654,3 +654,47 @@ async fn a_money_cap_raised_into_an_uncapped_run_mid_drive_is_never_reported_ove
          five priced calls the cap's own drive never ledgered"
     );
 }
+
+/// MEDIUM (AG-12 review): the post-call `Uncosted` refusal is the only thing between a
+/// money-capped run and spend its ledger cannot see. Reached in memory through the
+/// unchecked `update_config`: a NEGATIVE input price prices the chain (so the pre-call
+/// `Unpriced` check passes) but makes the gateway's `actual_cost` total negative, which
+/// `content::cost_micro_usd` refuses to trust. The node fails closed and nothing reaches
+/// the money ledger.
+#[tokio::test]
+async fn an_uncosted_response_fails_the_node_under_a_money_cap() {
+    let (gateway, calls) = metered_gateway(Some(kernel::types::cost::TokenUsage {
+        input_tokens: 10,
+        output_tokens: 100,
+        total_tokens: 110,
+    }))
+    .await;
+    price_single_chain(&gateway, -10.0, OUT_PER_1K).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let out = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .run_with_budget(run, &chain_of(2), money(1_000_000))
+        .await
+        .expect("drives");
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "the provider was called once"
+    );
+    let (node, error) = out.failed.as_ref().expect("an uncosted call fails closed");
+    assert_eq!(node.0, "n1");
+    assert!(error.starts_with("uncosted model call: "), "{error}");
+    let events = journal.load(run).await.unwrap();
+    assert!(
+        events.iter().any(|(_, e)| matches!(
+            e,
+            JournalEvent::NodeFailed { node, error } if node.0 == "n1" && error.starts_with("uncosted")
+        )),
+        "the refusal is journaled as the node's failure"
+    );
+    assert!(
+        journaled_costs(&events, |_| true).is_empty(),
+        "nothing uncosted is journaled as an effect"
+    );
+    assert_eq!(crate::money_spend_of(&events), (0, Some(1_000_000)));
+}
