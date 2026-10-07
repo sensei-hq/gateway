@@ -548,6 +548,30 @@ pub(super) enum RefusalKind {
     Failed(String),
 }
 
+/// AG-3 × AG-12: the ONE error to surface when several concurrently driven children
+/// failed fatally in the same round — the first [`OrchestratorError::SpendUnrecorded`] if
+/// any child raised one, otherwise the first error in `fatals`' order. `None` iff empty.
+///
+/// The precedence is what keeps an unrecorded spend from being retried. Concurrent
+/// children are driven to completion before their errors are folded, so a sibling's plain
+/// `Journal(Backend)` blink — retryable, because it bought nothing — can sit at a lower
+/// index than a child whose paid call never reached the ledger. Surfacing the blink would
+/// hand the scheduler a retryable error, and the retry would dispatch and pay for the
+/// unrecorded call again. Every site that aggregates errors from concurrently run children
+/// folds them through here rather than returning the first by position.
+pub(super) fn most_severe_fatal(
+    fatals: impl IntoIterator<Item = OrchestratorError>,
+) -> Option<OrchestratorError> {
+    let mut first = None;
+    for e in fatals {
+        if matches!(e, OrchestratorError::SpendUnrecorded { .. }) {
+            return Some(e);
+        }
+        first.get_or_insert(e);
+    }
+    first
+}
+
 impl Executor {
     /// AG-3 × AG-12: make a PAID call's effect record durable — the CAS split of its
     /// output, then the `EffectRecorded` (built by `event` around the split output)

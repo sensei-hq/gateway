@@ -315,6 +315,7 @@ impl Executor {
         let mut ok = 0usize;
         let mut failed = 0usize;
         let mut paused: Option<String> = None;
+        let mut fatals = Vec::new();
         for (i, child) in collected {
             match child {
                 Ok(Ok(value)) => {
@@ -328,8 +329,15 @@ impl Executor {
                 Err(OrchestratorError::MapChildPaused { reason, .. }) => {
                     paused.get_or_insert(reason);
                 }
-                Err(fatal) => return Err(fatal),
+                Err(fatal) => fatals.push(fatal),
             }
+        }
+        // Every child was driven to the end under `join_all`, so several can have failed
+        // fatally in one round. Which error reaches the scheduler is NOT "the lowest
+        // index": a child whose paid call went unrecorded outranks a sibling's retryable
+        // blink, or the scheduler would back the run off and the retry re-buy the call.
+        if let Some(fatal) = super::dispatch::most_severe_fatal(fatals) {
+            return Err(fatal);
         }
         // A paused child means the Map cannot complete this round: return `Paused`
         // (marks the Map terminal-for-now + sets `RunOutcome.paused`, suppressing
