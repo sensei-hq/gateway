@@ -261,9 +261,12 @@ source: crates/orchestrator*
 >   only: a `GateSpec::Human` loop gate does not escalate, and its expiry failure says so when
 >   its role declares `escalate_to`.
 >
+> **Hooks:** the new events fire AG-2's HITL hooks — `on_tool_confirm_awaited`,
+> `on_tool_confirm_decided` and `on_agent_escalated`, once per real occurrence and never on a
+> resumed replay; see [hooks](hooks.md#confirm-before-run-and-escalation-hooks-ag-2--ag-15).
+>
 > **Carry-forwards:** who may answer a confirmation or an escalated question is `torii`'s
-> (torii#47) — `actor` is attribution only; no `OrchestratorHooks` callback fires for the new
-> events (AG-2's HITL hooks are the place); a stale `Observation` re-read of an already
+> (torii#47) — `actor` is attribution only; a stale `Observation` re-read of an already
 > APPROVED confirm tool past its confirm deadline is refused rather than re-read (the expiry is
 > checked before the decision for every live pass).
 
