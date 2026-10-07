@@ -20,7 +20,9 @@ source: crates/orchestrator*
 > **context** (`on_context_write{scope,key}`), **planner** (`on_plan_expanded`,
 > `on_planner_selected`) and — AG-2 (#86) — **human-in-the-loop** (`on_signal_awaited`/
 > `received`, `on_gate_awaited`/`decided`, `on_agent_awaited`/`answered`,
-> `on_loop_gate_awaited`/`decided`/`settled`; see [below](#human-in-the-loop-hooks-ag-2)).
+> `on_loop_gate_awaited`/`decided`/`settled`; see [below](#human-in-the-loop-hooks-ag-2)),
+> and for AG-15's confirm-before-run calls and escalations `on_tool_confirm_awaited`/`decided`
+> and `on_agent_escalated` ([below](#confirm-before-run-and-escalation-hooks-ag-2--ag-15)).
 > Run/node/context hooks fire from
 > inside `Executor::append` (matched on the just-journaled event) — *can't-miss*
 > and **replay-suppressed for free**: a resumed completed prefix isn't
@@ -69,10 +71,8 @@ Nine no-op-default methods cover the four SP-6 waiting kinds. The contract is **
 per real occurrence, never on a resumed replay**; how each half achieves it differs, because
 only one half has an executor write to mirror.
 
-AG-15's human-in-the-loop events are **not** covered yet: a confirm-before-run tool call
-(`ToolConfirmAwaited`/`ToolConfirmDecided`) and a human-backed agent's escalation
-(`AgentEscalated`) fire no hook — an observer learns of an escalated question only by
-polling, and of its answer through the usual `on_agent_answered`. A carry-forward.
+AG-15's human-in-the-loop events have three more under the same contract —
+[below](#confirm-before-run-and-escalation-hooks-ag-2--ag-15).
 
 | Hook | Fires when | Why it is exactly-once |
 |---|---|---|
@@ -139,6 +139,46 @@ each driving fresh executors over one journal with the decision appended between
     When an operator appends GateDecided and the run is driven three more times
     Then on_gate_decided fires on the first of those drives only
     And an executor without hooks journals no DecisionHookFired row
+```
+
+### Confirm-before-run and escalation hooks (AG-2 × AG-15)
+
+AG-15's confirm-before-run tool calls and escalated questions fire three more no-op-default
+hooks, under the contract above.
+
+| Hook | Fires when | Why it is exactly-once |
+|---|---|---|
+| `on_tool_confirm_awaited(node, effect_id, tool, arguments, deadline)` | right after `ToolConfirmAwaited` is journaled, from inside `append` | the ask is journaled once per **call** (first-wins, keyed by the call's `effect_id`); a resume re-pauses without re-asking. One node can ask about several calls, one at a time — each fires |
+| `on_tool_confirm_decided(node, effect_id, approved, actor, note)` | on the drive that **first honours** the decision — inside its deadline, just before the approved call runs (so before its `on_agent_tool_call`) or the rejected one is refused | a `DecisionHookFired { node, decision, effect_id }` row, **keyed per call** |
+| `on_agent_escalated(node, from, to, deadline)` | right after `AgentEscalated` is journaled, from inside `append` | the executor journals a hop at most once per target per node; the escalated question's answer is the usual `on_agent_answered` |
+
+A confirmed call is memoized once it runs or is refused, so a later drive never re-judges it
+— **except** a call honoured and then left unrecorded: an approved Pure/Observation tool that
+**failed** (the node re-attempts on resume and reads the same decision) or a stale
+Observation re-read. That is what the per-call marker is for, and the rules are AG-2's: the
+re-attempt reports nothing while the call still holds the reported decision or one with
+identical content (an identical **redelivery** fires nothing), and a **correction** honoured
+by the re-attempt is reported. The marker is keyed by `effect_id`, not by node, because two
+calls on one node can be decided with identical content — a node-keyed dedupe would take the
+second for a redelivery of the first. (An approved Mutation journals its `EffectIntent`
+first, and an in-doubt call reconciles without returning to the confirmation.)
+
+A decision the **deadline beat** is never honoured — the call is refused as expired — and
+fires nothing; so does a call whose redacted arguments are too large to ask about (it is
+refused without an ask). `arguments` is redacted before the ask is journaled, so the awaited
+hook receives the journaled row; the tool name, the decision's actor and note, and the
+escalation's agent names go through the same `redact_text` at dispatch. Only when hooks are
+wired is the marker written: an unhooked run journals exactly what it did before. The three
+non-exactly-once edges above apply unchanged.
+
+Guarded by `crates/orchestrator/src/executor/tests/confirm_hooks.rs`.
+
+```gherkin
+  Scenario: A tool confirmation is reported once, even when the call is re-attempted
+    Given an approved confirm-before-run call whose tool failed after the decision was reported
+    When the decision is redelivered with identical content and the node re-attempts the call
+    Then the call runs and on_tool_confirm_decided does not fire again
+    And two calls on one node decided identically each fire their own decided hook
 ```
 
 ## Notes
