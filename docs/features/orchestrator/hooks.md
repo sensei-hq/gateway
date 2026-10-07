@@ -88,8 +88,9 @@ folding it, fires nothing while the node still holds that decision. That row is:
   did before (pinned by `an_unhooked_run_journals_exactly_what_it_did_before`);
 - **bookkeeping, not an audit fact** — nothing but the hook dispatch reads it, and its
   absence does not mean an answer was never honoured;
-- **best-effort** — a failed write skips that drive's hook (a later drive retries) and never
-  fails the node; it is written once, not on every replay.
+- **best-effort** — a failed write never fails the node, and the drive fires the hook anyway
+  (skipping it would lose the callback whenever that drive also finished the run); it is
+  written once, not on every replay.
 
 A decision that is **never honoured fires nothing**: one the deadline beat (the gate fails
 first; `on_node_failed` fires), one naming an option outside the published menu, one
@@ -106,11 +107,13 @@ race asks nobody: a signal folded before its `AwaitSignal` first ran fires
 redactor (the node output's scrub); awaited hooks receive exactly what was journaled, which
 was redacted before the append.
 
-**Two edges are not exactly-once**, both outside the hooks' control: a crash between the
+**Three edges are not exactly-once**, all outside the hooks' control: a crash between the
 durable marker (`DecisionHookFired`/`LoopGateSettled`) and the callback **loses** the
-callback; and a decision honoured by a drive with **no** hooks wired leaves no marker, so a
-later hooked drive that replays the completed node reports it then. A deployment that wires
-hooks on every drive never sees the second.
+callback; a decision honoured by a drive with **no** hooks wired leaves no marker, so a
+later hooked drive that replays the completed node reports it then (a deployment that wires
+hooks on every drive never sees this one); and a **failed** `DecisionHookFired` write leaves
+no marker either, so the honouring drive fires anyway and a later drive of a still-live run
+reports the same decision **again**.
 
 Guarded by `crates/orchestrator/src/executor/tests/hitl_hooks.rs` — one resume test per kind,
 each driving fresh executors over one journal with the decision appended between drives.

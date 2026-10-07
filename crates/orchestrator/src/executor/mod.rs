@@ -1847,10 +1847,15 @@ impl Executor {
     /// exactly what it did before (`an_unhooked_run_journals_exactly_what_it_did_before`).
     ///
     /// Best-effort, deliberately bypassing [`append`](Self::append)'s strict error mapping:
-    /// a hook must never affect execution, so a failed bookkeeping write skips this drive's
-    /// hook (a later drive retries the claim) rather than failing the node. The row is
-    /// written BEFORE the hook fires, matching every other hook's "after a successful
-    /// journal write" — a crash between the two loses the callback rather than repeating it.
+    /// a hook must never affect execution, so a failed bookkeeping write never fails the
+    /// node. It still RETURNS the hooks: the drive fires anyway, because skipping would
+    /// LOSE the callback whenever no later drive reaches this claim — the honouring drive
+    /// also finished the run, or honoured a `Fail` option that `gate_precheck` reads back
+    /// from then on. The cost is a possible duplicate: with no marker, a later drive of a
+    /// still-live run reports the same decision again (at-least-once on that edge). The
+    /// row is written BEFORE the hook fires, matching every other hook's "after a
+    /// successful journal write" — a crash between the two loses the callback rather than
+    /// repeating it.
     async fn claim_decided_hook(
         &self,
         run: RunId,
@@ -1877,9 +1882,10 @@ impl Executor {
                 tracing::warn!(
                     node = %node.0,
                     %error,
-                    "could not journal DecisionHookFired; skipping this drive's decided hook"
+                    "could not journal DecisionHookFired; firing the decided hook anyway \
+                     (a later drive of a still-live run may report it again)"
                 );
-                None
+                Some(hooks)
             }
         }
     }
