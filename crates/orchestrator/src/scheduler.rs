@@ -81,7 +81,10 @@ impl WakeRetryPolicy {
 
     /// `now + backoff(run, attempt)`, SATURATING at the end of `DateTime<Utc>`'s range: an
     /// overflow panic here would fire inside `tick` on every claim of the run — a poison pill
-    /// of its own. A saturated deadline parks the run; `force_wake` still reaches it.
+    /// of its own. A saturated deadline parks the run: `cancel` always reaches it, and
+    /// `force_wake` reaches it once it is `paused` (a failed drive re-schedules it `paused`; a
+    /// LOST drive leaves it `waking`, where only `cancel` applies — reachable only with a
+    /// backoff configured past the year 262143).
     fn retry_at(
         &self,
         now: chrono::DateTime<chrono::Utc>,
