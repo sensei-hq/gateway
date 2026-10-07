@@ -17544,6 +17544,49 @@ mod scheduler_driver {
         assert_eq!(journal.failures(), 3, "exactly max_attempts drives");
     }
 
+    /// `max_attempts: 0` is documented as `1`: a zero cap must still DRIVE each wake once.
+    /// Without the clamp, a first attempt (`1 > 0`) takes the over-cap branch, so an operator
+    /// who configured `0` would see every due paused run filed `Failed` without being driven.
+    #[tokio::test]
+    async fn a_zero_max_attempts_still_drives_each_wake_once() {
+        // Healthy journal: the single allowed attempt is driven and completes.
+        let run = RunId(uuid::Uuid::new_v4());
+        let store = Arc::new(InMemorySchedulerStore::new());
+        seed_due(store.as_ref(), run).await;
+        let journal = FaultyJournal::new(run, Fault::Backend, 0);
+        let clock = FakeClock::new(t0());
+        let (gw, calls) = recording_gateway().await;
+        let sched = sched_over(store.clone(), journal.clone(), clock.clone(), gw)
+            .with_wake_retry(retry(0, 10));
+        assert_eq!(sched.tick().await.unwrap(), 1);
+        let st = store.status(run).await.unwrap().unwrap();
+        assert_eq!(
+            st.status,
+            RunStatus::Completed,
+            "max_attempts 0 is treated as 1 — the wake is driven: {:?}",
+            st.reason
+        );
+        assert_eq!(calls.lock().unwrap().len(), 1, "exactly one drive");
+
+        // Failing journal: that one attempt is driven, fails, and is the last.
+        let run = RunId(uuid::Uuid::new_v4());
+        let store = Arc::new(InMemorySchedulerStore::new());
+        seed_due(store.as_ref(), run).await;
+        let journal = FaultyJournal::new(run, Fault::Backend, usize::MAX);
+        let (gw, _calls) = recording_gateway().await;
+        let sched = sched_over(store.clone(), journal.clone(), clock.clone(), gw)
+            .with_wake_retry(retry(0, 10));
+        assert_eq!(sched.tick().await.unwrap(), 1);
+        let st = store.status(run).await.unwrap().unwrap();
+        assert_eq!(st.status, RunStatus::Failed);
+        let reason = st.reason.unwrap();
+        assert!(
+            reason.contains("gave up after 1 failed wake attempts"),
+            "one attempt was made and failed: {reason}"
+        );
+        assert_eq!(journal.failures(), 1, "exactly one drive");
+    }
+
     /// A store that implements none of AG-3 — the trait defaults. The scheduler must behave
     /// exactly as before: a drive error is terminal at once, no backoff, no count.
     struct LegacyStore(InMemorySchedulerStore);
