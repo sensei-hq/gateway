@@ -670,3 +670,84 @@ async fn the_awaited_gate_menu_is_redacted_like_the_decided_option() {
         "no hook entry carries the secret: {fired:?}"
     );
 }
+
+/// Asserts `fired` holds an entry starting with `hook` and that no entry carries
+/// [`SECRET`].
+fn assert_fired_scrubbed(fired: &[String], hook: &str) {
+    assert!(
+        fired.iter().any(|e| e.starts_with(hook)),
+        "{hook} fires: {fired:?}"
+    );
+    assert!(
+        !fired.iter().any(|e| e.contains(SECRET)),
+        "no hook entry carries the secret: {fired:?}"
+    );
+}
+
+/// AG-2 review: the decided hooks' strings go through the redactor — `on_gate_decided`'s
+/// actor and note (operator free text), never the raw journaled row.
+#[tokio::test]
+async fn the_gate_decided_hook_receives_redacted_strings() {
+    let mut h = Harness::new(None);
+    h.redacted = true;
+    let graph = gate_graph();
+    h.drive(&graph).await;
+    h.append(JournalEvent::GateDecided {
+        node: NodeId("release".into()),
+        option: "ship".into(),
+        actor: format!("alice {SECRET}"),
+        note: Some(format!("key {SECRET}")),
+    })
+    .await;
+    assert_fired_scrubbed(&h.drive_hitl(&graph).await, "gate_decided(release,ship,");
+}
+
+/// `on_signal_received` gets the redacted node output, not the raw payload.
+#[tokio::test]
+async fn the_signal_received_hook_receives_the_redacted_payload() {
+    let mut h = Harness::new(None);
+    h.redacted = true;
+    let graph = signal_graph();
+    h.drive(&graph).await;
+    h.append(JournalEvent::SignalReceived {
+        node: NodeId("gate".into()),
+        payload: serde_json::json!({ "k": format!("key {SECRET}") }),
+    })
+    .await;
+    assert_fired_scrubbed(&h.drive_hitl(&graph).await, "signal_received(gate,");
+}
+
+/// `on_agent_answered` gets the redacted text and actor.
+#[tokio::test]
+async fn the_agent_answered_hook_receives_redacted_strings() {
+    let mut h = Harness::new(Some(human_registry(None)));
+    h.redacted = true;
+    let graph = agent_graph();
+    h.drive(&graph).await;
+    h.append(JournalEvent::AgentAnswered {
+        node: NodeId("review".into()),
+        text: format!("the key is {SECRET}"),
+        actor: format!("bob {SECRET}"),
+    })
+    .await;
+    assert_fired_scrubbed(&h.drive_hitl(&graph).await, "agent_answered(review,");
+}
+
+/// `on_loop_gate_decided` gets the redacted actor (attribution nothing upstream scrubs).
+#[tokio::test]
+async fn the_loop_gate_decided_hook_receives_a_redacted_actor() {
+    let mut h = Harness::new(Some(human_registry(None)));
+    h.redacted = true;
+    let graph = loop_gate_graph();
+    h.drive(&graph).await;
+    h.append(JournalEvent::LoopGateDecided {
+        node: NodeId("lp/0/__gate__".into()),
+        option: "ship".into(),
+        actor: format!("carol {SECRET}"),
+    })
+    .await;
+    assert_fired_scrubbed(
+        &h.drive_hitl(&graph).await,
+        "loop_gate_decided(lp/0/__gate__,ship,",
+    );
+}
