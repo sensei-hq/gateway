@@ -4,13 +4,13 @@ doctype: feature
 module: orchestrator
 status: partial
 phase: 3
-spec: SP-1, SP-DATA-1, SP-DATA-5, SP-6-4, SP-7b, AG-12
+spec: SP-1, SP-DATA-1, SP-DATA-5, SP-6-4, SP-7b, AG-12, AG-15
 source: orchestrator-core · orchestrator-store
 ---
 
 # Durable Journal
 
-> **Status: Partial (Phase 3 · SP-1 · SP-DATA-1 · SP-DATA-5 · SP-6-4 · SP-7b · AG-12).** Design §7.
+> **Status: Partial (Phase 3 · SP-1 · SP-DATA-1 · SP-DATA-5 · SP-6-4 · SP-7b · AG-12 · AG-15).** Design §7.
 > This header said "Planned (SP-1)" long after the Postgres backend, the spend ledger
 > and the HITL waiting kinds had shipped; the [module README](README.md) row was
 > the only place that stayed current. It then said SP-6-3 through the whole of s4, while
@@ -282,6 +282,55 @@ Feature: The money cap (AG-12)
 
   Scenario: A token-only run on a priced chain
     Then no money field appears anywhere on its journal
+```
+
+## AG-15 — tool-confirmation and escalation events
+
+Three additive variants (sensei-hq/gateway#90), so `FORMAT_VERSION` stays **1**; a journal
+written before them folds unchanged.
+
+- **`ToolConfirmAwaited { node, effect_id, tool, arguments, args_hash, deadline }`** — a call of
+  a confirm-before-run tool (`AgentDefinition::confirm_tools`) has begun waiting for a human.
+  Keyed by the CALL's `effect_id` (`effect_id(node, turn, k+1)`), not the node, because one
+  agent node can ask about many calls. Appended before the tool does anything (before any
+  `EffectIntent`). `arguments` is what the human approves, **redacted** before the append; a
+  call whose redacted arguments exceed `MAX_HUMAN_TEXT_BYTES` is refused to the model instead
+  of asked (approving truncated arguments is approving something nobody saw). The `deadline`
+  is absolute and folded **FIRST-wins**, like every waiting record.
+- **`ToolConfirmDecided { node, effect_id, approved, actor, note }`** — the human's answer,
+  folded **LAST-wins** (correctable before the run resumes, like `GateDecided`). The deadline
+  is checked BEFORE it is read, so a late approval runs nothing. Once an approved Mutation has
+  journaled its `EffectIntent` the decision is settled: neither the deadline nor a later
+  correction is consulted again, and an intent with no `EffectRecorded` reconciles in doubt. A rejection or an expiry is
+  recorded as a Pure `EffectRecorded` carrying a terse `{"error":"not_confirmed"}` — the model
+  sees neither `note` nor `actor`. `actor` is attribution, not authentication; who may answer
+  is `torii`'s concern (torii#47).
+- **`AgentEscalated { node, from, to, deadline }`** — a human-backed `Agent` node's holder
+  (`from`) let its SLA expire unanswered and the question now waits on `from`'s `escalate_to`
+  agent `to` until `deadline` (`to`'s own SLA from the escalation instant). The question is NOT
+  re-journaled: `to` is asked the question `AgentAwaited` already holds, and answers with the
+  same node-keyed `AgentAnswered`. Folded FIRST-wins per `to`, so a duplicated hop moves
+  nothing; the current deadline is the last hop's.
+
+The per-tool **call ceiling** has no event of its own: its count is derived from the agent's
+own transcript, which the memoized turns replay, and a refused call is an ordinary Pure
+`EffectRecorded` with `{"error":"call_limit_reached"}`.
+
+```gherkin
+Feature: Agent tool policy and escalation in the journal (AG-15)
+  Scenario: A confirm-before-run call survives a resume
+    Given an agent whose tool requires confirmation calls it
+    Then ToolConfirmAwaited is journaled and the run pauses before the tool runs
+    When the run is re-driven with no decision
+    Then it pauses again without a second ask and with the same deadline
+    When ToolConfirmDecided{approved: true} is appended and the run resumes
+    Then the tool runs exactly once
+
+  Scenario: An escalation survives a resume
+    Given a human-backed agent with escalate_to whose SLA has passed
+    Then AgentEscalated is journaled and the run pauses on the target's deadline
+    When the run is re-driven inside that deadline
+    Then nothing new is journaled and the deadline does not move
 ```
 
 ## Notes

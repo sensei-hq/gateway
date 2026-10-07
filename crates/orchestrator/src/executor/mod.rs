@@ -19,6 +19,7 @@ mod branch;
 mod content;
 mod dispatch;
 mod durability;
+mod escalation;
 mod expand;
 mod fanout;
 mod gate;
@@ -27,6 +28,7 @@ pub(crate) mod selector;
 mod signal;
 mod subgraph;
 mod support;
+mod tool_policy;
 use support::{
     GatewayDisposition, build_request, classify_gateway_error, consolidate_compaction_target,
     fold_journal, input_hash, project_agent_outputs, ready_nodes,
@@ -410,6 +412,25 @@ struct Fold {
     /// (`agent.rs`) computes it on the line before `agent_input_hash` — so the budget that
     /// shapes the prompt can be looked up by a key that does not depend on the prompt.
     context_budgets: HashMap<EffectId, ContextBudget>,
+    /// AG-15: each confirm-before-run CALL's recorded deadline, from `ToolConfirmAwaited`,
+    /// keyed by the call's effect id. FIRST wins — the never-expires rule every waiting
+    /// record follows. Presence answers "has this call begun asking?".
+    tool_confirm_asks: HashMap<EffectId, Option<chrono::DateTime<chrono::Utc>>>,
+    /// AG-15: each confirm-before-run call's decision (`approved`), from
+    /// `ToolConfirmDecided`. LAST wins, like `gate_decisions`, so an operator can correct a
+    /// decision before the run resumes.
+    tool_confirm_decisions: HashMap<EffectId, bool>,
+    /// AG-15: each human-backed agent node's escalation chain, from `AgentEscalated`, in
+    /// journal order. The FIRST row for a given target wins (a re-appended hop is ignored),
+    /// so the chain — and the deadline of its last hop — never moves once recorded.
+    agent_escalations: HashMap<NodeId, Vec<AgentEscalation>>,
+}
+
+/// AG-15: one folded `AgentEscalated` hop.
+#[derive(Debug, Clone, PartialEq)]
+struct AgentEscalation {
+    to: String,
+    deadline: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// SP-7b: a folded `ContextBudgeted` — the two fields a later drive must REPRODUCE a cut
@@ -765,6 +786,27 @@ impl Fold {
     /// clock, then decision" satisfies both.
     fn loop_gate_settled_with(&self, node: &NodeId) -> Option<&str> {
         self.loop_gate_settlements.get(node).map(String::as_str)
+    }
+
+    /// AG-15: `None` ⇒ this call has not begun asking; `Some(deadline)` ⇒ it has, with the
+    /// deadline it recorded.
+    fn tool_confirm_deadline(
+        &self,
+        eid: &EffectId,
+    ) -> Option<Option<chrono::DateTime<chrono::Utc>>> {
+        self.tool_confirm_asks.get(eid).copied()
+    }
+
+    fn tool_confirm_decision(&self, eid: &EffectId) -> Option<bool> {
+        self.tool_confirm_decisions.get(eid).copied()
+    }
+
+    /// AG-15: the node's escalation hops so far, oldest first (empty if never escalated).
+    fn escalations_for(&self, node: &NodeId) -> &[AgentEscalation] {
+        self.agent_escalations
+            .get(node)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 }
 
