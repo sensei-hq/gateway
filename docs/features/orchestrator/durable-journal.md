@@ -310,9 +310,12 @@ errors — say `m/0`'s unpaid tool record blinking (retryable, it bought nothing
 `SpendUnrecorded`, never the lowest-index one: surfacing the blink would get the run
 retried and `m/1`'s call bought twice. If several children's spends went unrecorded the
 reason names the first; the operator reconciles the provider's side for the whole round.
-The `Map` is the only place the executor runs children concurrently — a round's ready
+Two places fold several fatal errors into one, and both apply this ordering: the `Map`,
+the only place the executor runs children concurrently, and the planner selector's error
+slot, which one `select()` can fill more than once (a selector that swallows an error and
+calls again must not let a later fault overwrite an unrecorded spend). A round's ready
 nodes, an agent's tool calls and `Loop` iterations all run in sequence and stop at the
-first error — so it is the only place this ordering is needed.
+first error, so they need no ordering.
 
 **The remaining edge, stated honestly: a PROCESS crash in that same window.** If the
 worker dies between the provider's response and the append, nothing survives to classify

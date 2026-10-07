@@ -557,8 +557,9 @@ pub(super) enum RefusalKind {
 /// `Journal(Backend)` blink — retryable, because it bought nothing — can sit at a lower
 /// index than a child whose paid call never reached the ledger. Surfacing the blink would
 /// hand the scheduler a retryable error, and the retry would dispatch and pay for the
-/// unrecorded call again. Every site that aggregates errors from concurrently run children
-/// folds them through here rather than returning the first by position.
+/// unrecorded call again. Every site that aggregates several fatals — a Map's concurrent
+/// children, and the planner selector's stash across one `select()`'s calls — folds them
+/// through here rather than keeping the first by position or the last written.
 pub(super) fn most_severe_fatal(
     fatals: impl IntoIterator<Item = OrchestratorError>,
 ) -> Option<OrchestratorError> {
@@ -1744,7 +1745,12 @@ impl<'a> SelectorDispatch<'a> {
     /// `Select` arm re-raises — nothing downstream of the selector reads this copy.
     fn fatal(&self, e: OrchestratorError) -> OrchestratorError {
         let surrogate = OrchestratorError::Gateway(e.to_string());
-        *self.fatal.lock().expect("selector fatal lock") = Some(e);
+        // One `select()` can raise several fatals (a selector that swallows an error and
+        // calls again), so the slot is a fold like a Map's: an unrecorded spend is never
+        // overwritten by a later fault, or the run would be filed — or retried — under
+        // the later one and the paid call re-bought.
+        let mut slot = self.fatal.lock().expect("selector fatal lock");
+        *slot = most_severe_fatal(slot.take().into_iter().chain(std::iter::once(e)));
         surrogate
     }
 
