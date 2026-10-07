@@ -7,8 +7,10 @@ use serde::{Deserialize, Serialize};
 /// `BudgetRaised`.
 ///
 /// This caps CONSUMPTION, not spend: 50k tokens costs very different amounts across
-/// models. Money denomination is deferred (spec §8) because it needs durable,
-/// current per-model pricing, and a stale price would silently make the cap wrong.
+/// models. The money cap is its own type, [`MoneyBudget`] (AG-12), and a run may carry
+/// either or both: it is ledgered from the cost the GATEWAY reports per call (its config
+/// pricing × the provider's usage), so a stale price in the gateway's config makes the
+/// money cap wrong by exactly as much — the reason this token cap still exists beside it.
 ///
 /// It is not a hard ceiling, and the shape of the slack has TWO parts.
 ///
