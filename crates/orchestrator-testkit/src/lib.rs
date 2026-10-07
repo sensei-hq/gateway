@@ -135,6 +135,8 @@ pub async fn journal(j: &dyn ExecutionJournal) {
                 seq,
                 completed: vec![NodeId(node.into())],
                 spent: 7,
+                spent_micro_usd: 21_000,
+                money_budget_micro_usd: Some(100_000),
                 ..Default::default()
             },
         )
@@ -154,12 +156,62 @@ pub async fn journal(j: &dyn ExecutionJournal) {
         snap.spent, 7,
         "journal: a snapshot round-trips the spend ledger"
     );
+    assert_eq!(
+        (snap.spent_micro_usd, snap.money_budget_micro_usd),
+        (21_000, Some(100_000)),
+        "journal: a snapshot round-trips the MONEY half of the ledger (AG-12)"
+    );
     assert!(
         j.latest_snapshot(b)
             .await
             .expect("latest_snapshot")
             .is_none(),
         "journal: snapshots are per run"
+    );
+
+    // AG-12: the money cap, a call's priced cost and a money raise round-trip EXACTLY — a
+    // backend that drops an unknown jsonb key, or writes `null` where the field was absent,
+    // either loses a run's dollar cap on resume or changes a money-free journal's bytes.
+    let m = fresh_run();
+    let money_events = [
+        JournalEvent::RunStarted {
+            version: "v1".into(),
+            budget: None,
+            money_budget: Some(orchestrator_core::MoneyBudget {
+                total_micro_usd: 100_000,
+            }),
+        },
+        JournalEvent::EffectRecorded {
+            node: NodeId("n1".into()),
+            effect_id: orchestrator_core::effect_id("n1", 0, 0),
+            class: orchestrator_core::EffectClass::Pure,
+            input_hash: "h".into(),
+            seq: 0,
+            output: orchestrator_core::EffectOutput::Inline(serde_json::json!("out")),
+            observation: None,
+            usage: Some(orchestrator_core::TokenUsage {
+                input_tokens: 10,
+                output_tokens: 100,
+                total_tokens: 110,
+                cost_micro_usd: Some(21_000),
+            }),
+        },
+        JournalEvent::MoneyBudgetRaised {
+            new_total_micro_usd: 1_000_000,
+        },
+    ];
+    for e in &money_events {
+        j.append(m, e.clone()).await.expect("append");
+    }
+    assert_eq!(
+        j.load(m)
+            .await
+            .expect("load")
+            .iter()
+            .map(|(_, e)| enc(e))
+            .collect::<Vec<_>>(),
+        money_events.iter().map(enc).collect::<Vec<_>>(),
+        "journal: the money cap, a call's cost and a money raise round-trip exactly (AG-12)"
     );
 
     // Compaction: remove exactly the named seqs, append the manifest after everything.
