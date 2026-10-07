@@ -6,6 +6,9 @@
 //! A double-drive is harmless (idempotent resume: fold + memo, zero re-spend), so the store's atomic
 //! `claim_due` prevents a thundering herd while a crash between drive and record self-heals on the next
 //! tick.
+//!
+//! AG-3: a wake that keeps failing is not re-driven forever — each claimed wake is counted, a failed
+//! or lost one is backed off ([`WakeRetryPolicy`]), and past `max_attempts` the run is filed `Failed`.
 
 use crate::executor::{Executor, RunOutcome};
 use orchestrator_core::{

@@ -369,8 +369,9 @@ async fn status_of(s: &dyn SchedulerStore, run: RunId) -> Option<RunStatus> {
     s.status(run).await.expect("status").map(|r| r.status)
 }
 
-/// [`SchedulerStore`] + [`RunLock`](orchestrator_core::RunLock). **Needs a fresh store with no
-/// rows** — `claim_due`, `list_paused` and pruning are store-wide.
+/// [`SchedulerStore`] + [`RunLock`](orchestrator_core::RunLock), including AG-3's wake-attempt
+/// counting and backoff (`begin_wake_attempt` / `record_wake_failed`). **Needs a fresh store with
+/// no rows** — `claim_due`, `list_paused` and pruning are store-wide.
 pub async fn scheduler(s: &dyn SchedulerStore) {
     let t0 = base_time();
     let lease = Duration::seconds(60);
