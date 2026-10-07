@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 
 use crate::context::{ContextKey, Scope};
+use crate::effect::EffectId;
 use crate::graph::{GateOption, Graph, LoopGateOption};
 use crate::ids::{NodeId, RunId};
 use crate::plan::NodePlan;
@@ -179,6 +180,73 @@ pub trait OrchestratorHooks: Send + Sync {
     /// The executor journaled `LoopGateSettled` for this gate: `option` is the name the
     /// loop acted on (another iteration, or convergence).
     async fn on_loop_gate_settled(&self, _run: RunId, _node: &NodeId, _option: &str) {}
+
+    // ------------------------------------------------------------------------------
+    // AG-2 × AG-15: confirm-before-run tool calls and escalated questions — the same
+    // contract as the hooks above, one human-in-the-loop occurrence per firing.
+    //
+    // `on_tool_confirm_awaited` and `on_agent_escalated` mirror executor writes
+    // (`ToolConfirmAwaited`, `AgentEscalated`) and fire from inside the executor's append,
+    // like every awaited hook: the ask is journaled once per CALL (first-wins, keyed by the
+    // call's effect id) and an escalation once per hop (the executor never re-escalates to
+    // an agent already in the chain), so a resume that re-pauses fires neither.
+    //
+    // `on_tool_confirm_decided` is a decided hook: `ToolConfirmDecided` is appended by
+    // another process, so it fires on the drive that FIRST HONOURS the decision — the one
+    // that runs the approved call or refuses the rejected one — exactly as
+    // `on_gate_decided` does, with the same `DecisionHookFired` bookkeeping row, carrying
+    // the call's `effect_id` because one agent node can ask about several calls. A
+    // memoized call is never re-judged, but a call honoured and then NOT recorded (the
+    // approved tool failed, and the node re-attempts on resume; a stale Observation
+    // re-read) is judged again — and reports nothing while the decision is the one, or
+    // repeats the content of the one, already reported. A decision the deadline beat is
+    // never honoured (the call is refused as expired) and fires nothing.
+    //
+    // Strings are redacted as above: `arguments` is redacted before it is journaled, so
+    // the awaited hook receives the journaled row; the tool name, the actor, the note and
+    // the agent names pass through the same `redact_text` at dispatch.
+    // ------------------------------------------------------------------------------
+
+    /// An agent's call of a confirm-before-run tool began waiting for a human (its
+    /// `ToolConfirmAwaited` was just journaled): `effect_id` names the CALL an operator
+    /// answers, `arguments` is the redacted text the human approves, and `deadline` the
+    /// absolute SLA recorded (`None` = indefinite).
+    async fn on_tool_confirm_awaited(
+        &self,
+        _run: RunId,
+        _node: &NodeId,
+        _effect_id: &EffectId,
+        _tool: &str,
+        _arguments: &str,
+        _deadline: Option<DateTime<Utc>>,
+    ) {
+    }
+    /// A confirm-before-run call's decision was honoured: `approved` ran the tool, a
+    /// rejection refused it to the model. Fires before the tool runs (so before that
+    /// call's `on_agent_tool_call`). `actor` is attribution, not authentication; `actor`
+    /// and `note` are redacted.
+    async fn on_tool_confirm_decided(
+        &self,
+        _run: RunId,
+        _node: &NodeId,
+        _effect_id: &EffectId,
+        _approved: bool,
+        _actor: &str,
+        _note: Option<&str>,
+    ) {
+    }
+    /// A human-backed `Agent` node's question was escalated (its `AgentEscalated` was just
+    /// journaled): `from` let its SLA lapse, `to` now holds the SAME question until
+    /// `deadline`. The answer still arrives as `on_agent_answered`.
+    async fn on_agent_escalated(
+        &self,
+        _run: RunId,
+        _node: &NodeId,
+        _from: &str,
+        _to: &str,
+        _deadline: Option<DateTime<Utc>>,
+    ) {
+    }
 }
 
 #[cfg(test)]
