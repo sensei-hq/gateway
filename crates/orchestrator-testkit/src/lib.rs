@@ -248,8 +248,8 @@ pub async fn journal(j: &dyn ExecutionJournal) {
 
     // AG-15 (gateway#90): the human-in-the-loop events the executor folds to resume a paused
     // tool confirmation or an escalated question must come back exactly — a backend that maps
-    // event kinds to columns or a CHECK list must know these three, or a paused run can never
-    // be answered.
+    // event kinds to columns or a CHECK list must know these three (and AG-2's
+    // `DecisionHookFired`, below), or a paused run can never be answered.
     let c = fresh_run();
     let deadline = Some(base_time() + Duration::hours(1));
     let hitl = [
@@ -287,6 +287,38 @@ pub async fn journal(j: &dyn ExecutionJournal) {
             .collect::<Vec<_>>(),
         hitl.iter().map(enc).collect::<Vec<_>>(),
         "journal: the AG-15 tool-confirmation and escalation events round-trip exactly"
+    );
+
+    // AG-2 (gateway#86): the `DecisionHookFired` marker is what keeps a HITL hook firing
+    // ONCE across drives. A backend that rejects the kind makes every later drive re-fire the
+    // decided hooks; one that drops `effect_id` folds a confirm-call marker (AG-2 x AG-15) as
+    // a node marker, so `on_tool_confirm_decided` re-fires on every resume. Both shapes —
+    // node-keyed (`effect_id` absent) and call-keyed — must come back exactly.
+    let h = fresh_run();
+    let marks = [
+        JournalEvent::DecisionHookFired {
+            node: NodeId("g".into()),
+            decision: Some(3),
+            effect_id: None,
+        },
+        JournalEvent::DecisionHookFired {
+            node: NodeId("n1".into()),
+            decision: Some(7),
+            effect_id: Some(orchestrator_core::EffectId("eid-2".into())),
+        },
+    ];
+    for e in &marks {
+        j.append(h, e.clone()).await.expect("append a hooks marker");
+    }
+    assert_eq!(
+        j.load(h)
+            .await
+            .expect("load")
+            .iter()
+            .map(|(_, e)| enc(e))
+            .collect::<Vec<_>>(),
+        marks.iter().map(enc).collect::<Vec<_>>(),
+        "journal: AG-2's DecisionHookFired (node- and call-keyed) round-trips exactly"
     );
 }
 
