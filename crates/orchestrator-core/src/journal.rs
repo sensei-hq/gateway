@@ -1679,6 +1679,33 @@ mod tests {
         );
     }
 
+    /// AG-2's node-keyed `DecisionHookFired` serializes exactly as it shipped — the bytes a
+    /// hooked journal already holds — and a row written before `decision` existed still
+    /// reads back as covering any decision.
+    #[test]
+    fn the_node_decision_hook_marker_keeps_its_shipped_bytes() {
+        let ev = JournalEvent::DecisionHookFired {
+            node: NodeId("gate".into()),
+            decision: Some(3),
+        };
+        assert_eq!(
+            serde_json::to_string(&ev).expect("serialises"),
+            r#"{"DecisionHookFired":{"node":"gate","decision":3}}"#
+        );
+        let old: JournalEvent =
+            serde_json::from_str(r#"{"DecisionHookFired":{"node":"gate"}}"#).expect("reads");
+        assert_eq!(
+            format!("{old:?}"),
+            format!(
+                "{:?}",
+                JournalEvent::DecisionHookFired {
+                    node: NodeId("gate".into()),
+                    decision: None,
+                }
+            )
+        );
+    }
+
     /// AG-15 — the tool-confirmation and escalation events round-trip whole; the fence stays 1.
     /// Compared as whole `Debug` renderings for the reason `ContextBudgeted`'s test gives.
     #[test]

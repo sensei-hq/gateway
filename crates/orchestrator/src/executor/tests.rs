@@ -6502,11 +6502,54 @@ impl OrchestratorHooks for RecordingHooks {
     async fn on_loop_gate_settled(&self, _r: RunId, n: &NodeId, option: &str) {
         self.push(format!("loop_gate_settled({},{option})", n.0));
     }
+    // AG-2 × AG-15: the confirm-before-run and escalation hooks (`mod confirm_hooks`).
+    async fn on_tool_confirm_awaited(
+        &self,
+        _r: RunId,
+        n: &NodeId,
+        effect_id: &EffectId,
+        tool: &str,
+        arguments: &str,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        self.push(format!(
+            "tool_confirm_awaited({},{},{tool},{arguments},{deadline:?})",
+            n.0, effect_id.0
+        ));
+    }
+    async fn on_tool_confirm_decided(
+        &self,
+        _r: RunId,
+        n: &NodeId,
+        effect_id: &EffectId,
+        approved: bool,
+        actor: &str,
+        note: Option<&str>,
+    ) {
+        self.push(format!(
+            "tool_confirm_decided({},{},{approved},{actor},{note:?})",
+            n.0, effect_id.0
+        ));
+    }
+    async fn on_agent_escalated(
+        &self,
+        _r: RunId,
+        n: &NodeId,
+        from: &str,
+        to: &str,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        self.push(format!("agent_escalated({},{from},{to},{deadline:?})", n.0));
+    }
 }
 
 /// AG-2 (#86): the human-in-the-loop hooks, exactly once per real occurrence and never
 /// on a resumed replay. A file of its own rather than more of this one.
 mod hitl_hooks;
+
+/// AG-2 × AG-15 (#86, #90): the same contract for AG-15's confirm-before-run tool calls
+/// and escalated questions.
+mod confirm_hooks;
 
 /// Acceptance §9.1 — run + node lifecycle fires in order.
 #[tokio::test]
