@@ -738,6 +738,73 @@ pub enum JournalEvent {
         dropped_deps: u32,
         dropped_tools: Vec<String>,
     },
+    /// AG-15: an agent's call of a CONFIRM-BEFORE-RUN tool
+    /// ([`AgentDefinition::confirm_tools`](crate::registry::AgentDefinition::confirm_tools))
+    /// has begun waiting for a human decision. Appended BEFORE the tool executes and before
+    /// any `EffectIntent`, so the tool has done nothing yet.
+    ///
+    /// Keyed by the CALL's `effect_id` (`effect_id(node, turn, k+1)`), not by the node — one
+    /// agent node can ask about several calls over its life, and the node-keyed waiting
+    /// machinery (`SignalAwaited`/`GateAwaited`/`AgentAwaited`) keys "has this begun
+    /// asking?" by node. `node` rides along so an operator surface can name the node.
+    ///
+    /// `arguments` is what the human approves, so it is carried — REDACTED by the
+    /// executor's redactor before the append, the obligation every human-facing journal
+    /// write in this enum carries. A call whose arguments exceed
+    /// [`MAX_HUMAN_TEXT_BYTES`] is refused to the model rather than truncated: approving a
+    /// call whose arguments were cut is approving something nobody saw. `args_hash` is the
+    /// call's tool input hash, so a decision can be checked against the exact call.
+    ///
+    /// The deadline is ABSOLUTE and FIRST record wins when folded, exactly as for the
+    /// node-keyed waiting events — recomputing `now + timeout` on every resume is the
+    /// never-expires bug. `None` waits indefinitely.
+    ToolConfirmAwaited {
+        node: NodeId,
+        effect_id: EffectId,
+        tool: String,
+        arguments: String,
+        args_hash: String,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    /// AG-15: a human approved or rejected a confirm-before-run tool call.
+    ///
+    /// LAST record wins when folded (an operator may correct a decision before the run
+    /// resumes), as for `GateDecided`. The deadline is checked BEFORE the decision is read,
+    /// so an approval landing after the deadline never runs the tool — the `HumanGate`
+    /// ordering. A rejection (or an expiry) is fed back to the model as a terse
+    /// `not_confirmed` refusal; `note` is journaled for the audit and is NOT shown to the
+    /// model.
+    ///
+    /// `actor` is ATTRIBUTION, NOT AUTHENTICATION, as on `GateDecided`: who may answer is the
+    /// operator surface's concern (`torii`), not the engine's.
+    ToolConfirmDecided {
+        node: NodeId,
+        effect_id: EffectId,
+        approved: bool,
+        actor: String,
+        note: Option<String>,
+    },
+    /// AG-15: a human-backed `Agent` node's question was ESCALATED — the agent currently
+    /// holding it (`from`) let its SLA expire unanswered, and the question now waits on
+    /// `from`'s [`escalate_to`](crate::registry::AgentDefinition::escalate_to) agent `to`,
+    /// until `deadline` (`to`'s own SLA, measured from the escalation; `None` waits
+    /// indefinitely).
+    ///
+    /// The question itself is NOT re-journaled: the escalation target is asked the SAME
+    /// question the node's `AgentAwaited` recorded, and the answer arrives as the same
+    /// node-keyed `AgentAnswered` — so an operator answering an escalated question uses the
+    /// verb they always did, and `actor` records who did. The original `AgentAwaited`
+    /// deadline is left untouched (it is first-wins and has passed); the CURRENT deadline
+    /// is the last escalation's.
+    ///
+    /// Appended at most once per target per node: the fold keeps the FIRST row for a given
+    /// `to`, and the executor refuses to escalate to an agent already in the node's chain.
+    AgentEscalated {
+        node: NodeId,
+        from: String,
+        to: String,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+    },
 }
 
 /// A round-boundary checkpoint of a run's state (§7.4). Written to the journal's
@@ -1570,6 +1637,52 @@ mod tests {
         );
         let back: JournalEvent = serde_json::from_str(&json).expect("deserialises");
         assert_eq!(format!("{back:?}"), format!("{ev:?}"));
+        assert_eq!(
+            FORMAT_VERSION, 1,
+            "an additive variant must not bump the format fence"
+        );
+    }
+
+    /// AG-15 — the tool-confirmation and escalation events round-trip whole; the fence stays 1.
+    /// Compared as whole `Debug` renderings for the reason `ContextBudgeted`'s test gives.
+    #[test]
+    fn the_ag15_events_round_trip() {
+        let at = chrono::DateTime::from_timestamp(1_000, 0).expect("valid");
+        for ev in [
+            JournalEvent::ToolConfirmAwaited {
+                node: NodeId("n1".into()),
+                effect_id: EffectId("eid-1".into()),
+                tool: "deploy".into(),
+                arguments: "{\"env\":\"prod\"}".into(),
+                args_hash: "h".into(),
+                deadline: Some(at),
+            },
+            JournalEvent::ToolConfirmAwaited {
+                node: NodeId("n1".into()),
+                effect_id: EffectId("eid-2".into()),
+                tool: "deploy".into(),
+                arguments: String::new(),
+                args_hash: "h".into(),
+                deadline: None,
+            },
+            JournalEvent::ToolConfirmDecided {
+                node: NodeId("n1".into()),
+                effect_id: EffectId("eid-1".into()),
+                approved: false,
+                actor: "alice".into(),
+                note: Some("use staging".into()),
+            },
+            JournalEvent::AgentEscalated {
+                node: NodeId("review".into()),
+                from: "reviewer".into(),
+                to: "lead".into(),
+                deadline: Some(at),
+            },
+        ] {
+            let json = serde_json::to_string(&ev).expect("serialises");
+            let back: JournalEvent = serde_json::from_str(&json).expect("deserialises");
+            assert_eq!(format!("{back:?}"), format!("{ev:?}"));
+        }
         assert_eq!(
             FORMAT_VERSION, 1,
             "an additive variant must not bump the format fence"

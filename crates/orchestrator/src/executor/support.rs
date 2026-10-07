@@ -446,6 +446,38 @@ pub(crate) fn fold_journal(
                         dropped_tools: dropped_tools.clone(),
                     });
             }
+            // AG-15: the ask FIRST-wins (its deadline must never move), the decision
+            // LAST-wins (an operator may correct it before the run resumes).
+            JournalEvent::ToolConfirmAwaited {
+                effect_id,
+                deadline,
+                ..
+            } => {
+                fold.tool_confirm_asks
+                    .entry(effect_id.clone())
+                    .or_insert(*deadline);
+            }
+            JournalEvent::ToolConfirmDecided {
+                effect_id,
+                approved,
+                ..
+            } => {
+                fold.tool_confirm_decisions
+                    .insert(effect_id.clone(), *approved);
+            }
+            // AG-15: FIRST row per target wins, so a duplicated hop can neither move the
+            // chain's current deadline nor lengthen the chain.
+            JournalEvent::AgentEscalated {
+                node, to, deadline, ..
+            } => {
+                let chain = fold.agent_escalations.entry(node.clone()).or_default();
+                if !chain.iter().any(|hop| &hop.to == to) {
+                    chain.push(super::AgentEscalation {
+                        to: to.clone(),
+                        deadline: *deadline,
+                    });
+                }
+            }
             _ => {}
         }
     }

@@ -245,6 +245,49 @@ pub async fn journal(j: &dyn ExecutionJournal) {
         1,
         "journal: compaction never touches another run"
     );
+
+    // AG-15 (gateway#90): the human-in-the-loop events the executor folds to resume a paused
+    // tool confirmation or an escalated question must come back exactly — a backend that maps
+    // event kinds to columns or a CHECK list must know these three, or a paused run can never
+    // be answered.
+    let c = fresh_run();
+    let deadline = Some(base_time() + Duration::hours(1));
+    let hitl = [
+        JournalEvent::ToolConfirmAwaited {
+            node: NodeId("n1".into()),
+            effect_id: orchestrator_core::EffectId("eid-1".into()),
+            tool: "deploy".into(),
+            arguments: "{\"env\":\"prod\"}".into(),
+            args_hash: "h".into(),
+            deadline,
+        },
+        JournalEvent::ToolConfirmDecided {
+            node: NodeId("n1".into()),
+            effect_id: orchestrator_core::EffectId("eid-1".into()),
+            approved: true,
+            actor: "alice".into(),
+            note: Some("ok".into()),
+        },
+        JournalEvent::AgentEscalated {
+            node: NodeId("review".into()),
+            from: "reviewer".into(),
+            to: "lead".into(),
+            deadline,
+        },
+    ];
+    for e in &hitl {
+        j.append(c, e.clone()).await.expect("append an AG-15 event");
+    }
+    assert_eq!(
+        j.load(c)
+            .await
+            .expect("load")
+            .iter()
+            .map(|(_, e)| enc(e))
+            .collect::<Vec<_>>(),
+        hitl.iter().map(enc).collect::<Vec<_>>(),
+        "journal: the AG-15 tool-confirmation and escalation events round-trip exactly"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

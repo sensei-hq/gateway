@@ -97,6 +97,10 @@ fn intent_key(events: &[(Seq, JournalEvent)], eid: &EffectId) -> Option<String> 
 fn agent_def(chain: &str) -> AgentDefinition {
     AgentDefinition {
         default_planner: false,
+        tool_limits: Default::default(),
+        confirm_tools: Vec::new(),
+        confirm_timeout: None,
+        escalate_to: None,
         name: "a".into(),
         area: "research".into(),
         kind: "reasoning".into(),
@@ -340,6 +344,10 @@ async fn agent_routes_via_area_kind_binding_end_to_end() {
     // Agent omits chain; the (research,reasoning) binding maps it to "c".
     let agent = AgentDefinition {
         default_planner: false,
+        tool_limits: Default::default(),
+        confirm_tools: Vec::new(),
+        confirm_timeout: None,
+        escalate_to: None,
         name: "a".into(),
         area: "research".into(),
         kind: "reasoning".into(),
@@ -395,6 +403,10 @@ async fn phase_override_wins_over_base_route_through_from_config() {
     chains.insert("plan".to_string(), "c".to_string());
     let agent = AgentDefinition {
         default_planner: false,
+        tool_limits: Default::default(),
+        confirm_tools: Vec::new(),
+        confirm_timeout: None,
+        escalate_to: None,
         name: "a".into(),
         area: "research".into(),
         kind: "reasoning".into(),
@@ -2847,6 +2859,17 @@ fn label(event: &JournalEvent) -> String {
         // is that the event is there and WHERE — a test that cares about the number reads the
         // event itself.
         JournalEvent::ContextBudgeted { node, .. } => format!("ContextBudgeted({})", node.0),
+        // AG-15: confirm-before-run. Node only, like every arm here — the effect id is
+        // payload, and a test that cares which call asked reads the event itself.
+        JournalEvent::ToolConfirmAwaited { node, .. } => {
+            format!("ToolConfirmAwaited({})", node.0)
+        }
+        JournalEvent::ToolConfirmDecided { node, .. } => {
+            format!("ToolConfirmDecided({})", node.0)
+        }
+        JournalEvent::AgentEscalated { node, to, .. } => {
+            format!("AgentEscalated({}->{})", node.0, to)
+        }
     }
 }
 
@@ -3628,6 +3651,10 @@ async fn agent_node_drives_real_reference_chain_to_local_fallover() {
     let journal = InMemoryJournal::new();
     let registry = Arc::new(Registry::default().with_agent(AgentDefinition {
         default_planner: false,
+        tool_limits: Default::default(),
+        confirm_tools: Vec::new(),
+        confirm_timeout: None,
+        escalate_to: None,
         name: "researcher".into(),
         area: "research".into(),
         kind: "reasoning".into(),
@@ -4211,6 +4238,10 @@ async fn map_of_agents_then_consolidate_drives_the_real_reference_chain_to_local
     let journal = InMemoryJournal::new();
     let mk_agent = |name: &str| AgentDefinition {
         default_planner: false,
+        tool_limits: Default::default(),
+        confirm_tools: Vec::new(),
+        confirm_timeout: None,
+        escalate_to: None,
         name: name.into(),
         area: "research".into(),
         kind: "reasoning".into(),
@@ -4331,6 +4362,10 @@ async fn e2e_map_observation_agents_plus_mutation_agent_through_the_real_gateway
 
     let mk_agent = |name: &str, tools: Vec<String>| AgentDefinition {
         default_planner: false,
+        tool_limits: Default::default(),
+        confirm_tools: Vec::new(),
+        confirm_timeout: None,
+        escalate_to: None,
         name: name.into(),
         area: "research".into(),
         kind: "reasoning".into(),
@@ -4490,6 +4525,10 @@ async fn in_doubt_mutation_in_a_map_child_pauses_the_whole_run() {
     let mk_recorder = |sink: Arc<std::sync::Mutex<Vec<String>>>| {
         let recorder = AgentDefinition {
             default_planner: false,
+            tool_limits: Default::default(),
+            confirm_tools: Vec::new(),
+            confirm_timeout: None,
+            escalate_to: None,
             name: "recorder".into(),
             area: "research".into(),
             kind: "reasoning".into(),
@@ -4899,6 +4938,10 @@ async fn agent_prompt_includes_its_dependency_output_from_the_blackboard() {
     let (gw, _c) = echo_system_gateway().await;
     let mk = |name: &str, sys: &str| AgentDefinition {
         default_planner: false,
+        tool_limits: Default::default(),
+        confirm_tools: Vec::new(),
+        confirm_timeout: None,
+        escalate_to: None,
         name: name.into(),
         area: "research".into(),
         kind: "reasoning".into(),
@@ -5673,6 +5716,10 @@ async fn loop_subgraph_body_pause_pauses_the_loop() {
     let mk_recorder = |sink: Arc<std::sync::Mutex<Vec<String>>>| {
         let recorder = AgentDefinition {
             default_planner: false,
+            tool_limits: Default::default(),
+            confirm_tools: Vec::new(),
+            confirm_timeout: None,
+            escalate_to: None,
             name: "recorder".into(),
             area: "research".into(),
             kind: "reasoning".into(),
@@ -6139,6 +6186,10 @@ async fn coordinator_loop_expand_body_with_gate_agent_converges() {
         Registry::default()
             .with_agent(AgentDefinition {
                 default_planner: false,
+                tool_limits: Default::default(),
+                confirm_tools: Vec::new(),
+                confirm_timeout: None,
+                escalate_to: None,
                 name: "planner".into(),
                 area: "planning".into(),
                 kind: "reasoning".into(),
@@ -6152,6 +6203,10 @@ async fn coordinator_loop_expand_body_with_gate_agent_converges() {
             })
             .with_agent(AgentDefinition {
                 default_planner: false,
+                tool_limits: Default::default(),
+                confirm_tools: Vec::new(),
+                confirm_timeout: None,
+                escalate_to: None,
                 name: "gate".into(),
                 area: "gating".into(),
                 kind: "reasoning".into(),
@@ -7680,6 +7735,10 @@ async fn an_in_doubt_mutation_in_a_subgraph_pauses_the_run() {
     let mk_recorder = |sink: Arc<std::sync::Mutex<Vec<String>>>| {
         let recorder = AgentDefinition {
             default_planner: false,
+            tool_limits: Default::default(),
+            confirm_tools: Vec::new(),
+            confirm_timeout: None,
+            escalate_to: None,
             name: "recorder".into(),
             area: "research".into(),
             kind: "reasoning".into(),
@@ -8196,6 +8255,10 @@ async fn an_in_doubt_mutation_in_a_branch_arm_pauses_the_run() {
     let mk_recorder = |sink: Arc<std::sync::Mutex<Vec<String>>>| {
         let recorder = AgentDefinition {
             default_planner: false,
+            tool_limits: Default::default(),
+            confirm_tools: Vec::new(),
+            confirm_timeout: None,
+            escalate_to: None,
             name: "recorder".into(),
             area: "research".into(),
             kind: "reasoning".into(),
@@ -8965,6 +9028,10 @@ async fn an_in_doubt_mutation_in_an_expand_plan_pauses_the_run() {
     let mk_recorder = |sink: Arc<std::sync::Mutex<Vec<String>>>| {
         let recorder = AgentDefinition {
             default_planner: false,
+            tool_limits: Default::default(),
+            confirm_tools: Vec::new(),
+            confirm_timeout: None,
+            escalate_to: None,
             name: "recorder".into(),
             area: "research".into(),
             kind: "reasoning".into(),
@@ -9137,6 +9204,10 @@ async fn on_plan_expanded_fires_with_the_plan() {
 fn planner_registry() -> Arc<Registry> {
     Arc::new(Registry::default().with_agent(AgentDefinition {
         default_planner: false,
+        tool_limits: Default::default(),
+        confirm_tools: Vec::new(),
+        confirm_timeout: None,
+        escalate_to: None,
         name: "planner".into(),
         area: "planning".into(),
         kind: "reasoning".into(),
@@ -9504,6 +9575,10 @@ async fn planner_agent_determinism_violation_in_the_plan_sub_run_halts() {
     let planner_reg = |sys: &str| {
         Arc::new(Registry::default().with_agent(AgentDefinition {
             default_planner: false,
+            tool_limits: Default::default(),
+            confirm_tools: Vec::new(),
+            confirm_timeout: None,
+            escalate_to: None,
             name: "planner".into(),
             area: "planning".into(),
             kind: "reasoning".into(),
@@ -9575,6 +9650,10 @@ async fn planner_agent_uses_validate_plan_then_emits_a_single_agent_plan() {
     // Registry: a `planner` agent granted validate_plan + list_agents, and a `worker` agent.
     let worker = AgentDefinition {
         default_planner: false,
+        tool_limits: Default::default(),
+        confirm_tools: Vec::new(),
+        confirm_timeout: None,
+        escalate_to: None,
         name: "worker".into(),
         area: "research".into(),
         kind: "reasoning".into(),
@@ -9588,6 +9667,10 @@ async fn planner_agent_uses_validate_plan_then_emits_a_single_agent_plan() {
     };
     let planner = AgentDefinition {
         default_planner: false,
+        tool_limits: Default::default(),
+        confirm_tools: Vec::new(),
+        confirm_timeout: None,
+        escalate_to: None,
         name: "planner".into(),
         area: "planning".into(),
         kind: "reasoning".into(),
@@ -9779,6 +9862,10 @@ fn two_planner_agents_marking(marked: Option<&str>) -> Vec<AgentDefinition> {
         .into_iter()
         .map(|name| AgentDefinition {
             default_planner: marked == Some(name),
+            tool_limits: Default::default(),
+            confirm_tools: Vec::new(),
+            confirm_timeout: None,
+            escalate_to: None,
             name: name.into(),
             area: "planning".into(),
             kind: "reasoning".into(),
@@ -9818,6 +9905,10 @@ fn expand_select_node(id: &str, deps: Vec<Dep>) -> Node {
 async fn planner_candidates_orders_the_marked_agent_first() {
     let mk = |name: &str, marked: bool| AgentDefinition {
         default_planner: marked,
+        tool_limits: Default::default(),
+        confirm_tools: Vec::new(),
+        confirm_timeout: None,
+        escalate_to: None,
         name: name.into(),
         area: "planning".into(),
         kind: "reasoning".into(),
@@ -10049,6 +10140,10 @@ async fn select_with_no_candidates_fails_the_node() {
     // registry has an agent but NOT area=="planning".
     let reg = Arc::new(Registry::default().with_agent(AgentDefinition {
         default_planner: false,
+        tool_limits: Default::default(),
+        confirm_tools: Vec::new(),
+        confirm_timeout: None,
+        escalate_to: None,
         name: "coder".into(),
         area: "coding".into(),
         kind: "exec".into(),
@@ -20213,6 +20308,10 @@ mod human_agent {
     pub(super) fn reviewer(timeout: Option<Duration>, skills: Vec<String>) -> AgentDefinition {
         AgentDefinition {
             default_planner: false,
+            tool_limits: Default::default(),
+            confirm_tools: Vec::new(),
+            confirm_timeout: None,
+            escalate_to: None,
             name: "reviewer".into(),
             area: "review".into(),
             kind: "human".into(),
@@ -28269,3 +28368,1126 @@ mod discovery_tools_per_run {
 
 // AG-12 (#89): the money-denominated run budget.
 mod money_budget;
+
+/// AG-15 (#90): engine-enforced agent tool policy — confirm-before-run and the per-tool call
+/// ceiling. Every test drives agent "a" on chain "c" through the scripted gateway, with the
+/// `fs.write` `ScopedWriter` as the tool, so the SINK proves whether the tool really ran.
+mod agent_tool_policy {
+    use super::human_gate::{at, paused_resume_afters};
+    use super::*;
+    use crate::test_support::FakeClock;
+    use chrono::{DateTime, Duration, Utc};
+
+    fn n1() -> NodeId {
+        NodeId("n1".into())
+    }
+
+    /// The turn-0, first-call effect id — the key every confirmation in this module uses.
+    fn teid() -> EffectId {
+        effect_id("n1", 0, 1)
+    }
+
+    type Sink = Arc<std::sync::Mutex<Vec<String>>>;
+
+    fn sink() -> Sink {
+        Arc::new(std::sync::Mutex::new(Vec::new()))
+    }
+
+    /// Agent "a" LISTS `fs.write`, holds a `/workspace` grant for it and must confirm it.
+    pub(super) fn confirm_agent(timeout: Option<Duration>) -> AgentDefinition {
+        AgentDefinition {
+            tools: vec!["fs.write".into()],
+            grants: std::collections::HashMap::from([(
+                "fs.write".to_string(),
+                path_grant(&["/workspace"]),
+            )]),
+            confirm_tools: vec!["fs.write".into()],
+            confirm_timeout: timeout,
+            ..agent_def("c")
+        }
+    }
+
+    pub(super) fn registry_of(agent: AgentDefinition) -> Arc<Registry> {
+        Arc::new(
+            Registry::default()
+                .with_agent(agent)
+                .with_tool(ScopedWriter::new(sink()).spec()),
+        )
+    }
+
+    fn write_args(path: &str, content: &str) -> String {
+        serde_json::json!({ "path": path, "content": content }).to_string()
+    }
+
+    /// An executor over a caller-owned journal (so a decision can be appended between
+    /// drives, the shape `torii` has), a settable clock, and a sink for the tool's writes.
+    async fn build_executor(
+        journal: &InMemoryJournal,
+        registry: Arc<Registry>,
+        script: Vec<kernel::types::io::ChatResponse>,
+        sink: &Sink,
+        now: DateTime<Utc>,
+    ) -> (Executor, Arc<FakeClock>) {
+        let clock = FakeClock::new(now);
+        let (gw, _calls) = scripted_gateway(script).await;
+        let ex = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_registry(registry)
+            .with_tools(Arc::new(
+                ToolRegistry::default().with_tool(Arc::new(ScopedWriter::new(sink.clone()))),
+            ))
+            .with_clock(clock.clone());
+        (ex, clock)
+    }
+
+    fn decided(approved: bool, actor: &str, note: Option<&str>) -> JournalEvent {
+        JournalEvent::ToolConfirmDecided {
+            node: n1(),
+            effect_id: teid(),
+            approved,
+            actor: actor.into(),
+            note: note.map(str::to_string),
+        }
+    }
+
+    /// Every `ToolConfirmAwaited` in the journal, as `(effect_id, tool, arguments, deadline)`.
+    #[allow(clippy::type_complexity)]
+    fn asks(
+        events: &[(Seq, JournalEvent)],
+    ) -> Vec<(EffectId, String, String, Option<DateTime<Utc>>)> {
+        events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                JournalEvent::ToolConfirmAwaited {
+                    effect_id,
+                    tool,
+                    arguments,
+                    deadline,
+                    ..
+                } => Some((
+                    effect_id.clone(),
+                    tool.clone(),
+                    arguments.clone(),
+                    *deadline,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The headline: the call PAUSES the run before the tool does anything, a re-drive with
+    /// no decision re-pauses WITHOUT re-asking (first-wins), and an approval resumes the run
+    /// and runs the tool exactly once.
+    #[tokio::test]
+    async fn a_confirm_tool_pauses_before_it_runs_and_runs_once_approved() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "write it")],
+        };
+        let writes = sink();
+        let call = write_args("/workspace/a.txt", "x");
+
+        // Drive 1: the model asks for the tool → the run pauses on a human decision.
+        let (ex, _clock) = build_executor(
+            &journal,
+            registry_of(confirm_agent(None)),
+            vec![tool_call_response("t1", "fs.write", &call)],
+            &writes,
+            at(1_000),
+        )
+        .await;
+        let o1 = ex.start(run, &graph).await.expect("drive 1");
+        let paused = o1.paused.expect("a confirm-before-run call pauses the run");
+        assert_eq!(paused.node, n1());
+        assert!(paused.reason.contains("fs.write"), "{}", paused.reason);
+        assert!(
+            paused.reason.contains(&teid().0),
+            "the pause names the call an operator must answer: {}",
+            paused.reason
+        );
+        assert!(writes.lock().unwrap().is_empty(), "the tool has not run");
+        let events = journal.load(run).await.unwrap();
+        let a = asks(&events);
+        assert_eq!(a.len(), 1, "{a:?}");
+        assert_eq!(a[0].0, teid());
+        assert_eq!(a[0].1, "fs.write");
+        assert!(a[0].2.contains("/workspace/a.txt"), "{}", a[0].2);
+        assert_eq!(a[0].3, None, "no confirm_timeout ⇒ waits indefinitely");
+        assert!(
+            !has_effect_intent(&events, &teid()),
+            "no intent before approval"
+        );
+        assert_eq!(effect_recorded_count(&events, &teid()), 0);
+
+        // Drive 2: still undecided → still paused, and the ask is NOT repeated.
+        let (ex, _clock) = build_executor(
+            &journal,
+            registry_of(confirm_agent(None)),
+            vec![],
+            &writes,
+            at(2_000),
+        )
+        .await;
+        let o2 = ex.start(run, &graph).await.expect("drive 2");
+        assert!(o2.paused.is_some(), "undecided stays paused: {o2:?}");
+        assert!(writes.lock().unwrap().is_empty());
+        assert_eq!(asks(&journal.load(run).await.unwrap()).len(), 1);
+
+        // A human approves; drive 3 runs the tool and finishes the node.
+        journal
+            .append(run, decided(true, "alice", None))
+            .await
+            .unwrap();
+        let (ex, _clock) = build_executor(
+            &journal,
+            registry_of(confirm_agent(None)),
+            vec![final_response("done")],
+            &writes,
+            at(3_000),
+        )
+        .await;
+        let o3 = ex.start(run, &graph).await.expect("drive 3");
+        assert!(o3.paused.is_none() && o3.failed.is_none(), "{o3:?}");
+        assert_eq!(o3.outputs[&n1()]["text"], "done");
+        assert_eq!(&*writes.lock().unwrap(), &["/workspace/a.txt".to_string()]);
+        let events = journal.load(run).await.unwrap();
+        assert_eq!(asks(&events).len(), 1, "asked exactly once over the run");
+        assert_eq!(
+            recorded_output(&events, &teid()).expect("the approved call is recorded")["written"],
+            "/workspace/a.txt"
+        );
+    }
+
+    /// A rejection is a TERSE refusal fed back to the model — like an ungranted tool — and
+    /// the tool never runs. The operator's note is audit, never model input.
+    #[tokio::test]
+    async fn a_rejected_confirmation_is_a_terse_refusal_and_the_tool_never_runs() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "write it")],
+        };
+        let writes = sink();
+        let call = write_args("/workspace/a.txt", "x");
+        let (ex, _clock) = build_executor(
+            &journal,
+            registry_of(confirm_agent(None)),
+            vec![tool_call_response("t1", "fs.write", &call)],
+            &writes,
+            at(1_000),
+        )
+        .await;
+        assert!(ex.start(run, &graph).await.unwrap().paused.is_some());
+
+        journal
+            .append(run, decided(false, "bob", Some("use the staging bucket")))
+            .await
+            .unwrap();
+        let (ex, _clock) = build_executor(
+            &journal,
+            registry_of(confirm_agent(None)),
+            vec![final_response("done")],
+            &writes,
+            at(2_000),
+        )
+        .await;
+        let o = ex.start(run, &graph).await.expect("drive 2");
+        assert!(o.paused.is_none() && o.failed.is_none(), "{o:?}");
+        assert!(
+            writes.lock().unwrap().is_empty(),
+            "a rejected call never runs"
+        );
+        let events = journal.load(run).await.unwrap();
+        let refusal = recorded_output(&events, &teid()).expect("the refusal is recorded");
+        assert_eq!(refusal["error"], "not_confirmed");
+        assert_eq!(refusal["tool"], "fs.write");
+        assert!(
+            !refusal.to_string().contains("staging") && !refusal.to_string().contains("bob"),
+            "the model sees a terse refusal, not the operator's note or name: {refusal}"
+        );
+        assert!(!has_effect_intent(&events, &teid()));
+    }
+
+    /// Gate semantics: the deadline is checked BEFORE the decision is read, so an approval
+    /// that lands after it never runs the tool. And the pause carries the absolute deadline
+    /// as its `resume_after`, so the scheduler wakes the run to expire it.
+    #[tokio::test]
+    async fn an_approval_after_the_confirm_deadline_does_not_run_the_tool() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "write it")],
+        };
+        let writes = sink();
+        let call = write_args("/workspace/a.txt", "x");
+        let agent = || confirm_agent(Some(Duration::hours(1)));
+        let (ex, _clock) = build_executor(
+            &journal,
+            registry_of(agent()),
+            vec![tool_call_response("t1", "fs.write", &call)],
+            &writes,
+            at(1_000),
+        )
+        .await;
+        assert!(ex.start(run, &graph).await.unwrap().paused.is_some());
+        let events = journal.load(run).await.unwrap();
+        assert_eq!(asks(&events)[0].3, Some(at(1_000 + 3_600)));
+        assert_eq!(
+            paused_resume_afters(&events).last().copied().flatten(),
+            Some(at(1_000 + 3_600)),
+            "the pause wakes at the recorded deadline"
+        );
+
+        // Re-driven inside the SLA but later: the deadline is the RECORDED one, not now+1h.
+        let (ex, _clock) =
+            build_executor(&journal, registry_of(agent()), vec![], &writes, at(3_000)).await;
+        assert!(ex.start(run, &graph).await.unwrap().paused.is_some());
+        assert_eq!(
+            paused_resume_afters(&journal.load(run).await.unwrap())
+                .last()
+                .copied()
+                .flatten(),
+            Some(at(1_000 + 3_600)),
+            "a re-drive must not push the deadline forward"
+        );
+
+        journal
+            .append(run, decided(true, "alice", None))
+            .await
+            .unwrap();
+        let (ex, _clock) = build_executor(
+            &journal,
+            registry_of(agent()),
+            vec![final_response("done")],
+            &writes,
+            at(1_000 + 3_600),
+        )
+        .await;
+        let o = ex.start(run, &graph).await.expect("past the deadline");
+        assert!(o.paused.is_none() && o.failed.is_none(), "{o:?}");
+        assert!(
+            writes.lock().unwrap().is_empty(),
+            "a late approval runs nothing"
+        );
+        let refusal = recorded_output(&journal.load(run).await.unwrap(), &teid())
+            .expect("the expiry is recorded as a refusal");
+        assert_eq!(refusal["error"], "not_confirmed");
+    }
+
+    /// The arguments a human approves are a durable, operator-facing write — redacted before
+    /// the append, like every other human-facing journal row.
+    #[tokio::test]
+    async fn the_journaled_confirmation_arguments_are_redacted() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "write it")],
+        };
+        // Built at runtime so no credential-shaped literal sits in source.
+        let secret = format!("sk-{}", "abcdefghijklmnopqrstuvwx");
+        let call = write_args("/workspace/a.txt", &secret);
+        let (gw, _calls) =
+            scripted_gateway(vec![tool_call_response("t1", "fs.write", &call)]).await;
+        let ex = Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_registry(registry_of(confirm_agent(None)))
+            .with_tools(Arc::new(
+                ToolRegistry::default().with_tool(Arc::new(ScopedWriter::new(sink()))),
+            ))
+            .with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()));
+        assert!(ex.start(run, &graph).await.unwrap().paused.is_some());
+        let a = asks(&journal.load(run).await.unwrap());
+        assert_eq!(a.len(), 1);
+        assert!(
+            !a[0].2.contains(&secret),
+            "plaintext secret journaled: {}",
+            a[0].2
+        );
+        assert!(a[0].2.contains("[REDACTED]"), "{}", a[0].2);
+    }
+
+    /// Arguments too large to show a human are refused, never truncated — approving a call
+    /// whose arguments were cut is approving something nobody saw. No ask is journaled.
+    #[tokio::test]
+    async fn oversized_confirmation_arguments_are_refused_without_asking() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "write it")],
+        };
+        let writes = sink();
+        let big = "x".repeat(orchestrator_core::MAX_HUMAN_TEXT_BYTES + 1);
+        let call = write_args("/workspace/a.txt", &big);
+        let (ex, _clock) = build_executor(
+            &journal,
+            registry_of(confirm_agent(None)),
+            vec![
+                tool_call_response("t1", "fs.write", &call),
+                final_response("done"),
+            ],
+            &writes,
+            at(1_000),
+        )
+        .await;
+        let o = ex.start(run, &graph).await.expect("drive");
+        assert!(o.paused.is_none() && o.failed.is_none(), "{o:?}");
+        assert!(writes.lock().unwrap().is_empty());
+        let events = journal.load(run).await.unwrap();
+        assert!(
+            asks(&events).is_empty(),
+            "nothing a human could read was asked"
+        );
+        assert_eq!(
+            recorded_output(&events, &teid()).expect("refusal recorded")["error"],
+            "not_confirmed"
+        );
+    }
+
+    /// The s1 permission gate runs FIRST: a call the grant does not cover is denied outright
+    /// and never put to a human — a person must not be asked to approve what the agent may
+    /// not do at all.
+    #[tokio::test]
+    async fn an_ungranted_confirm_tool_call_is_denied_without_asking() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "write it")],
+        };
+        let writes = sink();
+        let call = write_args("/etc/passwd", "x");
+        let (ex, _clock) = build_executor(
+            &journal,
+            registry_of(confirm_agent(None)),
+            vec![
+                tool_call_response("t1", "fs.write", &call),
+                final_response("done"),
+            ],
+            &writes,
+            at(1_000),
+        )
+        .await;
+        let o = ex.start(run, &graph).await.expect("drive");
+        assert!(o.paused.is_none() && o.failed.is_none(), "{o:?}");
+        let events = journal.load(run).await.unwrap();
+        assert!(asks(&events).is_empty());
+        assert_eq!(
+            recorded_output(&events, &teid()).expect("denial recorded")["error"],
+            "permission_denied"
+        );
+    }
+
+    /// Agent "a" LISTS `fs.write` (with a `/workspace` grant) under a call ceiling of
+    /// `limit`, and `calc`, which it must CONFIRM — the confirmation is only here to give a
+    /// resume test a durable pause in the middle of the ReAct loop.
+    fn limited_agent(limit: u32) -> AgentDefinition {
+        AgentDefinition {
+            tools: vec!["fs.write".into(), "calc".into()],
+            grants: std::collections::HashMap::from([(
+                "fs.write".to_string(),
+                path_grant(&["/workspace"]),
+            )]),
+            tool_limits: std::collections::HashMap::from([("fs.write".to_string(), limit)]),
+            confirm_tools: vec!["calc".into()],
+            ..agent_def("c")
+        }
+    }
+
+    fn limited_registry(limit: u32) -> Arc<Registry> {
+        Arc::new(
+            Registry::default()
+                .with_agent(limited_agent(limit))
+                .with_tool(ScopedWriter::new(sink()).spec())
+                .with_tool(Calc.spec()),
+        )
+    }
+
+    async fn limited_executor(
+        journal: &InMemoryJournal,
+        limit: u32,
+        script: Vec<kernel::types::io::ChatResponse>,
+        sink: &Sink,
+    ) -> Executor {
+        let (gw, _calls) = scripted_gateway(script).await;
+        Executor::new(Arc::new(gw), Arc::new(journal.clone()), "v1")
+            .with_registry(limited_registry(limit))
+            .with_tools(Arc::new(
+                ToolRegistry::default()
+                    .with_tool(Arc::new(ScopedWriter::new(sink.clone())))
+                    .with_tool(Arc::new(Calc)),
+            ))
+            .with_clock(FakeClock::new(at(1_000)))
+    }
+
+    fn write(id: &str, path: &str) -> kernel::types::io::ChatResponse {
+        tool_call_response(id, "fs.write", &write_args(path, "x"))
+    }
+
+    /// The ceiling: calls up to it run, the call after it is refused with a terse
+    /// `call_limit_reached` fed back to the model (no tool run, no intent), and the agent
+    /// carries on to its answer.
+    #[tokio::test]
+    async fn the_call_after_the_ceiling_is_refused_and_never_runs() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "write three")],
+        };
+        let writes = sink();
+        let ex = limited_executor(
+            &journal,
+            2,
+            vec![
+                write("t1", "/workspace/1"),
+                write("t2", "/workspace/2"),
+                write("t3", "/workspace/3"),
+                final_response("done"),
+            ],
+            &writes,
+        )
+        .await;
+        let o = ex.start(run, &graph).await.expect("drive");
+        assert!(o.paused.is_none() && o.failed.is_none(), "{o:?}");
+        assert_eq!(o.outputs[&n1()]["text"], "done");
+        assert_eq!(
+            &*writes.lock().unwrap(),
+            &["/workspace/1".to_string(), "/workspace/2".to_string()],
+            "exactly the ceiling's worth of calls ran"
+        );
+        let events = journal.load(run).await.unwrap();
+        let third = effect_id("n1", 2, 1);
+        let refusal = recorded_output(&events, &third).expect("the refusal is recorded");
+        assert_eq!(refusal["error"], "call_limit_reached");
+        assert_eq!(refusal["tool"], "fs.write");
+        assert!(
+            !has_effect_intent(&events, &third),
+            "a refused Mutation has no intent"
+        );
+    }
+
+    /// REPLAY-SAFE: the count is derived from the journal, not from process memory. Drive 1
+    /// makes the ceiling's two calls and then pauses (on an unrelated confirmation); drive 2
+    /// is a FRESH executor over the same journal, and the model's next `fs.write` must still
+    /// be refused — a counter kept in memory, or one that counts only LIVE calls, starts
+    /// again at zero there and lets it run.
+    #[tokio::test]
+    async fn the_call_ceiling_survives_a_resume_on_a_fresh_executor() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "write, check, write")],
+        };
+        let first = sink();
+        let ex = limited_executor(
+            &journal,
+            2,
+            vec![
+                write("t1", "/workspace/1"),
+                write("t2", "/workspace/2"),
+                tool_call_response("t3", "calc", "{\"op\":\"add\",\"a\":1,\"b\":1}"),
+            ],
+            &first,
+        )
+        .await;
+        let o1 = ex.start(run, &graph).await.expect("drive 1");
+        assert!(o1.paused.is_some(), "the calc confirmation pauses: {o1:?}");
+        assert_eq!(first.lock().unwrap().len(), 2);
+
+        journal
+            .append(
+                run,
+                JournalEvent::ToolConfirmDecided {
+                    node: n1(),
+                    effect_id: effect_id("n1", 2, 1),
+                    approved: true,
+                    actor: "alice".into(),
+                    note: None,
+                },
+            )
+            .await
+            .unwrap();
+        let second = sink();
+        let ex = limited_executor(
+            &journal,
+            2,
+            vec![write("t4", "/workspace/3"), final_response("done")],
+            &second,
+        )
+        .await;
+        let o2 = ex.start(run, &graph).await.expect("drive 2");
+        assert!(o2.paused.is_none() && o2.failed.is_none(), "{o2:?}");
+        assert!(
+            second.lock().unwrap().is_empty(),
+            "the resumed run must not get a fresh ceiling"
+        );
+        let events = journal.load(run).await.unwrap();
+        assert_eq!(
+            recorded_output(&events, &effect_id("n1", 3, 1)).expect("recorded")["error"],
+            "call_limit_reached"
+        );
+    }
+
+    /// The documented SCOPE: one agent invocation. Two nodes driving the same agent each get
+    /// their own ceiling — the count is the invocation's transcript, not the run's.
+    #[tokio::test]
+    async fn the_call_ceiling_is_per_agent_invocation() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let mut second = agent_node("n2", "a", "write one more");
+        second.deps = vec![Dep::hard("n1")];
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "write one"), second],
+        };
+        let writes = sink();
+        let ex = limited_executor(
+            &journal,
+            1,
+            vec![
+                write("t1", "/workspace/1"),
+                final_response("one"),
+                write("t2", "/workspace/2"),
+                final_response("two"),
+            ],
+            &writes,
+        )
+        .await;
+        let o = ex.start(run, &graph).await.expect("drive");
+        assert!(o.paused.is_none() && o.failed.is_none(), "{o:?}");
+        assert_eq!(
+            &*writes.lock().unwrap(),
+            &["/workspace/1".to_string(), "/workspace/2".to_string()],
+            "each invocation has its own ceiling of one"
+        );
+    }
+
+    /// Drive a confirm-before-run `fs.write` to its pause, append `decisions` in order, then
+    /// resume; returns what the tool wrote and the call's recorded output.
+    async fn decide_in_order(decisions: &[bool]) -> (Vec<String>, Option<serde_json::Value>) {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "write it")],
+        };
+        let writes = sink();
+        let (ex, _clock) = build_executor(
+            &journal,
+            registry_of(confirm_agent(None)),
+            vec![tool_call_response(
+                "t1",
+                "fs.write",
+                &write_args("/workspace/1", "x"),
+            )],
+            &writes,
+            at(1_000),
+        )
+        .await;
+        assert!(ex.start(run, &graph).await.unwrap().paused.is_some());
+        for (i, approved) in decisions.iter().enumerate() {
+            journal
+                .append(run, decided(*approved, &format!("op{i}"), None))
+                .await
+                .unwrap();
+        }
+        let (ex, _clock) = build_executor(
+            &journal,
+            registry_of(confirm_agent(None)),
+            vec![final_response("done")],
+            &writes,
+            at(2_000),
+        )
+        .await;
+        let o = ex.start(run, &graph).await.expect("resume");
+        assert!(o.paused.is_none() && o.failed.is_none(), "{o:?}");
+        let recorded = recorded_output(&journal.load(run).await.unwrap(), &teid());
+        let written = writes.lock().unwrap().clone();
+        (written, recorded)
+    }
+
+    /// `ToolConfirmDecided` folds LAST-wins, like `GateDecided`: an operator can correct a
+    /// decision before the run resumes, in either direction.
+    #[tokio::test]
+    async fn the_last_confirmation_decision_wins() {
+        let (written, recorded) = decide_in_order(&[false, true]).await;
+        assert_eq!(
+            written,
+            vec!["/workspace/1".to_string()],
+            "the corrected approval runs the tool exactly once"
+        );
+        assert_eq!(recorded.expect("recorded")["written"], "/workspace/1");
+
+        let (written, recorded) = decide_in_order(&[true, false]).await;
+        assert!(
+            written.is_empty(),
+            "an approval corrected to a rejection never runs the tool"
+        );
+        assert_eq!(recorded.expect("recorded")["error"], "not_confirmed");
+    }
+
+    /// The ceiling runs BEFORE confirm-before-run: a call over the ceiling is refused outright
+    /// and never put to a human — nobody is asked to approve a call that would be refused
+    /// anyway, and the run does not pause on it.
+    #[tokio::test]
+    async fn a_call_over_the_ceiling_is_never_put_to_a_human() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "write twice")],
+        };
+        let writes = sink();
+        let agent = || AgentDefinition {
+            tool_limits: std::collections::HashMap::from([("fs.write".to_string(), 1)]),
+            ..confirm_agent(None)
+        };
+        let (ex, _clock) = build_executor(
+            &journal,
+            registry_of(agent()),
+            vec![tool_call_response(
+                "t1",
+                "fs.write",
+                &write_args("/workspace/1", "x"),
+            )],
+            &writes,
+            at(1_000),
+        )
+        .await;
+        assert!(ex.start(run, &graph).await.unwrap().paused.is_some());
+        journal
+            .append(run, decided(true, "alice", None))
+            .await
+            .unwrap();
+
+        let (ex, _clock) = build_executor(
+            &journal,
+            registry_of(agent()),
+            vec![
+                tool_call_response("t2", "fs.write", &write_args("/workspace/2", "x")),
+                final_response("done"),
+            ],
+            &writes,
+            at(2_000),
+        )
+        .await;
+        let o = ex.start(run, &graph).await.expect("drive 2");
+        assert!(
+            o.paused.is_none() && o.failed.is_none(),
+            "the over-ceiling call must not pause on a human: {o:?}"
+        );
+        assert_eq!(&*writes.lock().unwrap(), &["/workspace/1".to_string()]);
+        let events = journal.load(run).await.unwrap();
+        assert_eq!(asks(&events).len(), 1, "only the first call was asked");
+        assert_eq!(
+            recorded_output(&events, &effect_id("n1", 1, 1)).expect("recorded")["error"],
+            "call_limit_reached"
+        );
+    }
+
+    /// Drive a confirm-before-run `fs.write` to the point an APPROVED drive has journaled its
+    /// `EffectIntent` and then crashed before `EffectRecorded`: drive 1 pauses on the ask, an
+    /// approval lands, drive 2 runs the call to completion, and the journal is then cut back
+    /// to the intent. Returns the cut journal, the run, and the graph.
+    async fn approved_and_in_doubt(timeout: Option<Duration>) -> (InMemoryJournal, RunId, Graph) {
+        let full = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "write it")],
+        };
+        let writes = sink();
+        let call = write_args("/workspace/a.txt", "x");
+        let (ex, _clock) = build_executor(
+            &full,
+            registry_of(confirm_agent(timeout)),
+            vec![tool_call_response("t1", "fs.write", &call)],
+            &writes,
+            at(1_000),
+        )
+        .await;
+        assert!(ex.start(run, &graph).await.unwrap().paused.is_some());
+        full.append(run, decided(true, "alice", None))
+            .await
+            .unwrap();
+        let (ex, _clock) = build_executor(
+            &full,
+            registry_of(confirm_agent(timeout)),
+            vec![final_response("done")],
+            &writes,
+            at(2_000),
+        )
+        .await;
+        let o = ex.start(run, &graph).await.expect("approved drive");
+        assert!(o.paused.is_none() && o.failed.is_none(), "{o:?}");
+        assert_eq!(writes.lock().unwrap().len(), 1, "the approved call ran");
+
+        let events = full.load(run).await.unwrap();
+        let cut = events
+            .iter()
+            .position(|(_, e)| matches!(e, JournalEvent::EffectIntent { effect_id, .. } if *effect_id == teid()))
+            .expect("the approved Mutation journaled an intent");
+        let seeded = InMemoryJournal::new();
+        for (_, e) in &events[..=cut] {
+            seeded.append(run, e.clone()).await.unwrap();
+        }
+        (seeded, run, graph)
+    }
+
+    /// An approved call whose `EffectIntent` stands with no `EffectRecorded` is IN DOUBT — the
+    /// side effect may already have happened. The approval is settled; a resume after the
+    /// confirm deadline must reconcile it (here: no provider ⇒ `Indeterminate` ⇒ pause loud),
+    /// never re-judge it as expired and journal a `not_confirmed` refusal over the intent.
+    #[tokio::test]
+    async fn an_approved_in_doubt_confirm_mutation_reconciles_after_the_deadline() {
+        let (journal, run, graph) = approved_and_in_doubt(Some(Duration::hours(1))).await;
+        let writes = sink();
+        let (ex, _clock) = build_executor(
+            &journal,
+            registry_of(confirm_agent(Some(Duration::hours(1)))),
+            vec![final_response("done")],
+            &writes,
+            at(1_000 + 7_200),
+        )
+        .await;
+        let o = ex.start(run, &graph).await.expect("resume");
+        let events = journal.load(run).await.unwrap();
+        assert!(
+            o.paused.is_some(),
+            "an in-doubt approved Mutation pauses for reconcile: got {o:?}, recorded {:?}",
+            recorded_output(&events, &teid())
+        );
+        assert!(writes.lock().unwrap().is_empty(), "never blind re-run");
+        assert_eq!(
+            effect_recorded_count(&events, &teid()),
+            0,
+            "nothing is recorded over the standing intent"
+        );
+    }
+
+    /// The same in-doubt call with a later corrective REJECTION appended: the decision can no
+    /// longer un-run what may already have happened, so the resume still reconciles.
+    #[tokio::test]
+    async fn a_rejection_after_an_in_doubt_approved_mutation_still_reconciles() {
+        let (journal, run, graph) = approved_and_in_doubt(None).await;
+        journal
+            .append(run, decided(false, "bob", None))
+            .await
+            .unwrap();
+        let writes = sink();
+        let (ex, _clock) = build_executor(
+            &journal,
+            registry_of(confirm_agent(None)),
+            vec![final_response("done")],
+            &writes,
+            at(3_000),
+        )
+        .await;
+        let o = ex.start(run, &graph).await.expect("resume");
+        let events = journal.load(run).await.unwrap();
+        assert!(
+            o.paused.is_some(),
+            "an in-doubt approved Mutation pauses for reconcile: got {o:?}, recorded {:?}",
+            recorded_output(&events, &teid())
+        );
+        assert!(writes.lock().unwrap().is_empty(), "never blind re-run");
+        assert_eq!(effect_recorded_count(&events, &teid()), 0);
+    }
+}
+
+/// AG-15 (#90): ESCALATION of a human-backed `Agent` node whose SLA expires unanswered.
+/// Built on `mod human_agent`'s shared fixtures — the human-backed `reviewer` role, its
+/// question, and an executor over a caller-owned journal with a settable clock.
+mod human_escalation {
+    use super::human_agent::{QUESTION, exec_at, failures, journaled_prompts, reviewer};
+    use super::human_gate::{at, paused_resume_afters};
+    use super::*;
+    use chrono::{DateTime, Duration, Utc};
+
+    fn review() -> NodeId {
+        NodeId("review".into())
+    }
+
+    fn graph() -> Graph {
+        Graph {
+            nodes: vec![agent_node("review", "reviewer", "the Acme MSA")],
+        }
+    }
+
+    /// A human-backed role named `name`, answering `QUESTION`, with an SLA of `hours`, that
+    /// escalates to `to`.
+    fn role(name: &str, hours: i64, to: Option<&str>) -> AgentDefinition {
+        AgentDefinition {
+            name: name.into(),
+            escalate_to: to.map(str::to_string),
+            ..reviewer(Some(Duration::hours(hours)), vec![])
+        }
+    }
+
+    fn registry(agents: Vec<AgentDefinition>) -> Arc<Registry> {
+        let mut r = Registry::default();
+        for a in agents {
+            r = r.with_agent(a);
+        }
+        r.validate().expect("the fixture registry is valid");
+        Arc::new(r)
+    }
+
+    /// Every `AgentEscalated` for the node, as `(from, to, deadline)`.
+    fn escalations(events: &[(Seq, JournalEvent)]) -> Vec<(String, String, Option<DateTime<Utc>>)> {
+        events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                JournalEvent::AgentEscalated {
+                    node,
+                    from,
+                    to,
+                    deadline,
+                } if node == &review() => Some((from.clone(), to.clone(), *deadline)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The headline, across resumes: the reviewer's SLA expires → the node is NOT failed but
+    /// escalated to `lead` on lead's own SLA (from the escalation instant), with the SAME
+    /// question and no re-ask; a re-drive inside lead's SLA neither escalates again nor moves
+    /// the deadline; and an answer then completes the node — all at zero gateway spend.
+    #[tokio::test]
+    async fn an_expired_human_agent_escalates_and_the_target_answers_after_a_resume() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let reg = registry(vec![
+            role("reviewer", 1, Some("lead")),
+            role("lead", 2, None),
+        ]);
+        let (ex, clock, calls) = exec_at(&journal, reg, at(1_000)).await;
+
+        assert!(ex.start(run, &graph()).await.unwrap().paused.is_some());
+
+        // The reviewer's hour passes unanswered.
+        clock.set(at(1_000 + 3_600));
+        let o = ex.start(run, &graph()).await.expect("drive 2");
+        assert!(
+            o.failed.is_none(),
+            "an escalating role does not fail: {o:?}"
+        );
+        let paused = o.paused.expect("it waits on the escalation target");
+        assert!(paused.reason.contains("lead"), "{}", paused.reason);
+        let events = journal.load(run).await.unwrap();
+        let lead_deadline = at(1_000 + 3_600 + 7_200);
+        assert_eq!(
+            escalations(&events),
+            vec![("reviewer".into(), "lead".into(), Some(lead_deadline))]
+        );
+        assert_eq!(
+            paused_resume_afters(&events).last().copied().flatten(),
+            Some(lead_deadline),
+            "the scheduler wakes the run at the TARGET's deadline"
+        );
+        assert_eq!(
+            journaled_prompts(&events).len(),
+            1,
+            "the escalation target is asked the SAME journaled question, not a new one"
+        );
+        assert!(journaled_prompts(&events)[0].contains(QUESTION));
+        assert!(failures(&journal, run, &review()).await.is_empty());
+
+        // A resume inside lead's SLA: no second escalation, no moved deadline.
+        clock.set(at(1_000 + 3_600 + 60));
+        let o = ex.start(run, &graph()).await.expect("drive 3");
+        assert!(o.paused.is_some(), "{o:?}");
+        let events = journal.load(run).await.unwrap();
+        assert_eq!(escalations(&events).len(), 1, "escalated exactly once");
+        assert_eq!(
+            paused_resume_afters(&events).last().copied().flatten(),
+            Some(lead_deadline)
+        );
+
+        // The lead answers.
+        journal
+            .append(
+                run,
+                JournalEvent::AgentAnswered {
+                    node: review(),
+                    text: "Yes — clause 7.2.".into(),
+                    actor: "carol".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let o = ex.start(run, &graph()).await.expect("drive 4");
+        assert!(o.paused.is_none() && o.failed.is_none(), "{o:?}");
+        assert_eq!(o.outputs[&review()]["text"], "Yes — clause 7.2.");
+        assert_eq!(o.outputs[&review()]["actor"], "carol");
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            0,
+            "a human chain spends nothing"
+        );
+    }
+
+    /// Chainable, and ends LOUDLY: reviewer → lead → director, each on its own SLA, and only
+    /// the LAST agent in the chain expiring fails the node — naming the chain it walked.
+    #[tokio::test]
+    async fn an_escalation_chain_is_walked_and_only_its_last_expiry_fails_the_node() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let reg = registry(vec![
+            role("reviewer", 1, Some("lead")),
+            role("lead", 2, Some("director")),
+            role("director", 1, None),
+        ]);
+        let (ex, clock, _calls) = exec_at(&journal, reg, at(1_000)).await;
+        assert!(ex.start(run, &graph()).await.unwrap().paused.is_some());
+
+        let lead_at = 1_000 + 3_600;
+        clock.set(at(lead_at));
+        assert!(ex.start(run, &graph()).await.unwrap().paused.is_some());
+        let director_at = lead_at + 7_200;
+        clock.set(at(director_at));
+        assert!(ex.start(run, &graph()).await.unwrap().paused.is_some());
+        let events = journal.load(run).await.unwrap();
+        assert_eq!(
+            escalations(&events),
+            vec![
+                ("reviewer".into(), "lead".into(), Some(at(director_at))),
+                (
+                    "lead".into(),
+                    "director".into(),
+                    Some(at(director_at + 3_600))
+                ),
+            ]
+        );
+
+        clock.set(at(director_at + 3_600));
+        let o = ex.start(run, &graph()).await.expect("last expiry");
+        let (node, message) = o.failed.expect("the end of the chain fails the node");
+        assert_eq!(node, review());
+        assert!(message.contains("director"), "{message}");
+        assert!(message.contains("escalat"), "names the walk: {message}");
+        assert_eq!(failures(&journal, run, &review()).await.len(), 1);
+    }
+
+    /// A cycle that slipped past load (`with_agent` does not validate) still ENDS: the
+    /// runtime refuses to hand the question back to an agent that already held it, rather
+    /// than appending a hop on every wake forever.
+    #[tokio::test]
+    async fn an_unvalidated_escalation_cycle_fails_loudly_instead_of_looping() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let reg = Arc::new(
+            Registry::default()
+                .with_agent(role("reviewer", 1, Some("lead")))
+                .with_agent(role("lead", 1, Some("reviewer"))),
+        );
+        let (ex, clock, _calls) = exec_at(&journal, reg, at(1_000)).await;
+        assert!(ex.start(run, &graph()).await.unwrap().paused.is_some());
+        clock.set(at(1_000 + 3_600));
+        assert!(ex.start(run, &graph()).await.unwrap().paused.is_some());
+        clock.set(at(1_000 + 7_200));
+        let o = ex.start(run, &graph()).await.expect("drive");
+        let (_node, message) = o.failed.expect("a cycle fails the node");
+        assert!(message.contains("cycle"), "{message}");
+        assert_eq!(escalations(&journal.load(run).await.unwrap()).len(), 1);
+    }
+
+    /// The same refusal for a cycle that loops back to a MID-chain agent, not the node's
+    /// original one (reviewer -> lead -> director -> lead): the check must cover every agent
+    /// that already held the question, or `director`'s expiry appends a hop the fold drops
+    /// and the run re-pauses on a past deadline forever.
+    #[tokio::test]
+    async fn an_unvalidated_mid_chain_escalation_cycle_fails_loudly() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let reg = Arc::new(
+            Registry::default()
+                .with_agent(role("reviewer", 1, Some("lead")))
+                .with_agent(role("lead", 1, Some("director")))
+                .with_agent(role("director", 1, Some("lead"))),
+        );
+        let (ex, clock, _calls) = exec_at(&journal, reg, at(1_000)).await;
+        for t in [1_000, 1_000 + 3_600, 1_000 + 7_200] {
+            clock.set(at(t));
+            let o = ex.start(run, &graph()).await.expect("drive");
+            assert!(o.paused.is_some(), "t={t}: {o:?}");
+        }
+        clock.set(at(1_000 + 10_800));
+        let o = ex.start(run, &graph()).await.expect("drive");
+        let (_node, message) = o.failed.expect("a mid-chain cycle fails the node");
+        assert!(message.contains("cycle"), "{message}");
+        assert_eq!(
+            escalations(&journal.load(run).await.unwrap()).len(),
+            2,
+            "reviewer -> lead and lead -> director, and no hop back to lead"
+        );
+    }
+
+    /// Escalation never pre-empts an answer: the human-agent ordering reads the answer
+    /// BEFORE the expiry, so an answer that landed is honoured and nobody is escalated to.
+    #[tokio::test]
+    async fn an_answer_that_landed_is_honoured_and_never_escalated() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let reg = registry(vec![
+            role("reviewer", 1, Some("lead")),
+            role("lead", 2, None),
+        ]);
+        let (ex, clock, _calls) = exec_at(&journal, reg, at(1_000)).await;
+        assert!(ex.start(run, &graph()).await.unwrap().paused.is_some());
+        journal
+            .append(
+                run,
+                JournalEvent::AgentAnswered {
+                    node: review(),
+                    text: "No.".into(),
+                    actor: "alice".into(),
+                },
+            )
+            .await
+            .unwrap();
+        clock.set(at(1_000 + 3_600 * 5));
+        let o = ex.start(run, &graph()).await.expect("drive");
+        assert!(o.paused.is_none() && o.failed.is_none(), "{o:?}");
+        assert!(escalations(&journal.load(run).await.unwrap()).is_empty());
+    }
+
+    /// A `GateSpec::Human` loop gate does NOT escalate — the minimal scope of AG-15 — and
+    /// says so LOUDLY when its role declares `escalate_to`, rather than letting an author
+    /// believe the escalation they configured applies there too.
+    #[tokio::test]
+    async fn a_loop_gate_whose_role_escalates_says_it_does_not_on_expiry() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let reg = registry(vec![
+            role("reviewer", 1, Some("lead")),
+            role("lead", 2, None),
+        ]);
+        let (ex, clock, _calls) = exec_at(&journal, reg, at(1_000)).await;
+        let graph = Graph {
+            nodes: vec![Node {
+                id: NodeId("lp".into()),
+                kind: NodeKind::Loop {
+                    body: LoopBody::ModelCall { chain: "c".into() },
+                    input: serde_json::json!({ "prompt": "draft it" }),
+                    gate: GateSpec::Human {
+                        agent: AgentRef("reviewer".into()),
+                        menu: vec![
+                            orchestrator_core::LoopGateOption {
+                                name: "revise".into(),
+                                stops: false,
+                            },
+                            orchestrator_core::LoopGateOption {
+                                name: "ship".into(),
+                                stops: true,
+                            },
+                        ],
+                    },
+                    max_iters: 2,
+                },
+                deps: vec![],
+            }],
+        };
+        assert!(ex.start(run, &graph).await.unwrap().paused.is_some());
+        clock.set(at(1_000 + 3_600));
+        let o = ex.start(run, &graph).await.expect("expiry");
+        let (_node, message) = o.failed.expect("the loop gate still fails on its deadline");
+        assert!(
+            message.contains("does not escalate"),
+            "the configured escalation is named as not applying: {message}"
+        );
+    }
+}
