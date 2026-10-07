@@ -18,8 +18,12 @@ status: partial
 > `journal`, `content`, `context`, `scheduler` and `config_store` from a `#[tokio::test]` with a
 > fresh, isolated store. The gateway's in-memory stores pass it; so do torii's tenant-scoped
 > Postgres stores (sensei-hq/torii) — except `scheduler`'s AG-3 wake-attempt clause
-> (#87), which torii's `PgSchedulerStore` passes once it overrides
-> `begin_wake_attempt`/`record_wake_failed`.
+> (#87). torii's `PgSchedulerStore` passes it only with the whole delta: two columns,
+> `attempts INT NOT NULL` (set to 1 by `enqueue`, reset to 0 by `record_paused`) and
+> `last_wake_error TEXT` (cleared by `record_paused`); overrides of `begin_wake_attempt`
+> and `record_wake_failed`; and `claim_due`'s stale-`waking` arm gaining
+> `AND (next_wake IS NULL OR next_wake <= $now)`, so a lost drive waits out its armed
+> retry. Overriding the two methods alone still fails the testkit.
 
 The agentic execution framework that wraps the gateway: a hierarchical,
 runtime-expandable graph of agents on a durable step-journal, resumable without
