@@ -17,6 +17,40 @@ use std::sync::Arc;
 const DEFAULT_LEASE_SECS: i64 = 60;
 const CLAIM_BATCH: usize = 64;
 
+/// AG-3: how [`Scheduler::tick`] retries a wake that failed, and when it gives up.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WakeRetryPolicy {
+    /// Total wake attempts a run gets between successful drives.
+    pub max_attempts: u32,
+    /// The delay after the first failed attempt.
+    pub base_backoff: chrono::Duration,
+    /// The ceiling the doubling delay is clamped to.
+    pub max_backoff: chrono::Duration,
+    /// Fraction of each delay that is jittered away.
+    pub jitter: f64,
+    /// Keys the deterministic jitter.
+    pub jitter_seed: u64,
+}
+
+impl Default for WakeRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 5,
+            base_backoff: chrono::Duration::seconds(30),
+            max_backoff: chrono::Duration::hours(1),
+            jitter: 0.2,
+            jitter_seed: 0,
+        }
+    }
+}
+
+impl WakeRetryPolicy {
+    /// The delay before retrying `run` after its wake attempt `attempt` failed.
+    pub fn backoff(&self, _run: RunId, _attempt: u32) -> chrono::Duration {
+        chrono::Duration::zero()
+    }
+}
+
 /// Drives paused runs to their durable wakes over a [`SchedulerStore`].
 pub struct Scheduler {
     store: Arc<dyn SchedulerStore>,
@@ -24,6 +58,8 @@ pub struct Scheduler {
     journal: Arc<dyn ExecutionJournal>,
     clock: Arc<dyn Clock>,
     lease: chrono::Duration,
+    #[allow(dead_code)]
+    retry: WakeRetryPolicy,
 }
 
 impl Scheduler {
@@ -50,11 +86,18 @@ impl Scheduler {
             journal,
             clock,
             lease: chrono::Duration::seconds(DEFAULT_LEASE_SECS),
+            retry: WakeRetryPolicy::default(),
         }
     }
 
     pub fn with_lease(mut self, lease: chrono::Duration) -> Self {
         self.lease = lease;
+        self
+    }
+
+    /// AG-3: replace the default [`WakeRetryPolicy`].
+    pub fn with_wake_retry(mut self, retry: WakeRetryPolicy) -> Self {
+        self.retry = retry;
         self
     }
 
@@ -270,5 +313,94 @@ impl Scheduler {
                 _ => None,
             })
             .min())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+
+    fn run(n: u128) -> RunId {
+        RunId(uuid::Uuid::from_u128(n))
+    }
+
+    fn no_jitter() -> WakeRetryPolicy {
+        WakeRetryPolicy {
+            jitter: 0.0,
+            ..WakeRetryPolicy::default()
+        }
+    }
+
+    #[test]
+    fn the_default_policy_caps_at_five_attempts() {
+        assert_eq!(WakeRetryPolicy::default().max_attempts, 5);
+    }
+
+    #[test]
+    fn backoff_doubles_from_the_base_and_clamps_at_the_max() {
+        let p = no_jitter();
+        let r = run(1);
+        assert_eq!(p.backoff(r, 1), Duration::seconds(30), "attempt 1 → base");
+        assert_eq!(p.backoff(r, 2), Duration::seconds(60), "attempt 2 → 2×base");
+        assert_eq!(
+            p.backoff(r, 3),
+            Duration::seconds(120),
+            "attempt 3 → 4×base"
+        );
+        assert_eq!(p.backoff(r, 8), Duration::seconds(3600), "clamped to max");
+        assert_eq!(
+            p.backoff(r, u32::MAX),
+            Duration::seconds(3600),
+            "a huge attempt number clamps instead of overflowing"
+        );
+    }
+
+    /// The jitter is a pure function of (seed, run, attempt): a test asserting a deadline gets
+    /// the same one every time, and two runs that failed together do not retry together.
+    #[test]
+    fn jitter_is_deterministic_bounded_and_spreads_runs_apart() {
+        let p = WakeRetryPolicy::default(); // jitter 0.2
+        for attempt in 1..=5 {
+            let full = no_jitter().backoff(run(0), attempt);
+            let floor = full - full * 2 / 10;
+            for n in 0..64 {
+                let d = p.backoff(run(n), attempt);
+                assert_eq!(d, p.backoff(run(n), attempt), "deterministic");
+                assert!(
+                    d <= full && d >= floor,
+                    "attempt {attempt}: {d} outside [{floor}, {full}]"
+                );
+            }
+        }
+        let distinct: std::collections::HashSet<_> =
+            (0..64).map(|n| p.backoff(run(n), 1)).collect();
+        assert!(
+            distinct.len() > 32,
+            "jitter must spread runs apart, got {} distinct delays of 64",
+            distinct.len()
+        );
+        let reseeded = WakeRetryPolicy {
+            jitter_seed: 7,
+            ..WakeRetryPolicy::default()
+        };
+        assert!(
+            (0..64).any(|n| reseeded.backoff(run(n), 1) != p.backoff(run(n), 1)),
+            "the seed keys the jitter"
+        );
+    }
+
+    /// Jitter only ever SHORTENS a delay, by at most `jitter` (≤ ½), so the spacing between a
+    /// run's attempts still strictly grows until the clamp.
+    #[test]
+    fn jittered_spacing_still_grows_attempt_over_attempt() {
+        let p = WakeRetryPolicy::default();
+        for n in 0..64 {
+            let delays: Vec<_> = (1..=5).map(|a| p.backoff(run(n), a)).collect();
+            assert!(
+                delays.windows(2).all(|w| w[0] < w[1]),
+                "run {n}: {delays:?} must strictly grow"
+            );
+        }
     }
 }
