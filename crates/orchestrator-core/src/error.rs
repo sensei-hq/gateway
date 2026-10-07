@@ -107,4 +107,21 @@ pub enum OrchestratorError {
     ContentDigestMiss(String),
     #[error("registry load error: {0}")]
     RegistryLoad(String),
+    /// AG-3 × AG-12: a model call was DISPATCHED — the provider has been paid — but the
+    /// effect record carrying its spend (`EffectRecorded { usage }`) could not be made
+    /// durable: `source` is the CAS put or journal append that failed. The durable ledger
+    /// therefore does not know about the call, and the effect has no memo, so a re-drive
+    /// would dispatch it and pay for it AGAIN, outside every cap.
+    ///
+    /// Deliberately NOT a [`JournalError::Backend`] even though one usually caused it: the
+    /// scheduler retries a backend fault, and this is the one backend fault a retry must
+    /// not cure. A run that raises it is filed terminal for an operator, who can reconcile
+    /// the provider-side spend before re-driving.
+    #[error(
+        "spend not recorded at {node:?}: a paid model call's usage could not be journaled ({source}) — not retried automatically, because a re-drive would dispatch and pay for the call again"
+    )]
+    SpendUnrecorded {
+        node: NodeId,
+        source: Box<OrchestratorError>,
+    },
 }

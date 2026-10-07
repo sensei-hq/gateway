@@ -549,6 +549,45 @@ pub(super) enum RefusalKind {
 }
 
 impl Executor {
+    /// AG-3 × AG-12: make a PAID call's effect record durable — the CAS split of its
+    /// output, then the `EffectRecorded` (built by `event` around the split output)
+    /// that carries its `usage` — or fail with [`OrchestratorError::SpendUnrecorded`].
+    ///
+    /// Every one of the five producers calls this, and calls it only on the
+    /// `Ok(Ok(response))` arm of [`dispatch_metered`](Self::dispatch_metered): by then the
+    /// provider has been paid and the call charged to this drive's in-memory meter, and
+    /// this record is the ONLY thing that will tell any later drive so. A failure here
+    /// loses the spend from the durable ledger and leaves the effect without a memo, so a
+    /// re-drive would re-dispatch it and pay again — under a cap, past it, because the next
+    /// drive's meter starts from the journal. The scheduler retries a plain
+    /// `Journal(Backend)`/`Store` error (AG-3); wrapping it here is what removes exactly
+    /// these faults from that allowlist while every fault BEFORE a paid dispatch stays
+    /// retryable.
+    ///
+    /// What this cannot cover is a PROCESS crash between the provider's response and this
+    /// append: nothing runs to classify it, the stale lease is reclaimed, and the re-drive
+    /// re-buys the call. That at-least-once window predates AG-3 and is stated in
+    /// `durable-journal.md`.
+    pub(super) async fn record_paid_effect(
+        &self,
+        run: RunId,
+        node: &NodeId,
+        output: &serde_json::Value,
+        event: impl FnOnce(orchestrator_core::EffectOutput) -> JournalEvent,
+    ) -> Result<(), OrchestratorError> {
+        let recorded = async {
+            let split = self.split_output(output).await?;
+            self.append(run, event(split)).await
+        }
+        .await;
+        recorded
+            .map(|_| ())
+            .map_err(|source| OrchestratorError::SpendUnrecorded {
+                node: node.clone(),
+                source: Box::new(source),
+            })
+    }
+
     /// Gate on the ledger, dispatch, then charge the call back to the ledger.
     ///
     /// `meter` is the run's live spend view: its journaled base is folded by effect id
@@ -1803,12 +1842,14 @@ impl orchestrator_core::ModelDispatch for SelectorDispatch<'_> {
             .unwrap_or_default()
             .to_string();
 
-        let recorded = self.exec.split_output(&output).await?;
+        // A spend that cannot be journaled is the executor's failure, not the selector's:
+        // routed through `fatal` so a selector that swallows its `Err` cannot downgrade it
+        // into a soft `NodeFailed` — the drive aborts with the typed `SpendUnrecorded`.
+        let node = NodeId(path);
         self.exec
-            .append(
-                self.run,
+            .record_paid_effect(self.run, &node, &output, |recorded| {
                 JournalEvent::EffectRecorded {
-                    node: NodeId(path),
+                    node: node.clone(),
                     effect_id: eid,
                     class: orchestrator_core::EffectClass::Pure,
                     input_hash: ih,
@@ -1816,9 +1857,10 @@ impl orchestrator_core::ModelDispatch for SelectorDispatch<'_> {
                     output: recorded,
                     observation: None,
                     usage: self.fold.recorded_usage(&response),
-                },
-            )
-            .await?;
+                }
+            })
+            .await
+            .map_err(|e| self.fatal(e))?;
         Ok(text)
     }
 }

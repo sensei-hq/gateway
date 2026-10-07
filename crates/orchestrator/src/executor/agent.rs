@@ -1593,9 +1593,9 @@ impl Executor {
                 // its tools correctly. Same `{model, text, tool_calls}` shape as before.
                 let mut output = self.model_output(&response);
                 output["tool_calls"] = serde_json::json!(response.tool_calls);
-                let recorded = self.split_output(&output).await?;
-                self.append(
-                    run,
+                // AG-3 × AG-12: a failure to journal this PAID turn is
+                // `SpendUnrecorded`, never a retryable journal fault.
+                self.record_paid_effect(run, node_id, &output, |recorded| {
                     JournalEvent::EffectRecorded {
                         node: node_id.clone(),
                         effect_id: eid,
@@ -1607,8 +1607,8 @@ impl Executor {
                         // SP-DATA-5: the ReAct-turn producer — the real usage the
                         // provider reported on this turn, converted at the boundary.
                         usage: meter.recorded_usage(&response),
-                    },
-                )
+                    }
+                })
                 .await?;
                 Ok(ToolOutcome::Ok(output))
             }
