@@ -82,7 +82,9 @@ it. `AwaitSignal`, `HumanGate` and a human-backed `Agent` journal nothing when t
 on an answer, and every later drive of a still-live run re-completes them from the fold. So
 the honouring drive journals **`JournalEvent::DecisionHookFired { node, decision }`** before
 firing — `decision` is the `Seq` of the decision row it reported — and every later drive,
-folding it, fires nothing while the node still holds that decision. That row is:
+folding it, fires nothing while the node still holds that decision — that row, or a later
+row with **identical content** (a retrying webhook or a double-submitted option decides
+nothing new, so it reports nothing). That row is:
 
 - written **only when hooks are wired** — an executor with no hooks journals exactly what it
   did before (pinned by `an_unhooked_run_journals_exactly_what_it_did_before`);
@@ -100,7 +102,11 @@ finished. A correction appended after a **completed** `AwaitSignal`/`HumanGate`/
 while the run is still live **is** honoured — those kinds journal no durable completion and
 the decision rows fold LAST-wins, so the next drive re-completes the node on it (a `Fail`
 option then fails a gate that had completed) — and that drive reports it, because its
-decision row's `Seq` differs from the marker's. The early-signal
+decision row says something other than the row the marker recorded. The comparison is
+against the decision **last reported** and covers the whole row the hook reports (a gate's
+actor and note, an answer's actor): a correction reverted before any drive honoured it
+reports nothing, one honoured and then reverted reports each change, and the same option
+resubmitted by a different actor is reported. The early-signal
 race asks nobody: a signal folded before its `AwaitSignal` first ran fires
 `on_signal_received` with no `on_signal_awaited`. `on_gate_decided` for a `Fail` option fires
 **before** that node's `on_node_failed`. Decided-hook strings pass through the executor's
@@ -116,7 +122,8 @@ callback; a decision honoured by a drive with **no** hooks wired leaves no marke
 later hooked drive that replays the completed node reports it then (a deployment that wires
 hooks on every drive never sees this one); and a **failed** `DecisionHookFired` write leaves
 no marker either, so the honouring drive fires anyway and a later drive of a still-live run
-reports the same decision **again**.
+reports the same decision **again**. An identical **redelivery** of a reported decision is
+not a fourth edge: it fires nothing.
 
 Guarded by `crates/orchestrator/src/executor/tests/hitl_hooks.rs` — one resume test per kind,
 each driving fresh executors over one journal with the decision appended between drives.

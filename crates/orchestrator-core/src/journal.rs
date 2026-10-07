@@ -737,8 +737,10 @@ pub enum JournalEvent {
     /// LAST-wins and none of the three kinds journals a durable completion, so a
     /// correction appended after a hooked drive honoured the first decision is honoured
     /// AGAIN by the next drive of a still-live run (a `Fail` option then fails a gate that
-    /// had completed). That drive sees a marker for a different `Seq` and reports the
-    /// decision it actually honoured. LAST wins per node; a duplicate is harmless.
+    /// had completed). That drive sees a marker for a different row and reports the
+    /// decision it actually honoured — unless the two rows have IDENTICAL content (a
+    /// redelivery), which decides nothing new and reports nothing. LAST wins per node; a
+    /// duplicate is harmless.
     /// `#[serde(default)]`: a row without it (`None`) counts as covering whatever
     /// decision the node holds.
     ///
