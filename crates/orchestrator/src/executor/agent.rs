@@ -1509,7 +1509,7 @@ impl Executor {
                         observation: None,
                         // SP-DATA-5: the ReAct-turn producer — the real usage the
                         // provider reported on this turn, converted at the boundary.
-                        usage: response.usage.map(super::content::convert_usage),
+                        usage: meter.recorded_usage(&response),
                     },
                 )
                 .await?;

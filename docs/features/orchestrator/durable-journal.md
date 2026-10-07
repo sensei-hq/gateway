@@ -4,13 +4,13 @@ doctype: feature
 module: orchestrator
 status: partial
 phase: 3
-spec: SP-1, SP-DATA-1, SP-DATA-5, SP-6-4, SP-7b
+spec: SP-1, SP-DATA-1, SP-DATA-5, SP-6-4, SP-7b, AG-12
 source: orchestrator-core · orchestrator-store
 ---
 
 # Durable Journal
 
-> **Status: Partial (Phase 3 · SP-1 · SP-DATA-1 · SP-DATA-5 · SP-6-4 · SP-7b).** Design §7.
+> **Status: Partial (Phase 3 · SP-1 · SP-DATA-1 · SP-DATA-5 · SP-6-4 · SP-7b · AG-12).** Design §7.
 > This header said "Planned (SP-1)" long after the Postgres backend, the spend ledger
 > and the HITL waiting kinds had shipped; the [module README](README.md) row was
 > the only place that stayed current. It then said SP-6-3 through the whole of s4, while
@@ -211,6 +211,77 @@ Feature: The context budget's journal (SP-7b)
   Scenario: The first budget wins
     Given two ContextBudgeted records for one effect id
     Then the fold keeps the FIRST — a later record cannot move a cut already hashed against
+```
+
+## AG-12 — the money cap
+
+A run's budget can be denominated in **money** as well as tokens — either, both or neither
+(`orchestrator_core::RunBudget`, submitted through `Executor::run_with_budget` /
+`Scheduler::submit_with_budget`). torii derives the dollar figure from its
+individual/group/org caps (torii#41); the engine only enforces it. Everything rides the
+SP-DATA-5 ledger rather than beside it:
+
+- **`RunStarted.money_budget: Option<MoneyBudget { total_micro_usd }>`** — the cap, in
+  INTEGER micro-dollars (1 USD = 1 000 000). Never `f64` in the journal or the fold: a
+  float ledger makes `spent >= cap` depend on the order the fold sums in.
+- **`TokenUsage.cost_micro_usd: Option<u64>`** on each `EffectRecorded.usage` (and so on
+  each `CompactChild.usage`) — the gateway's `InferenceResponse.actual_cost`, rounded UP to
+  whole micro-dollars (representation noise below a nano-dollar is not charged). Keyed by
+  effect id with the tokens, so a duplicate `Confirmed` record, a re-folded `MapCompacted`
+  or a resume counts it once — the token ledger's idempotency, inherited rather than
+  re-argued. **Recorded only while a money cap is in force**, so an unbudgeted or
+  token-only run journals byte-identically to before.
+- **`MoneyBudgetRaised { new_total_micro_usd }`** — the money twin of `BudgetRaised`: latest
+  wins, lowering below spend halts the run. Its own variant because the caps are independent
+  (`BudgetRaised.new_total_tokens` is required). It **moves** a money cap and never
+  introduces one: on a run that started WITHOUT a money cap the fold ignores it. A drive in
+  flight when such a raise lands folded "no cap" and journals every call uncosted, so a cap
+  introduced then would be reported over spend the ledger never counted. A run that needs a
+  money cap is submitted with one.
+- **`Snapshot.spent_micro_usd` / `money_budget_micro_usd`** — the money half of the
+  snapshot's ledger scalars, for the reason `spent`/`budget` are there.
+- **`money_spend_of(events)`** — the folded `(spent_micro_usd, cap)`, the money twin of
+  `spend_of`, for `torii run status`.
+
+Every new field is `#[serde(default)]` and skipped when unset; `MoneyBudgetRaised` is an
+additive variant. **`FORMAT_VERSION` stays 1** (pinned byte-for-byte by
+`a_run_without_a_money_cap_journals_byte_identically`).
+
+Enforcement is at the SAME metered-dispatch chokepoint as tokens (SP-DATA-5, see the
+[overview](../../superpowers/orchestrator-overview.md)): a money cap takes the run's 1-permit
+serialisation gate; `money_spent >= cap` pauses (the `budget: ` HOTL pause,
+`resume_after: None`); otherwise `max_tokens` is clamped to what the remaining
+micro-dollars buy after the per-request fee and the pessimistic input estimate, at the
+chain's **worst-case** price (`Gateway::worst_case_pricing`, the componentwise max over
+the chain — the clamp is set before selection), and below `MIN_OUTPUT_TOKENS` it pauses
+instead — including when the fee and input estimate alone exceed what is left, which a
+zero output price would otherwise read as unlimited output. On a money-only run whose
+chain's declared `max_output_tokens` is itself under the floor, the pause says
+`output limit: ` and names that limit — no money raise can release it. The residual overshoot is the token clamp's, priced:
+`(actual_input − est_input) × input_price`, plus under one micro-dollar of rounding.
+
+**Fail closed.** A chain with ANY model lacking `pricing` is refused **before** dispatch
+under a money cap (`NodeFailed`, "unpriced model call"): `pricing: None` means *free* to
+routing but *unmeasured* to a cap, since the gateway reports no cost for it. A free model
+declares an explicit zero price. A response with usage but no USD cost is refused after
+the call (`NodeFailed`, "uncosted"); one with no usage at all is the existing
+`Unmetered` failure. Known gap: the gateway's `actual_cost` omits a model's
+`per_request` fee, so the ledger under-counts it (the clamp reserves it per call).
+
+```gherkin
+Feature: The money cap (AG-12)
+  Scenario: A run capped at $X pauses before exceeding it and resumes with zero re-spend
+    Given a run capped at $0.10 on a chain priced at $0.1/1k in and $0.2/1k out
+    When three $0.021 calls have been made
+    Then the fourth is refused before dispatch and the run pauses with spent $0.063
+    And after a MoneyBudgetRaised to $1 a wake runs only the remaining nodes
+
+  Scenario: An unpriced chain under a money cap
+    Given a money-capped run whose chain has a model with no pricing
+    Then the node fails closed and the provider is never called
+
+  Scenario: A token-only run on a priced chain
+    Then no money field appears anywhere on its journal
 ```
 
 ## Notes
