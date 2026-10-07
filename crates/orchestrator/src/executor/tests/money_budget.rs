@@ -554,3 +554,103 @@ async fn with_both_caps_the_tighter_one_clamps() {
         );
     }
 }
+
+/// A chat adapter that, on its FIRST call, appends a `MoneyBudgetRaised` to the run's
+/// journal — modelling an operator (or torii, cross-process) moving the money cap while a
+/// drive is in flight. Reports `usage` on every response so the gateway prices each call.
+struct RaisingMidDriveAdapter {
+    journal: InMemoryJournal,
+    run: RunId,
+    calls: Arc<std::sync::Mutex<usize>>,
+}
+
+impl gateway::adapters::capability::Model for RaisingMidDriveAdapter {
+    fn id(&self) -> &str {
+        "r"
+    }
+}
+
+#[async_trait::async_trait]
+impl gateway::adapters::capability::ChatModel for RaisingMidDriveAdapter {
+    async fn chat(
+        &self,
+        _cfg: &kernel::types::config::RouterConfig,
+        req: &kernel::types::io::ChatRequest,
+    ) -> Result<kernel::types::io::ChatResponse, kernel::types::error::GatewayError> {
+        let first = {
+            let mut n = self.calls.lock().unwrap();
+            *n += 1;
+            *n == 1
+        };
+        if first {
+            self.journal
+                .append(
+                    self.run,
+                    JournalEvent::MoneyBudgetRaised {
+                        new_total_micro_usd: 30_000,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        Ok(kernel::types::io::ChatResponse {
+            content: Some("canned-response".into()),
+            tool_calls: Vec::new(),
+            usage: Some(kernel::types::cost::TokenUsage {
+                input_tokens: 10,
+                output_tokens: 100,
+                total_tokens: 110,
+            }),
+            model: req.model.clone(),
+            degraded: false,
+        })
+    }
+}
+
+/// HIGH (AG-12 review): a money cap moved INTO a run that started without one, while a
+/// drive is in flight, must never be reported over spend the ledger did not count.
+///
+/// The drive folded "no money cap" when it started, so every call it makes journals
+/// `cost_micro_usd: None` — permanently: no later fold can recover a cost that was never
+/// written. Reporting `(0, Some(30_000))` after five priced calls (105 000 micro-dollars)
+/// would tell an operator a cap was in force and nothing was spent under it. The ledger
+/// may only claim a money cap it has counted every call against.
+#[tokio::test]
+async fn a_money_cap_raised_into_an_uncapped_run_mid_drive_is_never_reported_over_uncounted_spend()
+{
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let calls = Arc::new(std::sync::Mutex::new(0usize));
+    let adapters = gateway::adapters::AdapterRegistry::new();
+    adapters
+        .register_chat(Arc::new(RaisingMidDriveAdapter {
+            journal: journal.clone(),
+            run,
+            calls: calls.clone(),
+        }))
+        .await;
+    let gateway = gateway::Gateway::new(
+        crate::test_support::two_window_chain_config(),
+        adapters,
+        gateway::circuit_breaker::CircuitBreakerManager::new(
+            gateway::circuit_breaker::CircuitBreakerConfig::default(),
+        ),
+    );
+    price_single_chain(&gateway, IN_PER_1K, OUT_PER_1K).await;
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    exec.run_with_budget(run, &chain_of(5), RunBudget::default())
+        .await
+        .expect("drives");
+    assert_eq!(
+        *calls.lock().unwrap(),
+        5,
+        "an uncapped drive runs every node"
+    );
+    let events = journal.load(run).await.unwrap();
+    let (spent, cap) = crate::money_spend_of(&events);
+    assert!(
+        cap.is_none() || spent > 0,
+        "the ledger reports a money cap of {cap:?} over {spent} counted micro-dollars, after \
+         five priced calls the cap's own drive never ledgered"
+    );
+}
