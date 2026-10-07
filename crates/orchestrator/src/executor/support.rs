@@ -13,7 +13,9 @@ use orchestrator_core::{
 };
 use sha2::{Digest, Sha256};
 
-use super::{AgentAnswer, ContextBudget, Fold, GateDecision, LoopGateAsk, LoopGateDecision};
+use super::{
+    AgentAnswer, ContextBudget, DecisionContent, Fold, GateDecision, LoopGateAsk, LoopGateDecision,
+};
 
 /// One scheduling round's **ready set** (§3.2): the not-yet-terminal nodes whose
 /// `Hard` deps have all completed and `Soft` deps are all terminal, in graph
@@ -70,7 +72,7 @@ pub(crate) fn fold_journal(
     let mut fold = Fold::default();
     let mut node_last_output: HashMap<NodeId, EffectOutput> = HashMap::new();
     let mut completed: Vec<NodeId> = Vec::new();
-    for (_, event) in events {
+    for (seq, event) in events {
         match event {
             JournalEvent::EffectRecorded {
                 node,
@@ -210,6 +212,9 @@ pub(crate) fn fold_journal(
             // so an operator can correct a mistaken decision before the run resumes.
             JournalEvent::SignalReceived { node, payload } => {
                 fold.signals.insert(node.clone(), payload.clone());
+                fold.decision_seqs.insert(node.clone(), *seq);
+                fold.decision_rows
+                    .insert(*seq, DecisionContent::Signal(payload.clone()));
             }
             // SP-6 s1: also EXPLICIT, for the same reason. FIRST wins —
             // `entry().or_insert()`, NOT `insert` — the opposite asymmetry from
@@ -265,14 +270,15 @@ pub(crate) fn fold_journal(
                 actor,
                 note,
             } => {
-                fold.gate_decisions.insert(
-                    node.clone(),
-                    GateDecision {
-                        option: option.clone(),
-                        actor: actor.clone(),
-                        note: note.clone(),
-                    },
-                );
+                let decision = GateDecision {
+                    option: option.clone(),
+                    actor: actor.clone(),
+                    note: note.clone(),
+                };
+                fold.decision_rows
+                    .insert(*seq, DecisionContent::Gate(decision.clone()));
+                fold.gate_decisions.insert(node.clone(), decision);
+                fold.decision_seqs.insert(node.clone(), *seq);
             }
             // SP-6 s3: the ask. EXPLICIT, never folded by a catch-all — a catch-all
             // silently absorbing a new variant is how this codebase has shipped fold bugs.
@@ -321,13 +327,14 @@ pub(crate) fn fold_journal(
             }
             // SP-6 s3: the answer. LAST wins (`insert` overwrites).
             JournalEvent::AgentAnswered { node, text, actor } => {
-                fold.agent_answers.insert(
-                    node.clone(),
-                    AgentAnswer {
-                        text: text.clone(),
-                        actor: actor.clone(),
-                    },
-                );
+                let answer = AgentAnswer {
+                    text: text.clone(),
+                    actor: actor.clone(),
+                };
+                fold.decision_rows
+                    .insert(*seq, DecisionContent::Agent(answer.clone()));
+                fold.agent_answers.insert(node.clone(), answer);
+                fold.decision_seqs.insert(node.clone(), *seq);
             }
             // SP-6 s4: the ask. EXPLICIT, never folded by a catch-all.
             //
@@ -384,6 +391,16 @@ pub(crate) fn fold_journal(
                 fold.loop_gate_settlements
                     .entry(node.clone())
                     .or_insert_with(|| option.clone());
+            }
+            // AG-2: hooks bookkeeping — the node whose "decided" hook already fired, and
+            // for WHICH decision row. An EXPLICIT arm, never the `_` catch-all: absorbed
+            // silently, every later drive of a still-live run would re-report a decision
+            // it is merely replaying, and it would compile perfectly. LAST wins, so the
+            // marker tracks the most recent decision reported; a duplicate changes nothing.
+            // The decision arms above record each row's content in `decision_rows`, which
+            // is what lets an identical redelivery count as the decision already reported.
+            JournalEvent::DecisionHookFired { node, decision } => {
+                fold.decided_hooks_fired.insert(node.clone(), *decision);
             }
             // SP-DATA-5: the run's original cap, set once at submit. An EXPLICIT
             // arm — not the `_` catch-all below — because a budget that silently
