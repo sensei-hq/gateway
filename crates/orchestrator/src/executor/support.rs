@@ -1203,6 +1203,34 @@ mod tests {
         );
     }
 
+    /// AG-12 review (HIGH): a money cap exists only if the run STARTED with one. A
+    /// `MoneyBudgetRaised` on a run whose `RunStarted.money_budget` is `None` moves
+    /// nothing — it can race a drive that folded "no cap" and so journals every call
+    /// uncosted, and a cap reported over spend it never counted is worse than no cap.
+    #[test]
+    fn a_money_raise_on_a_run_that_started_without_a_money_cap_introduces_none() {
+        use orchestrator_core::{JournalEvent, TokenBudget};
+        let evs = vec![
+            (
+                0,
+                JournalEvent::RunStarted {
+                    version: "v1".into(),
+                    budget: Some(TokenBudget { total_tokens: 900 }),
+                    money_budget: None,
+                },
+            ),
+            (
+                1,
+                JournalEvent::MoneyBudgetRaised {
+                    new_total_micro_usd: 5_000,
+                },
+            ),
+        ];
+        let (fold, _, _) = fold_journal(&evs);
+        assert_eq!(fold.money_budget(), None);
+        assert_eq!(crate::executor::money_spend_of(&evs), (0, None));
+    }
+
     /// AG-12: money spend is keyed by effect id exactly like tokens — a duplicate record
     /// (the two-phase `Confirmed` reconcile) counts ONCE, distinct effects sum, and a
     /// compacted Map child's cost re-enters under its original id.
