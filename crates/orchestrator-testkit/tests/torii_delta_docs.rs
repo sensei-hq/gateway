@@ -58,3 +58,28 @@ fn the_overview_carry_forwards_name_the_full_torii_scheduler_delta() {
         assert_names_full_delta("orchestrator-overview.md", passage);
     }
 }
+
+/// The trait doc is the authoritative surface for `begin_wake_attempt`: it must not claim torii's
+/// `PgSchedulerStore` already overrides it. Until it does, production keeps the pre-AG-3 crash
+/// loop, and a reader of the trait must be told so.
+#[test]
+fn the_begin_wake_attempt_doc_does_not_claim_torii_already_overrides_it() {
+    let src = repo_file("crates/orchestrator-core/src/scheduler.rs");
+    let end = src
+        .find("async fn begin_wake_attempt(")
+        .expect("the trait declares begin_wake_attempt");
+    let start = src[..end]
+        .rfind("/// AG-3: a claimed wake is about to be driven")
+        .expect("begin_wake_attempt keeps its AG-3 doc");
+    let doc = &src[start..end];
+    assert!(
+        !doc.contains("Both shipped stores override it"),
+        "the doc claims both shipped stores override begin_wake_attempt; only the in-memory \
+         store does:\n{doc}"
+    );
+    assert!(
+        doc.contains("PgSchedulerStore") && doc.contains("crash loop"),
+        "the doc must say torii's PgSchedulerStore does not override it yet, and what that \
+         costs:\n{doc}"
+    );
+}
