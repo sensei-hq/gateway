@@ -839,3 +839,27 @@ async fn the_planner_selector_producer_journals_its_cost() {
     );
     assert_eq!(crate::money_spend_of(&events).0, 21_000);
 }
+
+/// MEDIUM (AG-12 review): a chain with a ZERO output price and a positive input price
+/// must still refuse a call whose input cost alone exceeds the remaining dollars. Zero
+/// output price makes every output token affordable — but only once the call's
+/// reservation (fee + input estimate) fits at all. Here one input token costs
+/// 100 000 micro-dollars against a 100 micro-dollar cap.
+#[tokio::test]
+async fn a_free_output_chain_still_refuses_a_call_whose_input_alone_exceeds_the_cap() {
+    let (gateway, seen) = clamp_observing_gateway(1, 10).await;
+    price_single_chain(&gateway, 100.0, 0.0).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let out = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .run_with_budget(run, &chain_of(1), money(100))
+        .await
+        .expect("drives");
+    let (spent, _) = crate::money_spend_of(&journal.load(run).await.unwrap());
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "nothing may be dispatched: spent {spent} against a cap of 100"
+    );
+    let pause = out.paused.as_ref().expect("the floor pauses the run");
+    assert!(pause.reason.starts_with("budget: "), "{}", pause.reason);
+}
