@@ -1804,9 +1804,9 @@ impl Executor {
                         // events by that outer `(Seq, event)` from `load` — never by
                         // this in-event field — so it is set to 0 rather than the
                         // (circular) value `append` would return.
-                        let recorded = self.split_output(&output).await?;
-                        self.append(
-                            run,
+                        // AG-3 × AG-12: a failure to journal this PAID call is
+                        // `SpendUnrecorded`, never a retryable journal fault.
+                        self.record_paid_effect(run, &node.id, &output, |recorded| {
                             JournalEvent::EffectRecorded {
                                 node: node.id.clone(),
                                 effect_id: eid,
@@ -1818,8 +1818,8 @@ impl Executor {
                                 // SP-DATA-5: the ModelCall producer — the real usage the
                                 // provider reported, converted at the boundary.
                                 usage: fold.recorded_usage(&response),
-                            },
-                        )
+                            }
+                        })
                         .await?;
                         self.append(
                             run,

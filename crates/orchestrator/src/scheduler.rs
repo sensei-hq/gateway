@@ -9,6 +9,16 @@
 //!
 //! AG-3: a wake that keeps failing is not re-driven forever — each claimed wake is counted, a failed
 //! or lost one is backed off ([`WakeRetryPolicy`]), and past `max_attempts` the run is filed `Failed`.
+//!
+//! "Zero re-spend" has one honest exception, and a retry must not widen it. A journal fault AFTER a
+//! paid model call — the provider answered, the append of its `EffectRecorded { usage }` failed —
+//! leaves a call the durable ledger never saw and no memo to replay, so a re-drive would buy it
+//! again past every cap. The executor raises that as [`OrchestratorError::SpendUnrecorded`], which
+//! is NOT retryable: the run is filed `Failed` naming the unrecorded spend, for an operator. A fault
+//! before any paid dispatch stays retryable. What no classification can cover is a PROCESS crash in
+//! the same window (between the provider's response and the append): the lost worker's lease is
+//! reclaimed and the re-drive re-buys that one call — the pre-existing at-least-once edge
+//! `durable-journal.md` states, bounded by `max_attempts` because every reclaim is a counted attempt.
 
 use crate::executor::{Executor, RunOutcome};
 use orchestrator_core::{
@@ -116,6 +126,10 @@ fn unit_interval(seed: u64, run: RunId, attempt: u32) -> f64 {
 /// graph, …): retrying cannot change its answer, so it stays terminal at once, exactly as
 /// before AG-3, rather than delaying the operator's signal by the whole backoff budget. An
 /// ALLOWLIST, so a new error variant defaults to terminal rather than to a retry loop.
+///
+/// [`OrchestratorError::SpendUnrecorded`] is deliberately absent even though a backend fault
+/// usually causes it: it means a PAID call's spend never reached the journal, and a retry
+/// would re-dispatch and re-pay that call outside the cap.
 fn is_retryable(e: &OrchestratorError) -> bool {
     matches!(
         e,
