@@ -218,3 +218,55 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod cost_tests {
+    use super::{ceil_micro, cost_micro_usd};
+    use kernel::types::cost::Cost;
+
+    fn cost(total: f64, currency: &str) -> Cost {
+        Cost {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            input_cost: 0.0,
+            output_cost: total,
+            total_cost: total,
+            currency: currency.into(),
+        }
+    }
+
+    /// AG-12: the ledger integer is the gateway's float total rounded UP — but NOT by
+    /// float representation noise. `0.001 + 0.02` is `0.021000000000000001` in `f64`, and
+    /// a plain `ceil` charged 21 001 for a call worth exactly 21 000; a genuine fraction
+    /// of a micro-dollar is still charged as a whole one.
+    #[test]
+    fn a_cost_is_rounded_up_to_whole_micro_dollars_but_not_by_float_noise() {
+        // Built the way the gateway builds it (`Cost::from_usage`), which is where the
+        // noise comes from: `(100 / 1000) × 0.2` is `0.020000000000000004`.
+        let usage = kernel::types::cost::TokenUsage {
+            input_tokens: 10,
+            output_tokens: 100,
+            total_tokens: 110,
+        };
+        let priced = Cost::from_usage(&usage, 0.1, 0.2);
+        assert!(
+            priced.total_cost * 1e6 > 21_000.0,
+            "the fixture must carry the noise"
+        );
+        assert_eq!(cost_micro_usd(&priced), Some(21_000));
+        assert_eq!(cost_micro_usd(&cost(0.000_000_5, "USD")), Some(1));
+        assert_eq!(cost_micro_usd(&cost(0.0, "usd")), Some(0));
+        assert_eq!(ceil_micro(2.4), 3);
+    }
+
+    /// AG-12: a figure the money ledger cannot trust is refused, not guessed: a non-USD
+    /// currency (the cap is in dollars), a non-finite or a negative total.
+    #[test]
+    fn an_untrustworthy_cost_is_none() {
+        assert_eq!(cost_micro_usd(&cost(1.0, "EUR")), None);
+        assert_eq!(cost_micro_usd(&cost(f64::NAN, "USD")), None);
+        assert_eq!(cost_micro_usd(&cost(f64::INFINITY, "USD")), None);
+        assert_eq!(cost_micro_usd(&cost(-0.5, "USD")), None);
+    }
+}

@@ -489,7 +489,25 @@ pub async fn two_window_scripted_window_watching_gateway(
 /// metered, latency and scripted adapters — can be run under a money cap with its
 /// behaviour otherwise untouched.
 pub async fn price_single_chain(gateway: &Gateway, input_per_1k: f64, output_per_1k: f64) {
-    let mut config = single_chain_config();
+    price_single_chain_with_output_limit(
+        gateway,
+        input_per_1k,
+        output_per_1k,
+        FIXTURE_MAX_OUTPUT_TOKENS,
+    )
+    .await;
+}
+
+/// [`price_single_chain`] for a fixture built over
+/// [`single_chain_config_with_output_limit`] — re-pricing must not silently reset the
+/// fixture's output limit to the default.
+pub async fn price_single_chain_with_output_limit(
+    gateway: &Gateway,
+    input_per_1k: f64,
+    output_per_1k: f64,
+    max_output_tokens: u32,
+) {
+    let mut config = single_chain_config_with_output_limit(max_output_tokens);
     for model in config.models.values_mut() {
         model.pricing = Some(kernel::types::config::ModelPricing {
             input_per_1k,

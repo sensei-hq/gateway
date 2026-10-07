@@ -7,7 +7,7 @@
 //! micro-dollars.
 
 use super::*;
-use crate::test_support::price_single_chain;
+use crate::test_support::{price_single_chain, price_single_chain_with_output_limit};
 use orchestrator_core::{MoneyBudget, RunBudget};
 
 /// `$0.1 / 1k` input — 100 micro-dollars a token.
@@ -403,4 +403,102 @@ async fn submit_with_budget_journals_the_money_cap_and_records_the_pause() {
             ..
         }
     ));
+}
+
+/// The money GATE's boundary: spend EXACTLY at the cap stops the run on the gate (`>=`),
+/// not on the floor one line later. Seeded from a journal so the gate is the first thing
+/// the next call meets; the reason wording tells the gate's message from the floor's,
+/// which is what makes a `>=` → `>` change visible.
+#[tokio::test]
+async fn spending_exactly_the_money_cap_stops_the_run_on_the_gate() {
+    let (gateway, seen) = clamp_observing_gateway(10, 100).await;
+    price_single_chain(&gateway, IN_PER_1K, OUT_PER_1K).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let cap = 21_000;
+    journal
+        .append(
+            run,
+            JournalEvent::RunStarted {
+                version: "v1".into(),
+                budget: None,
+                money_budget: Some(MoneyBudget {
+                    total_micro_usd: cap,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    journal
+        .append(
+            run,
+            JournalEvent::EffectRecorded {
+                node: NodeId("n1".into()),
+                effect_id: effect_id("n1", 0, 0),
+                class: EffectClass::Pure,
+                input_hash: input_hash("c", &serde_json::json!({ "prompt": "p1" })).unwrap(),
+                seq: 0,
+                output: EffectOutput::Inline(serde_json::json!({ "model": "m", "text": "x" })),
+                observation: None,
+                usage: Some(orchestrator_core::TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 100,
+                    total_tokens: 110,
+                    cost_micro_usd: Some(cap),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    journal
+        .append(
+            run,
+            JournalEvent::NodeCompleted {
+                node: NodeId("n1".into()),
+            },
+        )
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let out = exec.start(run, &chain_of(2)).await.expect("drives");
+    assert_eq!(seen.lock().unwrap().len(), 0, "n1 replays; n2 is gated");
+    let pause = out.paused.as_ref().expect("spent == cap pauses");
+    assert_eq!(pause.node.0, "n2");
+    assert!(
+        pause
+            .reason
+            .starts_with("budget: $0.021000 of $0.021000 spent against the run's money cap"),
+        "the GATE's message, in dollars: {}",
+        pause.reason
+    );
+}
+
+/// On a MONEY-only run a model bound (here the chain's 200-token output limit, under the
+/// 256 floor) refuses against the MONEY cap — in dollars — rather than naming a token cap
+/// the run does not have.
+#[tokio::test]
+async fn a_money_only_run_refused_by_a_model_bound_reports_against_the_money_cap() {
+    let (gateway, seen) = sub_floor_output_clamp_observing_gateway(10, 100).await;
+    price_single_chain_with_output_limit(
+        &gateway,
+        IN_PER_1K,
+        OUT_PER_1K,
+        SUB_FLOOR_MAX_OUTPUT_TOKENS,
+    )
+    .await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1");
+    let out = exec
+        .run_with_budget(run, &chain_of(1), money(10_000_000))
+        .await
+        .expect("drives");
+    assert_eq!(seen.lock().unwrap().len(), 0);
+    let pause = out.paused.as_ref().expect("a sub-floor ceiling pauses");
+    assert!(
+        pause.reason.contains("run's money cap")
+            && pause.reason.contains("$0.000000 of $10.000000"),
+        "a money-only run's refusal names the money cap, in dollars: {}",
+        pause.reason
+    );
 }
