@@ -564,3 +564,74 @@ async fn a_corrected_signal_honoured_after_the_first_is_reported_once() {
     );
     assert_eq!(h.drive_hitl(&graph).await, Vec::<String>::new());
 }
+
+// ------------------------------------------------- a failed bookkeeping write
+
+/// An `InMemoryJournal` that rejects every `DecisionHookFired` append and passes every
+/// other call through — a transient store error on exactly the hooks' bookkeeping write.
+#[derive(Clone)]
+struct FailMarker(InMemoryJournal);
+
+#[async_trait::async_trait]
+impl ExecutionJournal for FailMarker {
+    async fn append(&self, run: RunId, event: JournalEvent) -> Result<Seq, JournalError> {
+        if matches!(event, JournalEvent::DecisionHookFired { .. }) {
+            return Err(JournalError::Backend("injected marker failure".into()));
+        }
+        self.0.append(run, event).await
+    }
+    async fn load(&self, run: RunId) -> Result<Vec<(Seq, JournalEvent)>, JournalError> {
+        self.0.load(run).await
+    }
+}
+
+/// AG-2 review: the marker write is best-effort, but a failed one must not LOSE the
+/// hook. When the honouring drive also finishes the run there is no later drive to
+/// retry the claim, so a skip on `Err` lost `on_gate_decided` for good. The drive fires
+/// the hook anyway (at worst a later drive of a still-live run reports it again), and
+/// the failed write never fails the node or the run.
+#[tokio::test]
+async fn a_failed_marker_write_still_fires_the_decided_hook_and_never_fails_the_run() {
+    let journal = InMemoryJournal::new();
+    let hooks = RecordingHooks::default();
+    let run = RunId(uuid::Uuid::new_v4());
+    let mut graph = gate_graph();
+    graph.nodes.truncate(1); // `release` alone: the honouring drive finishes the run.
+
+    let drive = |j: Arc<dyn ExecutionJournal>| {
+        let hooks = hooks.clone();
+        let graph = graph.clone();
+        async move {
+            let (gw, _calls) = recording_gateway().await;
+            Executor::new(Arc::new(gw), j, "v1")
+                .with_hooks(Arc::new(hooks))
+                .with_clock(FakeClock::new(at(1_000_000)))
+                .start(run, &graph)
+                .await
+        }
+    };
+    drive(Arc::new(journal.clone())).await.expect("asks");
+    journal
+        .append(run, gate_decided("ship", None))
+        .await
+        .unwrap();
+
+    let before = hooks.log().len();
+    let outcome = drive(Arc::new(FailMarker(journal.clone())))
+        .await
+        .expect("a failed bookkeeping write never fails the drive");
+    let fired = hooks.log()[before..].to_vec();
+    assert!(
+        outcome.failed.is_none() && outcome.completed.contains(&NodeId("release".into())),
+        "the gate completes on its decision: {outcome:?}"
+    );
+    assert!(
+        !fired.iter().any(|e| e.starts_with("node_failed(")),
+        "the failed write fails nothing: {fired:?}"
+    );
+    assert!(
+        fired.contains(&"gate_decided(release,ship,alice,None)".to_string()),
+        "the honouring drive reports the decision even though its marker was not \
+         written — no later drive ever reaches the claim: {fired:?}"
+    );
+}
