@@ -740,3 +740,73 @@ async fn a_paid_consolidate_call_whose_spend_was_not_journaled_is_never_redispat
         "the terminal reason names the unrecorded spend: {reason}"
     );
 }
+
+/// A selector that swallows EVERY dispatch error and calls `complete` twice — the
+/// shortlist-then-choose shape — before falling back to the first candidate.
+struct SwallowTwiceSelector;
+#[async_trait::async_trait]
+impl orchestrator_core::PlannerSelector for SwallowTwiceSelector {
+    async fn select(
+        &self,
+        _goal: &serde_json::Value,
+        candidates: &[AgentRef],
+        dispatch: &dyn orchestrator_core::ModelDispatch,
+    ) -> Result<AgentRef, OrchestratorError> {
+        let _ = dispatch.complete("sys", "shortlist", Some("c")).await;
+        let _ = dispatch.complete("sys", "choose", Some("c")).await;
+        Ok(candidates[0].clone())
+    }
+}
+
+/// The selector's stash is a fold of several executor fatals from ONE `select()`, so it
+/// obeys the same precedence as a Map: a later fault — here call 1's determinism
+/// violation against a memo an earlier drive left — must not overwrite call 0's
+/// unrecorded spend. Last-wins would file the run under the later error (and a later
+/// retryable `Store` fault would hand the scheduler a retry that re-buys call 0).
+#[tokio::test]
+async fn a_selectors_later_fault_does_not_overwrite_its_unrecorded_spend() {
+    let (gateway, seen) = clamp_observing_gateway(10, 295).await;
+    price_single_chain(&gateway, 0.1, 0.2).await;
+    let journal = FailSpendOnce::new("e/__select__");
+    let run = RunId(uuid::Uuid::new_v4());
+    journal
+        .append(
+            run,
+            JournalEvent::RunStarted {
+                version: "v1".into(),
+                budget: None,
+                money_budget: Some(MoneyBudget {
+                    total_micro_usd: CAP,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    journal
+        .append(
+            run,
+            spent_effect(
+                &select_path(),
+                orchestrator_core::effect_id(&select_path(), 0, 1),
+                "bogus".into(),
+                0,
+            ),
+        )
+        .await
+        .unwrap();
+    journal.arm();
+
+    let err = Executor::new(Arc::new(gateway), journal.clone(), "v1")
+        .with_registry(two_planner_registry())
+        .with_planner_selector(Arc::new(SwallowTwiceSelector))
+        .start(run, &select_graph())
+        .await
+        .expect_err("call 0's spend went unrecorded");
+
+    assert!(
+        matches!(&err, OrchestratorError::SpendUnrecorded { node, .. } if node.0 == select_path()),
+        "expected SpendUnrecorded at {}, got {err:?}",
+        select_path()
+    );
+    assert_eq!(seen.lock().unwrap().len(), 1, "only call 0 was paid for");
+}
