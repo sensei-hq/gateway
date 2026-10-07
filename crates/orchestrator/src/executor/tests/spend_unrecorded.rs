@@ -106,6 +106,22 @@ async fn wake_into_one_failed_spend_record(
     journal: Arc<FailSpendOnce>,
     graph: Graph,
 ) -> (RunId, orchestrator_core::ScheduledRun) {
+    let arm = journal.clone();
+    wake_into_armed_faults(exec, journal, move || arm.arm(), graph, CAP, |_| {}).await
+}
+
+/// The general shape behind [`wake_into_one_failed_spend_record`]: submit `graph` under a
+/// 1-micro-dollar cap (so it pauses before spending), raise the cap to `cap`, `arm` the
+/// journal's faults, force a wake, call `after_wake_1` with the row as wake 1 left it, then
+/// tick past every backoff the policy could schedule. Returns the final row.
+async fn wake_into_armed_faults(
+    exec: Executor,
+    journal: Arc<dyn ExecutionJournal>,
+    arm: impl FnOnce(),
+    graph: Graph,
+    cap: u64,
+    after_wake_1: impl FnOnce(&orchestrator_core::ScheduledRun),
+) -> (RunId, orchestrator_core::ScheduledRun) {
     let store = Arc::new(InMemorySchedulerStore::new());
     let clock = FakeClock::new(t0());
     let run = RunId(uuid::Uuid::new_v4());
@@ -129,17 +145,18 @@ async fn wake_into_one_failed_spend_record(
         .append(
             run,
             JournalEvent::MoneyBudgetRaised {
-                new_total_micro_usd: CAP,
+                new_total_micro_usd: cap,
             },
         )
         .await
         .unwrap();
-    journal.arm();
+    arm();
     sched.force_wake(run).await.unwrap();
 
     // Attempt 1 dispatches the call and fails to journal its spend. Then walk the clock
     // past every backoff `retry(3)` could schedule (10s, 20s) and tick at each step.
     assert_eq!(sched.tick().await.unwrap(), 1, "the forced wake is driven");
+    after_wake_1(&store.status(run).await.unwrap().expect("the run has a row"));
     for secs in [10, 30, 70, 150, 3_700] {
         clock.set(t0() + Duration::seconds(secs));
         sched.tick().await.unwrap();
@@ -364,4 +381,179 @@ async fn a_journal_fault_before_any_paid_dispatch_is_still_retried() {
         RunStatus::Completed
     );
     assert_eq!(seen.lock().unwrap().len(), 1, "the call is paid for once");
+}
+
+// ---- Precedence: an unrecorded spend in ONE concurrent child outranks a retryable
+// ---- fault in ANOTHER.
+
+/// A cap roomy enough for every call the masking scenario could make.
+const ROOMY_CAP: u64 = 10_000_000;
+
+/// The journal behind the Map-masking scenario. Once ARMED it fails, once each:
+///
+/// - `m/0`'s first UNPAID `EffectRecorded` (its `calc` tool result, `usage: None`) — a plain
+///   retryable `Journal(Backend)` fault that cost nothing; and
+/// - `m/1`'s first PAID `EffectRecorded` (its ReAct turn, `usage: Some`) — the spend record
+///   of a call the provider has already been paid for.
+struct FailMaskedMapChildren {
+    inner: InMemoryJournal,
+    armed: AtomicBool,
+    unpaid_m0: AtomicBool,
+    paid_m1: AtomicBool,
+}
+
+impl FailMaskedMapChildren {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: InMemoryJournal::new(),
+            armed: AtomicBool::new(false),
+            unpaid_m0: AtomicBool::new(true),
+            paid_m1: AtomicBool::new(true),
+        })
+    }
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl ExecutionJournal for FailMaskedMapChildren {
+    async fn append(
+        &self,
+        run: RunId,
+        event: JournalEvent,
+    ) -> Result<Seq, orchestrator_core::JournalError> {
+        if self.armed.load(Ordering::SeqCst)
+            && let JournalEvent::EffectRecorded { node, usage, .. } = &event
+        {
+            let blink = match (node.0.as_str(), usage.is_some()) {
+                ("m/0", false) => self.unpaid_m0.swap(false, Ordering::SeqCst),
+                ("m/1", true) => self.paid_m1.swap(false, Ordering::SeqCst),
+                _ => false,
+            };
+            if blink {
+                return Err(orchestrator_core::JournalError::Backend(
+                    "the database blinked".into(),
+                ));
+            }
+        }
+        self.inner.append(run, event).await
+    }
+    async fn load(
+        &self,
+        run: RunId,
+    ) -> Result<Vec<(Seq, JournalEvent)>, orchestrator_core::JournalError> {
+        self.inner.load(run).await
+    }
+    async fn load_since(
+        &self,
+        run: RunId,
+        since: Seq,
+    ) -> Result<Vec<(Seq, JournalEvent)>, orchestrator_core::JournalError> {
+        self.inner.load_since(run, since).await
+    }
+}
+
+/// A Map over `[i0, i1]` whose body is the `calc`-holding agent `a`, at concurrency 4 — so
+/// both children are driven under one `join_all`. Every scripted response reports usage,
+/// so the money cap admits it; the script is long enough for whatever an (unfixed) retry
+/// would buy.
+async fn masking_map_fixture() -> (Executor, CallLog, Arc<FailMaskedMapChildren>, Graph) {
+    let usage = kernel::types::cost::TokenUsage {
+        input_tokens: 10,
+        output_tokens: 295,
+        total_tokens: 305,
+    };
+    let with_usage = |mut r: kernel::types::io::ChatResponse| {
+        r.usage = Some(usage.clone());
+        r
+    };
+    let calc = || tool_call_response("t1", "calc", "{\"op\":\"add\",\"a\":2,\"b\":3}");
+    let (gateway, calls) = scripted_gateway(vec![
+        with_usage(calc()),
+        with_usage(calc()),
+        with_usage(final_response("done")),
+        with_usage(final_response("done")),
+        with_usage(final_response("done")),
+        with_usage(final_response("done")),
+    ])
+    .await;
+    price_single_chain(&gateway, 0.1, 0.2).await;
+    let journal = FailMaskedMapChildren::new();
+    let graph = Graph {
+        nodes: vec![Node {
+            id: NodeId("m".into()),
+            kind: NodeKind::Map {
+                body: MapBody::Agent(AgentRef("a".into())),
+                over: vec![serde_json::json!("i0"), serde_json::json!("i1")],
+                concurrency: 4,
+                aggregation: Aggregation::BestEffort,
+            },
+            deps: vec![],
+        }],
+    };
+    let exec = Executor::new(Arc::new(gateway), journal.clone(), "v1")
+        .with_registry(tool_agent_registry())
+        .with_tools(calc_tools());
+    (exec, calls, journal, graph)
+}
+
+/// THE precedence property, through the scheduler. `m/0` (the LOWER index) fails with a
+/// retryable journal fault that bought nothing; `m/1` fails to journal a call it already
+/// paid for. If the Map surfaced the first fatal by index, the retryable one would win, the
+/// scheduler would back the run off, and the retry would buy `m/1`'s call again — a run
+/// that ends `Completed` with a ledger missing a payment. Whatever ELSE went wrong in the
+/// round, an unrecorded spend is what must reach the scheduler: wake 1 files the run
+/// `Failed`, and no wake ever dispatches again.
+#[tokio::test]
+async fn an_unrecorded_spend_in_one_map_child_is_not_masked_by_a_retryable_fault_in_another() {
+    let (exec, calls, journal, graph) = masking_map_fixture().await;
+    let arm = journal.clone();
+
+    let (_run, row) = wake_into_armed_faults(
+        exec,
+        journal,
+        move || arm.arm(),
+        graph,
+        ROOMY_CAP,
+        |row| {
+            assert_eq!(
+                row.status,
+                RunStatus::Failed,
+                "wake 1 files the run terminal — a retry would re-buy m/1's call: {row:?}"
+            );
+        },
+    )
+    .await;
+
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        2,
+        "one paid turn per child, and never a second copy of m/1's"
+    );
+    assert_eq!(row.status, RunStatus::Failed, "{row:?}");
+    let reason = row.reason.unwrap_or_default();
+    assert!(
+        reason.contains("spend") && reason.contains("not recorded"),
+        "the terminal reason names the unrecorded spend, not m/0's blink: {reason}"
+    );
+}
+
+/// The same scenario on a bare executor, to pin the TYPE rather than a message: the drive's
+/// error is `SpendUnrecorded` naming `m/1`, not `m/0`'s `Journal(Backend)`.
+#[tokio::test]
+async fn a_map_surfaces_the_unrecorded_spend_as_its_typed_error_whatever_its_index() {
+    let (exec, calls, journal, graph) = masking_map_fixture().await;
+    journal.arm();
+
+    let err = exec
+        .run_with_budget(RunId(uuid::Uuid::new_v4()), &graph, money(ROOMY_CAP))
+        .await
+        .expect_err("a child's spend went unrecorded");
+
+    assert!(
+        matches!(&err, OrchestratorError::SpendUnrecorded { node, .. } if node.0 == "m/1"),
+        "expected SpendUnrecorded at m/1, got {err:?}"
+    );
+    assert_eq!(calls.lock().unwrap().len(), 2, "one paid turn per child");
 }
