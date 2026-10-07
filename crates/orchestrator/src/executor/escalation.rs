@@ -22,10 +22,15 @@
 //! - **Top-level `Agent` nodes only.** A `GateSpec::Human` loop gate does not escalate; its
 //!   expiry failure says so when its role declares `escalate_to`.
 //!
-//! Each drive escalates at most ONE hop and then pauses on the new deadline. A run left
-//! undriven across several SLAs therefore walks the chain one wake at a time — each pause
-//! carries a past `resume_after`, so the scheduler wakes it again at once — which keeps
-//! every hop its own durable journal row rather than a burst decided from one stale fold.
+//! Each drive escalates at most ONE hop and then pauses on the new holder's deadline:
+//! `now + the target's timeout`, measured from the ESCALATION INSTANT (the drive that
+//! appends `AgentEscalated`), not from when the previous holder's SLA passed. A run left
+//! undriven past an SLA therefore does not catch up: every hop waits its target's full SLA
+//! from whenever it is actually escalated, so walking an n-hop chain costs n full SLAs after
+//! the first expiry is noticed (each hop's pause carries that FUTURE `resume_after`, which
+//! is what the scheduler wakes it on). One hop per drive keeps every hop its own durable
+//! journal row, decided against a fresh clock, rather than a burst decided from one stale
+//! fold.
 
 use orchestrator_core::{AgentBacking, AgentRef, JournalEvent, NodeId, OrchestratorError, RunId};
 
