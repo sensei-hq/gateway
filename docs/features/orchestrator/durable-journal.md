@@ -228,7 +228,9 @@ written before them folds unchanged.
   is absolute and folded **FIRST-wins**, like every waiting record.
 - **`ToolConfirmDecided { node, effect_id, approved, actor, note }`** — the human's answer,
   folded **LAST-wins** (correctable before the run resumes, like `GateDecided`). The deadline
-  is checked BEFORE it is read, so a late approval runs nothing. A rejection or an expiry is
+  is checked BEFORE it is read, so a late approval runs nothing. Once an approved Mutation has
+  journaled its `EffectIntent` the decision is settled: neither the deadline nor a later
+  correction is consulted again, and an intent with no `EffectRecorded` reconciles in doubt. A rejection or an expiry is
   recorded as a Pure `EffectRecorded` carrying a terse `{"error":"not_confirmed"}` — the model
   sees neither `note` nor `actor`. `actor` is attribution, not authentication; who may answer
   is `torii`'s concern (torii#47).

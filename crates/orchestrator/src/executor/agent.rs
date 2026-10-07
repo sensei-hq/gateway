@@ -1122,7 +1122,13 @@ impl Executor {
         // happens until a human has said yes. A rejection or expiry is recorded exactly like
         // a permission denial (a Pure effect, replayed on resume); a pending decision pauses
         // the run durably.
-        if ar.confirm_tools.iter().any(|t| t == &call.name) {
+        //
+        // A standing `EffectIntent` for this call settles the question: an intent is only
+        // ever journaled AFTER an approval, so the side effect may already have happened.
+        // That call is IN DOUBT and goes straight to `mutation_tool_effect`'s reconcile —
+        // re-judging it here (a resume past the deadline, or a later corrective rejection)
+        // would journal a `not_confirmed` refusal over a call that may have run.
+        if ar.confirm_tools.iter().any(|t| t == &call.name) && !ar.fold.intents.contains_key(teid) {
             match self
                 .confirm_tool_call(
                     ar.run,
