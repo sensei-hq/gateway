@@ -28508,6 +28508,9 @@ mod discovery_tools_per_run {
 // AG-12 (#89): the money-denominated run budget.
 mod money_budget;
 
+// AG-3 (#87) x AG-12 (#89): a retry never re-buys a paid call whose spend went unrecorded.
+mod spend_unrecorded;
+
 /// AG-15 (#90): engine-enforced agent tool policy — confirm-before-run and the per-tool call
 /// ceiling. Every test drives agent "a" on chain "c" through the scripted gateway, with the
 /// `fs.write` `ScopedWriter` as the tool, so the SINK proves whether the tool really ran.
