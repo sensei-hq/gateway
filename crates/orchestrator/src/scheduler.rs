@@ -12,8 +12,8 @@
 
 use crate::executor::{Executor, RunOutcome};
 use orchestrator_core::{
-    Clock, ExecutionJournal, Graph, JournalError, JournalEvent, OrchestratorError, RunId,
-    RunStatus, ScheduledRun, SchedulerStore, Seq, TokenBudget, WakeAttempt,
+    Clock, ExecutionJournal, Graph, JournalError, JournalEvent, OrchestratorError, RunBudget,
+    RunId, RunStatus, ScheduledRun, SchedulerStore, Seq, TokenBudget, WakeAttempt,
 };
 use std::sync::Arc;
 
@@ -188,6 +188,26 @@ impl Scheduler {
         graph: Graph,
         budget: Option<TokenBudget>,
     ) -> Result<RunOutcome, OrchestratorError> {
+        self.submit_with_budget(
+            run,
+            graph,
+            RunBudget {
+                tokens: budget,
+                money: None,
+            },
+        )
+        .await
+    }
+
+    /// AG-12: like [`submit_budgeted`](Self::submit_budgeted), with a token cap, a money
+    /// cap, both or neither (via [`Executor::run_with_budget`]) — the path torii takes
+    /// once it derives a run's dollar limit from its caps (torii#41/#49).
+    pub async fn submit_with_budget(
+        &self,
+        run: RunId,
+        graph: Graph,
+        budget: RunBudget,
+    ) -> Result<RunOutcome, OrchestratorError> {
         self.store.enqueue(run, &graph, self.clock.now()).await?;
         let since = match self.watermark(run).await {
             Ok(s) => s,
@@ -211,7 +231,7 @@ impl Scheduler {
                 run.0
             )));
         };
-        let outcome = self.executor.run_budgeted(run, &graph, budget).await;
+        let outcome = self.executor.run_with_budget(run, &graph, budget).await;
         let recorded = self.record(run, since, &outcome).await;
         lock.release().await?;
         recorded?;

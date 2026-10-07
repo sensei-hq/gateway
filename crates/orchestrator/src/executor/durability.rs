@@ -166,6 +166,9 @@ impl Executor {
             // journal prefix left off.
             spent: fold.spent(),
             budget: fold.budget(),
+            // AG-12: the money half, same live-inclusive total the money gate reads.
+            spent_micro_usd: fold.money_spent(),
+            money_budget_micro_usd: fold.money_budget(),
         };
         self.journal
             .snapshot(run, snap)

@@ -2805,6 +2805,7 @@ fn label(event: &JournalEvent) -> String {
         JournalEvent::RunPaused { .. } => "RunPaused".to_string(),
         // SP-DATA-5 Task 2 gives this a real label once BudgetRaised is exercised.
         JournalEvent::BudgetRaised { .. } => "BudgetRaised".to_string(),
+        JournalEvent::MoneyBudgetRaised { .. } => "MoneyBudgetRaised".to_string(),
         JournalEvent::SignalAwaited { node, .. } => format!("SignalAwaited({})", node.0),
         JournalEvent::SignalReceived { node, .. } => format!("SignalReceived({})", node.0),
         // SP-6 s2 (Task 1): no test exercises these yet (Task 5 adds the executor
@@ -3373,6 +3374,7 @@ async fn start_halts_on_determinism_violation_without_calling_gateway() {
                 version: "v1".into(),
                 // SP-DATA-5: this test doesn't exercise a budget.
                 budget: None,
+                money_budget: None,
             },
         )
         .await
@@ -3435,6 +3437,7 @@ async fn start_refuses_resume_on_version_fence_mismatch() {
                 version: "v1".into(),
                 // SP-DATA-5: this test doesn't exercise a budget.
                 budget: None,
+                money_budget: None,
             },
         )
         .await
@@ -7067,7 +7070,11 @@ async fn reload_bumps_the_run_version_and_fences_in_flight_resume() {
         .unwrap()
         .into_iter()
         .find_map(|(_, e)| match e {
-            JournalEvent::RunStarted { version, budget: _ } => Some(version),
+            JournalEvent::RunStarted {
+                version,
+                budget: _,
+                money_budget: _,
+            } => Some(version),
             _ => None,
         })
         .unwrap();
@@ -7132,7 +7139,11 @@ async fn each_run_pins_the_generation_live_at_its_start() {
                 .unwrap()
                 .into_iter()
                 .find_map(|(_, e)| match e {
-                    JournalEvent::RunStarted { version, budget: _ } => Some(version),
+                    JournalEvent::RunStarted {
+                        version,
+                        budget: _,
+                        money_budget: _,
+                    } => Some(version),
                     _ => None,
                 })
                 .unwrap()
@@ -7177,7 +7188,11 @@ async fn handle_wired_executor_resumes_a_partial_run_at_the_same_generation() {
         .unwrap()
         .into_iter()
         .find_map(|(_, e)| match e {
-            JournalEvent::RunStarted { version, budget: _ } => Some(version),
+            JournalEvent::RunStarted {
+                version,
+                budget: _,
+                money_budget: _,
+            } => Some(version),
             _ => None,
         })
         .unwrap();
@@ -7288,7 +7303,11 @@ async fn start_on_a_handle_wired_executor_freshly_runs_and_pins_the_generation()
         .unwrap()
         .into_iter()
         .find_map(|(_, e)| match e {
-            JournalEvent::RunStarted { version, budget: _ } => Some(version),
+            JournalEvent::RunStarted {
+                version,
+                budget: _,
+                money_budget: _,
+            } => Some(version),
             _ => None,
         })
         .unwrap();
@@ -12751,6 +12770,7 @@ fn run_started_with_budget(cap: u64) -> JournalEvent {
     JournalEvent::RunStarted {
         version: "v1".into(),
         budget: Some(orchestrator_core::TokenBudget { total_tokens: cap }),
+        money_budget: None,
     }
 }
 
@@ -12771,6 +12791,7 @@ fn spent_effect(node: &str, eid: EffectId, ih: String, total_tokens: u32) -> Jou
             input_tokens: 0,
             output_tokens: total_tokens,
             total_tokens,
+            cost_micro_usd: None,
         }),
     }
 }
@@ -13581,6 +13602,7 @@ async fn a_selector_cannot_swallow_the_executors_determinism_violation() {
             JournalEvent::RunStarted {
                 version: "v1".into(),
                 budget: None,
+                money_budget: None,
             },
         )
         .await
@@ -13903,6 +13925,7 @@ async fn reported_usage_is_journaled_on_the_effect_record() {
             input_tokens: 30,
             output_tokens: 70,
             total_tokens: 100,
+            cost_micro_usd: None,
         }),
         "the reported usage reached the journal through the boundary conversion, field for field"
     );
@@ -17701,6 +17724,7 @@ mod scheduler_driver {
                 JournalEvent::RunStarted {
                     version: "v0-older-config".into(),
                     budget: None,
+                    money_budget: None,
                 },
             )
             .await
@@ -17798,6 +17822,7 @@ mod await_signal {
                 JournalEvent::RunStarted {
                     version: "v1".into(),
                     budget: None,
+                    money_budget: None,
                 },
             )
             .await
@@ -19124,6 +19149,7 @@ mod waiting_node_helpers {
                 JournalEvent::RunStarted {
                     version: "v1".into(),
                     budget: None,
+                    money_budget: None,
                 },
             )
             .await
@@ -19809,6 +19835,7 @@ mod human_gate {
                 JournalEvent::RunStarted {
                     version: "v1".into(),
                     budget: None,
+                    money_budget: None,
                 },
             )
             .await
@@ -20432,6 +20459,7 @@ mod human_agent {
                 JournalEvent::RunStarted {
                     version: "v1".into(),
                     budget: None,
+                    money_budget: None,
                 },
             )
             .await
@@ -21824,6 +21852,7 @@ mod human_agent {
                 JournalEvent::RunStarted {
                     version: "v1".into(),
                     budget: None,
+                    money_budget: None,
                 },
             )
             .await
@@ -22923,6 +22952,7 @@ mod human_loop_gate {
                 JournalEvent::RunStarted {
                     version: "v1".into(),
                     budget: None,
+                    money_budget: None,
                 },
             )
             .await
@@ -23315,6 +23345,7 @@ mod human_loop_gate {
                 JournalEvent::RunStarted {
                     version: "v1".into(),
                     budget: None,
+                    money_budget: None,
                 },
             )
             .await
@@ -23497,6 +23528,7 @@ mod human_loop_gate {
             JournalEvent::RunStarted {
                 version: "v1".into(),
                 budget: None,
+                money_budget: None,
             },
             JournalEvent::NodeStarted { node: gate(0) },
             JournalEvent::NodeCompleted { node: gate(0) },
@@ -23559,6 +23591,7 @@ mod human_loop_gate {
                 JournalEvent::RunStarted {
                     version: "v1".into(),
                     budget: None,
+                    money_budget: None,
                 },
             )
             .await
@@ -26759,6 +26792,7 @@ fn run_started_unbudgeted() -> JournalEvent {
     JournalEvent::RunStarted {
         version: "v1".into(),
         budget: None,
+        money_budget: None,
     }
 }
 
@@ -28232,3 +28266,6 @@ mod discovery_tools_per_run {
         );
     }
 }
+
+// AG-12 (#89): the money-denominated run budget.
+mod money_budget;

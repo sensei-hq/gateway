@@ -116,6 +116,7 @@ mod tests {
             version: "v".into(),
             // SP-DATA-5: this store test doesn't exercise a budget.
             budget: None,
+            money_budget: None,
         }
     }
 
@@ -204,6 +205,8 @@ mod tests {
             outputs: vec![],
             spent: 0,
             budget: None,
+            spent_micro_usd: 0,
+            money_budget_micro_usd: None,
         };
         journal.snapshot(run, snap).await.unwrap();
         let got = journal
@@ -222,6 +225,8 @@ mod tests {
             outputs: vec![],
             spent: 0,
             budget: None,
+            spent_micro_usd: 0,
+            money_budget_micro_usd: None,
         };
         journal.snapshot(run, snap2).await.unwrap();
         assert_eq!(journal.latest_snapshot(run).await.unwrap().unwrap().seq, s1);

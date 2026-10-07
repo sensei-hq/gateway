@@ -9,7 +9,7 @@ use orchestrator_core::{
     AgentRef, Clock, ContentStore, ContextKey, ContextRef, ContextStore, EffectClass, EffectId,
     EffectOutput, ExecutionJournal, Graph, JournalEvent, NodeId, NodeKind, ObservationMeta,
     OrchestratorError, OrchestratorHooks, PLANNER_AREA, Planner, PlannerSelector, Registry,
-    RegistryHandle, RunId, Scope, Seq, SystemClock, TokenBudget, effect_id,
+    RegistryHandle, RunBudget, RunId, Scope, Seq, SystemClock, TokenBudget, effect_id,
 };
 
 use crate::agent::tools::{ReconcileRegistry, ToolRegistry};
@@ -359,6 +359,15 @@ struct Fold {
     /// The effective cap: `RunStarted.budget`, then the latest `BudgetRaised` (latest
     /// wins). `None` for an unbudgeted run — the gate never fires.
     budget: Option<u64>,
+    /// AG-12: the effective MONEY cap in micro-dollars — `RunStarted.money_budget`, then
+    /// the latest `MoneyBudgetRaised`. Independent of `budget`: either, both or neither.
+    /// The spend it is compared against is NOT a separate ledger — it is the
+    /// `cost_micro_usd` riding on each entry of `usage` above, so it is keyed by effect
+    /// id and inherits every idempotency property of the token ledger.
+    money_budget: Option<u64>,
+    /// AG-12: micro-dollars dispatched by THIS drive, not yet visible in `usage` — the
+    /// money twin of `live_spend`, for the same reason.
+    live_money: Arc<std::sync::atomic::AtomicU64>,
     /// SP-DATA-5: tokens dispatched by THIS drive, not yet visible in `usage`.
     ///
     /// A `Fold` is built once per drive (from the journal on resume, or empty-but-for-
@@ -497,6 +506,30 @@ impl Fold {
         self.budget
     }
 
+    /// AG-12: micro-dollars this run had spent as of the journal this fold was built from.
+    ///
+    /// The same keyed sum as [`journaled_spend`](Self::journaled_spend), over the same
+    /// map, reading the other field — so a duplicate record or a re-folded compaction
+    /// manifest counts once here for exactly the reason it counts once there. Saturating
+    /// HIGH for the same reason too: it pauses the run rather than resetting the ledger.
+    fn journaled_money(&self) -> u64 {
+        self.usage
+            .values()
+            .filter_map(|u| u.cost_micro_usd)
+            .fold(0u64, |acc, m| acc.saturating_add(m))
+    }
+
+    /// AG-12: total micro-dollars this run has spent: journaled + in-flight this drive.
+    fn money_spent(&self) -> u64 {
+        self.journaled_money()
+            .saturating_add(self.live_money.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// AG-12: the run's effective money cap in micro-dollars, or `None`.
+    fn money_budget(&self) -> Option<u64> {
+        self.money_budget
+    }
+
     /// This fold's ledger as the metered-dispatch chokepoint consumes it. Borrowing the
     /// live counter (rather than copying two scalars out) is what lets spend accumulate
     /// WITHIN a drive — see [`dispatch::Meter`].
@@ -507,6 +540,23 @@ impl Fold {
             &self.live_spend,
             &self.serial_gate,
         )
+        .with_money(self.journaled_money(), self.money_budget, &self.live_money)
+    }
+
+    /// AG-12: the usage a producer journals on its `EffectRecorded` — the provider's
+    /// token counts, plus the gateway's priced cost in micro-dollars when (and only when)
+    /// this run has a money cap in force.
+    ///
+    /// The ONE conversion every producer uses. It lives on the fold because whether cost
+    /// is ledgered is a property of the RUN, and a per-site flag would be five chances to
+    /// journal tokens and silently drop the money; there is no other converter left to
+    /// call. Gating on the cap rather than recording cost always is what keeps an
+    /// unbudgeted or token-only run's journal byte-identical to before AG-12.
+    fn recorded_usage(
+        &self,
+        response: &kernel::types::request::InferenceResponse,
+    ) -> Option<orchestrator_core::TokenUsage> {
+        content::recorded_usage(response, self.money_budget.is_some())
     }
 
     /// SP-6 s1: the folded signal for an `AwaitSignal` node, if one has been delivered
@@ -734,6 +784,18 @@ impl Fold {
 pub fn spend_of(events: &[(Seq, JournalEvent)]) -> (u64, Option<u64>) {
     let (fold, _, _) = fold_journal(events);
     (fold.spent(), fold.budget())
+}
+
+/// AG-12: a run's folded MONEY `(spent_micro_usd, money_budget_micro_usd)` — the money
+/// twin of [`spend_of`], routed through the same `fold_journal` for the same reason, so
+/// `torii run status` can display dollars spent without re-deriving them.
+///
+/// Spend counts only calls made while a money cap was in force (cost is ledgered only
+/// then — see `TokenUsage::cost_micro_usd`), so on a run that never had one this is
+/// `(0, None)`.
+pub fn money_spend_of(events: &[(Seq, JournalEvent)]) -> (u64, Option<u64>) {
+    let (fold, _, _) = fold_journal(events);
+    (fold.money_spent(), fold.money_budget())
 }
 
 /// Run-scoped tallies for the expansion caps (§4.5). Only ever mutated from the
@@ -1057,6 +1119,33 @@ impl Executor {
         graph: &Graph,
         budget: Option<TokenBudget>,
     ) -> Result<RunOutcome, OrchestratorError> {
+        self.run_with_budget(
+            run,
+            graph,
+            RunBudget {
+                tokens: budget,
+                money: None,
+            },
+        )
+        .await
+    }
+
+    /// AG-12: like [`run_budgeted`](Self::run_budgeted), with a token cap, a MONEY cap,
+    /// both or neither. The money cap is journaled on `RunStarted.money_budget` and
+    /// enforced by the same metered-dispatch chokepoint as the token cap: a call is
+    /// refused once the folded money spend reaches the cap, each call's `max_tokens` is
+    /// clamped to what the remaining dollars afford at the chain's worst-case price, and
+    /// exhaustion is the same durable `RunPaused` an operator lifts with
+    /// `MoneyBudgetRaised` + a wake.
+    ///
+    /// `RunBudget::default()` is exactly [`run`](Self::run), and a token-only budget is
+    /// exactly [`run_budgeted`](Self::run_budgeted) — byte-identical journals.
+    pub async fn run_with_budget(
+        &self,
+        run: RunId,
+        graph: &Graph,
+        budget: RunBudget,
+    ) -> Result<RunOutcome, OrchestratorError> {
         if let Some(h) = &self.handle {
             let (registry, generation) = h.snapshot();
             return self
@@ -1072,7 +1161,7 @@ impl Executor {
         &self,
         run: RunId,
         graph: &Graph,
-        budget: Option<TokenBudget>,
+        budget: RunBudget,
     ) -> Result<RunOutcome, OrchestratorError> {
         graph.validate_dag()?;
         let this = self.clone().with_expansion_seed(0, 0);
@@ -1080,7 +1169,8 @@ impl Executor {
             run,
             JournalEvent::RunStarted {
                 version: this.version.clone(),
-                budget,
+                budget: budget.tokens,
+                money_budget: budget.money,
             },
         )
         .await?;
@@ -1090,7 +1180,8 @@ impl Executor {
         // however small the cap. (A resume gets the same value from `fold_journal`
         // reading the `RunStarted` this call just appended, plus any `BudgetRaised`.)
         let fold = Fold {
-            budget: budget.map(|b| b.total_tokens),
+            budget: budget.tokens.map(|b| b.total_tokens),
+            money_budget: budget.money.map(|m| m.total_micro_usd),
             ..Default::default()
         };
         // The RUN's own graph: a human-backed `Agent` node here is at the one
@@ -1147,7 +1238,7 @@ impl Executor {
             // branch only fires for a run id that was never submitted at all, which is
             // not a product path `Scheduler::tick` reaches (it only re-drives runs its
             // own `submit` already journaled `RunStarted` for).
-            return self.run_inner(run, graph, None).await;
+            return self.run_inner(run, graph, RunBudget::default()).await;
         }
 
         // Version fence: the first recorded `RunStarted.version` must match ours.
@@ -1156,7 +1247,11 @@ impl Executor {
         // The fence compares the executor version string only; `budget` is
         // deliberately not fenced (a config-only change, not a code-version change).
         if let Some(recorded) = events.iter().find_map(|(_, e)| match e {
-            JournalEvent::RunStarted { version, budget: _ } => Some(version.clone()),
+            JournalEvent::RunStarted {
+                version,
+                budget: _,
+                money_budget: _,
+            } => Some(version.clone()),
             _ => None,
         }) && recorded != self.version
         {
@@ -1573,7 +1668,7 @@ impl Executor {
                                 observation: None,
                                 // SP-DATA-5: the ModelCall producer — the real usage the
                                 // provider reported, converted at the boundary.
-                                usage: response.usage.map(content::convert_usage),
+                                usage: fold.recorded_usage(&response),
                             },
                         )
                         .await?;

@@ -479,6 +479,80 @@ pub async fn two_window_scripted_window_watching_gateway(
     )
 }
 
+/// AG-12: re-price every single-chain fixture's models — chain `"c"`'s `"m"` and
+/// chain `"emb"`'s `"me"` — at `input_per_1k` / `output_per_1k` USD, in place.
+///
+/// Every gateway built over [`single_chain_config`] is UNPRICED (`pricing: None`), which a
+/// money cap refuses before dispatch. Rather than a priced twin of each fixture
+/// constructor, this swaps the config under an already-built gateway through the
+/// unchecked `update_config`, so any single-chain double — the clamp observer, the
+/// metered, latency and scripted adapters — can be run under a money cap with its
+/// behaviour otherwise untouched.
+pub async fn price_single_chain(gateway: &Gateway, input_per_1k: f64, output_per_1k: f64) {
+    price_single_chain_with_output_limit(
+        gateway,
+        input_per_1k,
+        output_per_1k,
+        FIXTURE_MAX_OUTPUT_TOKENS,
+    )
+    .await;
+}
+
+/// [`price_single_chain`] for a fixture built over
+/// [`single_chain_config_with_output_limit`] — re-pricing must not silently reset the
+/// fixture's output limit to the default.
+pub async fn price_single_chain_with_output_limit(
+    gateway: &Gateway,
+    input_per_1k: f64,
+    output_per_1k: f64,
+    max_output_tokens: u32,
+) {
+    price_single_chain_full(
+        gateway,
+        input_per_1k,
+        output_per_1k,
+        None,
+        max_output_tokens,
+    )
+    .await;
+}
+
+/// [`price_single_chain`] with a flat `per_request` fee (USD) on every model — the term
+/// the money clamp reserves before it sizes `max_tokens` (AG-12).
+pub async fn price_single_chain_with_fee(
+    gateway: &Gateway,
+    input_per_1k: f64,
+    output_per_1k: f64,
+    per_request: f64,
+) {
+    price_single_chain_full(
+        gateway,
+        input_per_1k,
+        output_per_1k,
+        Some(per_request),
+        FIXTURE_MAX_OUTPUT_TOKENS,
+    )
+    .await;
+}
+
+async fn price_single_chain_full(
+    gateway: &Gateway,
+    input_per_1k: f64,
+    output_per_1k: f64,
+    per_request: Option<f64>,
+    max_output_tokens: u32,
+) {
+    let mut config = single_chain_config_with_output_limit(max_output_tokens);
+    for model in config.models.values_mut() {
+        model.pricing = Some(kernel::types::config::ModelPricing {
+            input_per_1k,
+            output_per_1k,
+            per_request,
+        });
+    }
+    gateway.update_config(config).await;
+}
+
 /// Build a minimal gateway whose chain `"c"` resolves `TextChat` to the
 /// recording adapter (router `"r"`, model `"m"`), returning the gateway and the
 /// shared call log. `fail_after` is threaded into the adapter's crash injector.
