@@ -389,8 +389,14 @@ pub(crate) fn fold_journal(
             // arm — not the `_` catch-all below — because a budget that silently
             // never folds is a bug the compiler cannot catch for us (`budget` stays
             // `Option`-shaped either way), so this must be deliberate, not implicit.
-            JournalEvent::RunStarted { budget, .. } => {
+            JournalEvent::RunStarted {
+                budget,
+                money_budget,
+                ..
+            } => {
                 fold.budget = budget.map(|b| b.total_tokens);
+                // AG-12: the money cap, independently of the token cap.
+                fold.money_budget = money_budget.map(|m| m.total_micro_usd);
             }
             // SP-DATA-5: an operator-issued raise (or lower). Latest value wins, so
             // this OVERWRITES rather than accumulates — also an EXPLICIT arm for the
@@ -398,6 +404,12 @@ pub(crate) fn fold_journal(
             // compile cleanly and silently make the budget un-raisable.
             JournalEvent::BudgetRaised { new_total_tokens } => {
                 fold.budget = Some(*new_total_tokens);
+            }
+            // AG-12: the money twin — latest wins, EXPLICIT arm for the same reason.
+            JournalEvent::MoneyBudgetRaised {
+                new_total_micro_usd,
+            } => {
+                fold.money_budget = Some(*new_total_micro_usd);
             }
             // SP-7b: the `## Context` byte budget a turn was cut to. FIRST wins —
             // `entry().or_insert()`, NOT `insert`. A budget a later record could move is not
