@@ -205,6 +205,21 @@ impl Executor {
                     .await;
             };
 
+            // AG-2: the decision is honoured from here on, whichever outcome it names, so
+            // this is where the drive that FIRST honours it reports it — once across
+            // resumes (a `Complete` gate re-completes from the fold on every later drive,
+            // and `claim_decided_hook` reads its bookkeeping row back; a `Fail` gate is read
+            // back by `gate_precheck` above and never gets here again). Fired BEFORE the
+            // `Fail` arm's `NodeFailed`, so an observer sees the decision, then what it
+            // caused. Every string goes through the same redactor as the node output.
+            if let Some(h) = self.claim_decided_hook(run, &node.id, fold).await {
+                let option = self.redact_text(decision.option.clone());
+                let actor = self.redact_text(decision.actor.clone());
+                let note = decision.note.clone().map(|n| self.redact_text(n));
+                h.on_gate_decided(run, &node.id, &option, &actor, note.as_deref())
+                    .await;
+            }
+
             return match chosen.outcome {
                 // SP-4 s2 (§6.4): redact ONCE and hand that one value to BOTH the node's
                 // return AND — via `apply_node_result` → `publish_context` — the durable

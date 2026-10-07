@@ -345,8 +345,17 @@ impl Executor {
         //    A payload is not a credential channel (the broker is), and unlike a pause
         //    reason it does not merely get displayed — it becomes the node's output and
         //    flows into downstream nodes and model prompts.
+        //
+        //    AG-2: the drive that FIRST honours the signal reports it — once across
+        //    resumes, since a later drive re-completes this node from the fold and
+        //    `claim_decided_hook` reads the bookkeeping row back. The hook gets the same
+        //    redacted value the node outputs.
         if let Some(payload) = fold.signal_for(&node.id) {
-            return Ok(NodeExec::Completed(self.redact(payload)));
+            let output = self.redact(payload);
+            if let Some(h) = self.claim_decided_hook(run, &node.id, fold).await {
+                h.on_signal_received(run, &node.id, &output).await;
+            }
+            return Ok(NodeExec::Completed(output));
         }
 
         // 2. Not answered. Take what this node ALREADY recorded, or — only on the very

@@ -385,6 +385,13 @@ pub(crate) fn fold_journal(
                     .entry(node.clone())
                     .or_insert_with(|| option.clone());
             }
+            // AG-2: hooks bookkeeping — the node whose "decided" hook already fired. An
+            // EXPLICIT arm, never the `_` catch-all: absorbed silently, every later drive of
+            // a still-live run would re-report a decision it is merely replaying, and it
+            // would compile perfectly. A set, so a duplicate row changes nothing.
+            JournalEvent::DecisionHookFired { node } => {
+                fold.decided_hooks_fired.insert(node.clone());
+            }
             // SP-DATA-5: the run's original cap, set once at submit. An EXPLICIT
             // arm — not the `_` catch-all below — because a budget that silently
             // never folds is a bug the compiler cannot catch for us (`budget` stays
