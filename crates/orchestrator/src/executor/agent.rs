@@ -277,7 +277,7 @@ impl Executor {
             // it is returned to `run_human_loop_gate` rather than re-read there.
             let (question, timeout) = self.human_question_for(agent_ref, input, context)?;
             return Ok(step(
-                self.run_human_agent(run, node_id, &question, timeout, fold)
+                self.run_human_agent(run, node_id, agent_ref, &question, timeout, fold)
                     .await?,
             ));
         }

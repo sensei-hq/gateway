@@ -28565,6 +28565,29 @@ mod human_escalation {
         assert_eq!(failures(&journal, run, &review()).await.len(), 1);
     }
 
+    /// A cycle that slipped past load (`with_agent` does not validate) still ENDS: the
+    /// runtime refuses to hand the question back to an agent that already held it, rather
+    /// than appending a hop on every wake forever.
+    #[tokio::test]
+    async fn an_unvalidated_escalation_cycle_fails_loudly_instead_of_looping() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let reg = Arc::new(
+            Registry::default()
+                .with_agent(role("reviewer", 1, Some("lead")))
+                .with_agent(role("lead", 1, Some("reviewer"))),
+        );
+        let (ex, clock, _calls) = exec_at(&journal, reg, at(1_000)).await;
+        assert!(ex.start(run, &graph()).await.unwrap().paused.is_some());
+        clock.set(at(1_000 + 3_600));
+        assert!(ex.start(run, &graph()).await.unwrap().paused.is_some());
+        clock.set(at(1_000 + 7_200));
+        let o = ex.start(run, &graph()).await.expect("drive");
+        let (_node, message) = o.failed.expect("a cycle fails the node");
+        assert!(message.contains("cycle"), "{message}");
+        assert_eq!(escalations(&journal.load(run).await.unwrap()).len(), 1);
+    }
+
     /// Escalation never pre-empts an answer: the human-agent ordering reads the answer
     /// BEFORE the expiry, so an answer that landed is honoured and nobody is escalated to.
     #[tokio::test]

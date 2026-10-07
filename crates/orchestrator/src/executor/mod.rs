@@ -19,6 +19,7 @@ mod branch;
 mod content;
 mod dispatch;
 mod durability;
+mod escalation;
 mod expand;
 mod fanout;
 mod gate;
@@ -410,6 +411,17 @@ struct Fold {
     /// `ToolConfirmDecided`. LAST wins, like `gate_decisions`, so an operator can correct a
     /// decision before the run resumes.
     tool_confirm_decisions: HashMap<EffectId, bool>,
+    /// AG-15: each human-backed agent node's escalation chain, from `AgentEscalated`, in
+    /// journal order. The FIRST row for a given target wins (a re-appended hop is ignored),
+    /// so the chain — and the deadline of its last hop — never moves once recorded.
+    agent_escalations: HashMap<NodeId, Vec<AgentEscalation>>,
+}
+
+/// AG-15: one folded `AgentEscalated` hop.
+#[derive(Debug, Clone, PartialEq)]
+struct AgentEscalation {
+    to: String,
+    deadline: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// SP-7b: a folded `ContextBudgeted` — the two fields a later drive must REPRODUCE a cut
@@ -737,6 +749,14 @@ impl Fold {
 
     fn tool_confirm_decision(&self, eid: &EffectId) -> Option<bool> {
         self.tool_confirm_decisions.get(eid).copied()
+    }
+
+    /// AG-15: the node's escalation hops so far, oldest first (empty if never escalated).
+    fn escalations_for(&self, node: &NodeId) -> &[AgentEscalation] {
+        self.agent_escalations
+            .get(node)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 }
 

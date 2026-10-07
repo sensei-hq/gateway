@@ -486,6 +486,7 @@ impl Executor {
         &self,
         run: RunId,
         node_id: &NodeId,
+        agent_ref: &AgentRef,
         question: &HumanQuestion,
         timeout: Option<chrono::Duration>,
         fold: &Fold,
@@ -725,16 +726,13 @@ impl Executor {
         //    become the node's OUTPUT and flow into every downstream model prompt.
         let deadline = match state {
             WaitState::NotYetAsking(fresh) => fresh,
+            // AG-15: the asked agent's SLA passed with no answer. If it (or the agent the
+            // question was last escalated to) declares `escalate_to`, the question moves on
+            // instead of failing; only the END of the chain expiring fails the node, with
+            // the pre-AG-15 message verbatim when no escalation was configured.
             WaitState::Expired(d) => {
                 return self
-                    .fail_human_agent(
-                        run,
-                        node_id,
-                        format!(
-                            "human_agent: node {} passed its deadline {d} with no answer",
-                            node_id.0
-                        ),
-                    )
+                    .escalate_or_expire(run, node_id, agent_ref, d, fold)
                     .await;
             }
             WaitState::Waiting(d) => d,
@@ -932,13 +930,30 @@ impl Executor {
             // decision DID land "no decision" would send them hunting a delivery bug that
             // does not exist, in a durable message every later drive re-emits.
             Ok(WaitState::Expired(deadline)) => {
+                // AG-15: escalation applies to a top-level human-backed `Agent` node only. A
+                // role that declares `escalate_to` and is used here would otherwise fail
+                // silently un-escalated, so the message says so — and is byte-identical to
+                // the pre-AG-15 one for every role that declares nothing.
+                let not_escalated = self
+                    .registry
+                    .agent(&agent_ref.0)
+                    .and_then(|a| a.escalate_to.as_deref())
+                    .map(|to| {
+                        format!(
+                            " (its role {:?} declares escalate_to {to:?}, but a loop gate \
+                             does not escalate — escalation applies to a top-level \
+                             human-backed Agent node only)",
+                            agent_ref.0
+                        )
+                    })
+                    .unwrap_or_default();
                 self.fail_loop_gate(
                     run,
                     node_id,
                     format!(
                         "loop_gate: node {} passed its deadline {deadline}; the gate fails \
                          on the deadline BEFORE any decision is read, so a decision that \
-                         had already landed does not authorize another iteration",
+                         had already landed does not authorize another iteration{not_escalated}",
                         node_id.0
                     ),
                 )

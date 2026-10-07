@@ -443,6 +443,19 @@ pub(crate) fn fold_journal(
                 fold.tool_confirm_decisions
                     .insert(effect_id.clone(), *approved);
             }
+            // AG-15: FIRST row per target wins, so a duplicated hop can neither move the
+            // chain's current deadline nor lengthen the chain.
+            JournalEvent::AgentEscalated {
+                node, to, deadline, ..
+            } => {
+                let chain = fold.agent_escalations.entry(node.clone()).or_default();
+                if !chain.iter().any(|hop| &hop.to == to) {
+                    chain.push(super::AgentEscalation {
+                        to: to.clone(),
+                        deadline: *deadline,
+                    });
+                }
+            }
             _ => {}
         }
     }
