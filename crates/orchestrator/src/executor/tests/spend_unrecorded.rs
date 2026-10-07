@@ -557,3 +557,114 @@ async fn a_map_surfaces_the_unrecorded_spend_as_its_typed_error_whatever_its_ind
     );
     assert_eq!(calls.lock().unwrap().len(), 2, "one paid turn per child");
 }
+
+// ---- The planner-selector producer (`SelectorDispatch::complete`).
+
+/// `"e/__select__"` — the reserved path the selector of `expand_select_node("e")`
+/// journals its spend under.
+fn select_path() -> String {
+    format!("e/{}", orchestrator_core::RESERVED_SELECT_ID)
+}
+
+fn select_graph() -> Graph {
+    Graph {
+        nodes: vec![expand_select_node("e", vec![])],
+    }
+}
+
+/// The selector producer: a `Select` planner's paid call whose `EffectRecorded` append
+/// fails is never re-bought by a retry. The selector reaches the provider only through
+/// the lent `SelectorDispatch`, whose `complete` is the fifth paid producer; a plain
+/// journal fault there would be retryable, and the retry — with no memo for the call —
+/// would dispatch it again.
+#[tokio::test]
+async fn a_paid_selector_call_whose_spend_was_not_journaled_is_never_redispatched_by_a_retry() {
+    let (gateway, seen) = clamp_observing_gateway(10, 295).await;
+    price_single_chain(&gateway, 0.1, 0.2).await;
+    let journal = FailSpendOnce::new("e/__select__");
+    let registry = two_planner_registry();
+    let exec = Executor::new(Arc::new(gateway), journal.clone(), "v1")
+        .with_registry(registry.clone())
+        .with_planner_selector(Arc::new(crate::LlmPlannerSelector::new(registry, "c")));
+
+    let (_run, row) = wake_into_one_failed_spend_record(exec, journal, select_graph()).await;
+
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "the selector's paid call is dispatched exactly once — a retry would pay for it again"
+    );
+    assert_eq!(row.status, RunStatus::Failed, "{row:?}");
+    let reason = row.reason.unwrap_or_default();
+    assert!(
+        reason.contains("spend") && reason.contains("not recorded"),
+        "the terminal reason names the unrecorded spend: {reason}"
+    );
+}
+
+/// The selector case's TYPE, on a bare executor: the drive aborts with `SpendUnrecorded`
+/// at the reserved select path — not a `Journal(Backend)` the scheduler would retry, and
+/// not a soft `NodeFailed` (`LlmPlannerSelector` propagates the dispatch's `Err` with `?`,
+/// which the `Select` arm would otherwise turn into `expand_failed`).
+#[tokio::test]
+async fn a_selectors_unrecorded_spend_aborts_the_drive_as_spend_unrecorded() {
+    let (gateway, seen) = clamp_observing_gateway(10, 295).await;
+    price_single_chain(&gateway, 0.1, 0.2).await;
+    let journal = FailSpendOnce::new("e/__select__");
+    journal.arm();
+    let registry = two_planner_registry();
+
+    let err = Executor::new(Arc::new(gateway), journal.clone(), "v1")
+        .with_registry(registry.clone())
+        .with_planner_selector(Arc::new(crate::LlmPlannerSelector::new(registry, "c")))
+        .run_with_budget(RunId(uuid::Uuid::new_v4()), &select_graph(), money(CAP))
+        .await
+        .expect_err("the selector's spend went unrecorded");
+
+    assert!(
+        matches!(&err, OrchestratorError::SpendUnrecorded { node, .. } if node.0 == select_path()),
+        "expected SpendUnrecorded at {}, got {err:?}",
+        select_path()
+    );
+    assert_eq!(seen.lock().unwrap().len(), 1, "one paid selector call");
+}
+
+/// A selector that SWALLOWS the dispatch's `Err` and falls back to the first candidate
+/// still cannot turn the unrecorded spend into a normal selection: the error is the
+/// executor's, stashed on the dispatch and read before `select()`'s own result, so the
+/// drive aborts with the typed `SpendUnrecorded` — no `PlannerSelected`, no soft
+/// `NodeFailed`, and no further spend on the strength of the fallback pick.
+#[tokio::test]
+async fn a_selector_cannot_swallow_an_unrecorded_spend() {
+    let (gateway, seen) = clamp_observing_gateway(10, 295).await;
+    price_single_chain(&gateway, 0.1, 0.2).await;
+    let journal = FailSpendOnce::new("e/__select__");
+    journal.arm();
+    let run = RunId(uuid::Uuid::new_v4());
+
+    let err = Executor::new(Arc::new(gateway), journal.clone(), "v1")
+        .with_registry(two_planner_registry())
+        .with_planner_selector(Arc::new(SwallowingSelector))
+        .run_with_budget(run, &select_graph(), money(CAP))
+        .await
+        .expect_err("the unrecorded spend outranks the selector's fallback");
+
+    assert!(
+        matches!(&err, OrchestratorError::SpendUnrecorded { node, .. } if node.0 == select_path()),
+        "expected SpendUnrecorded at {}, got {err:?}",
+        select_path()
+    );
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "nothing further is dispatched on the strength of the fallback pick"
+    );
+    let events = journal.load(run).await.unwrap();
+    assert!(
+        !events.iter().any(|(_, ev)| matches!(
+            ev,
+            JournalEvent::PlannerSelected { .. } | JournalEvent::NodeFailed { .. }
+        )),
+        "neither a journaled selection nor a soft failure: {events:?}"
+    );
+}
