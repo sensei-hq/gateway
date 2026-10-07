@@ -17419,6 +17419,42 @@ mod scheduler_driver {
         assert_eq!(sched.tick().await.unwrap(), 0, "never re-claimed");
     }
 
+    /// An operator-configured backoff so large that `now + backoff` leaves `DateTime<Utc>`'s
+    /// range must not panic: a panic inside `tick` is itself a poison pill (the SP-6 s1
+    /// `AwaitSignal` timeout shape). The deadline saturates instead — the run is parked, not
+    /// lost, and `force_wake` still reaches it.
+    #[tokio::test]
+    async fn an_overflowing_backoff_saturates_instead_of_panicking_the_tick() {
+        let run = RunId(uuid::Uuid::new_v4());
+        let store = Arc::new(InMemorySchedulerStore::new());
+        seed_due(store.as_ref(), run).await;
+        let journal = FaultyJournal::new(run, Fault::Backend, usize::MAX);
+        let clock = FakeClock::new(t0());
+        let (gw, _calls) = recording_gateway().await;
+        let huge = Duration::milliseconds(i64::MAX);
+        let sched = sched_over(store.clone(), journal.clone(), clock.clone(), gw).with_wake_retry(
+            crate::WakeRetryPolicy {
+                base_backoff: huge,
+                max_backoff: huge,
+                ..retry(3, 10)
+            },
+        );
+
+        assert_eq!(
+            sched
+                .tick()
+                .await
+                .expect("an overflowing backoff must not fail the tick"),
+            1
+        );
+        let st = store.status(run).await.unwrap().unwrap();
+        assert_eq!(
+            (st.status, st.next_wake),
+            (RunStatus::Paused, Some(DateTime::<Utc>::MAX_UTC)),
+            "the retry deadline saturates at the end of time"
+        );
+    }
+
     /// A run that recovers on its LAST allowed attempt completes — the cap is on failures,
     /// not on drives.
     #[tokio::test]
