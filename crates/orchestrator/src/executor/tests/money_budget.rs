@@ -292,8 +292,10 @@ async fn a_money_capped_map_fanout_dispatches_one_child_before_the_gate_fires() 
 }
 
 /// Producer coverage: the ReAct turn and the Map item journal their cost too (the
-/// `ModelCall` node is covered above). Every producer converts its usage through the ONE
-/// `Fold::recorded_usage`, so a producer cannot journal tokens and silently drop cost.
+/// `ModelCall` node is covered above; `Consolidate` and the selector by their own tests
+/// below). Every producer converts through `Fold::recorded_usage` (or the meter's mirror),
+/// but nothing in the type system stops a site calling `content::recorded_usage` with
+/// `priced: false` — so each of the five producers is pinned by a test, not by the shape.
 #[tokio::test]
 async fn the_react_turn_and_map_item_producers_journal_their_cost() {
     let usage = kernel::types::cost::TokenUsage {
@@ -745,4 +747,95 @@ async fn a_per_request_fee_that_leaves_less_than_the_floor_pauses_before_dispatc
         .as_ref()
         .expect("the fee leaves too little: pause");
     assert!(pause.reason.starts_with("budget: "), "{}", pause.reason);
+}
+
+fn priced_usage() -> kernel::types::cost::TokenUsage {
+    kernel::types::cost::TokenUsage {
+        input_tokens: 10,
+        output_tokens: 100,
+        total_tokens: 110,
+    }
+}
+
+/// MEDIUM (AG-12 review): the `Consolidate` synthesis journals its cost. Nothing but this
+/// test stops that producer from converting its usage with the cost dropped — the money
+/// cap would see the call live and lose it on every resume.
+#[tokio::test]
+async fn the_consolidate_producer_journals_its_cost() {
+    let (gateway, _calls) = metered_gateway(Some(priced_usage())).await;
+    price_single_chain(&gateway, IN_PER_1K, OUT_PER_1K).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("m".into()),
+                kind: NodeKind::Map {
+                    body: MapBody::ModelCall { chain: "c".into() },
+                    over: map_items(["i0"]),
+                    concurrency: 1,
+                    aggregation: Aggregation::BestEffort,
+                },
+                deps: vec![],
+            },
+            Node {
+                id: NodeId("cons".into()),
+                kind: NodeKind::Consolidate {
+                    over: NodeId("m".into()),
+                    min_viable: 1,
+                    body: MapBody::ModelCall { chain: "c".into() },
+                },
+                deps: vec![Dep::soft("m")],
+            },
+        ],
+    };
+    let out = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .run_with_budget(run, &graph, money(10_000_000))
+        .await
+        .expect("drives");
+    assert!(out.failed.is_none() && out.paused.is_none(), "{out:?}");
+    let events = journal.load(run).await.unwrap();
+    assert_eq!(
+        journaled_costs(&events, |n| n == "cons"),
+        vec![Some(21_000)],
+        "the Consolidate synthesis journals its cost"
+    );
+    assert_eq!(crate::money_spend_of(&events).0, 42_000);
+}
+
+/// MEDIUM (AG-12 review): the planner selector's lent dispatch journals its cost on the
+/// `e/__select__` record. `PlannerSelected` memoizes the choice, so a resumed run never
+/// re-invokes the selector: a cost it did not journal is gone from the money ledger for
+/// good. The run fails (the canned reply is not a candidate) — deliberately, as in
+/// `the_planner_selector_journals_its_spend_to_the_ledger`: the money was spent either way.
+#[tokio::test]
+async fn the_planner_selector_producer_journals_its_cost() {
+    let (gateway, calls) =
+        metered_latency_gateway(Some(priced_usage()), std::time::Duration::ZERO).await;
+    price_single_chain(&gateway, IN_PER_1K, OUT_PER_1K).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let registry = two_planner_registry();
+    let graph = Graph {
+        nodes: vec![expand_select_node("e", vec![])],
+    };
+    Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(registry.clone())
+        .with_planner_selector(Arc::new(crate::LlmPlannerSelector::new(registry, "c")))
+        .run_with_budget(run, &graph, money(10_000_000))
+        .await
+        .expect("drives");
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "the selector dispatched once"
+    );
+    let select = format!("e/{}", orchestrator_core::RESERVED_SELECT_ID);
+    let events = journal.load(run).await.unwrap();
+    assert_eq!(
+        journaled_costs(&events, |n| n == select),
+        vec![Some(21_000)],
+        "the selector's call journals its cost"
+    );
+    assert_eq!(crate::money_spend_of(&events).0, 21_000);
 }
