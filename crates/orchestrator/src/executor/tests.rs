@@ -6305,11 +6305,22 @@ async fn coordinator_loop_expand_body_with_gate_agent_converges() {
 // ============================= SP-1 OrchestratorHooks ==========================
 
 /// A hooks spy: each fired hook appends a "label(args)" string.
+///
+/// The second field keeps the PROMPTS the agent and loop-gate asks hand over, apart from
+/// the one-line log: a prompt is long, and `mod hitl_hooks` compares it with the journaled
+/// ask rather than spelling it out.
 #[derive(Clone, Default)]
-struct RecordingHooks(Arc<std::sync::Mutex<Vec<String>>>);
+struct RecordingHooks(
+    Arc<std::sync::Mutex<Vec<String>>>,
+    Arc<std::sync::Mutex<Vec<(String, String)>>>,
+);
 impl RecordingHooks {
     fn log(&self) -> Vec<String> {
         self.0.lock().unwrap().clone()
+    }
+    /// `(node, prompt)` for every `on_agent_awaited`/`on_loop_gate_awaited`, in order.
+    fn prompts(&self) -> Vec<(String, String)> {
+        self.1.lock().unwrap().clone()
     }
     fn push(&self, s: String) {
         self.0.lock().unwrap().push(s);
@@ -6372,11 +6383,15 @@ impl OrchestratorHooks for RecordingHooks {
         &self,
         _r: RunId,
         n: &NodeId,
-        _deadline: Option<chrono::DateTime<chrono::Utc>>,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
         options: &[orchestrator_core::GateOption],
     ) {
         let names: Vec<&str> = options.iter().map(|o| o.name.as_str()).collect();
-        self.push(format!("gate_awaited({},{})", n.0, names.join("|")));
+        self.push(format!(
+            "gate_awaited({},{deadline:?},{})",
+            n.0,
+            names.join("|")
+        ));
     }
     async fn on_gate_decided(
         &self,
@@ -6392,10 +6407,14 @@ impl OrchestratorHooks for RecordingHooks {
         &self,
         _r: RunId,
         n: &NodeId,
-        _deadline: Option<chrono::DateTime<chrono::Utc>>,
-        _prompt: &str,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+        prompt: &str,
     ) {
-        self.push(format!("agent_awaited({})", n.0));
+        self.1
+            .lock()
+            .unwrap()
+            .push((n.0.clone(), prompt.to_string()));
+        self.push(format!("agent_awaited({},{deadline:?})", n.0));
     }
     async fn on_agent_answered(&self, _r: RunId, n: &NodeId, text: &str, actor: &str) {
         self.push(format!("agent_answered({},{text},{actor})", n.0));
@@ -6404,12 +6423,20 @@ impl OrchestratorHooks for RecordingHooks {
         &self,
         _r: RunId,
         n: &NodeId,
-        _deadline: Option<chrono::DateTime<chrono::Utc>>,
-        _prompt: &str,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+        prompt: &str,
         menu: &[orchestrator_core::LoopGateOption],
     ) {
+        self.1
+            .lock()
+            .unwrap()
+            .push((n.0.clone(), prompt.to_string()));
         let names: Vec<&str> = menu.iter().map(|o| o.name.as_str()).collect();
-        self.push(format!("loop_gate_awaited({},{})", n.0, names.join("|")));
+        self.push(format!(
+            "loop_gate_awaited({},{deadline:?},{})",
+            n.0,
+            names.join("|")
+        ));
     }
     async fn on_loop_gate_decided(&self, _r: RunId, n: &NodeId, option: &str, actor: &str) {
         self.push(format!("loop_gate_decided({},{option},{actor})", n.0));

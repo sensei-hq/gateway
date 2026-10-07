@@ -248,7 +248,7 @@ async fn gate_hooks_fire_once_per_occurrence_and_never_on_a_resumed_replay() {
     assert_eq!(
         h.drive_hitl(&graph).await,
         vec![
-            "gate_awaited(release,ship|reject)",
+            "gate_awaited(release,None,ship|reject)",
             "signal_awaited(hold,None)"
         ],
     );
@@ -352,7 +352,7 @@ async fn agent_hooks_fire_once_per_occurrence_and_never_on_a_resumed_replay() {
 
     assert_eq!(
         h.drive_hitl(&graph).await,
-        vec!["agent_awaited(review)", "signal_awaited(hold,None)"],
+        vec!["agent_awaited(review,None)", "signal_awaited(hold,None)"],
     );
     assert_eq!(h.drive_hitl(&graph).await, Vec::<String>::new());
 
@@ -424,7 +424,7 @@ async fn loop_gate_hooks_fire_once_per_occurrence_and_never_on_a_resumed_replay(
     assert_eq!(
         h.drive_hitl(&graph).await,
         vec![
-            "loop_gate_awaited(lp/0/__gate__,revise|ship)",
+            "loop_gate_awaited(lp/0/__gate__,None,revise|ship)",
             "signal_awaited(hold,None)"
         ],
     );
@@ -436,7 +436,7 @@ async fn loop_gate_hooks_fire_once_per_occurrence_and_never_on_a_resumed_replay(
         vec![
             "loop_gate_decided(lp/0/__gate__,revise,carol)",
             "loop_gate_settled(lp/0/__gate__,revise)",
-            "loop_gate_awaited(lp/1/__gate__,revise|ship)",
+            "loop_gate_awaited(lp/1/__gate__,None,revise|ship)",
         ],
         "iteration 0's gate settles on `revise`, so iteration 1 runs and asks"
     );
@@ -770,4 +770,66 @@ async fn an_off_menu_decision_is_never_reported() {
         "the rejection is reported, the off-menu decision is not: {fired:?}"
     );
     assert_eq!(h.drive_hitl(&graph).await, Vec::<String>::new());
+}
+
+// ------------------------------------------------------- awaited-hook arguments
+
+/// AG-2 review: the awaited hooks carry the ABSOLUTE deadline the ask recorded and, for
+/// the agent and loop-gate asks, the JOURNALED question — the two things an SSE stream or
+/// an expiry alert needs. Every other fixture uses `timeout: None`, so a hook passing
+/// `None` or an empty prompt stayed green.
+#[tokio::test]
+async fn awaited_hooks_carry_the_recorded_deadline_and_the_journaled_prompt() {
+    let hour = chrono::Duration::hours(1);
+    let due = format!("{:?}", Some(at(1_000_000) + hour));
+
+    // Signal + gate, both with a one-hour SLA.
+    let mut h = Harness::new(None);
+    let mut graph = gate_graph();
+    if let NodeKind::HumanGate { timeout, .. } = &mut graph.nodes[0].kind {
+        *timeout = Some(hour);
+    }
+    graph.nodes[1].kind = NodeKind::AwaitSignal {
+        timeout: Some(hour),
+    };
+    assert_eq!(
+        h.drive_hitl(&graph).await,
+        vec![
+            format!("gate_awaited(release,{due},ship|reject)"),
+            format!("signal_awaited(hold,{due})"),
+        ],
+    );
+
+    // A human-backed agent and a human loop gate, the role carrying the SLA.
+    for graph in [agent_graph(), loop_gate_graph()] {
+        let mut h = Harness::new(Some(human_registry(Some(hour))));
+        let fired = h.drive_hitl(&graph).await;
+        let asked = fired
+            .iter()
+            .find(|e| e.starts_with("agent_awaited(") || e.starts_with("loop_gate_awaited("))
+            .unwrap_or_else(|| panic!("the human ask fires: {fired:?}"));
+        assert!(asked.contains(&due), "{asked} carries the deadline {due}");
+
+        let journaled: Vec<(String, String)> = h
+            .journal
+            .load(h.run)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                JournalEvent::AgentAwaited { node, prompt, .. }
+                | JournalEvent::LoopGateAwaited { node, prompt, .. } => Some((node.0, prompt)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !journaled.is_empty() && journaled.iter().all(|(_, p)| !p.is_empty()),
+            "the ask journaled a question: {journaled:?}"
+        );
+        assert_eq!(
+            h.hooks.prompts(),
+            journaled,
+            "the hook hands over exactly the journaled question"
+        );
+    }
 }
