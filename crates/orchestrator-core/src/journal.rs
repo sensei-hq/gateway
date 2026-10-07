@@ -730,11 +730,23 @@ pub enum JournalEvent {
     /// row itself (`SignalReceived`/`GateDecided`/`AgentAnswered`) was appended by another
     /// process and says nothing about which drive first acted on it. A loop gate needs no
     /// such row: the executor's own [`JournalEvent::LoopGateSettled`] already marks the
-    /// honouring drive. Folded as a set, so a duplicate is harmless.
+    /// honouring drive.
+    ///
+    /// `decision` is the journal `Seq` of the decision row the hook REPORTED. It is what
+    /// makes the marker per-decision rather than per-node: the decision rows fold
+    /// LAST-wins and none of the three kinds journals a durable completion, so a
+    /// correction appended after a hooked drive honoured the first decision is honoured
+    /// AGAIN by the next drive of a still-live run (a `Fail` option then fails a gate that
+    /// had completed). That drive sees a marker for a different `Seq` and reports the
+    /// decision it actually honoured. LAST wins per node; a duplicate is harmless.
+    /// `#[serde(default)]`: a row without it (`None`) counts as covering whatever
+    /// decision the node holds.
     ///
     /// Additive: `FORMAT_VERSION` stays 1.
     DecisionHookFired {
         node: NodeId,
+        #[serde(default)]
+        decision: Option<Seq>,
     },
 }
 

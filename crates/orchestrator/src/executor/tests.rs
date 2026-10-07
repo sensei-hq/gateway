@@ -2848,7 +2848,7 @@ fn label(event: &JournalEvent) -> String {
         JournalEvent::ContextBudgeted { node, .. } => format!("ContextBudgeted({})", node.0),
         // AG-2: the hooked path's bookkeeping row. `mod hitl_hooks` pins that an unhooked
         // run never journals one.
-        JournalEvent::DecisionHookFired { node } => format!("DecisionHookFired({})", node.0),
+        JournalEvent::DecisionHookFired { node, .. } => format!("DecisionHookFired({})", node.0),
     }
 }
 

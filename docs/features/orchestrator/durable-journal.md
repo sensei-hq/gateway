@@ -142,12 +142,14 @@ graph, which is why the journal is the *only* record that anything is waiting th
 
 All three are **new variants of an existing enum**, so `FORMAT_VERSION` stays **1**.
 
-## AG-2 — `DecisionHookFired { node }`
+## AG-2 — `DecisionHookFired { node, decision }`
 
 Hooks bookkeeping, not an audit fact. Written **only when `OrchestratorHooks` are wired**, by
 the drive that first honours an `AwaitSignal`/`HumanGate`/human-`Agent` answer, just before
-it fires that node's decided hook; folded as a set so every later drive — which re-completes
-the node from the fold — fires nothing. Nothing else reads it: execution, the memo, outputs
+it fires that node's decided hook. `decision` (`#[serde(default)]`) is the `Seq` of the
+decision row it reported; folded LAST-wins per node, so every later drive — which
+re-completes the node from the fold — fires nothing while the fold still holds that row,
+and a correction honoured after it (a newer `Seq`) is reported once more. Nothing else reads it: execution, the memo, outputs
 and determinism checks are blind to it, and an unhooked executor never writes one (so its
 absence does NOT mean an answer was never honoured). A loop gate needs none —
 `LoopGateSettled` already marks its honouring drive. Additive: `FORMAT_VERSION` stays **1**.
