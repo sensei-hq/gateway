@@ -233,8 +233,11 @@ SP-DATA-5 ledger rather than beside it:
   token-only run journals byte-identically to before.
 - **`MoneyBudgetRaised { new_total_micro_usd }`** — the money twin of `BudgetRaised`: latest
   wins, lowering below spend halts the run. Its own variant because the caps are independent
-  (`BudgetRaised.new_total_tokens` is required). On a run that started WITHOUT a money cap it
-  introduces one that counts only spend journaled from then on.
+  (`BudgetRaised.new_total_tokens` is required). It **moves** a money cap and never
+  introduces one: on a run that started WITHOUT a money cap the fold ignores it. A drive in
+  flight when such a raise lands folded "no cap" and journals every call uncosted, so a cap
+  introduced then would be reported over spend the ledger never counted. A run that needs a
+  money cap is submitted with one.
 - **`Snapshot.spent_micro_usd` / `money_budget_micro_usd`** — the money half of the
   snapshot's ledger scalars, for the reason `spent`/`budget` are there.
 - **`money_spend_of(events)`** — the folded `(spent_micro_usd, cap)`, the money twin of
