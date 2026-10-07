@@ -440,6 +440,16 @@ struct Fold {
     /// `ToolConfirmDecided`. LAST wins, like `gate_decisions`, so an operator can correct a
     /// decision before the run resumes.
     tool_confirm_decisions: HashMap<EffectId, bool>,
+    /// AG-2 × AG-15: the `Seq` of each call's CURRENT `ToolConfirmDecided` (LAST wins, in
+    /// step with [`Fold::tool_confirm_decisions`]); the row's content is in
+    /// [`Fold::decision_rows`]. The per-call twin of [`Fold::decision_seqs`], read only by
+    /// the hook dispatch.
+    tool_confirm_decision_seqs: HashMap<EffectId, Seq>,
+    /// AG-2 × AG-15: the calls whose `on_tool_confirm_decided` a hooked drive already
+    /// fired (`DecisionHookFired` with an `effect_id`), each with the `Seq` of the decision
+    /// it reported (LAST wins). The per-call twin of [`Fold::decided_hooks_fired`], read
+    /// only by [`Executor::claim_tool_confirm_hook`].
+    tool_confirm_hooks_fired: HashMap<EffectId, Option<Seq>>,
     /// AG-15: each human-backed agent node's escalation chain, from `AgentEscalated`, in
     /// journal order. The FIRST row for a given target wins (a re-appended hop is ignored),
     /// so the chain — and the deadline of its last hop — never moves once recorded.
@@ -490,6 +500,16 @@ enum DecisionContent {
     Signal(serde_json::Value),
     Gate(GateDecision),
     Agent(AgentAnswer),
+    ToolConfirm(ToolConfirmDecision),
+}
+
+/// AG-2 × AG-15: a folded `ToolConfirmDecided` — what `on_tool_confirm_decided` reports.
+#[derive(Debug, Clone, PartialEq)]
+struct ToolConfirmDecision {
+    approved: bool,
+    /// ATTRIBUTION, NOT AUTHENTICATION — see `JournalEvent::ToolConfirmDecided`.
+    actor: String,
+    note: Option<String>,
 }
 
 /// SP-6 s2: a folded `GateDecided`.
@@ -844,10 +864,31 @@ impl Fold {
     /// so it reports nothing). A marker for a row that said something else does not
     /// count: a correction appended after it is honoured again, and is reported again.
     fn decided_hook_fired(&self, node: &NodeId) -> bool {
-        match self.decided_hooks_fired.get(node) {
+        self.marker_covers(
+            self.decided_hooks_fired.get(node),
+            self.decision_seqs.get(node),
+        )
+    }
+
+    /// AG-2 × AG-15: the per-CALL twin of [`decided_hook_fired`](Self::decided_hook_fired)
+    /// for a confirm-before-run call's `on_tool_confirm_decided` — the same rule, keyed by
+    /// the call's effect id, because one agent node can ask about several calls and two of
+    /// them may well be decided with identical content.
+    fn tool_confirm_hook_fired(&self, eid: &EffectId) -> bool {
+        self.marker_covers(
+            self.tool_confirm_hooks_fired.get(eid),
+            self.tool_confirm_decision_seqs.get(eid),
+        )
+    }
+
+    /// AG-2: does a folded marker (`None` = none; `Some(None)` = a marker that covers any
+    /// decision; `Some(Some(seq))` = the row it reported) cover the decision row the fold
+    /// holds NOW (`current`)? Yes when it names that row, or a row with IDENTICAL content.
+    fn marker_covers(&self, marker: Option<&Option<Seq>>, current: Option<&Seq>) -> bool {
+        match marker {
             None => false,
             Some(None) => true,
-            Some(Some(reported)) => match self.decision_seqs.get(node) {
+            Some(Some(reported)) => match current {
                 None => false,
                 Some(current) => {
                     current == reported
@@ -857,6 +898,16 @@ impl Fold {
                         )
                 }
             },
+        }
+    }
+
+    /// AG-2 × AG-15: the `ToolConfirmDecided` row this call currently honours — its `Seq`
+    /// and content — if any.
+    fn tool_confirm_row(&self, eid: &EffectId) -> Option<(Seq, &ToolConfirmDecision)> {
+        let seq = *self.tool_confirm_decision_seqs.get(eid)?;
+        match self.decision_rows.get(&seq)? {
+            DecisionContent::ToolConfirm(row) => Some((seq, row)),
+            _ => None,
         }
     }
 
@@ -2004,6 +2055,36 @@ impl Executor {
                     h.on_loop_gate_awaited(run, node, *deadline, prompt, menu)
                         .await
                 }
+                // AG-2 × AG-15: a confirm-before-run CALL's ask — journaled once per call
+                // (first-wins, keyed by its effect id), so once per ask like the four above.
+                // `arguments` was redacted before it was journaled; the tool name was not
+                // (it is the row an operator matches a decision against), so it is
+                // scrubbed here, as `GateAwaited`'s menu is.
+                JournalEvent::ToolConfirmAwaited {
+                    node,
+                    effect_id,
+                    tool,
+                    arguments,
+                    deadline,
+                    ..
+                } => {
+                    let tool = self.redact_text(tool.clone());
+                    h.on_tool_confirm_awaited(run, node, effect_id, &tool, arguments, *deadline)
+                        .await
+                }
+                // AG-2 × AG-15: an escalation hop — journaled at most once per target per
+                // node (the executor never re-escalates to an agent already in the chain),
+                // so once per occurrence. The agent names pass through the same redactor.
+                JournalEvent::AgentEscalated {
+                    node,
+                    from,
+                    to,
+                    deadline,
+                } => {
+                    let from = self.redact_text(from.clone());
+                    let to = self.redact_text(to.clone());
+                    h.on_agent_escalated(run, node, &from, &to, *deadline).await
+                }
                 _ => {}
             }
         }
@@ -2047,27 +2128,68 @@ impl Executor {
         if fold.decided_hook_fired(node) {
             return None;
         }
-        match self
+        self.mark_decided_hook(run, node, fold.decision_seq(node), None)
+            .await;
+        Some(hooks)
+    }
+
+    /// AG-2 × AG-15: [`claim_decided_hook`](Self::claim_decided_hook) for ONE
+    /// confirm-before-run call's `on_tool_confirm_decided`, keyed by the call's effect id.
+    ///
+    /// Called by `confirm_tool_call` at the moment it HONOURS a decision — inside the
+    /// deadline, about to run the approved call or refuse the rejected one. A memoized call
+    /// never gets there again, but a call honoured and then left unrecorded does (the
+    /// approved tool failed and the node re-attempts on resume; a stale Observation
+    /// re-read), and it reads the same decision: the `DecisionHookFired { effect_id }` row
+    /// written here is what keeps that drive from reporting it twice. Every rule of
+    /// `claim_decided_hook` holds as written there — `None` with no hooks and before any
+    /// write, an identical redelivery claims nothing, a correction claims again, and a
+    /// failed write still fires.
+    async fn claim_tool_confirm_hook(
+        &self,
+        run: RunId,
+        node: &NodeId,
+        eid: &EffectId,
+        fold: &Fold,
+    ) -> Option<&Arc<dyn OrchestratorHooks>> {
+        let hooks = self.hooks.as_ref()?;
+        if fold.tool_confirm_hook_fired(eid) {
+            return None;
+        }
+        let decision = fold.tool_confirm_row(eid).map(|(seq, _)| seq);
+        self.mark_decided_hook(run, node, decision, Some(eid.clone()))
+            .await;
+        Some(hooks)
+    }
+
+    /// AG-2: journal the `DecisionHookFired` bookkeeping row, best-effort — deliberately
+    /// bypassing [`append`](Self::append)'s strict error mapping (see `claim_decided_hook`
+    /// for why a failed write is logged and the hook fired anyway).
+    async fn mark_decided_hook(
+        &self,
+        run: RunId,
+        node: &NodeId,
+        decision: Option<Seq>,
+        effect_id: Option<EffectId>,
+    ) {
+        if let Err(error) = self
             .journal
             .append(
                 run,
                 JournalEvent::DecisionHookFired {
                     node: node.clone(),
-                    decision: fold.decision_seq(node),
+                    decision,
+                    effect_id,
                 },
             )
             .await
         {
-            Ok(_) => Some(hooks),
-            Err(error) => {
-                tracing::warn!(
-                    node = %node.0,
-                    %error,
-                    "could not journal DecisionHookFired; firing the decided hook anyway \
-                     (a later drive of a still-live run may report it again)"
-                );
-                Some(hooks)
-            }
+            tracing::warn!(
+                node = %node.0,
+                %error,
+                "could not journal DecisionHookFired; firing the decided hook anyway \
+                 (a later drive of a still-live run may report it again)"
+            );
         }
     }
 

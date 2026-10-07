@@ -835,11 +835,27 @@ pub enum JournalEvent {
     /// `#[serde(default)]`: a row without it (`None`) counts as covering whatever
     /// decision the node holds.
     ///
+    /// **`effect_id`** (AG-2 × AG-15): `Some` marks the `on_tool_confirm_decided` hook of
+    /// ONE confirm-before-run call — `decision` is then the `Seq` of that call's
+    /// `ToolConfirmDecided` — and the marker is keyed by the call, not the node, because
+    /// one agent node can ask about several calls. A memoized call is never re-judged, but
+    /// a call honoured and then left unrecorded (the approved tool failed and the node
+    /// re-attempts on resume; a stale Observation re-read) reads the same decision again,
+    /// and this row is what keeps that drive from reporting it twice. The same rules as
+    /// above apply per call: identical content is a redelivery, a different decision is
+    /// reported. `None` (and absent — `skip_serializing_if`, so a node marker's bytes are
+    /// exactly what AG-2 shipped) is the node-keyed marker. Reusing the variant rather than
+    /// adding one keeps the journal's set of event KINDS unchanged for a backend that
+    /// enumerates them; a reader that predates the field reads the row as a node marker
+    /// for an agent node that has no decided hook of its own, which is inert.
+    ///
     /// Additive: `FORMAT_VERSION` stays 1.
     DecisionHookFired {
         node: NodeId,
         #[serde(default)]
         decision: Option<Seq>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effect_id: Option<EffectId>,
     },
 }
 
@@ -1687,6 +1703,7 @@ mod tests {
         let ev = JournalEvent::DecisionHookFired {
             node: NodeId("gate".into()),
             decision: Some(3),
+            effect_id: None,
         };
         assert_eq!(
             serde_json::to_string(&ev).expect("serialises"),
@@ -1701,9 +1718,27 @@ mod tests {
                 JournalEvent::DecisionHookFired {
                     node: NodeId("gate".into()),
                     decision: None,
+                    effect_id: None,
                 }
             )
         );
+    }
+
+    /// AG-2 × AG-15: a confirm-call marker carries its `effect_id` and round-trips whole.
+    #[test]
+    fn the_tool_confirm_decision_hook_marker_round_trips() {
+        let ev = JournalEvent::DecisionHookFired {
+            node: NodeId("n1".into()),
+            decision: Some(7),
+            effect_id: Some(EffectId("eid-2".into())),
+        };
+        let json = serde_json::to_string(&ev).expect("serialises");
+        assert_eq!(
+            json,
+            r#"{"DecisionHookFired":{"node":"n1","decision":7,"effect_id":"eid-2"}}"#
+        );
+        let back: JournalEvent = serde_json::from_str(&json).expect("deserialises");
+        assert_eq!(format!("{back:?}"), format!("{ev:?}"));
     }
 
     /// AG-15 — the tool-confirmation and escalation events round-trip whole; the fence stays 1.

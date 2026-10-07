@@ -128,8 +128,29 @@ impl Executor {
 
         // 3. The decision, against the ask just published or read back.
         match fold.tool_confirm_decision(teid) {
-            Some(true) => Ok(Confirmation::Approved),
-            Some(false) => Ok(refused()),
+            Some(approved) => {
+                // AG-2 × AG-15: the decision is honoured from here — inside its deadline,
+                // the approved call about to run or the rejected one about to be refused —
+                // so this is where the drive that FIRST honours it reports it, before the
+                // call's own `on_agent_tool_call`. Once per call across resumes: a memoized
+                // call never gets here again, and one that does (its approved tool failed
+                // and the node re-attempts) finds the marker `claim_tool_confirm_hook`
+                // wrote. Operator free text goes through the same redactor as every
+                // decided hook's.
+                if let Some(h) = self.claim_tool_confirm_hook(run, node, teid, fold).await
+                    && let Some((_, row)) = fold.tool_confirm_row(teid)
+                {
+                    let actor = self.redact_text(row.actor.clone());
+                    let note = row.note.clone().map(|n| self.redact_text(n));
+                    h.on_tool_confirm_decided(run, node, teid, approved, &actor, note.as_deref())
+                        .await;
+                }
+                if approved {
+                    Ok(Confirmation::Approved)
+                } else {
+                    Ok(refused())
+                }
+            }
             None => {
                 let reason = format!(
                     "tool_confirm: waiting for a human to confirm tool '{}' on node {} \

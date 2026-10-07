@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     AgentAnswer, ContextBudget, DecisionContent, Fold, GateDecision, LoopGateAsk, LoopGateDecision,
+    ToolConfirmDecision,
 };
 
 /// One scheduling round's **ready set** (§3.2): the not-yet-terminal nodes whose
@@ -399,9 +400,22 @@ pub(crate) fn fold_journal(
             // marker tracks the most recent decision reported; a duplicate changes nothing.
             // The decision arms above record each row's content in `decision_rows`, which
             // is what lets an identical redelivery count as the decision already reported.
-            JournalEvent::DecisionHookFired { node, decision } => {
-                fold.decided_hooks_fired.insert(node.clone(), *decision);
-            }
+            //
+            // AG-2 × AG-15: a marker carrying an `effect_id` is a confirm-before-run CALL's,
+            // keyed by that call — never the node's, or it would cover whatever the node's
+            // own decided hook reports.
+            JournalEvent::DecisionHookFired {
+                node,
+                decision,
+                effect_id,
+            } => match effect_id {
+                Some(eid) => {
+                    fold.tool_confirm_hooks_fired.insert(eid.clone(), *decision);
+                }
+                None => {
+                    fold.decided_hooks_fired.insert(node.clone(), *decision);
+                }
+            },
             // SP-DATA-5: the run's original cap, set once at submit. An EXPLICIT
             // arm — not the `_` catch-all below — because a budget that silently
             // never folds is a bug the compiler cannot catch for us (`budget` stays
@@ -474,13 +488,28 @@ pub(crate) fn fold_journal(
                     .entry(effect_id.clone())
                     .or_insert(*deadline);
             }
+            //
+            // AG-2 × AG-15: the row's `Seq` and content too, so the hook dispatch can tell a
+            // redelivery of the decision it reported from a correction.
             JournalEvent::ToolConfirmDecided {
                 effect_id,
                 approved,
+                actor,
+                note,
                 ..
             } => {
                 fold.tool_confirm_decisions
                     .insert(effect_id.clone(), *approved);
+                fold.tool_confirm_decision_seqs
+                    .insert(effect_id.clone(), *seq);
+                fold.decision_rows.insert(
+                    *seq,
+                    DecisionContent::ToolConfirm(ToolConfirmDecision {
+                        approved: *approved,
+                        actor: actor.clone(),
+                        note: note.clone(),
+                    }),
+                );
             }
             // AG-15: FIRST row per target wins, so a duplicated hop can neither move the
             // chain's current deadline nor lengthen the chain.
