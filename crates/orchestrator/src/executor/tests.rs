@@ -28390,6 +28390,64 @@ mod agent_tool_policy {
         );
     }
 
+    /// The ceiling runs BEFORE confirm-before-run: a call over the ceiling is refused outright
+    /// and never put to a human — nobody is asked to approve a call that would be refused
+    /// anyway, and the run does not pause on it.
+    #[tokio::test]
+    async fn a_call_over_the_ceiling_is_never_put_to_a_human() {
+        let journal = InMemoryJournal::new();
+        let run = RunId(uuid::Uuid::new_v4());
+        let graph = Graph {
+            nodes: vec![agent_node("n1", "a", "write twice")],
+        };
+        let writes = sink();
+        let agent = || AgentDefinition {
+            tool_limits: std::collections::HashMap::from([("fs.write".to_string(), 1)]),
+            ..confirm_agent(None)
+        };
+        let (ex, _clock) = build_executor(
+            &journal,
+            registry_of(agent()),
+            vec![tool_call_response(
+                "t1",
+                "fs.write",
+                &write_args("/workspace/1", "x"),
+            )],
+            &writes,
+            at(1_000),
+        )
+        .await;
+        assert!(ex.start(run, &graph).await.unwrap().paused.is_some());
+        journal
+            .append(run, decided(true, "alice", None))
+            .await
+            .unwrap();
+
+        let (ex, _clock) = build_executor(
+            &journal,
+            registry_of(agent()),
+            vec![
+                tool_call_response("t2", "fs.write", &write_args("/workspace/2", "x")),
+                final_response("done"),
+            ],
+            &writes,
+            at(2_000),
+        )
+        .await;
+        let o = ex.start(run, &graph).await.expect("drive 2");
+        assert!(
+            o.paused.is_none() && o.failed.is_none(),
+            "the over-ceiling call must not pause on a human: {o:?}"
+        );
+        assert_eq!(&*writes.lock().unwrap(), &["/workspace/1".to_string()]);
+        let events = journal.load(run).await.unwrap();
+        assert_eq!(asks(&events).len(), 1, "only the first call was asked");
+        assert_eq!(
+            recorded_output(&events, &effect_id("n1", 1, 1)).expect("recorded")["error"],
+            "call_limit_reached"
+        );
+    }
+
     /// Drive a confirm-before-run `fs.write` to the point an APPROVED drive has journaled its
     /// `EffectIntent` and then crashed before `EffectRecorded`: drive 1 pauses on the ask, an
     /// approval lands, drive 2 runs the call to completion, and the journal is then cut back
