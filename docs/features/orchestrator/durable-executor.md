@@ -199,6 +199,12 @@ run is recorded `Failed` — "gave up after N failed wake attempts; last error: 
 A successful drive (a recorded pause) resets the count. Every other drive error
 (config or `format_version` fence, determinism violation, …) is deterministic and
 stays terminal at once, as before; `submit`'s inline drive is unchanged.
+One backend fault is deliberately NOT retryable: a journal/CAS failure AFTER a paid
+model call, before its `EffectRecorded { usage }` is durable, surfaces as
+`OrchestratorError::SpendUnrecorded` and files the run `Failed` naming the unrecorded
+spend — a retry would dispatch and pay for that call again, past any cap. A process
+crash in the same window is the pre-existing at-least-once edge: the reclaimed re-drive
+re-buys that one call (see [durable journal § AG-12](durable-journal.md#ag-12--the-money-cap)).
 `force_wake` skips the backoff but **not** the count — an operator waking a
 poison run gets the attempts it has left, not a fresh budget; `cancel` is unchanged.
 Configure with `Scheduler::with_wake_retry(WakeRetryPolicy { .. })` (defaults: 5
