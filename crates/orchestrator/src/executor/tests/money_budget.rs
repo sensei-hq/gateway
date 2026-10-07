@@ -478,10 +478,14 @@ async fn spending_exactly_the_money_cap_stops_the_run_on_the_gate() {
 }
 
 /// On a MONEY-only run a model bound (here the chain's 200-token output limit, under the
-/// 256 floor) refuses against the MONEY cap — in dollars — rather than naming a token cap
-/// the run does not have.
+/// 256 floor) refuses — and says so. The money cap is NOT the binding term: $10 with
+/// nothing spent affords ~50 000 output tokens, so a message in money wording ("only 200
+/// output tokens are affordable … the money cap must exceed …") would send the operator
+/// to raise a cap that cannot release this call, and re-pause on the same node after
+/// every manual round trip (AG-12 review, MEDIUM). The reason names the output limit and
+/// its remedy, and still shows the money ledger for context.
 #[tokio::test]
-async fn a_money_only_run_refused_by_a_model_bound_reports_against_the_money_cap() {
+async fn a_money_only_run_refused_by_the_output_limit_names_the_limit_not_the_money_cap() {
     let (gateway, seen) = sub_floor_output_clamp_observing_gateway(10, 100).await;
     price_single_chain_with_output_limit(
         &gateway,
@@ -499,11 +503,22 @@ async fn a_money_only_run_refused_by_a_model_bound_reports_against_the_money_cap
         .expect("drives");
     assert_eq!(seen.lock().unwrap().len(), 0);
     let pause = out.paused.as_ref().expect("a sub-floor ceiling pauses");
+    let reason = &pause.reason;
     assert!(
-        pause.reason.contains("run's money cap")
-            && pause.reason.contains("$0.000000 of $10.000000"),
-        "a money-only run's refusal names the money cap, in dollars: {}",
-        pause.reason
+        reason.starts_with("output limit: "),
+        "not a budget pause: {reason}"
+    );
+    assert!(
+        reason.contains("`max_output_tokens` is 200 tokens"),
+        "names the binding limit: {reason}"
+    );
+    assert!(
+        !reason.contains("affordable") && !reason.contains("must exceed"),
+        "no money figure that a raise could satisfy: {reason}"
+    );
+    assert!(
+        reason.contains("$0.000000 of $10.000000"),
+        "the money ledger is still shown, for context: {reason}"
     );
 }
 
