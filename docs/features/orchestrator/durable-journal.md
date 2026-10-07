@@ -292,6 +292,27 @@ the call (`NodeFailed`, "uncosted"); one with no usage at all is the existing
 `Unmetered` failure. Known gap: the gateway's `actual_cost` omits a model's
 `per_request` fee, so the ledger under-counts it (the clamp reserves it per call).
 
+**A spend the journal never saw is never re-bought by a retry (AG-3 × AG-12).** The
+ledger is the `EffectRecorded { usage }` a producer appends AFTER the provider answers;
+the in-drive meter that counted the call dies with the drive. So if that append (or the
+CAS put before it) fails, the call is paid for, absent from the ledger and without a memo
+— and a re-drive would dispatch it again, under a cap that cannot see the first copy. The
+executor therefore raises that failure as `OrchestratorError::SpendUnrecorded`, at all
+five producers (ModelCall, ReAct turn, Map item, Consolidate, planner selector), and the
+scheduler does NOT retry it: the run is filed `Failed` with a reason that names the
+unrecorded spend, for an operator to reconcile before re-driving. A journal fault before
+any paid dispatch is still an ordinary retryable fault — nothing was bought.
+
+**The remaining edge, stated honestly: a PROCESS crash in that same window.** If the
+worker dies between the provider's response and the append, nothing survives to classify
+the fault: the lease is reclaimed, the re-drive finds no record and no memo, and that one
+call is dispatched and paid for again. This at-least-once window predates AG-3 and AG-12
+(it is the window every crash-resume of a pure effect has always had); per crash it costs
+at most one call per in-flight producer — exactly one on a budgeted run, which serialises
+its calls — and the scheduler's `max_attempts` bounds how many crashes a run is re-driven
+through. "Pauses before exceeding $X" and "zero re-spend" hold for every drive that ends
+in a recorded outcome; they are not claims about a worker killed mid-call.
+
 ```gherkin
 Feature: The money cap (AG-12)
   Scenario: A run capped at $X pauses before exceeding it and resumes with zero re-spend
@@ -306,6 +327,12 @@ Feature: The money cap (AG-12)
 
   Scenario: A token-only run on a priced chain
     Then no money field appears anywhere on its journal
+
+  Scenario: A paid call whose spend cannot be journaled is not retried (AG-3 x AG-12)
+    Given a woken money-capped run whose model call succeeds at the provider
+    And the append of its EffectRecorded fails with a journal backend fault
+    Then the run is filed Failed with a reason naming the unrecorded spend
+    And no automatic retry dispatches the call again
 ```
 
 ## AG-15 — tool-confirmation and escalation events
