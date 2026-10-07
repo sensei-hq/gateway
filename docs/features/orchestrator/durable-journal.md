@@ -254,7 +254,8 @@ serialisation gate; `money_spent >= cap` pauses (the `budget: ` HOTL pause,
 micro-dollars buy after the per-request fee and the pessimistic input estimate, at the
 chain's **worst-case** price (`Gateway::worst_case_pricing`, the componentwise max over
 the chain — the clamp is set before selection), and below `MIN_OUTPUT_TOKENS` it pauses
-instead. The residual overshoot is the token clamp's, priced:
+instead — including when the fee and input estimate alone exceed what is left, which a
+zero output price would otherwise read as unlimited output. The residual overshoot is the token clamp's, priced:
 `(actual_input − est_input) × input_price`, plus under one micro-dollar of rounding.
 
 **Fail closed.** A chain with ANY model lacking `pricing` is refused **before** dispatch

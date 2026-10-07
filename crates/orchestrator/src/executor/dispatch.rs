@@ -243,6 +243,10 @@ impl MoneyRates {
     /// How many output tokens `left` micro-dollars buy at the worst-case output price,
     /// rounded DOWN. A zero output price buys unlimited output — the clamp then has no
     /// money term on the output side and the model's own ceiling bounds the call.
+    ///
+    /// `left` is what remains AFTER [`reserved`](Self::reserved); the caller must refuse
+    /// outright when the reservation exceeds the remaining dollars rather than pass 0
+    /// here, or a free-output chain would dispatch a call whose input alone overspends.
     fn affordable_output(&self, left: u64) -> u64 {
         if self.output_per_token <= 0.0 {
             return u64::MAX;
@@ -850,8 +854,14 @@ impl Executor {
                                 floor_cost,
                             }));
                         };
-                        let affordable =
-                            rates.affordable_output(remaining.saturating_sub(reserved));
+                        // A reservation larger than what is left affords NOTHING —
+                        // explicitly, not via `saturating_sub` to 0: at a zero output
+                        // price `affordable_output(0)` is unlimited, and the call would
+                        // go out with its input cost alone past the cap (AG-12 review).
+                        let affordable = match remaining.checked_sub(reserved) {
+                            Some(left) => rates.affordable_output(left),
+                            None => 0,
+                        };
                         if affordable < orchestrator_core::MIN_OUTPUT_TOKENS {
                             return Ok(Err(Refusal::MoneyExhausted {
                                 spent: money_spent,
