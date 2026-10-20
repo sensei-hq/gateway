@@ -512,7 +512,7 @@ git commit -m "test(cloud-providers): laya's FastAPI error bodies map to Authent
 **Files:**
 - Modify: `crates/gateway/src/facade.rs` (doc comment ~line 162, the `llamacpp | sglang` arm ~line 269, and `mod tests`)
 
-- [ ] **Step 1: Write the failing facade test** (in `facade.rs` `mod tests`, after `build_registers_the_sp_dec_2_decision_routers_decision_only`)
+- [ ] **Step 1: Write the failing facade test** (in `facade.rs` `mod cloud_tests` — gated on the default `cloud` feature; `mod tests` is `local`-only — after `build_registers_the_sp_dec_2_decision_routers_decision_only`)
 
 ```rust
     /// SP-DEC-3 D1: `laya` comes up decision-only as a `SystemOneAdapter` —
@@ -580,7 +580,7 @@ git commit -m "test(cloud-providers): laya's FastAPI error bodies map to Authent
 - [ ] **Step 2: Run it and confirm it fails**
 
 ```bash
-cargo test -p sensei-gateway --lib facade::tests::build_registers_laya > /tmp/sp-dec-3.log 2>&1; echo "exit $?"
+cargo test -p sensei-gateway --lib facade::cloud_tests::build_registers_laya > /tmp/sp-dec-3.log 2>&1; echo "exit $?"
 rg -n "panicked at|test result" /tmp/sp-dec-3.log
 ```
 
@@ -606,7 +606,7 @@ In the `register_cloud_from_config` doc comment, replace `` `typesafe`, `cloudfl
 - [ ] **Step 4: Run it and confirm it passes**
 
 ```bash
-cargo test -p sensei-gateway --lib facade::tests > /tmp/sp-dec-3.log 2>&1; echo "exit $?"
+cargo test -p sensei-gateway --lib facade::cloud_tests > /tmp/sp-dec-3.log 2>&1; echo "exit $?"
 rg -n "panicked at|test result" /tmp/sp-dec-3.log
 ```
 
