@@ -159,8 +159,8 @@ impl FacadeBuilder {
 
 /// Register the cloud adapter matching each well-known router name from config
 /// (`openrouter` gets both its OpenAI-wire chat adapter and a System One
-/// decision adapter; `typesafe`, `cloudflare`, `llamacpp` and `sglang` are
-/// decision-only),
+/// decision adapter; `typesafe`, `cloudflare`, `llamacpp`, `sglang` and `laya`
+/// are decision-only),
 /// returning `(router, error)` for any that failed to build. `bedrock` (which
 /// needs explicit AWS SDK setup) and unrecognised router names are skipped for
 /// the caller to register manually via the shared registry.
@@ -259,6 +259,7 @@ async fn register_cloud_from_config(
             // SP-DEC-2: Cloudflare Workers AI (clef / clef-flash) and the
             // self-hosted System One servers — decision-only; a chat adapter the
             // caller registers under the same id lives in its own map, untouched.
+            // SP-DEC-3: `laya` (laya-coreml-serve) is one more self-hosted id.
             "cloudflare" => Some(
                 reg(
                     registry,
@@ -266,7 +267,7 @@ async fn register_cloud_from_config(
                 )
                 .await,
             ),
-            id @ ("llamacpp" | "sglang") => Some(
+            id @ ("llamacpp" | "sglang" | "laya") => Some(
                 reg(
                     registry,
                     cp::systemone::SystemOneAdapter::from_config_with_id(id, router),
@@ -604,6 +605,65 @@ mod cloud_tests {
             registry.chat("llamacpp").await.is_some(),
             "the caller's own llamacpp chat adapter survives build()"
         );
+    }
+
+    /// SP-DEC-3 D1: `laya` comes up decision-only as a `SystemOneAdapter` —
+    /// proven by calling it (plain `/v1/systemone`) and by its D2 behaviour,
+    /// which only the `laya` id has: an image is refused before sending.
+    #[tokio::test]
+    async fn build_registers_laya_decision_only() {
+        use crate::types::decision::{DecisionQuestion, DecisionQuestions};
+        use crate::types::io::DecisionRequest;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "laya-rl-agent",
+                "answers": {"q": {"type": "noul", "noul": 0.5}},
+                "usage": {"input_tokens": 1, "output_tokens": 0}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let laya = RouterConfig {
+            url: server.uri(),
+            ..router()
+        };
+        let builder = FacadeBuilder::new(GatewayConfig {
+            routers: HashMap::from([("laya".to_string(), laya.clone())]),
+            ..Default::default()
+        });
+        let registry = builder.registry().clone();
+        builder.build().await;
+
+        let req = |images: Vec<String>| DecisionRequest {
+            model: Some("english".into()),
+            state: serde_json::json!("x"),
+            questions: DecisionQuestions::from([(
+                "q".to_string(),
+                DecisionQuestion::Noul {
+                    instructions: serde_json::json!("y?"),
+                    criteria: None,
+                },
+            )]),
+            images,
+            keep_alive: None,
+        };
+        let adapter = registry.decision("laya").await.expect("laya decides");
+        adapter
+            .decide(&laya, &req(vec![]))
+            .await
+            .expect("laya speaks plain /v1/systemone");
+        assert!(matches!(
+            adapter
+                .decide(&laya, &req(vec!["iVBORw0KGgo=".into()]))
+                .await,
+            Err(GatewayError::ProviderError { status: None, .. })
+        ));
+        assert!(registry.chat("laya").await.is_none(), "decision-only");
     }
 
     #[tokio::test]
