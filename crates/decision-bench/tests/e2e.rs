@@ -224,7 +224,8 @@ async fn a_full_run_and_report_over_three_models() {
         not_run,
         roster: cfg.models.iter().map(RosterEntry::from).collect(),
         labels_reviewed: vec![],
-        completed: vec![],
+        // `run` finished both runnable models (as `run_saving` records).
+        completed: runnable.clone(),
         paths: None,
         rows,
     };
@@ -291,6 +292,15 @@ async fn a_full_run_and_report_over_three_models() {
     assert!(!not_run_section.contains("good"), "{not_run_section}");
     assert!(md.contains("**Tie: "), "{md}");
     assert!(!md.contains("**Use "), "{md}");
+    // AC6: the report is of a finished run, over the shared subset, with
+    // picky's own coverage (25/30) shown.
+    assert!(!md.contains("INCOMPLETE"), "{md}");
+    assert!(md.contains("Shared cases: 25 "), "{md}");
+    assert!(
+        md.contains("| 1.000 (cov 83%) |"),
+        "picky's summary cell: {md}"
+    );
+    assert!(md.contains("| picky | 83% |"), "picky's table row: {md}");
 
     // results.json round-trips with the documented fields.
     let dir = tempfile::tempdir().unwrap();
@@ -390,7 +400,7 @@ async fn the_report_says_who_won_when_one_model_is_clearly_better() {
         not_run: vec![],
         roster: cfg.models.iter().map(RosterEntry::from).collect(),
         labels_reviewed: vec![],
-        completed: vec![],
+        completed: both.clone(),
         paths: None,
         rows,
     };
@@ -409,4 +419,5 @@ async fn the_report_says_who_won_when_one_model_is_clearly_better() {
     let md = render(&results, SEED);
     assert!(md.contains("**Use good for"), "{md}");
     assert!(!md.contains("## NOT RUN"), "{md}");
+    assert!(!md.contains("INCOMPLETE"), "{md}");
 }
