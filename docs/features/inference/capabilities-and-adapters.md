@@ -434,24 +434,60 @@ Routers:
   checkpoint (`english` 512-token window; `multilingual`, `typed-decisions` 1024;
   others via `LAYA_EXTRA_MODELS`). Bearer only when the server sets `LAYA_API_KEY`.
   The response `model` is always `laya-rl-agent` and `usage.output_tokens` is 0.
+  - *Security:* `laya-coreml-serve` defaults to `LAYA_HOST=0.0.0.0` with no auth unless
+    `LAYA_API_KEY` is set. Keep `LAYA_HOST=127.0.0.1`, or set a key and the router's
+    `api_key_env`.
+  - *`InputRejected` (D5):* every refusal below is `GatewayError::InputRejected { adapter,
+    message }` — "this candidate cannot serve this request's input; the endpoint is
+    healthy". It falls back whatever `fallback_triggers` holds (even empty), is never
+    retryable (so `with_max_transient_attempts` never repeats it), and is never recorded
+    by the circuit breaker, lockout, cooldown or performance recorders. It is neutral to
+    `AllGated`: other gated candidates still pause the chain on their gates; only
+    rejections give `AllAttemptsFailed { retryable: false }`; beside a hard failure the
+    exhaustion stays retryable. Stream code `"input_rejected"`. Chain a second decision
+    router.
   - *Images:* Laya ignores them, so the gateway refuses a `laya` decision that carries
-    images **before sending** (`ProviderError`, `status: None`, so a chain falls
-    back). The guard keys on the exact router id `laya` — a Laya server registered
-    under another id would receive images it silently ignores.
-  - *Truncation:* Laya truncates over-window input **silently** (200 with
+    images **before sending**. The guard keys on the exact router id `laya` — a Laya
+    server registered under another id would receive images it silently ignores.
+  - *Per-question head budget (D6):* Laya silently cuts each question's head
+    (`<type> question: <instructions>` plus its options) to `head_max_len` tokens and
+    trims every option when the options leave under 16 tokens; it reports neither. For
+    router id `laya` the gateway estimates each question before sending and refuses it if
+    the head exceeds the budget or its options exceed `budget - 16`. Budgets: `english`
+    192; `multilingual` / `typed-decisions` 256; any other name 192. Names are
+    canonicalised with Laya's aliases first (`en` / `laya` / `default`; `multi` / `ml` /
+    `laya-multilingual`; `typed` / `typed_decisions` / `laya-typed-decisions` /
+    `decisions`; the `convaiinnovations/laya-multilingual` and
+    `convaiinnovations/laya-typed-decisions` ids); the bundle id `convaiinnovations/laya`
+    means "let Laya choose" and gets 192. The estimate is a conservative character-class
+    token count (non-ASCII counts its UTF-8 bytes, symbols and digits 1, options as
+    rendered: `" " + text` capped at 48, +1 per option), checked against both checkpoints'
+    real tokenizers (never under across 52 option and 30 head samples; fixture
+    `crates/cloud-providers/tests/fixtures/laya_head_tokens.py`; known under-count: 6 of
+    21 000 short random strings, by 1 token). It errs high: about 1.6x on English (about
+    330 usable instruction chars on `english` against a real limit near 560), 2-7x on
+    non-Latin scripts (Chinese on `multilingual` allows about 70 chars). A
+    `LAYA_EXTRA_MODELS` checkpoint with `head_max_len` below 192 is unknown to the gateway
+    and can still be cut silently.
+  - *Truncation:* over-window input is truncated **silently** (200 with
     `usage.truncated: true`). The gateway reads that flag on every decision host
-    response (Ollama and Cloudflare included; only Laya sends it today); `true` is a `ProviderError` (status `Some(200)`), not a success. Set the
+    response (Ollama and Cloudflare included; only Laya sends it today); `true` is an
+    `InputRejected`, not a success, as is a `usage.options` entry with `distinct < total`
+    (options collapsed to identical tokens; every host reads it, only Laya sends it).
+    A call truncated on a hosted provider was dispatched, but `InputRejected` carries no
+    usage, so it is not metered. Set the
     model's `context_window` to its real token window so the context-window gate
-    refuses oversize requests before sending. Truncation is input-determined, so with
-    no other candidate the engine returns `AllAttemptsFailed { retryable: true }`; an
-    orchestrator node (ModelCall or Agent) retries the identical request only if the
-    executor was built with `with_max_transient_attempts(n > 1)` (default 1 = no retry),
-    and each repeat fails the same way. Each truncation counts toward the router's
-    circuit breaker — chain a second decision router.
+    refuses oversize requests before sending.
     Keep Laya's default payload: `LAYA_JEV_STRICT` strips `truncated` and disables the
     check.
+  - *Re-routed checkpoint (D7):* Laya auto-routes an unknown model name and returns 200.
+    If the response's `routing.model` differs from the requested model (both
+    canonicalised), the gateway returns a `ProviderError` (status 200) naming both, so a
+    misspelled `api_model_id` is refused; check names against the server's `/health`
+    `loaded` list. The bundle id skips the check; a `routing` that is not an object or has
+    no string `model` is ignored.
   - Errors are FastAPI `{"detail": …}`: 401 → `Authentication`; 400/413/422/500/503 →
-    `ProviderError` carrying the detail. `/v1/systemone/batch` is not used.
+    `ProviderError` carrying the detail (Laya's 413 and 422 therefore still count toward the breaker). `/v1/systemone/batch` is not used.
 - **`cloudflare`** — `CloudflareAdapter` (`cloud_providers::cloudflare`, re-exported as
   `gateway::adapters::cloudflare`), decision-only, for Workers AI's `clef` /
   `clef-flash`. It is a wire **dialect** of the same core, not a copy: `POST
@@ -475,9 +511,9 @@ Routers:
 receives it verbatim (it rejects data URLs). Every `SystemOneAdapter` id and
 `CloudflareAdapter` send `data:<mime>;base64,…` with the mime sniffed from the
 decoded magic bytes (PNG / JPEG / WebP / GIF); a value already starting `data:`
-passes through. An unrecognisable image is a `ProviderError` before any request is
-sent (so a chain listing that trigger falls back), never a guessed type. The exception
-is `laya`, which refuses any image before sending (`ProviderError`, `status: None`).
+passes through. An unrecognisable image is an `InputRejected` before any request is
+sent (the chain falls back whatever its triggers), never a guessed type. The exception
+is `laya`, which refuses any image before sending (also `InputRejected`).
 
 **Error messages** from every System One host are the provider's extracted message
 (`{error:{message}}`, a Cloudflare `{errors:[{message}]}` array, a flat `{message}`, or

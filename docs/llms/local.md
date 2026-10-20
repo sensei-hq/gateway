@@ -65,16 +65,37 @@ feature below, and a chat adapter you register under the same id is left untouch
   laya-coreml-serve`; router `url = "http://127.0.0.1:8000"`, pin `api_model_id` to a
   checkpoint (`english` 512-token window, `multilingual` / `typed-decisions` 1024, or
   your own via `LAYA_EXTRA_MODELS`). Bearer only if the server sets `LAYA_API_KEY`.
-  It ignores images, so the gateway refuses a `laya` decision with images before
-  sending (falls back). It truncates over-window input **silently** (200 +
-  `usage.truncated: true`); the gateway turns that into a `ProviderError` so the chain
-  falls back — set the model's `context_window` to its real window so oversize requests
-  are refused up front, and keep Laya's default payload (`LAYA_JEV_STRICT` strips the
-  flag). Truncation is input-determined, so chain a second decision router: with no other
-  candidate the engine returns `AllAttemptsFailed { retryable: true }`; an orchestrator
-  node (ModelCall or Agent) retries the identical request only if the executor was built
-  with `with_max_transient_attempts(n > 1)` (default 1 = no retry), and each repeat fails
-  the same way. Every truncation counts toward the breaker. The response `model` is
+  **Keep `LAYA_HOST=127.0.0.1`**: Laya's default is `0.0.0.0` with no auth unless
+  `LAYA_API_KEY` is set, so otherwise anyone on the network can call it — set a key and
+  the router's `api_key_env` if it must listen wider.
+  Laya ignores images and cuts over-long questions **silently**, so the gateway refuses
+  both itself, before sending, as `GatewayError::InputRejected` ("this candidate cannot
+  serve this input; the endpoint is healthy"): the chain falls back **whatever
+  `fallback_triggers` holds** (even empty), it is never retried and never counts toward
+  the breaker. Concretely, a `laya` decision is refused if it carries images, or if a
+  question's head (`<type> question: <instructions>`) is estimated over the checkpoint's
+  `head_max_len` (`english` 192 tokens; `multilingual` / `typed-decisions` 256; any other
+  name, 192), or its options over that budget minus 16 (Laya also trims every option
+  below 16 tokens of room). The estimate is a conservative character-class count measured
+  against both checkpoints' real tokenizers (never under in the committed fixture), so it
+  errs high — about 1.6x on English (roughly 330 usable instruction chars on `english`
+  against a real limit near 560), 2-7x on non-Latin scripts (Chinese on `multilingual`
+  allows about 70 chars). The model name is canonicalised with Laya's aliases first
+  (`en` / `laya` / `default`, `multi` / `ml`, `typed` / `decisions`, the
+  `convaiinnovations/laya-*` ids). A `LAYA_EXTRA_MODELS` checkpoint with `head_max_len`
+  below 192 is unknown to the gateway and can still be cut silently. Over-window input
+  is also caught by the model's `context_window` (set it to the real window) and by
+  `usage.truncated: true` on a 200 (an `InputRejected` too); keep Laya's default payload
+  (`LAYA_JEV_STRICT` strips the flag). A 200 whose `usage.options` has an entry with
+  `distinct < total` (options that collapsed to the same tokens) is an `InputRejected`
+  as well. Laya **auto-routes an unknown model name and still answers 200**, so if the
+  response's `routing.model` differs from the one you asked for (both canonicalised), the
+  gateway fails the call with a `ProviderError` naming both: a misspelled `api_model_id`
+  is refused — check names against the server's `/health` `loaded` list. Chain a second
+  decision router for refused requests: with only rejections in the chain the engine
+  returns `AllAttemptsFailed { retryable: false }`. Laya's own 413 (too many
+  questions/options) and 422 (e.g. over the exported `max_options`; CoreML caps at 32)
+  are still `ProviderError`s and do count toward the breaker. The response `model` is
   always `laya-rl-agent`; `usage.output_tokens` is 0. No `/v1/systemone/batch`.
 - **vLLM** — no upstream `/v1/systemone` (PR #59299 open; only an example proxy); not
   supported, no `vllm` id.

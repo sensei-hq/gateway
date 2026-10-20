@@ -6,15 +6,23 @@ routing call path (build a request, `gateway.execute(&req).await`, read
 `InferenceResponse`) stays source-compatible across every step below; each section
 lists only what you must touch.
 
-## Unreleased (after 0.11.0) — SP-DEC-3, Laya System One
+## 0.11.x → 0.12.0 (SP-DEC-3 — Laya System One, `InputRejected`)
 
-Additive; no type changes.
+**Breaking:** `GatewayError` is not `#[non_exhaustive]` and gains a variant, so exhaustive
+matches (including torii's) must add an arm. The routing call path is otherwise unchanged.
 
 | Area | Change | Action |
 |---|---|---|
+| `GatewayError` | new variant `InputRejected { adapter, message }` — "this candidate cannot serve this request's input; the endpoint is healthy"; stream error code `"input_rejected"` | add an arm to any exhaustive `match` |
+| Engine fallback | `InputRejected` falls back **whatever `fallback_triggers` holds, even empty**; it is never retryable (`with_max_transient_attempts` never repeats it) and never recorded by the circuit breaker, lockout, cooldown or performance recorders. Neutral to `AllGated`: a chain whose other candidates are gated still pauses on those gates; only rejections give `AllAttemptsFailed { retryable: false }`; beside a hard failure the exhaustion stays retryable | none; do not add a trigger for it, and do not expect it to count toward the breaker |
 | Facade (`FacadeBuilder::build`) | auto-registers `laya` (`SystemOneAdapter`, decision-only) for a local `laya-coreml-serve` | if you registered your own decision adapter under `laya`, it is now replaced; rename yours |
-| `SystemOneAdapter` | id `laya`: a decision with `images` fails before sending (`ProviderError`, `status: None`) | route image decisions to a vision-capable host |
-| `SystemOneAdapter`, `OllamaAdapter`, `CloudflareAdapter` (every decision host) | a 200 whose `usage.truncated` is `true` is a `ProviderError` (status 200), not a success; a `truncated` that is present but not a bool (e.g. `null`) now fails the parse as a `ProviderError`. Only Laya sends the field today | none; add `FallbackTrigger::ProviderError` to chains that should fall back |
+| Image refusals | id `laya`: a decision with `images` fails before sending; an unrecognisable image (not PNG / JPEG / WebP / GIF) on every data-URL host (`SystemOneAdapter`, `CloudflareAdapter`) — both are `InputRejected` (the latter was a `ProviderError` in 0.11) | callers that matched `ProviderError` for these must match `InputRejected`; route image decisions to a vision-capable host |
+| Truncation | `SystemOneAdapter`, `OllamaAdapter`, `CloudflareAdapter` (every decision host): a 200 whose `usage.truncated` is `true` is an `InputRejected` (status-less), not a success; a `truncated` that is present but not a bool (e.g. `null`) fails the parse as a `ProviderError`. Only Laya sends the field today | none; the chain falls back without any trigger. A call truncated on a hosted provider was dispatched but is not metered (no usage on `InputRejected`) |
+| Collapsed options | every decision host: a 200 whose `usage.options` has an entry with `distinct < total` is an `InputRejected`. Only Laya sends it | use fewer or shorter options |
+| Laya head budget (D6) | id `laya` only, before sending: a question whose estimated head (`<type> question: <instructions>` + options) exceeds the checkpoint budget (`english` 192 tokens; `multilingual` / `typed-decisions` 256; any other name 192, after Laya's aliases; the bundle id `convaiinnovations/laya` gets 192), or whose options exceed `budget - 16`, is an `InputRejected`. The estimate is conservative: about 1.6x high on English (about 330 usable instruction chars on `english`), 2-7x on non-Latin scripts | shorten instructions/options or chain a second decision router. A `LAYA_EXTRA_MODELS` checkpoint with `head_max_len` below 192 is not known and can still be cut silently |
+| Laya re-routed checkpoint (D7) | Laya auto-routes an unknown model name and answers 200; a response whose `routing.model` differs from the requested model (both canonicalised) is now a `ProviderError` naming both. The bundle id skips the check | fix a misspelled `api_model_id`; check names against the server's `/health` `loaded` list |
+| Laya 413 / 422 | still `ProviderError` (too many questions/options; CoreML caps at 32 options), so they count toward the breaker | none |
+| Security | `laya-coreml-serve` defaults to `LAYA_HOST=0.0.0.0` with no auth unless `LAYA_API_KEY` is set | keep `LAYA_HOST=127.0.0.1`, or set a key and the router's `api_key_env` |
 
 ## 0.10.x → 0.11.0 (agentic phase 1 — HITL hooks, wake retry, money budget, tool policy)
 
@@ -78,7 +86,7 @@ error messages from every adapter that parses errors through `base::http_json`.
 
 | Area | Change | Action |
 |---|---|---|
-| Decision `images` on `SystemOneAdapter` (`openrouter`, `typesafe`, `llamacpp`, `sglang`, any custom id) | now sent as `data:<mime>;base64,…` with the mime sniffed from the magic bytes (PNG / JPEG / WebP / GIF); previously the bare base64 was sent. A value already starting `data:` passes through. An image that is none of the four is a `ProviderError` **before any request is sent** | keep passing bare base64; make sure every image is PNG, JPEG, WebP or GIF. If a chain lists `ProviderError` as a trigger, an unrecognisable image now falls back instead of reaching the host |
+| Decision `images` on `SystemOneAdapter` (`openrouter`, `typesafe`, `llamacpp`, `sglang`, any custom id) | now sent as `data:<mime>;base64,…` with the mime sniffed from the magic bytes (PNG / JPEG / WebP / GIF); previously the bare base64 was sent. A value already starting `data:` passes through. An image that is none of the four is a `ProviderError` **before any request is sent** (an `InputRejected` since 0.12.0, which falls back whatever the triggers) | keep passing bare base64; make sure every image is PNG, JPEG, WebP or GIF. If a chain lists `ProviderError` as a trigger, an unrecognisable image falls back instead of reaching the host (from 0.12.0 it falls back regardless) |
 | `OllamaAdapter` decision images | unchanged — still bare base64 (Ollama rejects data URLs) | none |
 | Error messages | `base::extract_error_message` now also reads a Cloudflare `{errors:[{message}]}` array, a flat `{message}` and a FastAPI `{detail:[{loc,msg}]}` list (a body that matched an older shape yields the same message). It is shared: besides the decision hosts, **every adapter whose non-streaming errors go through `base::http_json`** — the OpenAI-compatible chat/embed core used by `openai` (and ids built on it, e.g. `openrouter`), `ollama`, `grok`, `huggingface` and `together` — now reports the extracted message where it used to report the raw JSON body for those three shapes | re-check anything asserting on the raw JSON text of a provider error |
 | Facade (`FacadeBuilder::build`) | now auto-registers `cloudflare` (`CloudflareAdapter`), `llamacpp` and `sglang` (`SystemOneAdapter`), all decision-only | if you registered your own **decision** adapter under one of those ids **before** `build()`, register it **after** instead — `build()` now replaces it. A **chat** adapter under the same id (e.g. an OpenAI-compatible `llamacpp`) is untouched |
