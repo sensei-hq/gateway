@@ -350,7 +350,7 @@ pub const INPUT_REJECTED_MARKER: &str = "cannot serve this input: ";
   - llama.cpp: `~/opt/llamacpp-systemone/bin-b11381/llama-b11381/llama-server -m ~/opt/llamacpp-systemone/models/Bespoke-Nimble-9B-v3-Q4_K_M.gguf --alias nimble-v3 --port 8091 -c 8192`.
   - Ollama: already running.
   - Wait for each health check.
-- [ ] **Step 3 — Run.** `cargo run -p decision-bench --release -- check`, then `fetch --per-scenario 200 --seed 2026`, `run`, and `report --out docs/benchmarks/2026-10-<dd>-system-one-local.md`. Record wall time.
+- [ ] **Step 3 — Run.** `cargo run -p decision-bench --release -- check`, then `fetch --per-scenario 200 --seed 2026`, `run`, and `report --out ../../docs/benchmarks/2026-10-<dd>-system-one-local.md` (a relative `--out` resolves under `crates/decision-bench/`, so climb to the repo root, or pass an absolute path). Record wall time.
 - [ ] **Step 4 — Read the report critically.** If any metric looks implausible (e.g. 0% or 100% everywhere, or coverage 0), investigate before committing.
 - [ ] **Step 5 — Stop the servers you started, then commit the report.** Commit as `docs(benchmarks): first local System One ranking (SP-DEC-4 T10, AC7)`.
 
