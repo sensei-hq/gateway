@@ -1133,7 +1133,7 @@ The Task 8 whole-slice review found that Laya silently cuts long question heads 
 **Files:** `crates/gateway/src/engine/execute.rs`, `crates/gateway/src/engine/exhaustion.rs`, tests in `crates/gateway/src/engine/decision_tests.rs` (and `tests.rs` if helpers live there).
 
 - In the `Err(err)` arm: if `err` is `InputRejected`, do NOT call `record_outcome`; still push the `Attempt` (`fallback_triggered` from `should_trigger_fallback`, which is now `true`); push `GateContribution::InputRejected`.
-- `GateContribution::InputRejected` (new): not `HardFailure` (so not retryable); `all_gated_error` returns `None` if any contribution is `InputRejected`.
+- `GateContribution::InputRejected` (new): not `HardFailure` (so not retryable); neutral to `all_gated_error` — neither vetoes nor counts as a gate (superseded the original veto in the R2 review fix `9d7b733`: a rejection beside a gated candidate pauses on that gate).
 - `contribution_for` must not be the path for it (or must map it to the new variant) — keep one source of truth.
 - Red-first tests:
   1. Breaker neutrality: a gateway whose breaker threshold is 1, a `Decider` double that returns `InputRejected` on the first call and succeeds after; two calls to the same router → the second is DISPATCHED (decider call count 2), not skipped as breaker-open.
