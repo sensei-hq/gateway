@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail};
 
 use crate::case::{Case, Scenario, read_case_file};
+use crate::run::LabelReview;
 use crate::scenarios::Manifest;
 
 /// What [`load`] found.
@@ -18,7 +19,7 @@ pub struct Loaded {
     /// `cases/manifest.json`, if present.
     pub manifest: Option<Manifest>,
     /// Each loaded S4 scenario with its header's `labels_reviewed_by`.
-    pub labels_reviewed: Vec<(Scenario, Option<String>)>,
+    pub labels_reviewed: Vec<LabelReview>,
     /// Scenarios asked for by name that no file provided.
     pub missing: Vec<Scenario>,
 }
@@ -112,7 +113,10 @@ pub fn load(cases_dir: &Path, s4_dir: &Path, only: Option<&[Scenario]>) -> anyho
     };
     for (scenario, reviewed_by, cases, hand_curated) in loaded {
         if hand_curated || is_s4(scenario) {
-            out.labels_reviewed.push((scenario, reviewed_by));
+            out.labels_reviewed.push(LabelReview {
+                scenario,
+                reviewed_by,
+            });
         }
         for c in cases {
             if !seen.insert((scenario.tag(), c.id.clone())) {
@@ -240,8 +244,14 @@ mod tests {
         assert_eq!(
             l.labels_reviewed,
             vec![
-                (Scenario::S4TestOutput, Some("jerry".to_string())),
-                (Scenario::S4FixCheck, None)
+                LabelReview {
+                    scenario: Scenario::S4TestOutput,
+                    reviewed_by: Some("jerry".to_string())
+                },
+                LabelReview {
+                    scenario: Scenario::S4FixCheck,
+                    reviewed_by: None
+                }
             ]
         );
         assert_eq!(l.manifest.unwrap().seed, 2026);
@@ -262,7 +272,13 @@ mod tests {
         let only = parse_scenarios("s4-fix-check,s1a").unwrap();
         let l = load(&cases, &s4, Some(&only)).unwrap();
         assert_eq!(ids(&l), ["f1"]);
-        assert_eq!(l.labels_reviewed, vec![(Scenario::S4FixCheck, None)]);
+        assert_eq!(
+            l.labels_reviewed,
+            vec![LabelReview {
+                scenario: Scenario::S4FixCheck,
+                reviewed_by: None
+            }]
+        );
         assert_eq!(l.missing, vec![Scenario::S1aIntentOos]);
     }
 

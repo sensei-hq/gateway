@@ -147,6 +147,23 @@ fn utc(secs: u64) -> String {
 fn title(md: &mut String, results: &Results) {
     let _ = writeln!(md, "# System One benchmark\n");
     let _ = writeln!(md, "Generated {}.\n", utc(results.generated_at));
+    let unfinished: Vec<&str> = results
+        .roster
+        .iter()
+        .map(|m| m.id.as_str())
+        .filter(|id| {
+            !results.completed.iter().any(|c| c == id)
+                && !results.not_run.iter().any(|n| n.model == *id)
+        })
+        .collect();
+    if !unfinished.is_empty() {
+        let _ = writeln!(
+            md,
+            "> **INCOMPLETE RUN**: {} never finished; the run stopped early, so their rows are \
+             partial or missing and this is not a complete ranking.\n",
+            unfinished.join(", ")
+        );
+    }
 }
 
 fn roster(md: &mut String, results: &Results) {
@@ -296,8 +313,8 @@ fn reviewed_by(results: &Results, s: Scenario) -> Option<&str> {
     results
         .labels_reviewed
         .iter()
-        .find(|(x, _)| *x == s)
-        .and_then(|(_, by)| by.as_deref())
+        .find(|l| l.scenario == s)
+        .and_then(|l| l.reviewed_by.as_deref())
 }
 
 fn scenario_section(md: &mut String, results: &Results, r: &ScenarioRanking) {
@@ -364,7 +381,7 @@ fn scenario_section(md: &mut String, results: &Results, r: &ScenarioRanking) {
 }
 
 fn label_review(md: &mut String, results: &Results, rankings: &[ScenarioRanking]) {
-    let mut s4: Vec<Scenario> = results.labels_reviewed.iter().map(|(s, _)| *s).collect();
+    let mut s4: Vec<Scenario> = results.labels_reviewed.iter().map(|l| l.scenario).collect();
     for r in rankings {
         if is_s4(r.scenario) && !s4.contains(&r.scenario) {
             s4.push(r.scenario);
@@ -501,7 +518,7 @@ mod tests {
     use super::*;
     use crate::case::Scenario;
     use crate::metrics::compute_on;
-    use crate::run::{NotRun, Outcome, ResultRow, RosterEntry};
+    use crate::run::{LabelReview, NotRun, Outcome, ResultRow, RosterEntry};
     use crate::scenarios::{Manifest, ManifestDataset};
 
     fn row(model: &str, scenario: Scenario, case: usize, outcome: Outcome) -> ResultRow {
@@ -610,7 +627,17 @@ mod tests {
                 roster("ane", "laya"),
                 roster("down", "laya"),
             ],
-            labels_reviewed: vec![(S4TestOutput, Some("jerry".into())), (S4FixCheck, None)],
+            labels_reviewed: vec![
+                LabelReview {
+                    scenario: S4TestOutput,
+                    reviewed_by: Some("jerry".into()),
+                },
+                LabelReview {
+                    scenario: S4FixCheck,
+                    reviewed_by: None,
+                },
+            ],
+            completed: vec!["good".into(), "mid".into(), "ane".into()],
             rows,
         }
     }
@@ -657,6 +684,24 @@ mod tests {
         for (w, h) in pos.windows(2).zip(order.windows(2)) {
             assert!(w[0] < w[1], "{:?} must come before {:?}:\n{md}", h[0], h[1]);
         }
+    }
+
+    /// T7 review I2: a roster model that neither finished nor was NOT RUN
+    /// means the run stopped early; the report says so at the top.
+    #[test]
+    fn a_run_that_stopped_early_is_flagged_incomplete_before_the_summary() {
+        let mut f = fixture();
+        f.completed = vec!["good".into()];
+        let md = render(&f, 7);
+        let banner = at(&md, "**INCOMPLETE RUN**");
+        assert!(banner < at(&md, "## Summary"));
+        let line = md[banner..].lines().next().unwrap();
+        assert!(line.contains("mid, ane never finished"), "{line}");
+        assert!(!line.contains("down"), "NOT RUN is not incomplete: {line}");
+        assert!(
+            !render(&fixture(), 7).contains("INCOMPLETE"),
+            "a finished run has no banner"
+        );
     }
 
     #[test]

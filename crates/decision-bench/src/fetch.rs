@@ -410,14 +410,32 @@ pub fn check_cached_sha(dir: &Path, live_sha: &str) -> anyhow::Result<Option<Met
     Ok(Some(meta))
 }
 
-/// Write `bytes` to `<path>.tmp`, then rename over `path`.
+/// Write `bytes` to a sibling temp file unique to this process and moment
+/// (`<path>.<pid>.<nanos>.tmp`), `sync_all` it, then rename over `path`, so a
+/// crash leaves either the old file or the new one, and two writers never
+/// share a temp file. A failed write removes its temp file.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(".{}.{nanos}.tmp", std::process::id()));
     let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))
+    let result = (|| -> anyhow::Result<()> {
+        let mut f =
+            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        f.write_all(bytes)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("syncing {}", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// sha256 of `bytes`, lowercase hex.
