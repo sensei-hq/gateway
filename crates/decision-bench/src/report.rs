@@ -91,6 +91,15 @@ fn describe(s: Scenario) -> &'static str {
     }
 }
 
+/// `s` with every control char (CR and LF, which CommonMark reads as line
+/// ends, tabs, escapes) as a space, so server-controlled text stays on its
+/// one list line.
+fn one_line(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 fn cell(s: &str) -> String {
     s.replace('|', "\\|")
 }
@@ -211,7 +220,7 @@ fn not_run(md: &mut String, results: &Results) {
          window), so they have no results below:\n"
     );
     for n in &results.not_run {
-        let _ = writeln!(md, "- **{}**: {}", n.model, n.reason.replace('\n', " "));
+        let _ = writeln!(md, "- **{}**: {}", n.model, one_line(&n.reason));
     }
     md.push('\n');
 }
@@ -425,7 +434,7 @@ fn not_applicable_reasons(md: &mut String, results: &Results, scenario: Scenario
         let Some(&(detail, n)) = counts.iter().rev().max_by_key(|(_, n)| *n) else {
             continue;
         };
-        let mut reason: String = detail.replace('\n', " ");
+        let mut reason = one_line(detail);
         if reason.chars().count() > REASON_MAX_CHARS {
             reason = reason.chars().take(REASON_MAX_CHARS).collect::<String>() + "…";
         }
@@ -1022,6 +1031,39 @@ mod tests {
             "{not_run}"
         );
         assert!(not_run.contains("**laya-ane**: no input fits"), "{not_run}");
+    }
+
+    /// SP-DEC-4 re-review R3: a server-controlled detail or NOT RUN reason
+    /// with a CR (a line end to CommonMark) or other control char stays on
+    /// its one list line.
+    #[test]
+    fn control_chars_in_a_reason_never_break_its_line() {
+        let mut f = fixture();
+        for r in f
+            .rows
+            .iter_mut()
+            .filter(|r| r.model == "ane" && r.outcome == Outcome::NotApplicable)
+        {
+            r.detail = Some("x\r\n| injected | row |".into());
+        }
+        f.not_run[0].reason = "refused\r| injected | row |\u{7}".into();
+        let md = render(&f, 7);
+        let line = md
+            .split('\n')
+            .find(|l| l.starts_with("- ane:"))
+            .unwrap_or_else(|| panic!("{md}"));
+        assert!(
+            line.contains("| injected | row |") && !line.chars().any(char::is_control),
+            "{line:?}"
+        );
+        let line = md
+            .split('\n')
+            .find(|l| l.starts_with("- **down**:"))
+            .unwrap_or_else(|| panic!("{md}"));
+        assert!(
+            line.contains("| injected | row |") && !line.chars().any(char::is_control),
+            "{line:?}"
+        );
     }
 
     /// SP-DEC-4 review A5: a model under the coverage floor is shown with
