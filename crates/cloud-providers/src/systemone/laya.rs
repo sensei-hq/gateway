@@ -74,15 +74,18 @@ fn laya_option_tokens(text: &str) -> usize {
 /// encodes it, `" " + text` (see [`laya_option_tokens`]). Non-string
 /// instructions are Laya's `json.dumps` text, separators included.
 ///
-/// Measured 2026-10-20 against both real tokenizers (`english`, which
-/// typed-decisions shares, and `multilingual`, which -ane shares) on 27 varied
-/// samples — English, JSON (compact, Python, pretty), Japanese, Chinese,
-/// Korean, Cyrillic, Arabic, Hindi, Thai, German, emoji, astral CJK, code,
-/// URLs, numbers, hex, base64, gibberish, mixed case, ALLCAPS, camelCase,
-/// symbols, whitespace, long words: the estimate is never below the real
-/// count; the tightest margins are +0 (astral CJK as an option: a byte bound)
-/// and +2 (whitespace, numbers). On 21 000 seeded random strings, 6 short ones
-/// were under by 1 token. The price is over-counting: about 1.6× on English
+/// The estimate errs high; it is not a proof. Measured 2026-10-20 by
+/// `tests/fixtures/laya_head_tokens.py` against both real tokenizers
+/// (`english`, which typed-decisions shares, and `multilingual`, which -ane
+/// shares) on 30 head samples and 52 option samples — English, JSON (compact,
+/// Python, pretty), Japanese, Chinese, Korean, Cyrillic, Arabic, Hindi, Thai,
+/// German, emoji, astral CJK, code, URLs, numbers, dates, money, hex, base64,
+/// gibberish, mixed case, ALLCAPS, camelCase, symbols, whitespace, long words,
+/// digit and CJK option keys: never below the real count. The tightest margins
+/// are +0 — digit-only options on multilingual (one token per digit plus the
+/// leading space) and astral CJK (a byte bound). Known under-count: 6 of
+/// 21 000 short random strings, by 1 token (`stress 99`); no whole head has
+/// been observed under. The price is over-counting: about 1.6× on English
 /// (the 288-char D6 instruction: 180 estimated, 109 real on `english`; the
 /// 548-char one that really fits, 300 vs 189, refused) and 2–7× on non-Latin
 /// scripts, whose every char is counted at its UTF-8 bytes. Refusing a head
@@ -447,7 +450,7 @@ mod tests {
     /// an under-count is a silent cut. Real counts measured 2026-10-20 with each
     /// checkpoint's own `tokenizer.json` (`english` = laya-coreml, also used by
     /// typed-decisions; `multilingual` = laya-multilingual-coreml, also -ane) by
-    /// `/tmp/r3-scripts/measure.py` / `rust_cases.py` (the `tokenizers` package,
+    /// `tests/fixtures/laya_head_tokens.py rust head` (the `tokenizers` package,
     /// `add_special_tokens=False`, exactly as `build_head` encodes the head).
     #[test]
     fn the_text_estimate_is_at_least_the_real_count_on_both_tokenizers() {
@@ -568,6 +571,52 @@ mod tests {
                 "{text:?}: estimate {estimate} < real (english {english}, multilingual {multilingual})"
             );
         }
+    }
+
+    /// The budget is inclusive: Laya cuts only past `head_max_len`, so a head
+    /// estimated at exactly the budget is sent and one token more is refused.
+    #[test]
+    fn a_head_estimated_at_exactly_the_budget_is_sent() {
+        let noul = |n: usize| DecisionQuestion::Noul {
+            instructions: serde_json::json!(vec!["a"; n].join(" ")),
+            criteria: None,
+        };
+        // Each further " a" costs exactly one token (a free space, a 1-token word).
+        let n = (1..200)
+            .find(|&n| estimated_head_tokens(&noul(n)) >= 192)
+            .unwrap();
+        assert_eq!(estimated_head_tokens(&noul(n)), 192);
+        let (_, options) = estimated_head_parts(&noul(n));
+        assert!(options <= 192 - 16, "only the whole-head rule is in play");
+        let questions = |n| DecisionQuestions::from([("q".to_string(), noul(n))]);
+        assert!(check_laya_head_budget("laya", "english", &questions(n)).is_ok());
+        assert!(matches!(
+            check_laya_head_budget("laya", "english", &questions(n + 1)),
+            Err(GatewayError::InputRejected { .. })
+        ));
+    }
+
+    /// Laya renders an empty description as none (`v is None or v == ""`): the
+    /// bare key.
+    #[test]
+    fn an_empty_choice_description_costs_the_same_as_none() {
+        let choice = |desc: Option<&str>| DecisionQuestion::Choice {
+            instructions: serde_json::json!("Pick"),
+            criteria: [
+                ("a".to_string(), desc.map(str::to_string)),
+                ("b".to_string(), None),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        assert_eq!(
+            estimated_head_tokens(&choice(Some(""))),
+            estimated_head_tokens(&choice(None))
+        );
+        assert!(
+            estimated_head_tokens(&choice(Some("a long description of option a")))
+                > estimated_head_tokens(&choice(None))
+        );
     }
 
     /// Laya encodes each option as `" " + text` (`build_head`), and on the
@@ -747,7 +796,7 @@ mod tests {
 
     /// The whole head — instruction plus Laya's default noul options — for the
     /// Japanese sample: measured 49 real tokens on `english`, 40 on `multilingual`
-    /// (`/tmp/r3-scripts/heads.py`).
+    /// (`tests/fixtures/laya_head_tokens.py heads`).
     #[test]
     fn a_japanese_question_is_not_under_counted() {
         let q = DecisionQuestion::Noul {
