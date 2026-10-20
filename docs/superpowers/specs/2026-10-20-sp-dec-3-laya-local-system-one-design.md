@@ -83,6 +83,7 @@ in-process vs 46.9 ms HTTP (noise); ANE 4.12 ms vs 4.47 ms (+0.35 ms ≈ 8%); ba
 ## Testing
 
 Red-first per task. Unit: `encode_images` under `Unsupported`; adapter picks the encoding by id. Wiremock
-(`tests/systemone_mock.rs`): AC2–AC5 against bodies captured from the live server. Facade: AC1 alongside the
+(`tests/systemone_mock.rs`): AC2–AC4 against bodies captured from the live server; AC5 against live 401/400/413 bodies and
+representative 422/500/503 `detail` strings. Facade: AC1 alongside the
 SP-DEC-2 "which adapter each id gets" test. Engine fallback: AC4 with a second decision router. Live: AC6,
 run on this machine before merge. Mutation-check the image guard and the truncation check.
