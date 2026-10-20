@@ -1160,6 +1160,7 @@ The Task 8 whole-slice review found that Laya silently cuts long question heads 
 - The LOW security note while here: Laya's default `LAYA_HOST` is `0.0.0.0` with no auth unless `LAYA_API_KEY` — keep `127.0.0.1` or set a key and the router's `api_key_env`.
 - `upgrading.md`: retitle the Unreleased section as **breaking** (target 0.12.0): new `GatewayError::InputRejected` variant (add an arm to exhaustive matches); the D2/D3/unrecognisable-image refusals are now `InputRejected` (callers matching `ProviderError` for them must change); the D6 and D7 refusals.
 - `cargo test -p sensei-gateway --test docs_sync_capabilities`, `cargo doc`, `cd site && bun run check`.
+- **As built (R4):** the `chars/3` estimator above was superseded by the conservative character-class estimate (head and options, canonical aliases, bundle id, `budget − 16` option rule); the spec's D6 and carry-forwards describe it, and `upgrading.md` is the 0.11.x → 0.12.0 breaking section.
 
 ### Task R5: re-verify (Task 8 Steps 1–3 again)
 
