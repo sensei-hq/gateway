@@ -11,7 +11,7 @@ A **provider-agnostic multimodal inference routing engine**. You configure provi
 models + fallback chains once, then send requests **by capability** — chat, embeddings,
 image, video, speech and System One **decisions** (typed questions → probabilities —
 over Ollama, OpenRouter, TypeSafe, Cloudflare Workers AI, or a self-hosted llama.cpp /
-SGLang server).
+SGLang / Laya server).
 The caller never picks a provider SDK — the gateway routes, retries down a fallback
 chain, trips a per-endpoint circuit breaker, meters cost, can
 run multi-model **consensus/panels**, and (optionally) enforces subscription quotas.

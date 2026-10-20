@@ -534,7 +534,10 @@ impl super::Gateway {
                 match &fail_error {
                     Some(err) => {
                         // Phase `Complete`: a setup failure is final — no
-                        // completion dispatch follows it, streaming or not.
+                        // completion dispatch follows it, streaming or not. An
+                        // `InputRejected` is filtered inside `dispatch_outcome` and
+                        // maps to its own contribution, exactly as in `execute`
+                        // (SP-DEC-3 D5).
                         let written_until = super::dispatch_outcome(
                             &recorders,
                             &crate::gates::AttemptOutcome {

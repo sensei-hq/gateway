@@ -19,6 +19,7 @@ pub(super) fn stream_error_code(err: &GatewayError) -> String {
         GatewayError::ProviderError { status, .. } => status
             .map(|s| s.to_string())
             .unwrap_or_else(|| "provider_error".to_string()),
+        GatewayError::InputRejected { .. } => "input_rejected".to_string(),
         GatewayError::ModelUnavailable { .. } => "model_unavailable".to_string(),
         GatewayError::Unsupported { .. } => "unsupported".to_string(),
         GatewayError::NoCandidates { .. } => "no_candidates".to_string(),
@@ -539,6 +540,15 @@ mod tests {
     use super::*;
     use crate::skip_reason::SkipReason;
     use crate::types::request::{Message, MessageContent, MessageRole, ToolCall, ToolDefinition};
+
+    #[test]
+    fn stream_error_code_names_input_rejected() {
+        let err = GatewayError::InputRejected {
+            adapter: "a".into(),
+            message: "m".into(),
+        };
+        assert_eq!(stream_error_code(&err), "input_rejected");
+    }
 
     fn chat(tools: Vec<ToolDefinition>) -> Payload {
         Payload::Chat {

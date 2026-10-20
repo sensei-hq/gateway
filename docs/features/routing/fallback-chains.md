@@ -66,7 +66,7 @@ pub struct FallbackChainConfig {
 | `id`                | `String`                | Chain identifier. Also the tie-breaker for capability-based selection (lowest id wins — see §4). |
 | `capability`        | `Capability`            | The capability this chain serves. Capability-based resolution matches on this. |
 | `models`            | `Vec<ChainEntry>`       | The candidate entries. Walked in ascending `priority` order, **not** slice order. |
-| `fallback_triggers` | `Vec<FallbackTrigger>`  | Which failure conditions are allowed to advance to the next candidate. An **empty** vec means *no* error triggers fallback (the walk stops on the first failing candidate). |
+| `fallback_triggers` | `Vec<FallbackTrigger>`  | Which failure conditions are allowed to advance to the next candidate. An **empty** vec means *no* error triggers fallback (the walk stops on the first failing candidate), with one exception: `InputRejected` always advances (see §3). |
 
 ### `ChainEntry`
 
@@ -129,6 +129,11 @@ The whole trigger/no-trigger decision lives in one method
 
 ```rust
 pub fn should_trigger_fallback(&self, triggers: &[FallbackTrigger]) -> bool {
+    // SP-DEC-3 D5: an input the candidate cannot serve falls back whatever the trigger set.
+    if matches!(self, GatewayError::InputRejected { .. }) {
+        return true;
+    }
+
     if triggers.is_empty() {
         return false;
     }
@@ -145,6 +150,8 @@ pub fn should_trigger_fallback(&self, triggers: &[FallbackTrigger]) -> bool {
         | GatewayError::NotConfigured
         | GatewayError::Network(_)
         | GatewayError::Serialization(_) => false,
+        // Handled by the early return above (D5); unreachable here.
+        GatewayError::InputRejected { .. } => true,
     }
 }
 ```
@@ -156,6 +163,7 @@ Which errors can vs. cannot advance the walk:
 | `RateLimit`             | if listed | Transient provider condition; another provider may succeed. |
 | `Timeout`               | if listed | Transient; another candidate may be faster/healthier. |
 | `ProviderError`         | if listed | Provider-side failure; another candidate may work. |
+| `InputRejected`         | **always** | This candidate cannot serve this request's *input* (an image sent to a host that ignores images, a state or question over the window) while the endpoint itself is healthy. Advances the walk whatever `fallback_triggers` holds (even empty), is never retryable, and is never recorded as an endpoint failure, so it does not count toward the circuit breaker. |
 | `ModelUnavailable`      | if listed | This model/adapter can't serve it; try the next. |
 | `BudgetExceeded`        | if listed | A cheaper candidate later in the chain may fit the budget. |
 | `Authentication`        | **never** | A bad/missing credential will not be fixed by another candidate; failing over would mask the misconfiguration. |
@@ -173,9 +181,17 @@ Which errors can vs. cannot advance the walk:
 
 Two guards to keep in mind:
 
-- **Empty `triggers` ⇒ always `false`.** A chain with no `fallback_triggers`
-  (or a direct/capability path that resolved no chain — see §4) treats *every*
+- **Empty `triggers` ⇒ `false` for everything except `InputRejected`, which
+  always advances (D5).** A chain with no `fallback_triggers` (or a
+  direct/capability path that resolved no chain — see §4) treats every other
   failure as fatal and stops on the first failing candidate.
+- **`InputRejected` is neutral to exhaustion (D5).** It is not a gate and not an
+  endpoint fault: a chain whose other candidates were gated pauses on *those*
+  gates (`AllGated`); a chain with only rejections ends
+  `AllAttemptsFailed { retryable: false }`; a rejection beside a hard failure
+  stays retryable. It is never recorded by the circuit breaker, lockout,
+  cooldown or performance recorders, and its stream error code is
+  `"input_rejected"`.
 - **`Authentication` is the canonical stop.** Even with all five triggers
   listed, an auth error breaks the loop immediately. This is asserted directly
   by `auth_error_never_triggers_fallback` in `error.rs` and
@@ -249,7 +265,8 @@ chain/registry selection actually drives the provider model. A caller-pinned
 - **Fall through (continue):** adapter execution returned an error *and*
   `should_trigger_fallback(triggers)` was `true`.
 - **Break (stop):** adapter execution returned an error and
-  `should_trigger_fallback` was `false` (non-trigger error, or empty triggers).
+  `should_trigger_fallback` was `false` (non-trigger error, or empty triggers; `InputRejected` is the one
+  error that never breaks on either count).
   The remaining candidates are **not** tried; the walk falls out to
   `AllAttemptsFailed`.
 - **Special case — unregistered adapter:** if no adapter is registered for

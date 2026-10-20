@@ -241,14 +241,14 @@ adapters — you always read/write the same `ToolDefinition` / `ToolCall` shapes
 `Capability::Decision` sends one shared `state` plus 1–64 named, typed questions and
 returns **probabilities**, not text — TypeSafe's System One API
 (`POST {base}/v1/systemone`), served by Ollama (≥ 0.35, local models only),
-OpenRouter, TypeSafe and self-hosted llama.cpp / SGLang servers; Cloudflare Workers AI
+OpenRouter, TypeSafe and self-hosted llama.cpp / SGLang / Laya servers; Cloudflare Workers AI
 serves `clef` / `clef-flash` on its own route. The facade
 (`FacadeBuilder::new(config).build().await`) auto-registers the `ollama`,
 `openrouter` (chat **and** decision), and the decision-only `typesafe`, `cloudflare`,
-`llamacpp` and `sglang` routers when they are in config; with a bare `Gateway`,
+`llamacpp`, `sglang` and `laya` routers when they are in config; with a bare `Gateway`,
 register `OllamaAdapter` yourself,
 `gateway::adapters::systemone::SystemOneAdapter::from_config_with_id("openrouter", &cfg)`
-for a `/v1/systemone` host (same call with `"typesafe"`, `"llamacpp"`, `"sglang"`), and
+for a `/v1/systemone` host (same call with `"typesafe"`, `"llamacpp"`, `"sglang"`, `"laya"`), and
 `gateway::adapters::cloudflare::CloudflareAdapter::from_config(&cfg)` for Cloudflare.
 Config validation rejects an empty router `url`, so give each one:
 `http://localhost:11434` (Ollama), `https://openrouter.ai/api` (serves both
@@ -317,11 +317,12 @@ if let Some(DecisionAnswer::Noul { noul }) = resp.decisions.as_ref().and_then(|d
   `GatewayError::InvalidRequest` — no candidate is tried, nothing is retried.
 - `execute_stream` refuses `Decision` (`Unsupported`); use `execute`. Panels work.
 - Only `ollama` has a default decision model (`nimble`); every other router
-  (`openrouter`, `typesafe`, `cloudflare`, `llamacpp`, `sglang`) needs one pinned via
+  (`openrouter`, `typesafe`, `cloudflare`, `llamacpp`, `sglang`, `laya`) needs one pinned via
   the model's `api_model_id`, else `InvalidRequest`.
 - `images` are always bare base64 from you; the adapter encodes them per host —
-  verbatim for Ollama, `data:<sniffed mime>;base64,…` for every other host. An image
-  that is not PNG / JPEG / WebP / GIF is a `ProviderError` before anything is sent.
+  verbatim for Ollama, `data:<sniffed mime>;base64,…` for every other host (except `laya`,
+  which refuses any image before sending). An image that is not PNG / JPEG / WebP / GIF
+  is an `InputRejected` before anything is sent (falls back whatever the triggers).
 
 ### Cloudflare Workers AI (`clef`, `clef-flash`)
 
@@ -392,5 +393,19 @@ The response `model` is the server alias and `usage.output_tokens` is always 0. 
 the same way; on SGLang v0.5.21 images are **silently dropped** (images need main,
 #42183), and a model name containing `:` is read as a LoRA adapter (400) — use a
 colon-free name. vLLM has no `/v1/systemone` and is not supported.
+
+A local `laya-coreml-serve` is configured the same way under the `laya` id:
+`url: "http://127.0.0.1:8000"`, `api_model_id: Some("english".into())`, and
+`context_window: 512` (1024 for `multilingual` / `typed-decisions`). Keep `LAYA_HOST=127.0.0.1`
+(the default `0.0.0.0` has no auth unless `LAYA_API_KEY` is set). Laya ignores images
+and silently cuts over-long questions, so the gateway refuses a `laya` decision with
+images, or with a question estimated over the checkpoint's head budget (192 tokens
+`english`, 256 `multilingual` / `typed-decisions`; a conservative estimate, so about
+300 instruction chars fit on `english`), before sending. A 200 with `usage.truncated:
+true` or collapsed `usage.options` is refused too. All of these are
+`GatewayError::InputRejected`: the chain falls back even with empty `fallback_triggers`,
+and they are never retried or counted by the breaker. A misspelled `api_model_id` (Laya
+would auto-route it) fails with a `ProviderError`; valid names are `english`, `multilingual`, `typed-decisions`, their aliases, the `convaiinnovations/laya-*` ids, or the server's `LAYA_EXTRA_MODELS` keys (`/health` `loaded` shows only resident checkpoints, not valid names).
+Details: `docs/llms/local.md`.
 
 Full reference: `docs/features/inference/capabilities-and-adapters.md#decision-system-one`.
