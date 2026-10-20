@@ -992,7 +992,10 @@ async fn a_truncated_laya_answer_is_a_provider_error() {
 async fn untruncated_and_truncation_unaware_answers_stay_successes() {
     let mut not_truncated = ok_body("laya-rl-agent");
     not_truncated["usage"]["truncated"] = json!(false);
-    for body in [not_truncated, ok_body("nimble-v3")] {
+    // Detail fields are diagnostics: a null in them never vetoes a valid answer.
+    let mut null_details = ok_body("laya-rl-agent");
+    null_details["usage"] = json!({"input_tokens":98,"output_tokens":0,"truncated":false,"state_tokens_dropped":null,"truncated_questions":null});
+    for body in [not_truncated, null_details, ok_body("nimble-v3")] {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/systemone"))
@@ -1007,5 +1010,62 @@ async fn untruncated_and_truncation_unaware_answers_stay_successes() {
             )
             .await
             .expect("not truncated → success");
+    }
+}
+
+/// Truncation is the more useful diagnosis: when the host cut the input AND
+/// the answers are incomplete, say "truncated", not "has no answer".
+#[tokio::test]
+async fn a_truncated_answer_reports_truncation_even_when_answers_are_missing() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"model":"laya-rl-agent","answers":{},"usage":{"input_tokens":512,"output_tokens":0,"truncated":true,"truncated_questions":["label"]}})))
+        .mount(&server)
+        .await;
+    let err = SystemOneAdapter::with_id("laya")
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &request(Some("english"), vec![], None),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        GatewayError::ProviderError { message, .. } => {
+            assert!(message.contains("truncated"), "{message}");
+            assert!(!message.contains("has no answer"), "{message}");
+        }
+        other => panic!("expected ProviderError, got {other:?}"),
+    }
+}
+
+/// A host that says `truncated: true` and nothing more is still a failed
+/// attempt; the message admits it has no detail.
+#[tokio::test]
+async fn a_truncated_flag_without_detail_is_still_a_provider_error() {
+    let server = MockServer::start().await;
+    let mut body = ok_body("laya-rl-agent");
+    body["usage"] = json!({"input_tokens":512,"output_tokens":0,"truncated":true});
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+    let err = SystemOneAdapter::with_id("laya")
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &request(Some("english"), vec![], None),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        GatewayError::ProviderError {
+            message,
+            status: Some(200),
+            ..
+        } => assert!(message.contains("no detail"), "{message}"),
+        other => panic!("expected ProviderError, got {other:?}"),
     }
 }
