@@ -40,7 +40,7 @@ engines with features:
 
 ```toml
 [dependencies]
-gateway = { package = "sensei-gateway", git = "https://github.com/sensei-hq/gateway", tag = "v0.4.8", features = ["local", "local-fastembed"] }
+gateway = { package = "sensei-gateway", git = "https://github.com/sensei-hq/gateway", tag = "v0.12.0", features = ["local", "local-fastembed"] }
 ```
 
 `gateway` re-exports the local surface under `gateway::local`, so a single dep can use
@@ -50,11 +50,11 @@ AWS SDK entirely? build with `--no-default-features` (drops the `cloud` feature)
 **Multi-crate** — depend on the split crates directly if you need their types:
 
 ```toml
-gateway         = { package = "sensei-gateway",         git = "https://github.com/sensei-hq/gateway", tag = "v0.4.8" }
-local-providers = { package = "sensei-local-providers", git = "https://github.com/sensei-hq/gateway", tag = "v0.4.8", features = ["llama-cpp"] }
-local-engine    = { package = "sensei-local-engine",    git = "https://github.com/sensei-hq/gateway", tag = "v0.4.8", features = ["hf-download"] }
+gateway         = { package = "sensei-gateway",         git = "https://github.com/sensei-hq/gateway", tag = "v0.12.0" }
+local-providers = { package = "sensei-local-providers", git = "https://github.com/sensei-hq/gateway", tag = "v0.12.0", features = ["llama-cpp"] }
+local-engine    = { package = "sensei-local-engine",    git = "https://github.com/sensei-hq/gateway", tag = "v0.12.0", features = ["hf-download"] }
 # Optional BYOK credential vault (consumed out-of-band; no dep edge to gateway):
-vault           = { package = "sensei-vault",           git = "https://github.com/sensei-hq/gateway", tag = "v0.4.8" }
+vault           = { package = "sensei-vault",           git = "https://github.com/sensei-hq/gateway", tag = "v0.12.0" }
 ```
 
 After adding or bumping, apply transitive security updates locally (the repo can't

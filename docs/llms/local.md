@@ -9,9 +9,9 @@ live in `local-providers`.
 
 ```toml
 local-providers = { package = "sensei-local-providers", git = "https://github.com/sensei-hq/gateway",
-                    tag = "v0.4.8", features = ["llama-cpp"] }   # or: ort  (fastembed deferred, see note)
+                    tag = "v0.12.0", features = ["llama-cpp"] }   # or: ort  (fastembed deferred, see note)
 local-engine    = { package = "sensei-local-engine", git = "https://github.com/sensei-hq/gateway",
-                    tag = "v0.4.8", features = ["hf-download"] } # resolvers + HF pull
+                    tag = "v0.12.0", features = ["hf-download"] } # resolvers + HF pull
 ```
 
 | Feature | Engine | Capabilities | Format |
