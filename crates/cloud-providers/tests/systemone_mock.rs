@@ -1069,3 +1069,60 @@ async fn a_truncated_flag_without_detail_is_still_a_provider_error() {
         other => panic!("expected ProviderError, got {other:?}"),
     }
 }
+
+/// AC5: Laya's FastAPI errors, verbatim from the live server — 401 is an
+/// Authentication error; every other status is a ProviderError carrying the
+/// server's `detail` string and the status.
+#[tokio::test]
+async fn laya_errors_surface_the_servers_detail() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_json(json!({"detail":"invalid or missing bearer token"})),
+        )
+        .mount(&server)
+        .await;
+    let adapter = SystemOneAdapter::with_id("laya").unwrap();
+    let req = request(Some("english"), vec![], None);
+    assert_authentication_error(
+        &adapter
+            .decide(&keyless(&server.uri()), &req)
+            .await
+            .unwrap_err(),
+    );
+
+    // The 401, 400 and 413 bodies were captured live from laya-coreml-serve
+    // 0.5.1; the 422, 500 and 503 `detail` strings are representative of its
+    // `HTTPException(status_code=…, detail=…)` handlers.
+    for (status, detail) in [
+        (400, "'state' is required"),
+        (413, "too many questions (70 > 64)"),
+        (422, "max_len must be a positive integer"),
+        (500, "inference failed"),
+        (503, "server busy"),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(json!({"detail": detail})))
+            .mount(&server)
+            .await;
+        match adapter
+            .decide(&keyless(&server.uri()), &req)
+            .await
+            .unwrap_err()
+        {
+            GatewayError::ProviderError {
+                status: Some(s),
+                message,
+                adapter,
+            } => assert_eq!(
+                (s, message.as_str(), adapter.as_str()),
+                (status, detail, "laya")
+            ),
+            other => panic!("{status}: expected ProviderError, got {other:?}"),
+        }
+    }
+}
