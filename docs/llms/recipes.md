@@ -320,8 +320,9 @@ if let Some(DecisionAnswer::Noul { noul }) = resp.decisions.as_ref().and_then(|d
   (`openrouter`, `typesafe`, `cloudflare`, `llamacpp`, `sglang`, `laya`) needs one pinned via
   the model's `api_model_id`, else `InvalidRequest`.
 - `images` are always bare base64 from you; the adapter encodes them per host —
-  verbatim for Ollama, `data:<sniffed mime>;base64,…` for every other host. An image
-  that is not PNG / JPEG / WebP / GIF is a `ProviderError` before anything is sent.
+  verbatim for Ollama, `data:<sniffed mime>;base64,…` for every other host (except `laya`,
+  which refuses any image before sending). An image that is not PNG / JPEG / WebP / GIF
+  is a `ProviderError` before anything is sent.
 
 ### Cloudflare Workers AI (`clef`, `clef-flash`)
 

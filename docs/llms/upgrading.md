@@ -14,7 +14,7 @@ Additive; no type changes.
 |---|---|---|
 | Facade (`FacadeBuilder::build`) | auto-registers `laya` (`SystemOneAdapter`, decision-only) for a local `laya-coreml-serve` | if you registered your own decision adapter under `laya`, it is now replaced; rename yours |
 | `SystemOneAdapter` | id `laya`: a decision with `images` fails before sending (`ProviderError`, `status: None`) | route image decisions to a vision-capable host |
-| `SystemOneAdapter` (every id) | a 200 whose `usage.truncated` is `true` is a `ProviderError` (status 200), not a success. Only Laya sends the field today | none; add `FallbackTrigger::ProviderError` to chains that should fall back |
+| `SystemOneAdapter`, `OllamaAdapter`, `CloudflareAdapter` (every decision host) | a 200 whose `usage.truncated` is `true` is a `ProviderError` (status 200), not a success; a `truncated` that is present but not a bool (e.g. `null`) now fails the parse as a `ProviderError`. Only Laya sends the field today | none; add `FallbackTrigger::ProviderError` to chains that should fall back |
 
 ## 0.10.x → 0.11.0 (agentic phase 1 — HITL hooks, wake retry, money budget, tool policy)
 
