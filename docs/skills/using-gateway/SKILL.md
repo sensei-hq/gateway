@@ -40,7 +40,7 @@ engines with features:
 
 ```toml
 [dependencies]
-gateway = { package = "sensei-gateway", git = "https://github.com/sensei-hq/gateway", tag = "v0.4.8", features = ["local", "local-fastembed"] }
+gateway = { package = "sensei-gateway", git = "https://github.com/sensei-hq/gateway", tag = "v0.12.0", features = ["local", "local-fastembed"] }
 ```
 
 `gateway` re-exports the local surface under `gateway::local`, so a single dep can use
@@ -50,11 +50,11 @@ AWS SDK entirely? build with `--no-default-features` (drops the `cloud` feature)
 **Multi-crate** — depend on the split crates directly if you need their types:
 
 ```toml
-gateway         = { package = "sensei-gateway",         git = "https://github.com/sensei-hq/gateway", tag = "v0.4.8" }
-local-providers = { package = "sensei-local-providers", git = "https://github.com/sensei-hq/gateway", tag = "v0.4.8", features = ["llama-cpp"] }
-local-engine    = { package = "sensei-local-engine",    git = "https://github.com/sensei-hq/gateway", tag = "v0.4.8", features = ["hf-download"] }
+gateway         = { package = "sensei-gateway",         git = "https://github.com/sensei-hq/gateway", tag = "v0.12.0" }
+local-providers = { package = "sensei-local-providers", git = "https://github.com/sensei-hq/gateway", tag = "v0.12.0", features = ["llama-cpp"] }
+local-engine    = { package = "sensei-local-engine",    git = "https://github.com/sensei-hq/gateway", tag = "v0.12.0", features = ["hf-download"] }
 # Optional BYOK credential vault (consumed out-of-band; no dep edge to gateway):
-vault           = { package = "sensei-vault",           git = "https://github.com/sensei-hq/gateway", tag = "v0.4.8" }
+vault           = { package = "sensei-vault",           git = "https://github.com/sensei-hq/gateway", tag = "v0.12.0" }
 ```
 
 After adding or bumping, apply transitive security updates locally (the repo can't
@@ -117,10 +117,10 @@ Send requests by capability; seven are live (via `kernel` capability traits):
 - **text-to-speech** (`TtsModel`) — openai, grok (cloud), kokoro (local)
 - **decision / System One** (`DecisionModel`) — ollama (≥ 0.35, local models), openrouter,
   typesafe, cloudflare (Workers AI `clef` / `clef-flash`; seed `context_window: 65_536`
-  — it truncates long state silently), and self-hosted llamacpp / sglang servers; all
+  — it truncates long state silently), self-hosted llamacpp / sglang servers, and a local laya (laya-coreml-serve, CoreML; keep `LAYA_HOST=127.0.0.1`; refuses images, over-budget questions and truncated or collapsed answers as `InputRejected`, which falls back even with empty triggers, is never retried and never trips the breaker; a misspelled model is refused); all
   but ollama need a pinned model, and the facade auto-registers every one. No vllm
   (no upstream route). Images go in as bare base64 and are sent as data URLs to every
-  host except Ollama. `Capability::Decision` + `Payload::Decision { state, questions, images,
+  host except Ollama (and laya, which refuses images). `Capability::Decision` + `Payload::Decision { state, questions, images,
   keep_alive }` → `resp.decisions` (probabilities, keyed by question name). Not
   streamable. A malformed call fails up front with `GatewayError::InvalidRequest`.
   **`confidence` is probability concentration, not correctness** — never show it as

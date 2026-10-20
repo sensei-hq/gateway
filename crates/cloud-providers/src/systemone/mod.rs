@@ -25,6 +25,8 @@ pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api";
 /// TypeSafe's API base (the reference implementation of System One).
 pub const TYPESAFE_BASE_URL: &str = "https://api.typesafe.ai";
 
+mod laya;
+
 const PATH: &str = "/v1/systemone";
 
 /// Which wire a System One host speaks. Everything else — transport, auth,
@@ -34,7 +36,7 @@ const PATH: &str = "/v1/systemone";
 pub(crate) enum Dialect {
     /// TypeSafe's API verbatim: `POST {base}/v1/systemone`, the body `model`
     /// as given, the response body is the result. Ollama, OpenRouter,
-    /// TypeSafe, llama.cpp, SGLang.
+    /// TypeSafe, llama.cpp, SGLang, Laya.
     SystemOne,
     /// Cloudflare Workers AI REST (verified 2026-10-03): `POST
     /// {base}/run/@cf/cloudflare/{model}` with `base = .../accounts/<id>/ai`;
@@ -92,6 +94,9 @@ pub(crate) enum ImageEncoding {
     /// `data:<sniffed mime>;base64,<b64>` — what llama.cpp (bare → 400),
     /// Cloudflare, vLLM's example and SGLang all accept.
     DataUrl,
+    /// The host does not read images and IGNORES the field (Laya: 200 with
+    /// text-only answers), so any image is refused before sending (SP-DEC-3 D2).
+    Unsupported,
 }
 
 /// Encode the caller's images for a host. A value already in data-URL form
@@ -99,28 +104,44 @@ pub(crate) enum ImageEncoding {
 /// bytes; an image that is no known format cannot be labelled truthfully, so
 /// it is an error (before anything is sent) rather than a guessed type.
 fn encode_images(images: &[String], encoding: ImageEncoding) -> Result<Vec<String>, String> {
-    if encoding == ImageEncoding::Bare {
-        return Ok(images.to_vec());
+    match encoding {
+        ImageEncoding::Unsupported if images.is_empty() => Ok(vec![]),
+        ImageEncoding::Unsupported => Err(format!(
+            "this host does not read images ({} sent) — it would answer as if they were \
+             absent; route image decisions to a vision-capable System One host",
+            images.len()
+        )),
+        ImageEncoding::Bare => Ok(images.to_vec()),
+        ImageEncoding::DataUrl => images
+            .iter()
+            .enumerate()
+            .map(|(i, img)| {
+                if img.starts_with("data:") {
+                    return Ok(img.clone());
+                }
+                let mime = sniff_image_mime(img).ok_or_else(|| {
+                    format!(
+                        "image {} is not PNG, JPEG, WebP or GIF base64 — cannot build a data URL for it",
+                        i + 1
+                    )
+                })?;
+                // The sniffer reads past line breaks (MIME/PEM-wrapped base64);
+                // the URL must not carry them into the request.
+                let b64: String = img.chars().filter(|c| !c.is_whitespace()).collect();
+                Ok(format!("data:{mime};base64,{b64}"))
+            })
+            .collect()
     }
-    images
-        .iter()
-        .enumerate()
-        .map(|(i, img)| {
-            if img.starts_with("data:") {
-                return Ok(img.clone());
-            }
-            let mime = sniff_image_mime(img).ok_or_else(|| {
-                format!(
-                    "image {} is not PNG, JPEG, WebP or GIF base64 — cannot build a data URL for it",
-                    i + 1
-                )
-            })?;
-            // The sniffer reads past line breaks (MIME/PEM-wrapped base64);
-            // the URL must not carry them into the request.
-            let b64: String = img.chars().filter(|c| !c.is_whitespace()).collect();
-            Ok(format!("data:{mime};base64,{b64}"))
-        })
-        .collect()
+}
+
+/// The image encoding the generic adapter uses for a router id: `laya`
+/// ignores images (SP-DEC-3 D2); every other `/v1/systemone` host that takes
+/// images accepts data URLs (SP-DEC-2 D1).
+fn image_encoding(id: &str) -> ImageEncoding {
+    match id {
+        "laya" => ImageEncoding::Unsupported,
+        _ => ImageEncoding::DataUrl,
+    }
 }
 
 /// The image type from the first decoded bytes of a base64 string.
@@ -225,6 +246,13 @@ struct WireResponse {
     answers: DecisionAnswers,
     #[serde(default)]
     usage: Option<WireUsage>,
+    /// Laya's report of the checkpoint that actually served the call (SP-DEC-3
+    /// D7): Laya auto-routes a `model` it does not know (200, no error), so
+    /// `routing.model` is the only sign of a misspelled `api_model_id`. Read as
+    /// raw JSON so another host's `routing` of any shape never fails the parse;
+    /// only a string `model` in an object is read.
+    #[serde(default)]
+    routing: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -233,6 +261,26 @@ struct WireUsage {
     input_tokens: u32,
     #[serde(default)]
     output_tokens: u32,
+    /// Laya's report that it cut the input to fit its window (SP-DEC-3 D3).
+    /// Absent on every other host, so it defaults to "not truncated". It is
+    /// the authority: `false` with `state_tokens_dropped > 0` is a success. A
+    /// `null` or non-bool fails the parse on purpose — we cannot tell the
+    /// answer was not truncated, so it fails closed (ProviderError, fallback);
+    /// `true` is an InputRejected (D5).
+    #[serde(default)]
+    truncated: bool,
+    /// Diagnostics only, shown in the error: a `null` here never vetoes an answer.
+    #[serde(default)]
+    state_tokens_dropped: Option<u32>,
+    #[serde(default)]
+    truncated_questions: Option<Vec<String>>,
+    /// Laya's per-question report of options it cut to fit its head budget
+    /// until some collapsed into the same tokens — `{"q": {"total": 25,
+    /// "distinct": 3, "tokens_per_option": 9}}`, present only when that
+    /// happened. Raw JSON so no other host's `options` can fail the parse; only
+    /// an entry with a numeric `distinct < total` is acted on.
+    #[serde(default)]
+    options: Option<serde_json::Value>,
 }
 
 /// A non-success response, before it becomes a [`GatewayError`] — kept apart
@@ -271,11 +319,13 @@ pub(crate) async fn decide(
     req: &DecisionRequest,
 ) -> Result<Result<DecisionResponse, Rejection>, GatewayError> {
     let adapter = host.adapter;
+    // An image this host cannot take (D2) or cannot be labelled (SP-DEC-2) is
+    // the request's fault, not the endpoint's: InputRejected (SP-DEC-3 D5) —
+    // falls back whatever the triggers, not retried, no breaker signal.
     let images =
-        encode_images(&req.images, host.images).map_err(|message| GatewayError::ProviderError {
+        encode_images(&req.images, host.images).map_err(|message| GatewayError::InputRejected {
             adapter: adapter.into(),
             message,
-            status: None,
         })?;
     let base = base_url.trim_end_matches('/');
     let (url, body_model, keep_alive) = match host.dialect {
@@ -350,6 +400,98 @@ pub(crate) async fn decide(
             }
         }
     };
+    // SP-DEC-3 D7: the host served another checkpoint than the one asked for
+    // (Laya auto-routes an unknown name) — answers from a model with another
+    // window. A configuration fault, so a ProviderError like any endpoint-wide
+    // fault. Checked FIRST, before truncation (D3), collapsed options and
+    // missing answers: a wrong checkpoint is an endpoint fault whatever else
+    // the response says, and a misspelled checkpoint with an over-window state
+    // is auto-routed AND truncated in one response — the input rejection would
+    // say "set context_window" (the wrong fix) and keep the fault off the
+    // breaker. Compared with the BODY model (Workers AI's is the short name),
+    // both sides resolved as Laya resolves names — its aliases, case and Hub
+    // ids are the same checkpoint; its bundle id asks it to choose. Only Laya
+    // sends `routing`, so the Laya spelling rules touch no other host.
+    if let Some(served) = wire
+        .routing
+        .as_ref()
+        .and_then(|r| r.get("model"))
+        .and_then(serde_json::Value::as_str)
+        && let Some(requested) = laya::laya_canonical_model(body_model)
+        && laya::laya_canonical_model(served).as_ref() != Some(&requested)
+    {
+        return Err(GatewayError::ProviderError {
+            adapter: adapter.into(),
+            message: format!(
+                "the host served checkpoint '{served}' instead of the requested '{body_model}' \
+                 — check the model's api_model_id (valid names: english, multilingual, \
+                 typed-decisions, their aliases, or a LAYA_EXTRA_MODELS key)"
+            ),
+            status: Some(status.as_u16()),
+        });
+    }
+
+    // SP-DEC-3 D3 (after D7 above): a host that truncated the input still
+    // answers 200 — about a state it never fully read. The same input truncates on every retry and
+    // the endpoint is healthy, so it is an InputRejected (D5): the chain falls
+    // back, nothing retries it, and the breaker never counts it.
+    if let Some(u) = wire.usage.as_ref().filter(|u| u.truncated) {
+        let mut cut = Vec::new();
+        let dropped = u.state_tokens_dropped.unwrap_or_default();
+        if dropped > 0 {
+            cut.push(format!("{dropped} state tokens dropped"));
+        }
+        if let Some(qs) = u.truncated_questions.as_deref().filter(|q| !q.is_empty()) {
+            cut.push(format!("questions cut: {qs:?}"));
+        }
+        return Err(GatewayError::InputRejected {
+            adapter: adapter.into(),
+            message: format!(
+                "the host truncated the input to fit its window ({}); its answers do not cover \
+                 the whole request — set the model's context_window to its real token window \
+                 (or lower it if it already is)",
+                if cut.is_empty() {
+                    "no detail".to_string()
+                } else {
+                    cut.join("; ")
+                }
+            ),
+        });
+    }
+
+    // The host cut the options until some became indistinguishable (Laya's
+    // `usage.options`): the answer cannot tell them apart. Input-determined
+    // like truncation, so an InputRejected (D5). Read leniently: only an entry
+    // whose numeric `distinct` is below its numeric `total` is a collapse, so
+    // another host's differently-shaped `options` never refuses an answer.
+    let collapsed: Vec<String> = wire
+        .usage
+        .as_ref()
+        .and_then(|u| u.options.as_ref())
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, v)| {
+            let count = |key| v.get(key).and_then(serde_json::Value::as_u64);
+            match (count("distinct"), count("total")) {
+                (Some(distinct), Some(total)) if distinct < total => Some(format!(
+                    "the options of question '{name}' ({distinct} distinct of {total})"
+                )),
+                _ => None,
+            }
+        })
+        .collect();
+    if !collapsed.is_empty() {
+        return Err(GatewayError::InputRejected {
+            adapter: adapter.into(),
+            message: format!(
+                "the host collapsed {} to fit its budget — its answers cannot tell those \
+                 options apart; use fewer or shorter options",
+                collapsed.join(", ")
+            ),
+        });
+    }
+
     // A 2xx with holes is not a success: report it as a failed attempt so the
     // engine records it and falls back, rather than `success: true` over
     // questions nobody answered.
@@ -380,7 +522,7 @@ pub(crate) async fn decide(
 }
 
 /// Generic System One adapter for any bearer-auth host of the endpoint —
-/// OpenRouter, TypeSafe, or a self-hosted server (llama.cpp, SGLang) via `url`.
+/// OpenRouter, TypeSafe, or a self-hosted server (llama.cpp, SGLang, Laya — `laya`, which refuses images) via `url`.
 /// Decision-only: register a chat adapter under the same id separately.
 pub struct SystemOneAdapter {
     client: Client,
@@ -447,10 +589,13 @@ impl kernel::adapters::capability::DecisionModel for SystemOneAdapter {
             });
         };
         let base_url = self.base_url(config)?;
+        if self.id == "laya" {
+            laya::check_laya_head_budget(&self.id, model, &req.questions)?;
+        }
         let host = Host {
             adapter: &self.id,
             dialect: Dialect::SystemOne,
-            images: ImageEncoding::DataUrl,
+            images: image_encoding(&self.id),
         };
         decide(&self.client, base_url, host, model, config, req)
             .await?
@@ -481,6 +626,28 @@ mod tests {
             enabled: true,
             timeout_ms: None,
             headers: HashMap::new(),
+        }
+    }
+
+    /// SP-DEC-3 D2: a host that ignores `images` must never receive them —
+    /// the answers would silently describe a text-only request.
+    #[test]
+    fn an_unsupported_host_refuses_images_and_passes_text_only_calls() {
+        assert_eq!(encode_images(&[], ImageEncoding::Unsupported), Ok(vec![]));
+        let err = encode_images(
+            &["iVBORw0KGgo=".to_string(), "iVBORw0KGgo=".to_string()],
+            ImageEncoding::Unsupported,
+        )
+        .unwrap_err();
+        assert!(err.contains("does not read images"), "{err}");
+        assert!(err.contains('2'), "says how many were refused: {err}");
+    }
+
+    #[test]
+    fn laya_is_the_only_generic_id_that_refuses_images() {
+        assert_eq!(image_encoding("laya"), ImageEncoding::Unsupported);
+        for id in ["openrouter", "typesafe", "llamacpp", "sglang", "custom"] {
+            assert_eq!(image_encoding(id), ImageEncoding::DataUrl, "{id}");
         }
     }
 

@@ -1,40 +1,37 @@
 # Checkpoint
 
-**Agentic completion — epic [torii#45](https://github.com/sensei-hq/torii/issues/45).** Agents run
-end to end in the product: seiki (cloud) configures/publishes, torii (local app) submits/watches/
-answers, one runtime = the gateway orchestrator. All 8 product decisions made 2026-10-06 (C1–C8,
-torii#37–#44; see the epic). Follows epic #76 (done; gateway v0.10.0, torii pins it).
+**Last slice: SP-DEC-3 — DONE, merged to develop (`4955595`, pushed 2026-10-20).** Local open-weight
+System One via Laya-CoreML (`laya` router) + `GatewayError::InputRejected`. **Breaking → next release
+0.12.0** (torii re-pin: exhaustive `GatewayError` matches). Spec
+`docs/superpowers/specs/2026-10-20-sp-dec-3-laya-local-system-one-design.md` (D1–D7, AC1–AC10).
 
-## Todo — Phase 1, this repo (then release + torii re-pin)
+## Done
 
-- [x] **AG-1** #85 — planner discovery tools (SP-REG-2) per run in `Executor::pinned`
-- [x] **AG-2** #86 — `OrchestratorHooks` for HITL events, incl. AG-15's confirm/escalation hooks
-- [x] **AG-3** #87 — scheduler wake backoff / jitter / `max_attempts` (+ testkit)
-- [x] **AG-12** #89 — money-denominated run budget; unrecorded paid spend = `SpendUnrecorded`
-- [x] **AG-15** #90 — per-tool call limit, confirm-before-run, escalation
-- [ ] release v0.11.0 (needs the user's OK for develop→main); then torii#53 AG-18 re-pin + adopt
+- SP-DEC-3: D5 InputRejected (falls back always, never retried, breaker/health-neutral, neutral to AllGated);
+  D6 Laya per-question head budget (conservative estimate, fixture-measured); D7 re-routed checkpoint.
+  Gate on merged develop: `cargo test --workspace` 1869 passed, stable clippy, fmt, live, docs-sync.
+- torii#45: Phase 1 → v0.11.0; Phase 2 wave A → torii #57.
 
-All on develop `38fa404` (integrated slice; whole-slice review + 3 fix rounds; 1815 passed).
+## Todo
 
-Phase 2 (torii): #53 adopt v0.11.0 · #34 boot seams · #33 run results · #35 config show/pull ·
-#46 config init + defaults · #47 gate authz · #49 budgets from caps · #36 slugs + authz.sql.
-Phase 3 (torii): #51 API + retire X2 design · #50 seiki publishing · #48 per-tenant workers · #52 UI.
+- [ ] SP-DEC-4: System One benchmark harness + per-scenario ranking report (option 1; no routing by score).
+- [ ] Release 0.12.0 (release checklist) + torii re-pin — when the user calls it.
+- [ ] torii#45 Phase 2 wave B (#46 #49 #55), then wave C #47.
 
 ## Next
 
-Ask the user to approve the v0.11.0 release (PR develop→main, CHANGELOG, docs sync, `make clean`),
-then torii#53 in a torii worktree: re-pin all 13 deps to `v0.11.0` and implement the store/CLI/SSE
-follow-ups listed there.
+Brainstorm SP-DEC-4 (`superpowers:brainstorming`). Laya venv kept at `/tmp/laya-bench/env`
+(`LAYA_HOST=127.0.0.1 LAYA_PORT=8766 LAYA_MODELS=english,multilingual …/laya-coreml-serve`; 8765 is taken).
 
 ## Open questions
 
-- Same gate option resubmitted by a different actor fires the decided hook again (attribution
-  semantics) — documented; confirm with the user if it matters for the SSE UI.
+- Upstream: ask Laya to report head truncation (external contact — user's call).
+- Bundle id `convaiinnovations/laya` skips D7 with budget 192 (kept; one-line change to refuse).
 
 ## Known-broken / carry-forwards
 
-- Process crash between a paid response and its `EffectRecorded` still re-buys one call per crash
-  (pre-existing at-least-once window; documented in durable-journal.md).
-- Until torii#53 lands, torii's Pg scheduler still crash-loops poison runs (trait defaults).
-- Lower-priority engine follow-ons, incl. cancel-after-claim and hook timeouts: #88.
-- torii `authz.sql` declassify case fails on unmodified develop — torii#36.
+- SP-DEC-3: Laya 413/422 still `ProviderError`; no per-model `head_max_len` override; exact tokenizer
+  counts; unmetered truncated hosted calls; image guard keyed on id `laya`; estimate errs ~1.7× high.
+- Flaky: `orchestrator agent::sandbox::tests::a_backgrounded_straggler_is_reaped_on_clean_exit` timed out
+  (8.0s > 5s) once under full-workspace load on a cold build; passed alone 3/3 and in the next full run.
+- sensei daemon `update_phase` 404 (2026-10-20). torii DB-gated tests don't run in CI (#55).

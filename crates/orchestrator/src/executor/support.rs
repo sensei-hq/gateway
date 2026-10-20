@@ -2137,4 +2137,45 @@ mod tests {
             GatewayDisposition::Fail(_)
         ));
     }
+
+    /// SP-DEC-3 D5 / AC8, end to end: an exhaustion made only of input rejections is
+    /// `retryable: false`, so even with transient-retry budget left (`max_attempts = 3`)
+    /// the run FAILS rather than re-sending an input no candidate can serve. The engine's
+    /// `an_exhaustion_of_input_rejections_is_not_retryable_and_not_all_gated` is what
+    /// proves the gateway produces `retryable: false`; this pins what the executor does
+    /// with it. The other half: a rejection beside a gated candidate is `AllGated` on
+    /// that gate (`an_input_rejection_beside_a_breaker_open_candidate_pauses_on_that_gate`),
+    /// which must PAUSE — the gate clears and the walk then passes the rejection.
+    #[test]
+    fn an_input_rejected_exhaustion_fails_instead_of_retrying() {
+        use kernel::types::error::GatewayError;
+        let t = chrono::Utc::now() + chrono::Duration::minutes(5);
+        let gated = GatewayError::AllGated {
+            resume_after: Some(t),
+            skipped: vec!["hosted:big — circuit breaker open".into()],
+            human_action: None,
+        };
+        assert!(matches!(
+            classify_gateway_error(&gated, 0, 3, chrono::Utc::now()),
+            GatewayDisposition::Pause { resume_after: Some(r), .. } if r == t
+        ));
+        let exhausted = GatewayError::AllAttemptsFailed {
+            attempts: 1,
+            errors: "[laya:english] adapter 'laya' cannot serve this input: image".into(),
+            attempts_detail: vec![],
+            retryable: false,
+        };
+        assert!(matches!(
+            classify_gateway_error(&exhausted, 0, 3, chrono::Utc::now()),
+            GatewayDisposition::Fail(_)
+        ));
+        let bare = GatewayError::InputRejected {
+            adapter: "laya".into(),
+            message: "image input".into(),
+        };
+        assert!(matches!(
+            classify_gateway_error(&bare, 0, 3, chrono::Utc::now()),
+            GatewayDisposition::Fail(_)
+        ));
+    }
 }

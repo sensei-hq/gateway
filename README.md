@@ -44,9 +44,9 @@ ort         # ONNX Runtime (CPU)
 Pin a tagged release via a git dependency:
 
 ```toml
-gateway         = { package = "sensei-gateway", git = "https://github.com/sensei-hq/gateway", tag = "v0.2.24" }
-local-providers = { package = "sensei-local-providers", git = "https://github.com/sensei-hq/gateway", tag = "v0.2.24", features = ["fastembed"] }
-local-engine    = { package = "sensei-local-engine", git = "https://github.com/sensei-hq/gateway", tag = "v0.2.24" }
+gateway         = { package = "sensei-gateway", git = "https://github.com/sensei-hq/gateway", tag = "v0.12.0" }
+local-providers = { package = "sensei-local-providers", git = "https://github.com/sensei-hq/gateway", tag = "v0.12.0", features = ["fastembed"] }
+local-engine    = { package = "sensei-local-engine", git = "https://github.com/sensei-hq/gateway", tag = "v0.12.0" }
 ```
 
 `Cargo.lock` in the consuming binary pins the exact commit, so there's no silent drift.
