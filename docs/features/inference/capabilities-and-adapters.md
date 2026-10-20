@@ -275,6 +275,7 @@ implements that capability trait and is registered into that map.
 | `cloudflare` |   |   |   |   |   |   | ✓ |
 | `llamacpp`   |   |   |   |   |   |   | ✓ |
 | `sglang`     |   |   |   |   |   |   | ✓ |
+| `laya`       |   |   |   |   |   |   | ✓ |
 | `gemini`     | ✓ | ✓ |   |   |   |   |   |
 | `huggingface` | ✓ | ✓ |   |   |   |   |   |
 | `bedrock`    | ✓ | ✓ |   |   |   |   |   |
@@ -300,10 +301,12 @@ implements that capability trait and is registered into that map.
 `openrouter` is two adapters under one router id: `OpenAIAdapter` (id `openrouter`,
 so it registers OpenAI's fixed chat/embed/STT/TTS/image set — whether OpenRouter
 actually serves each of those is up to OpenRouter) plus a decision-only
-`SystemOneAdapter`. `typesafe`, `llamacpp` and `sglang` are decision-only
-`SystemOneAdapter`s; `cloudflare` is the decision-only `CloudflareAdapter`. All five
+`SystemOneAdapter`. `typesafe`, `llamacpp`, `sglang` and `laya` are decision-only
+`SystemOneAdapter`s; `cloudflare` is the decision-only `CloudflareAdapter`. All six
 are auto-registered by the facade when their router id is in config (a chat adapter
-you register under `llamacpp` or `sglang` lives in the chat map and is untouched).
+you register under `llamacpp`, `sglang` or `laya` lives in the chat map and is
+untouched; a *decision* adapter you register under `laya` is replaced by `build()`,
+as for every other auto-wired id).
 `llamacpp` (a self-hosted `llama-server`) is not the embedded `llama_cpp` engine.
 
 `noop` is the catch-all test/dev adapter — it claims all seven capabilities (its
@@ -318,7 +321,7 @@ providers, and implement no capability trait.
 A decision call sends one shared `state` plus 1–64 named, typed questions and gets
 back **probabilities**, not text. The wire format is TypeSafe's System One API
 (`POST {base}/v1/systemone`), served by Ollama (≥ 0.35), OpenRouter, TypeSafe and
-the self-hosted llama.cpp and SGLang servers; Cloudflare Workers AI serves the same
+the self-hosted llama.cpp, SGLang and Laya servers; Cloudflare Workers AI serves the same
 models (`clef`, `clef-flash`) on its own REST route.
 Types live in `crates/kernel/src/types/decision.rs` (`gateway::types::decision`);
 `DecisionQuestions` / `DecisionAnswers` are `IndexMap`s because order is semantic —
@@ -425,6 +428,27 @@ Routers:
     only on main (#42183) — **v0.5.21 silently drops images** (200, text-only
     answers). A model name containing `:` is parsed as a LoRA adapter → 400; use a
     colon-free name. Optional `--api-key` bearer. `usage.output_tokens` is 0.
+- **`laya`** — a local `laya-coreml-serve` (open-weight, CoreML on Apple Silicon; no
+  cloud key), also `SystemOneAdapter`, decision-only. No default base URL (set `url`,
+  e.g. `http://127.0.0.1:8000`) and no default model: pin `api_model_id` to a
+  checkpoint (`english` 512-token window; `multilingual`, `typed-decisions` 1024;
+  others via `LAYA_EXTRA_MODELS`). Bearer only when the server sets `LAYA_API_KEY`.
+  The response `model` is always `laya-rl-agent` and `usage.output_tokens` is 0.
+  - *Images:* Laya ignores them, so the gateway refuses a `laya` decision that carries
+    images **before sending** (`ProviderError`, `status: None`, so a chain falls
+    back). The guard keys on the exact router id `laya` — a Laya server registered
+    under another id would receive images it silently ignores.
+  - *Truncation:* Laya truncates over-window input **silently** (200 with
+    `usage.truncated: true`). The gateway reads that flag on every System One
+    response; `true` is a `ProviderError` (status `Some(200)`), not a success. Set the
+    model's `context_window` to its real token window so the context-window gate
+    refuses oversize requests before sending. Truncation is input-determined, so with
+    no other candidate the same request is retried up to `max_attempts` and each one
+    counts toward the router's circuit breaker — chain a second decision router.
+    Keep Laya's default payload: `LAYA_JEV_STRICT` strips `truncated` and disables the
+    check.
+  - Errors are FastAPI `{"detail": …}`: 401 → `Authentication`; 400/413/422/500/503 →
+    `ProviderError` carrying the detail. `/v1/systemone/batch` is not used.
 - **`cloudflare`** — `CloudflareAdapter` (`cloud_providers::cloudflare`, re-exported as
   `gateway::adapters::cloudflare`), decision-only, for Workers AI's `clef` /
   `clef-flash`. It is a wire **dialect** of the same core, not a copy: `POST

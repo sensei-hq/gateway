@@ -241,14 +241,14 @@ adapters — you always read/write the same `ToolDefinition` / `ToolCall` shapes
 `Capability::Decision` sends one shared `state` plus 1–64 named, typed questions and
 returns **probabilities**, not text — TypeSafe's System One API
 (`POST {base}/v1/systemone`), served by Ollama (≥ 0.35, local models only),
-OpenRouter, TypeSafe and self-hosted llama.cpp / SGLang servers; Cloudflare Workers AI
+OpenRouter, TypeSafe and self-hosted llama.cpp / SGLang / Laya servers; Cloudflare Workers AI
 serves `clef` / `clef-flash` on its own route. The facade
 (`FacadeBuilder::new(config).build().await`) auto-registers the `ollama`,
 `openrouter` (chat **and** decision), and the decision-only `typesafe`, `cloudflare`,
-`llamacpp` and `sglang` routers when they are in config; with a bare `Gateway`,
+`llamacpp`, `sglang` and `laya` routers when they are in config; with a bare `Gateway`,
 register `OllamaAdapter` yourself,
 `gateway::adapters::systemone::SystemOneAdapter::from_config_with_id("openrouter", &cfg)`
-for a `/v1/systemone` host (same call with `"typesafe"`, `"llamacpp"`, `"sglang"`), and
+for a `/v1/systemone` host (same call with `"typesafe"`, `"llamacpp"`, `"sglang"`, `"laya"`), and
 `gateway::adapters::cloudflare::CloudflareAdapter::from_config(&cfg)` for Cloudflare.
 Config validation rejects an empty router `url`, so give each one:
 `http://localhost:11434` (Ollama), `https://openrouter.ai/api` (serves both
@@ -317,7 +317,7 @@ if let Some(DecisionAnswer::Noul { noul }) = resp.decisions.as_ref().and_then(|d
   `GatewayError::InvalidRequest` — no candidate is tried, nothing is retried.
 - `execute_stream` refuses `Decision` (`Unsupported`); use `execute`. Panels work.
 - Only `ollama` has a default decision model (`nimble`); every other router
-  (`openrouter`, `typesafe`, `cloudflare`, `llamacpp`, `sglang`) needs one pinned via
+  (`openrouter`, `typesafe`, `cloudflare`, `llamacpp`, `sglang`, `laya`) needs one pinned via
   the model's `api_model_id`, else `InvalidRequest`.
 - `images` are always bare base64 from you; the adapter encodes them per host —
   verbatim for Ollama, `data:<sniffed mime>;base64,…` for every other host. An image
@@ -392,5 +392,12 @@ The response `model` is the server alias and `usage.output_tokens` is always 0. 
 the same way; on SGLang v0.5.21 images are **silently dropped** (images need main,
 #42183), and a model name containing `:` is read as a LoRA adapter (400) — use a
 colon-free name. vLLM has no `/v1/systemone` and is not supported.
+
+A local `laya-coreml-serve` is configured the same way under the `laya` id:
+`url: "http://127.0.0.1:8000"`, `api_model_id: Some("english".into())`, and
+`context_window: 512` (1024 for `multilingual` / `typed-decisions`). Laya ignores images,
+so a `laya` decision with images is refused before sending; it truncates over-window
+input silently, and the gateway fails that attempt (`usage.truncated: true` is a
+`ProviderError`) so the chain falls back.
 
 Full reference: `docs/features/inference/capabilities-and-adapters.md#decision-system-one`.

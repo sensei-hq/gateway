@@ -61,10 +61,11 @@ fn registering_modules(src: &str) -> Vec<String> {
 }
 
 /// Matrix row names for a module: `systemone` is the generic adapter the
-/// facade registers as the `openrouter` and `typesafe` routers.
+/// facade registers as the `openrouter`, `typesafe`, `llamacpp`, `sglang` and
+/// `laya` routers.
 fn row_names(module: &str) -> Vec<&str> {
     match module {
-        "systemone" => vec!["openrouter", "typesafe", "llamacpp", "sglang"],
+        "systemone" => vec!["openrouter", "typesafe", "llamacpp", "sglang", "laya"],
         other => vec![other],
     }
 }
