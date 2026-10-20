@@ -1288,35 +1288,61 @@ async fn laya_errors_surface_the_servers_detail() {
 /// no `routing`).
 #[tokio::test]
 async fn a_re_routed_laya_checkpoint_is_a_provider_error_naming_both() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/systemone"))
-        .and(body_partial_json(json!({"model": "englsh"})))
-        .respond_with(ResponseTemplate::new(200).set_body_json(laya_ok_body()))
-        .expect(1)
-        .mount(&server)
-        .await;
-    let mut req = request(Some("englsh"), vec![], None);
-    req.questions = laya_questions();
-    match SystemOneAdapter::with_id("laya")
-        .unwrap()
-        .decide(&keyless(&server.uri()), &req)
-        .await
-        .unwrap_err()
-    {
-        GatewayError::ProviderError {
-            adapter,
-            message,
-            status: Some(200),
-        } => {
-            assert_eq!(adapter, "laya");
-            assert!(
-                message.contains("served checkpoint 'english' instead of the requested 'englsh'"),
-                "{message}"
-            );
-            assert!(message.contains("api_model_id"), "{message}");
+    // A wrong checkpoint is an endpoint fault whatever else the response says:
+    // reproduced live, `englsh` with an over-window state is auto-routed AND
+    // truncated in one response, and the D3/collapse InputRejected ("set
+    // context_window") would hide the misconfiguration from the breaker.
+    let mut truncated = laya_ok_body();
+    truncated["usage"]["truncated"] = json!(true);
+    truncated["usage"]["state_tokens_dropped"] = json!(718);
+    let mut collapsed = laya_ok_body();
+    collapsed["usage"]["options"] = json!({"label": {"total": 25, "distinct": 3}});
+    let mut unanswered = laya_ok_body();
+    unanswered["answers"] = json!({});
+    for (case, body) in [
+        ("plain", laya_ok_body()),
+        ("truncated", truncated),
+        ("collapsed", collapsed),
+        ("unanswered", unanswered),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .and(body_partial_json(json!({"model": "englsh"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut req = request(Some("englsh"), vec![], None);
+        req.questions = laya_questions();
+        match SystemOneAdapter::with_id("laya")
+            .unwrap()
+            .decide(&keyless(&server.uri()), &req)
+            .await
+            .unwrap_err()
+        {
+            GatewayError::ProviderError {
+                adapter,
+                message,
+                status: Some(200),
+            } => {
+                assert_eq!(adapter, "laya", "{case}");
+                assert!(
+                    message
+                        .contains("served checkpoint 'english' instead of the requested 'englsh'"),
+                    "{case}: {message}"
+                );
+                assert!(
+                    message.contains(
+                        "valid names: english, multilingual, typed-decisions, their aliases, \
+                         or a LAYA_EXTRA_MODELS key"
+                    ),
+                    "{case}: {message}"
+                );
+                assert!(!message.contains("loaded"), "{case}: {message}");
+            }
+            other => panic!("{case}: expected the D7 ProviderError, got {other:?}"),
         }
-        other => panic!("expected the D7 ProviderError, got {other:?}"),
     }
 }
 
@@ -1678,6 +1704,21 @@ async fn live_laya_answers_every_type_and_reports_truncation() {
             assert!(message.contains("'english'"), "{message}");
         }
         other => panic!("expected the D7 re-route refusal, got {other:?}"),
+    }
+    // D7 precedes D3: the same typo with an over-window state is auto-routed
+    // AND truncated by Laya; the re-route (an endpoint fault) is what's reported.
+    let mut typo_long = request(Some("englsh"), vec![], None);
+    typo_long.state = long.state.clone();
+    match adapter.decide(&cfg, &typo_long).await.unwrap_err() {
+        GatewayError::ProviderError {
+            status: Some(200),
+            message,
+            ..
+        } => {
+            eprintln!("LIVE D7-over-D3 refusal: {message}");
+            assert!(message.contains("'englsh'"), "{message}");
+        }
+        other => panic!("expected the D7 re-route refusal over D3, got {other:?}"),
     }
 
     // An image is refused client-side (the mock test `laya_refuses_images_before_any_request`
