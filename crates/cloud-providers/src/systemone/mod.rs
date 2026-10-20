@@ -482,13 +482,17 @@ pub(crate) async fn decide(
     // SP-DEC-3 D7: the host served another checkpoint than the one asked for
     // (Laya auto-routes an unknown name) — answers from a model with another
     // window. A configuration fault, so a ProviderError like any endpoint-wide
-    // fault. Compared with the BODY model: Workers AI's is the short name.
+    // fault. Compared with the BODY model (Workers AI's is the short name),
+    // both sides resolved as Laya resolves names — its aliases, case and Hub
+    // ids are the same checkpoint; its bundle id asks it to choose. Only Laya
+    // sends `routing`, so the Laya spelling rules touch no other host.
     if let Some(served) = wire
         .routing
         .as_ref()
         .and_then(|r| r.get("model"))
         .and_then(serde_json::Value::as_str)
-        && served != body_model
+        && let Some(requested) = laya::laya_canonical_model(body_model)
+        && laya::laya_canonical_model(served).as_ref() != Some(&requested)
     {
         return Err(GatewayError::ProviderError {
             adapter: adapter.into(),

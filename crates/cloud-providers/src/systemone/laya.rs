@@ -11,10 +11,39 @@ use kernel::types::error::GatewayError;
 /// `typed-decisions` 256. Any other name (an operator-registered checkpoint, a
 /// typo) gets the smallest, never room it may not have.
 fn laya_head_budget(model: &str) -> usize {
-    match model {
-        "multilingual" | "typed-decisions" => 256,
+    match laya_canonical_model(model).as_deref() {
+        Some("multilingual" | "typed-decisions") => 256,
+        // Unknown names, and the bundle id (Laya picks): the smallest budget.
         _ => 192,
     }
+}
+
+/// The checkpoint Laya serves for a requested `model`, as Laya 0.5.1 resolves
+/// it — `None` for the bundle id, which asks Laya to choose. Copied from the
+/// installed package:
+/// - `laya_coreml/serve.py` `_resolve_model`: a published Hub id (inverted
+///   `router.py` `STANDALONE_MODELS`, minus the bundle) pins its checkpoint,
+///   matched trimmed and lowercased; `convaiinnovations/laya` (`BUNDLE_REPO`)
+///   means auto-route;
+/// - `laya_coreml/router.py` `canonical_name`: trim, lowercase, then `_ALIASES`.
+///
+/// Any other name passes through canonicalised (trimmed, lowercased): a typo
+/// stays a typo, so D7 still refuses what Laya auto-routed.
+pub(super) fn laya_canonical_model(model: &str) -> Option<String> {
+    let key = model.trim().to_lowercase();
+    let canonical = match key.as_str() {
+        // serve.py: `STANDALONE_MODELS` inverted, the bundle excluded.
+        "convaiinnovations/laya-multilingual" => "multilingual",
+        "convaiinnovations/laya-typed-decisions" => "typed-decisions",
+        // serve.py: the bundle id is "let the Router choose".
+        "convaiinnovations/laya" => return None,
+        // router.py `_ALIASES`.
+        "en" | "laya" | "default" => "english",
+        "multi" | "ml" | "laya-multilingual" => "multilingual",
+        "typed" | "typed_decisions" | "laya-typed-decisions" | "decisions" => "typed-decisions",
+        _ => return Some(key),
+    };
+    Some(canonical.to_string())
 }
 
 /// The whole estimated head of [`estimated_head_parts`] (tests).
@@ -264,8 +293,56 @@ mod tests {
         assert_eq!(laya_head_budget("english"), 192);
         assert_eq!(laya_head_budget("multilingual"), 256);
         assert_eq!(laya_head_budget("typed-decisions"), 256);
-        for unknown in ["ane", "englsh", "", "MULTILINGUAL"] {
+        for unknown in ["ane", "englsh", "", "convaiinnovations/laya"] {
             assert_eq!(laya_head_budget(unknown), 192, "{unknown:?}");
+        }
+        // Laya's own spellings of the same checkpoints (aliases, case, spaces,
+        // published Hub ids) get the same budget.
+        for name in [
+            "ml",
+            "multi",
+            " Multilingual ",
+            "MULTILINGUAL",
+            "laya-multilingual",
+            "convaiinnovations/laya-multilingual",
+            "typed",
+            "typed_decisions",
+            "decisions",
+            "convaiinnovations/laya-typed-decisions",
+        ] {
+            assert_eq!(laya_head_budget(name), 256, "{name:?}");
+        }
+    }
+
+    /// Laya 0.5.1's name resolution, copied: `router.py` `canonical_name` (trim,
+    /// lowercase, `_ALIASES`) and `serve.py` `_resolve_model` (published Hub
+    /// ids pin; the bundle id `convaiinnovations/laya` means auto-route).
+    #[test]
+    fn laya_model_names_canonicalise_as_laya_resolves_them() {
+        let c = laya_canonical_model;
+        for (name, want) in [
+            ("english", Some("english")),
+            ("English", Some("english")),
+            ("  EN ", Some("english")),
+            ("laya", Some("english")),
+            ("default", Some("english")),
+            ("multi", Some("multilingual")),
+            ("ml", Some("multilingual")),
+            ("laya-multilingual", Some("multilingual")),
+            ("typed", Some("typed-decisions")),
+            ("typed_decisions", Some("typed-decisions")),
+            ("laya-typed-decisions", Some("typed-decisions")),
+            ("decisions", Some("typed-decisions")),
+            ("convaiinnovations/laya-multilingual", Some("multilingual")),
+            (
+                "Convaiinnovations/Laya-Typed-Decisions",
+                Some("typed-decisions"),
+            ),
+            ("convaiinnovations/laya", None),
+            ("englsh", Some("englsh")),
+            ("ane", Some("ane")),
+        ] {
+            assert_eq!(c(name).as_deref(), want, "{name:?}");
         }
     }
 
