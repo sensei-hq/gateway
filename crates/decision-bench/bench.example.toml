@@ -3,15 +3,21 @@
 # Starting each server (verified on this machine):
 #
 #   Laya, one server for english / multilingual / typed-decisions / ane.
-#   venv at /tmp/laya-bench/env, installed with
-#   `pip install "laya-coreml[serve]==0.5.1"`. Port 8765 is taken here, so 8766:
+#   venv at /tmp/laya-bench/env: a scratch venv that a reboot wipes. Recreate:
+#     uv venv -p 3.12 /tmp/laya-bench/env/.venv && \
+#     VIRTUAL_ENV=/tmp/laya-bench/env/.venv uv pip install "laya-coreml[serve]==0.5.1"
+#   Port 8765 is taken here, so 8766:
 #     LAYA_HOST=127.0.0.1 LAYA_PORT=8766 \
 #     LAYA_MODELS=english,multilingual,typed-decisions \
 #     LAYA_EXTRA_MODELS='{"ane":"aac6fef/laya-multilingual-coreml-ane"}' \
 #     /tmp/laya-bench/env/.venv/bin/laya-coreml-serve
 #
-#   Ollama (>= 0.35; pull the model once with `ollama pull nimble`):
+#   Ollama (verified on 0.40; pull the model once with `ollama pull nimble`):
 #     ollama serve
+#   `ollama show nimble`: Bespoke-Nimble-9B **Q8_0** (parent_model
+#   Bespoke-Nimble-9B-merged-current-Q8_0.gguf, capability `decision`). This is
+#   NOT the same build as `nimble-v3` below (llama.cpp, Q4_K_M, v3), so the roster
+#   compares two quantisations of a similar 9B model, not one model on two servers.
 #
 #   llama.cpp b11381:
 #     ~/opt/llamacpp-systemone/bin-b11381/llama-b11381/llama-server \
