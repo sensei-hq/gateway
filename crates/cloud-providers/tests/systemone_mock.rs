@@ -1017,7 +1017,16 @@ async fn untruncated_and_truncation_unaware_answers_stay_successes() {
     // Detail fields are diagnostics: a null in them never vetoes a valid answer.
     let mut null_details = ok_body("laya-rl-agent");
     null_details["usage"] = json!({"input_tokens":98,"output_tokens":0,"truncated":false,"state_tokens_dropped":null,"truncated_questions":null});
-    for body in [not_truncated, null_details, ok_body("nimble-v3")] {
+    // `truncated` is the authority: dropped tokens and a cut-question list
+    // beside `truncated: false` do not make it a truncation.
+    let mut details_but_not_truncated = ok_body("laya-rl-agent");
+    details_but_not_truncated["usage"] = json!({"input_tokens":98,"output_tokens":0,"truncated":false,"state_tokens_dropped":5,"truncated_questions":["q"]});
+    for body in [
+        not_truncated,
+        null_details,
+        details_but_not_truncated,
+        ok_body("nimble-v3"),
+    ] {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/systemone"))
@@ -1032,6 +1041,43 @@ async fn untruncated_and_truncation_unaware_answers_stay_successes() {
             )
             .await
             .expect("not truncated → success");
+    }
+}
+
+/// `truncated: null` cannot say the answer was NOT truncated, so it fails the
+/// parse on purpose (fail closed: a ProviderError the chain falls back on),
+/// never reads as `false`.
+#[tokio::test]
+async fn a_null_truncated_flag_fails_the_parse() {
+    let server = MockServer::start().await;
+    let mut body = ok_body("laya-rl-agent");
+    body["usage"] = json!({"input_tokens":1,"output_tokens":0,"truncated":null});
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+    match SystemOneAdapter::with_id("laya")
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &request(Some("english"), vec![], None),
+        )
+        .await
+        .unwrap_err()
+    {
+        GatewayError::ProviderError {
+            adapter,
+            message,
+            status: Some(200),
+        } => {
+            assert_eq!(adapter, "laya");
+            assert!(
+                message.contains("failed to parse System One response"),
+                "{message}"
+            );
+        }
+        other => panic!("expected the parse ProviderError, got {other:?}"),
     }
 }
 
