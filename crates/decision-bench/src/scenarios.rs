@@ -400,8 +400,6 @@ pub const DATASETS: [DatasetSpec; 4] = [
 
 /// Where `fetch_cases` reads from and writes to.
 pub struct FetchOptions<'a> {
-    pub ds_base: &'a str,
-    pub hub_base: &'a str,
     pub cache_root: &'a std::path::Path,
     pub out: &'a std::path::Path,
     pub seed: u64,
@@ -412,22 +410,15 @@ pub struct FetchOptions<'a> {
 /// scenario's cases, validate them, and write `<out>/s1a.jsonl` …
 /// `s3.jsonl` plus `manifest.json`.
 pub async fn fetch_cases(
-    client: &reqwest::Client,
+    hf: &crate::fetch::Hf,
     opts: &FetchOptions<'_>,
 ) -> anyhow::Result<Manifest> {
     let mut datasets = Vec::new();
     let mut built = Vec::new();
     for spec in DATASETS {
-        let ds = crate::fetch::load_or_fetch(
-            client,
-            opts.ds_base,
-            opts.hub_base,
-            opts.cache_root,
-            spec.id,
-            spec.config,
-            spec.split,
-        )
-        .await?;
+        let ds = hf
+            .load_or_fetch(opts.cache_root, spec.id, spec.config, spec.split)
+            .await?;
         let src = Source {
             dataset: spec.id,
             sha: &ds.meta.sha,
@@ -907,21 +898,23 @@ mod tests {
             .mount(&hub)
             .await;
         let cache = tempfile::tempdir().unwrap();
-        let client = reqwest::Client::new();
+        let hf = crate::fetch::Hf {
+            client: reqwest::Client::new(),
+            ds_base: ds.uri(),
+            hub_base: hub.uri(),
+            pacing: crate::fetch::Pacing::ZERO,
+        };
         let run = |out: std::path::PathBuf, seed: u64| {
-            let (client, ds, hub, cache) =
-                (client.clone(), ds.uri(), hub.uri(), cache.path().to_owned());
+            let (hf, cache) = (hf.clone(), cache.path().to_owned());
             async move {
                 std::fs::create_dir_all(&out).unwrap();
                 let opts = FetchOptions {
-                    ds_base: &ds,
-                    hub_base: &hub,
                     cache_root: &cache,
                     out: &out,
                     seed,
                     per_scenario: 5,
                 };
-                fetch_cases(&client, &opts).await.unwrap()
+                fetch_cases(&hf, &opts).await.unwrap()
             }
         };
         let root = tempfile::tempdir().unwrap();
