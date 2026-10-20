@@ -92,6 +92,8 @@ FallbackChainConfig {
 Candidates are tried in `priority` order. A failure only advances to the next
 candidate if its error kind is in `fallback_triggers` (else the chain stops).
 Triggers: `RateLimit`, `Timeout`, `ProviderError`, `ModelUnavailable`, `BudgetExceeded`.
+`GatewayError::InputRejected` (a candidate that cannot serve this input, e.g. an image sent to
+`laya`) is not a trigger: it always advances the walk, even with an empty set.
 
 > **Give each entry a distinct `priority` unless you mean to load balance.**
 > Entries that share a `priority` become a pool: their order is drawn per

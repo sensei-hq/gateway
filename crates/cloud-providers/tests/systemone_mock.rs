@@ -137,6 +137,38 @@ async fn ollama_posts_the_system_one_body_and_parses_typed_answers() {
     assert!(!resp.degraded);
 }
 
+/// The truncation check lives in the shared `decide` core, so Ollama gets it too.
+#[tokio::test]
+async fn ollama_also_treats_a_truncated_answer_as_an_input_rejection() {
+    let server = MockServer::start().await;
+    let mut body = ok_body("nimble:9b");
+    body["usage"] = json!({"input_tokens": 512, "output_tokens": 0, "truncated": true});
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+
+    match OllamaAdapter::new()
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &request(Some("nimble:9b"), vec![], None),
+        )
+        .await
+        .unwrap_err()
+    {
+        GatewayError::InputRejected { adapter, message } => {
+            assert_eq!(adapter, "ollama");
+            assert!(
+                message.contains("the host truncated the input"),
+                "{message}"
+            )
+        }
+        other => panic!("expected a truncation InputRejected, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn ollama_omits_absent_optionals_and_sends_no_auth_and_defaults_to_nimble() {
     let server = MockServer::start().await;
@@ -663,8 +695,8 @@ async fn ollama_keeps_receiving_bare_base64_images() {
 }
 
 /// An image whose bytes are no known format cannot be given a truthful mime
-/// type — fail before any request (a ProviderError, so the chain can fall
-/// back) rather than send a guessed one.
+/// type — fail before any request (an InputRejected, so the chain falls back
+/// whatever its triggers) rather than send a guessed one.
 #[tokio::test]
 async fn an_unrecognisable_image_fails_before_any_request() {
     let server = MockServer::start().await;
@@ -686,17 +718,14 @@ async fn an_unrecognisable_image_fails_before_any_request() {
         .await
         .unwrap_err();
     match err {
-        GatewayError::ProviderError {
-            message,
-            status: None,
-            ..
-        } => {
+        GatewayError::InputRejected { adapter, message } => {
+            assert_eq!(adapter, "llamacpp");
             assert!(
                 message.contains("image 2"),
                 "names the offending image: {message}"
             )
         }
-        other => panic!("expected ProviderError before sending, got {other:?}"),
+        other => panic!("expected InputRejected before sending, got {other:?}"),
     }
 }
 
@@ -832,4 +861,905 @@ async fn live_llama_cpp_answers_and_takes_data_url_images() {
         } => {}
         other => panic!("expected the 501 that follows a valid data URL, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// SP-DEC-3 — Laya (`laya-coreml-serve`) through the generic adapter
+// ---------------------------------------------------------------------------
+
+/// Laya ignores `images` (verified live: 200, text-only answers), so a `laya`
+/// call with images fails BEFORE sending — an InputRejected the chain falls
+/// back on whatever its triggers — the `llamacpp` half of AC2 is pinned by
+/// `the_generic_adapter_sends_images_as_data_urls_with_the_sniffed_mime` above.
+#[tokio::test]
+async fn laya_refuses_images_before_any_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body("laya-rl-agent")))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let err = SystemOneAdapter::with_id("laya")
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &request(Some("english"), vec![PNG_B64.to_string()], None),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        GatewayError::InputRejected { adapter, message } => {
+            assert_eq!(adapter, "laya");
+            assert!(message.contains("does not read images"), "{message}");
+        }
+        other => panic!("expected InputRejected before sending, got {other:?}"),
+    }
+}
+
+/// Laya's real default (non-strict) payload, captured live.
+fn laya_ok_body() -> serde_json::Value {
+    json!({"model":"laya-rl-agent","answers":{"label":{"type":"choice","choice":"billing","probabilities":{"billing":0.868,"bug":0.132},"confidence":0.437,"answer_confidence":0.868,"action":{"act_probability":1.0},"x_jev_confidence":0.736},"refund":{"type":"noul","noul":0.9038,"confidence":0.9038,"answer_confidence":0.9038,"action":{"act_probability":1.0}},"urgency":{"type":"score","score":1.9366,"legend":{"0":"Routine","1":"Soon","2":"Immediate"},"probabilities":{"0":0.0092,"1":0.045,"2":0.9458},"confidence":0.7857,"answer_confidence":0.9458,"action":{"act_probability":1.0},"x_jev_confidence":0.9049}},"usage":{"input_tokens":98,"output_tokens":0,"state_tokens":8,"state_tokens_dropped":0,"truncated":false,"truncated_questions":[]},"routing":{"model":"english","repo":"convaiinnovations/laya","reason":"explicit model='english'","detection":null,"workflow":null}})
+}
+
+fn laya_questions() -> DecisionQuestions {
+    let mut q = questions();
+    q.insert(
+        "refund".into(),
+        DecisionQuestion::Noul {
+            instructions: json!("Refund requested?"),
+            criteria: None,
+        },
+    );
+    q.insert(
+        "urgency".into(),
+        DecisionQuestion::Score {
+            instructions: json!("How urgent?"),
+            criteria: vec!["Routine".into(), "Soon".into(), "Immediate".into()],
+        },
+    );
+    q
+}
+
+/// AC3: every Laya extension (`routing`, `x_jev_confidence`, `answer_confidence`,
+/// `action`, noul `confidence`, extended `usage`) decodes into the plain answers.
+#[tokio::test]
+async fn laya_default_payload_decodes_into_typed_answers() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .and(body_partial_json(json!({"model": "english"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(laya_ok_body()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut req = request(Some("english"), vec![], None);
+    req.questions = laya_questions();
+    let resp = SystemOneAdapter::with_id("laya")
+        .unwrap()
+        .decide(&keyless(&server.uri()), &req)
+        .await
+        .expect("laya's default payload is a success");
+
+    match &resp.answers["label"] {
+        DecisionAnswer::Choice {
+            choice,
+            probabilities,
+            confidence,
+        } => {
+            assert_eq!(choice, "billing");
+            assert_eq!(probabilities["bug"], 0.132);
+            assert_eq!(
+                *confidence, 0.437,
+                "laya's own confidence, not x_jev_confidence"
+            );
+        }
+        other => panic!("choice expected, got {other:?}"),
+    }
+    assert_eq!(
+        resp.answers["refund"],
+        DecisionAnswer::Noul { noul: 0.9038 }
+    );
+    match &resp.answers["urgency"] {
+        DecisionAnswer::Score { score, legend, .. } => {
+            assert_eq!(*score, 1.9366);
+            assert_eq!(legend["2"], "Immediate");
+        }
+        other => panic!("score expected, got {other:?}"),
+    }
+    assert_eq!(resp.model.as_deref(), Some("laya-rl-agent"));
+    let usage = resp.usage.expect("usage");
+    assert_eq!((usage.input_tokens, usage.output_tokens), (98, 0));
+}
+
+/// AC4 (adapter level): Laya answers an over-window state with 200 and
+/// `usage.truncated: true` — answers about a state it never fully read. That is
+/// an input rejection (InputRejected, SP-DEC-3 D5: the chain falls back, the
+/// endpoint is healthy), never a success.
+#[tokio::test]
+async fn a_truncated_laya_answer_is_an_input_rejection() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"model":"laya-rl-agent","answers":{"label":{"type":"choice","choice":"bug","probabilities":{"billing":0.4,"bug":0.6},"confidence":0.03}},"usage":{"input_tokens":512,"output_tokens":0,"state_tokens":1200,"state_tokens_dropped":718,"truncated":true,"truncated_questions":["label"]},"routing":{"model":"english"}})))
+        .mount(&server)
+        .await;
+    let err = SystemOneAdapter::with_id("laya")
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &request(Some("english"), vec![], None),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        GatewayError::InputRejected { adapter, message } => {
+            assert_eq!(adapter, "laya");
+            assert!(message.contains("truncated"), "{message}");
+            assert!(
+                message.contains("718"),
+                "names the dropped tokens: {message}"
+            );
+            assert!(
+                message.contains("label"),
+                "names the cut question: {message}"
+            );
+        }
+        other => panic!("expected InputRejected, got {other:?}"),
+    }
+}
+
+/// D3 is additive: `truncated: false`, and a usage block with no such key
+/// (every other host), stay successes.
+#[tokio::test]
+async fn untruncated_and_truncation_unaware_answers_stay_successes() {
+    let mut not_truncated = ok_body("laya-rl-agent");
+    not_truncated["usage"]["truncated"] = json!(false);
+    // Detail fields are diagnostics: a null in them never vetoes a valid answer.
+    let mut null_details = ok_body("laya-rl-agent");
+    null_details["usage"] = json!({"input_tokens":98,"output_tokens":0,"truncated":false,"state_tokens_dropped":null,"truncated_questions":null});
+    // `truncated` is the authority: dropped tokens and a cut-question list
+    // beside `truncated: false` do not make it a truncation.
+    let mut details_but_not_truncated = ok_body("laya-rl-agent");
+    details_but_not_truncated["usage"] = json!({"input_tokens":98,"output_tokens":0,"truncated":false,"state_tokens_dropped":5,"truncated_questions":["q"]});
+    // Laya reports `usage.options` only for a question whose options collapsed;
+    // an empty object (or none, as above) is no collapse.
+    let mut no_collapse = ok_body("laya-rl-agent");
+    no_collapse["usage"]["options"] = json!({});
+    for body in [
+        not_truncated,
+        null_details,
+        details_but_not_truncated,
+        no_collapse,
+        ok_body("nimble-v3"),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        SystemOneAdapter::with_id("laya")
+            .unwrap()
+            .decide(
+                &keyless(&server.uri()),
+                &request(Some("english"), vec![], None),
+            )
+            .await
+            .expect("not truncated → success");
+    }
+}
+
+/// Laya cut every option to fit its head budget and several collapsed into
+/// the same tokens — the answer cannot tell them apart. Captured live
+/// (multilingual, 25 eight-digit keys): `truncated: false`, top probability
+/// 0.107. An input rejection, like truncation.
+#[tokio::test]
+async fn a_collapsed_options_answer_is_an_input_rejection() {
+    let server = MockServer::start().await;
+    let mut body = ok_body("laya-rl-agent");
+    body["usage"] = json!({"input_tokens":234,"output_tokens":0,"state_tokens":1,"state_tokens_dropped":0,"truncated":false,"truncated_questions":[],"options":{"label":{"total":25,"distinct":3,"tokens_per_option":9}}});
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+    match SystemOneAdapter::with_id("laya")
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &request(Some("english"), vec![], None),
+        )
+        .await
+        .unwrap_err()
+    {
+        GatewayError::InputRejected { adapter, message } => {
+            assert_eq!(adapter, "laya");
+            assert!(
+                message.contains("collapsed the options of question 'label' (3 distinct of 25)"),
+                "{message}"
+            );
+        }
+        other => panic!("expected the collapsed-options InputRejected, got {other:?}"),
+    }
+}
+
+/// `usage.options` is read leniently: only an entry that says `distinct <
+/// total` is a collapse. Another host's differently-shaped `options`, or an
+/// entry with nothing collapsed, never refuses a valid answer.
+#[tokio::test]
+async fn only_an_options_entry_with_distinct_below_total_is_a_collapse() {
+    for (options, collapsed) in [
+        (json!({"label": {"total": 25, "distinct": 3}}), true),
+        (json!({"label": {"total": 4, "distinct": 4}}), false),
+        (json!({"label": "whatever"}), false),
+        (json!({"label": {"total": 25}}), false),
+        (json!({"label": {"total": "25", "distinct": "3"}}), false),
+        (json!(["label"]), false),
+    ] {
+        let mut body = ok_body("laya-rl-agent");
+        body["usage"]["options"] = options.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        let result = SystemOneAdapter::with_id("laya")
+            .unwrap()
+            .decide(
+                &keyless(&server.uri()),
+                &request(Some("english"), vec![], None),
+            )
+            .await;
+        match (collapsed, result) {
+            (true, Err(GatewayError::InputRejected { .. })) | (false, Ok(_)) => {}
+            (_, other) => panic!("{options}: collapsed={collapsed}, got {other:?}"),
+        }
+    }
+}
+
+/// `truncated: null` cannot say the answer was NOT truncated, so it fails the
+/// parse on purpose (fail closed: a ProviderError the chain falls back on),
+/// never reads as `false`.
+#[tokio::test]
+async fn a_null_truncated_flag_fails_the_parse() {
+    let server = MockServer::start().await;
+    let mut body = ok_body("laya-rl-agent");
+    body["usage"] = json!({"input_tokens":1,"output_tokens":0,"truncated":null});
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+    match SystemOneAdapter::with_id("laya")
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &request(Some("english"), vec![], None),
+        )
+        .await
+        .unwrap_err()
+    {
+        GatewayError::ProviderError {
+            adapter,
+            message,
+            status: Some(200),
+        } => {
+            assert_eq!(adapter, "laya");
+            assert!(
+                message.contains("failed to parse System One response"),
+                "{message}"
+            );
+        }
+        other => panic!("expected the parse ProviderError, got {other:?}"),
+    }
+}
+
+/// Truncation is the more useful diagnosis: when the host cut the input AND
+/// the answers are incomplete, say "truncated", not "has no answer".
+#[tokio::test]
+async fn a_truncated_answer_reports_truncation_even_when_answers_are_missing() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"model":"laya-rl-agent","answers":{},"usage":{"input_tokens":512,"output_tokens":0,"truncated":true,"truncated_questions":["label"]}})))
+        .mount(&server)
+        .await;
+    let err = SystemOneAdapter::with_id("laya")
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &request(Some("english"), vec![], None),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        GatewayError::InputRejected { adapter, message } => {
+            assert_eq!(adapter, "laya");
+            assert!(message.contains("truncated"), "{message}");
+            assert!(!message.contains("has no answer"), "{message}");
+        }
+        other => panic!("expected InputRejected, got {other:?}"),
+    }
+}
+
+/// A host that says `truncated: true` and nothing more is still a failed
+/// attempt; the message admits it has no detail.
+#[tokio::test]
+async fn a_truncated_flag_without_detail_is_still_an_input_rejection() {
+    let server = MockServer::start().await;
+    let mut body = ok_body("laya-rl-agent");
+    body["usage"] = json!({"input_tokens":512,"output_tokens":0,"truncated":true});
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+    let err = SystemOneAdapter::with_id("laya")
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &request(Some("english"), vec![], None),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        GatewayError::InputRejected { adapter, message } => {
+            assert_eq!(adapter, "laya");
+            assert!(message.contains("no detail"), "{message}")
+        }
+        other => panic!("expected InputRejected, got {other:?}"),
+    }
+}
+
+/// AC5: Laya's FastAPI `{"detail": "<string>"}` errors — 401 is an
+/// Authentication error; every other status is a ProviderError carrying the
+/// server's `detail` string and the status. Which bodies were captured live
+/// and which are representative is noted inline.
+#[tokio::test]
+async fn laya_errors_surface_the_servers_detail() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_json(json!({"detail":"invalid or missing bearer token"})),
+        )
+        .mount(&server)
+        .await;
+    let adapter = SystemOneAdapter::with_id("laya").unwrap();
+    let req = request(Some("english"), vec![], None);
+    match adapter
+        .decide(&keyless(&server.uri()), &req)
+        .await
+        .unwrap_err()
+    {
+        GatewayError::Authentication { adapter, message } => assert_eq!(
+            (adapter.as_str(), message.as_str()),
+            ("laya", "invalid or missing bearer token")
+        ),
+        other => panic!("401: expected Authentication, got {other:?}"),
+    }
+
+    // The 401, 400 and 413 bodies were captured live from laya-coreml-serve
+    // 0.5.1; the 422, 500 and 503 `detail` strings are representative of its
+    // `HTTPException(status_code=…, detail=…)` handlers.
+    for (status, detail) in [
+        (400, "'state' is required"),
+        (413, "too many questions (70 > 64)"),
+        (422, "max_len must be a positive integer"),
+        (500, "inference failed"),
+        (503, "server busy"),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(json!({"detail": detail})))
+            .mount(&server)
+            .await;
+        match adapter
+            .decide(&keyless(&server.uri()), &req)
+            .await
+            .unwrap_err()
+        {
+            GatewayError::ProviderError {
+                status: Some(s),
+                message,
+                adapter,
+            } => assert_eq!(
+                (s, message.as_str(), adapter.as_str()),
+                (status, detail, "laya")
+            ),
+            other => panic!("{status}: expected ProviderError, got {other:?}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SP-DEC-3 D7 — a re-routed checkpoint is a failed attempt
+// ---------------------------------------------------------------------------
+
+/// AC10: Laya auto-routes an unknown `model` (200, `routing.model` says where it
+/// went), so a misspelled `api_model_id` would silently run on a checkpoint
+/// with another window. A configuration fault: ProviderError naming both. The
+/// equal case is `laya_default_payload_decodes_into_typed_answers` (requests
+/// `english`, `routing.model: "english"`); the absent case is
+/// `untruncated_and_truncation_unaware_answers_stay_successes` (`ok_body` has
+/// no `routing`).
+#[tokio::test]
+async fn a_re_routed_laya_checkpoint_is_a_provider_error_naming_both() {
+    // A wrong checkpoint is an endpoint fault whatever else the response says:
+    // reproduced live, `englsh` with an over-window state is auto-routed AND
+    // truncated in one response, and the D3/collapse InputRejected ("set
+    // context_window") would hide the misconfiguration from the breaker.
+    let mut truncated = laya_ok_body();
+    truncated["usage"]["truncated"] = json!(true);
+    truncated["usage"]["state_tokens_dropped"] = json!(718);
+    let mut collapsed = laya_ok_body();
+    collapsed["usage"]["options"] = json!({"label": {"total": 25, "distinct": 3}});
+    let mut unanswered = laya_ok_body();
+    unanswered["answers"] = json!({});
+    for (case, body) in [
+        ("plain", laya_ok_body()),
+        ("truncated", truncated),
+        ("collapsed", collapsed),
+        ("unanswered", unanswered),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .and(body_partial_json(json!({"model": "englsh"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut req = request(Some("englsh"), vec![], None);
+        req.questions = laya_questions();
+        match SystemOneAdapter::with_id("laya")
+            .unwrap()
+            .decide(&keyless(&server.uri()), &req)
+            .await
+            .unwrap_err()
+        {
+            GatewayError::ProviderError {
+                adapter,
+                message,
+                status: Some(200),
+            } => {
+                assert_eq!(adapter, "laya", "{case}");
+                assert!(
+                    message
+                        .contains("served checkpoint 'english' instead of the requested 'englsh'"),
+                    "{case}: {message}"
+                );
+                assert!(
+                    message.contains(
+                        "valid names: english, multilingual, typed-decisions, their aliases, \
+                         or a LAYA_EXTRA_MODELS key"
+                    ),
+                    "{case}: {message}"
+                );
+                assert!(!message.contains("loaded"), "{case}: {message}");
+            }
+            other => panic!("{case}: expected the D7 ProviderError, got {other:?}"),
+        }
+    }
+}
+
+/// Laya accepts its own aliases, any case and spacing, and the published Hub
+/// ids (`router.py` `_ALIASES`, `serve.py` `_resolve_model`) and reports the
+/// canonical name in `routing.model` — verified live: `ml`, `English` and `en`
+/// come back `reason: "explicit model=…"`. Those are no re-route. The bundle id
+/// `convaiinnovations/laya` asks Laya to choose, so whatever it chose is no
+/// re-route either.
+#[tokio::test]
+async fn laya_aliases_of_the_served_checkpoint_are_no_re_route() {
+    for (requested, served) in [
+        ("ml", "multilingual"),
+        ("English", "english"),
+        (" en ", "english"),
+        ("typed_decisions", "typed-decisions"),
+        ("convaiinnovations/laya-multilingual", "multilingual"),
+        ("convaiinnovations/laya", "multilingual"),
+        // The SERVED name is canonicalised too.
+        ("multilingual", "ML"),
+    ] {
+        let mut body = laya_ok_body();
+        body["routing"] = json!({"model": served, "reason": format!("explicit model='{served}'")});
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut req = request(Some(requested), vec![], None);
+        req.questions = laya_questions();
+        SystemOneAdapter::with_id("laya")
+            .unwrap()
+            .decide(&keyless(&server.uri()), &req)
+            .await
+            .unwrap_or_else(|e| panic!("{requested:?} served as {served:?}: {e:?}"));
+    }
+}
+
+/// A `routing` with no (or a null, or a non-string) `model` says nothing about
+/// a re-route — and another host's `routing` of any other shape (a string, a
+/// list) must never fail the parse of an otherwise good answer.
+#[tokio::test]
+async fn a_routing_block_without_a_model_is_a_success() {
+    for routing in [
+        json!({}),
+        json!({"model": null, "reason": "explicit"}),
+        json!({"model": 7}),
+        json!("auto"),
+        json!(["english"]),
+        json!(null),
+    ] {
+        let mut body = laya_ok_body();
+        body["routing"] = routing;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        let mut req = request(Some("english"), vec![], None);
+        req.questions = laya_questions();
+        SystemOneAdapter::with_id("laya")
+            .unwrap()
+            .decide(&keyless(&server.uri()), &req)
+            .await
+            .expect("no routed model, no re-route");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SP-DEC-3 D6 — Laya's per-question head budget, checked before sending
+// ---------------------------------------------------------------------------
+
+/// The instruction that, live on `english`, lost its question to Laya's silent
+/// head cut (noul 0.90 → 0.15 with `truncated: false`): 808 characters.
+fn long_instruction() -> String {
+    format!("{}Does the user want a refund?", "Ignore this. ".repeat(60))
+}
+
+/// One noul question `refund` with `instructions`.
+fn noul_request(model: &str, instructions: String) -> DecisionRequest {
+    DecisionRequest {
+        model: Some(model.into()),
+        state: json!("I was charged twice for my last invoice."),
+        questions: DecisionQuestions::from([(
+            "refund".to_string(),
+            DecisionQuestion::Noul {
+                instructions: json!(instructions),
+                criteria: None,
+            },
+        )]),
+        images: vec![],
+        keep_alive: None,
+    }
+}
+
+fn noul_ok_body() -> serde_json::Value {
+    json!({"model":"laya-rl-agent","answers":{"refund":{"type":"noul","noul":0.9}},"usage":{"input_tokens":120,"output_tokens":0,"truncated":false}})
+}
+
+/// A server that must never be called.
+async fn unreachable_server() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(noul_ok_body()))
+        .expect(0)
+        .mount(&server)
+        .await;
+    server
+}
+
+/// A server that answers the `refund` question exactly once.
+async fn answering_server() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(noul_ok_body()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    server
+}
+
+#[track_caller]
+fn assert_head_refusal(
+    err: GatewayError,
+    question: &str,
+    checkpoint: &str,
+    budget: usize,
+) -> String {
+    match err {
+        GatewayError::InputRejected { adapter, message } => {
+            assert_eq!(adapter, "laya");
+            assert!(
+                message.contains(&format!("question '{question}'")),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("checkpoint '{checkpoint}' allows {budget}")),
+                "{message}"
+            );
+            assert!(message.contains("Laya would silently cut it"), "{message}");
+            message
+        }
+        other => panic!("expected the D6 InputRejected before sending, got {other:?}"),
+    }
+}
+
+/// AC9: the 808-character instruction (269 real tokens with its two
+/// options) is over `english`'s 192 — refused, nothing sent.
+#[tokio::test]
+async fn laya_refuses_a_question_over_the_checkpoints_head_budget_before_sending() {
+    let server = unreachable_server().await;
+    let err = SystemOneAdapter::with_id("laya")
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &noul_request("english", long_instruction()),
+        )
+        .await
+        .unwrap_err();
+    let message = assert_head_refusal(err, "refund", "english", 192);
+    // The estimate itself is pinned by the unit tests (it changes whenever the
+    // counting rule does); here only that it is reported and over the budget.
+    let estimate: usize = message
+        .split("needs ≈")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no estimate in {message}"));
+    assert!(estimate > 192, "{message}");
+}
+
+/// `multilingual`'s budget is 256 — still under the 808-character estimate.
+#[tokio::test]
+async fn laya_refuses_the_long_instruction_on_multilingual_too() {
+    let server = unreachable_server().await;
+    let err = SystemOneAdapter::with_id("laya")
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &noul_request("multilingual", long_instruction()),
+        )
+        .await
+        .unwrap_err();
+    assert_head_refusal(err, "refund", "multilingual", 256);
+}
+
+/// A 288-character instruction (estimate 185; real 109) fits `english` and is sent.
+#[tokio::test]
+async fn laya_sends_a_question_within_the_head_budget() {
+    let server = answering_server().await;
+    let instructions = format!("{}Does the user want a refund?", "Ignore this. ".repeat(20));
+    assert_eq!(instructions.chars().count(), 288);
+    SystemOneAdapter::with_id("laya")
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &noul_request("english", instructions),
+        )
+        .await
+        .expect("a head within budget is sent");
+}
+
+/// Options count too: a short instruction with many long options (each capped
+/// at 48 tokens + its [MASK]) leaves Laya under 16 tokens of slack, so it would
+/// trim every option — refused on the options. Only the second question is
+/// over, so the refusal names it.
+#[tokio::test]
+async fn laya_counts_a_choices_options_against_the_head_budget() {
+    let server = unreachable_server().await;
+    let mut req = noul_request("english", "Refund?".into());
+    req.questions.insert(
+        "team".into(),
+        DecisionQuestion::Choice {
+            instructions: json!("Which team?"),
+            criteria: (0..6)
+                .map(|i| {
+                    (
+                        format!("team{i}"),
+                        Some("handles this kind of ticket ".repeat(10)),
+                    )
+                })
+                .collect(),
+        },
+    );
+    match SystemOneAdapter::with_id("laya")
+        .unwrap()
+        .decide(&keyless(&server.uri()), &req)
+        .await
+        .unwrap_err()
+    {
+        GatewayError::InputRejected { adapter, message } => {
+            assert_eq!(adapter, "laya");
+            assert!(
+                message.contains("the options of question 'team' need"),
+                "{message}"
+            );
+            assert!(
+                message.contains("leaves options 176 of its 192"),
+                "{message}"
+            );
+            assert!(message.contains("the options would be cut"), "{message}");
+        }
+        other => panic!("expected the per-option refusal before sending, got {other:?}"),
+    }
+}
+
+/// The budget is Laya's: any other id sends the same long instruction.
+#[tokio::test]
+async fn other_ids_are_never_head_budget_checked() {
+    let server = answering_server().await;
+    SystemOneAdapter::with_id("llamacpp")
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &noul_request("english", long_instruction()),
+        )
+        .await
+        .expect("no head budget outside laya");
+}
+
+/// Live, opt-in: a real `laya-coreml-serve` (laya-coreml 0.5.1, verified on an
+/// M4 Max, CoreML CPU+GPU):
+///   pip install "laya-coreml[serve]==0.5.1"
+///   LAYA_HOST=127.0.0.1 LAYA_PORT=8000 LAYA_MODELS=english laya-coreml-serve
+///   LAYA_URL=http://127.0.0.1:8000 cargo test -p sensei-cloud-providers \
+///     --test systemone_mock live_laya -- --ignored
+/// `LAYA_MODEL` picks the checkpoint (default `english`, a 512-token window).
+#[tokio::test]
+#[ignore = "requires LAYA_URL: a running laya-coreml-serve"]
+async fn live_laya_answers_every_type_and_reports_truncation() {
+    let url = std::env::var("LAYA_URL").expect("LAYA_URL");
+    let model = std::env::var("LAYA_MODEL").unwrap_or_else(|_| "english".into());
+    let mut cfg = keyless(&url);
+    cfg.timeout_ms = Some(120_000);
+    let adapter = SystemOneAdapter::with_id("laya").unwrap();
+
+    let mut req = request(Some(&model), vec![], None);
+    req.questions = laya_questions();
+    let resp = adapter
+        .decide(&cfg, &req)
+        .await
+        .expect("live laya decision");
+    eprintln!(
+        "LIVE laya answers: {:#?}\nusage: {:?}",
+        resp.answers, resp.usage
+    );
+    let DecisionAnswer::Choice {
+        choice,
+        probabilities,
+        ..
+    } = &resp.answers["label"]
+    else {
+        panic!("choice answer expected: {:?}", resp.answers);
+    };
+    // The contract, not the model's opinion.
+    assert_eq!(probabilities.keys().collect::<Vec<_>>(), ["billing", "bug"]);
+    let argmax = probabilities
+        .iter()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(k, _)| k.as_str());
+    assert_eq!(Some(choice.as_str()), argmax, "{probabilities:?}");
+    assert!((probabilities.values().sum::<f64>() - 1.0).abs() < 1e-3);
+    assert!(
+        matches!(resp.answers["refund"], DecisionAnswer::Noul { noul, .. } if (0.0..=1.0).contains(&noul))
+    );
+    assert!(
+        matches!(resp.answers["urgency"], DecisionAnswer::Score { score, .. } if (0.0..=2.0).contains(&score))
+    );
+    assert!(resp.usage.is_some_and(|u| u.input_tokens > 0));
+
+    // D3 against the real server: ~6000 tokens, many times any shipped checkpoint's
+    // window (english 512, multilingual 1024), yet under the server's 50 000-char state cap.
+    let mut long = request(Some(&model), vec![], None);
+    long.state =
+        json!(["The customer wrote again about the duplicate invoice charge."; 600].join(" "));
+    match adapter.decide(&cfg, &long).await.unwrap_err() {
+        GatewayError::InputRejected { message, .. } => {
+            assert!(
+                message.contains("the host truncated the input"),
+                "{message}"
+            )
+        }
+        other => panic!("expected the D3 truncation error, got {other:?}"),
+    }
+
+    // The per-option cut (found live on multilingual): 25 eight-digit keys are
+    // refused before sending on every checkpoint.
+    let mut many = request(Some(&model), vec![], None);
+    many.questions = DecisionQuestions::from([(
+        "q".to_string(),
+        DecisionQuestion::Choice {
+            instructions: json!("Pick"),
+            criteria: (0..25)
+                .map(|i| (format!("{}", 10_000_000 + i), None))
+                .collect(),
+        },
+    )]);
+    match adapter.decide(&cfg, &many).await.unwrap_err() {
+        GatewayError::InputRejected { message, .. } => {
+            eprintln!("LIVE option-cut refusal: {message}");
+            assert!(message.contains("question 'q'"), "{message}")
+        }
+        other => panic!("expected the option-budget refusal, got {other:?}"),
+    }
+
+    // D7 / AC10: a misspelled checkpoint is auto-routed by Laya, and refused here.
+    let mut typo = request(Some("englsh"), vec![], None);
+    typo.questions = laya_questions();
+    match adapter.decide(&cfg, &typo).await.unwrap_err() {
+        GatewayError::ProviderError {
+            status: Some(200),
+            message,
+            ..
+        } => {
+            eprintln!("LIVE D7 refusal: {message}");
+            assert!(message.contains("'englsh'"), "{message}");
+            assert!(message.contains("'english'"), "{message}");
+        }
+        other => panic!("expected the D7 re-route refusal, got {other:?}"),
+    }
+    // D7 precedes D3: the same typo with an over-window state is auto-routed
+    // AND truncated by Laya; the re-route (an endpoint fault) is what's reported.
+    let mut typo_long = request(Some("englsh"), vec![], None);
+    typo_long.state = long.state.clone();
+    match adapter.decide(&cfg, &typo_long).await.unwrap_err() {
+        GatewayError::ProviderError {
+            status: Some(200),
+            message,
+            ..
+        } => {
+            eprintln!("LIVE D7-over-D3 refusal: {message}");
+            assert!(message.contains("'englsh'"), "{message}");
+        }
+        other => panic!("expected the D7 re-route refusal over D3, got {other:?}"),
+    }
+
+    // An image is refused client-side (the mock test `laya_refuses_images_before_any_request`
+    // pins that nothing is sent).
+    match adapter
+        .decide(
+            &cfg,
+            &request(Some(&model), vec![PNG_B64.to_string()], None),
+        )
+        .await
+        .unwrap_err()
+    {
+        GatewayError::InputRejected { message, .. } => {
+            assert!(message.contains("does not read images"), "{message}")
+        }
+        other => panic!("expected the image refusal, got {other:?}"),
+    }
+
+    // D6 / AC9: the 808-character instruction is refused client-side (the mock
+    // tests pin that nothing is sent); the 288-character one is answered.
+    match adapter
+        .decide(&cfg, &noul_request(&model, long_instruction()))
+        .await
+        .unwrap_err()
+    {
+        GatewayError::InputRejected { message, .. } => {
+            eprintln!("LIVE D6 refusal: {message}");
+            assert!(message.contains("Laya would silently cut it"), "{message}")
+        }
+        other => panic!("expected the D6 head-budget refusal, got {other:?}"),
+    }
+    let fits = format!("{}Does the user want a refund?", "Ignore this. ".repeat(20));
+    let resp = adapter
+        .decide(&cfg, &noul_request(&model, fits))
+        .await
+        .expect("a 288-character instruction is within every checkpoint's budget");
+    eprintln!("LIVE 288-char answer: {:?}", resp.answers["refund"]);
+    assert!(matches!(
+        resp.answers["refund"],
+        DecisionAnswer::Noul { noul } if (0.0..=1.0).contains(&noul)
+    ));
 }

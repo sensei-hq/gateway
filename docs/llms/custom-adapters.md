@@ -88,8 +88,13 @@ A host of TypeSafe's System One API (`POST {base}/v1/systemone`) usually needs n
 adapter: `gateway::adapters::systemone::SystemOneAdapter::from_config_with_id("<router id>",
 &cfg)` is a decision-only, bearer-auth adapter for any such host — give the router a
 `url` (only `openrouter` and `typesafe` have a default). It sends decision images as
-`data:<sniffed mime>;base64,…` (PNG / JPEG / WebP / GIF); a host that only accepts bare
-base64, as Ollama does, needs its own adapter.
+`data:<sniffed mime>;base64,…` (PNG / JPEG / WebP / GIF) (except under the id `laya`, which refuses images before
+sending; a host that ignores images but is registered under another id still receives
+them); a host that only accepts bare base64, as Ollama does, needs its own adapter.
+A request your adapter cannot serve while the endpoint is healthy (an unsupported image, a
+truncated answer) should return `GatewayError::InputRejected { adapter, message }`: the
+engine falls back to the next candidate whatever `fallback_triggers` holds, never retries
+it, and never records it in the circuit breaker.
 
 ## Reuse the OpenAI-compatible core
 

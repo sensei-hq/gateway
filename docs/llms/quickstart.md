@@ -138,7 +138,7 @@ Always present: `success: bool`, `model: Option<String>`, `usage: Option<TokenUs
 `execute` returns `Result<InferenceResponse, GatewayError>`. Common variants:
 `NotConfigured`, `NoCandidates`, `InvalidRequest` (a structurally malformed decision
 call, raised before selection — never retried or fallen back), `Authentication`, `RateLimit`, `Timeout`,
-`ProviderError`, `BudgetExceeded`, `QuotaExceeded`, `AllAttemptsFailed { attempts_detail }`
+`ProviderError`, `InputRejected` (this candidate cannot serve the request's input while its endpoint is healthy — it always falls back, is never retried and never counts toward the breaker), `BudgetExceeded`, `QuotaExceeded`, `AllAttemptsFailed { attempts_detail }`
 (carries every attempt's error). Prefer `Gateway::try_new(..)` over `new` to validate
 config up front.
 
