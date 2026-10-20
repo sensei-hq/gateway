@@ -102,6 +102,16 @@ fn f2(v: Option<f64>) -> String {
     }
 }
 
+/// Accuracy and CI bounds: three decimals, because CI bounds are multiples of
+/// 0.005 and at two a separated winner's lower bound can print equal to the
+/// runner-up's upper bound.
+fn f3(v: Option<f64>) -> String {
+    match v {
+        Some(x) if x.is_finite() => format!("{x:.3}"),
+        _ => DASH.into(),
+    }
+}
+
 /// A share as a whole percent, rounded DOWN below 100% so that a model
 /// missing even one case never reads as "100%".
 fn pct(v: f64) -> String {
@@ -113,7 +123,7 @@ fn pct(v: f64) -> String {
 
 fn ci(v: Option<(f64, f64)>) -> String {
     match v {
-        Some((lo, hi)) if lo.is_finite() && hi.is_finite() => format!("[{lo:.2}, {hi:.2}]"),
+        Some((lo, hi)) if lo.is_finite() && hi.is_finite() => format!("[{lo:.3}, {hi:.3}]"),
         _ => DASH.into(),
     }
 }
@@ -269,9 +279,9 @@ fn summary(md: &mut String, models: &[String], rankings: &[ScenarioRanking]) {
             .iter()
             .map(|m| {
                 if let Some(x) = r.ranked.iter().find(|x| &x.id == m) {
-                    format!("{} (cov {})", f2(x.shared.accuracy), pct(x.own.coverage))
+                    format!("{} (cov {})", f3(x.shared.accuracy), pct(x.own.coverage))
                 } else if let Some((_, x)) = r.low_coverage.iter().find(|(id, _)| id == m) {
-                    format!("{} (cov {}, own cases)", f2(x.accuracy), pct(x.coverage))
+                    format!("{} (cov {}, own cases)", f3(x.accuracy), pct(x.coverage))
                 } else {
                     DASH.into()
                 }
@@ -293,7 +303,7 @@ fn metrics_row(md: &mut String, id: &str, own: &Metrics, m: &Metrics) {
         "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
         cell(id),
         pct(own.coverage),
-        f2(m.accuracy),
+        f3(m.accuracy),
         ci(m.ci),
         f2(m.ece),
         f2(m.confident_wrong),
@@ -812,10 +822,10 @@ mod tests {
             .unwrap_or_else(|| panic!("{summary}"));
         // good: 32/32 on the 32 shared cases; mid: 16/32 at 80% coverage;
         // ane: 10 own applicable cases, all right.
-        assert!(s3.contains("| 1.00 (cov 100%) |"), "{s3}");
+        assert!(s3.contains("| 1.000 (cov 100%) |"), "{s3}");
         // T7 review I4: the coverage is mid's own, not the shared set's 100%.
-        assert!(s3.contains("| 0.50 (cov 80%) |"), "{s3}");
-        assert!(s3.contains("| 1.00 (cov 25%, own cases) |"), "{s3}");
+        assert!(s3.contains("| 0.500 (cov 80%) |"), "{s3}");
+        assert!(s3.contains("| 1.000 (cov 25%, own cases) |"), "{s3}");
         let s2 = summary.lines().find(|l| l.starts_with("| S2")).unwrap();
         assert!(s2.trim_end().ends_with("| — |"), "ane has no S2 rows: {s2}");
     }
@@ -857,7 +867,7 @@ mod tests {
     }
 
     #[test]
-    fn numbers_use_two_decimals_and_cis_are_bracketed() {
+    fn accuracy_and_cis_use_three_decimals_other_rates_two_and_cis_are_bracketed() {
         let md = md();
         let f = fixture();
         let mid: Vec<ResultRow> = f
@@ -879,12 +889,63 @@ mod tests {
             .lines()
             .find(|l| l.starts_with("| mid |"))
             .unwrap_or_else(|| panic!("{s3}"));
-        assert!(line.contains("| 0.50 |"), "{line}");
-        assert!(line.contains(&format!("| [{lo:.2}, {hi:.2}] |")), "{line}");
+        assert!(line.contains("| 0.500 |"), "{line}");
+        assert!(line.contains(&format!("| [{lo:.3}, {hi:.3}] |")), "{line}");
         let error_rate = format!("| {:.2} |", 2.0 / 32.0);
         assert!(line.contains(&error_rate), "error rate 2/32: {line}");
         // T7 review I4: coverage is over mid's own 40 cases.
         assert!(line.starts_with("| mid | 80% |"), "{line}");
+    }
+
+    /// SP-DEC-4 review A3: CI bounds are multiples of 0.005, so at two
+    /// decimals a separated winner (lower bound 0.945) and the runner-up
+    /// (upper bound 0.94) both print "0.94" and the table contradicts the
+    /// verdict. Accuracy and CIs print to three decimals.
+    #[test]
+    fn ci_bounds_and_accuracy_print_three_decimals_so_a_winner_reads_separated() {
+        let metrics = |accuracy: f64, ci: (f64, f64)| Metrics {
+            n_total: 200,
+            n_applicable: 200,
+            n_ok: 200,
+            n_error: 0,
+            not_reached: 0,
+            coverage: 1.0,
+            accuracy: Some(accuracy),
+            ci: Some(ci),
+            ece: Some(0.05),
+            confident_wrong: Some(0.01),
+            error_rate: Some(0.0),
+            mae: None,
+            p50_ms: Some(10),
+            p95_ms: Some(20),
+        };
+        let model = |id: &str, m: Metrics| crate::rank::RankedModel {
+            id: id.into(),
+            shared: m.clone(),
+            own: m,
+        };
+        let ranking = ScenarioRanking {
+            scenario: Scenario::S1aIntentOos,
+            shared_cases: 200,
+            ranked: vec![
+                model("nimble", metrics(0.9675, (0.945, 0.99))),
+                model("laya-multilingual", metrics(0.9, (0.855, 0.94))),
+            ],
+            verdict: Verdict::Winner("nimble".into()),
+            low_coverage: vec![],
+            no_rows: vec![],
+        };
+        let mut md = String::new();
+        scenario_section(&mut md, &fixture(), &ranking);
+        summary(
+            &mut md,
+            &["nimble".into(), "laya-multilingual".into()],
+            std::slice::from_ref(&ranking),
+        );
+        assert!(md.contains("[0.945, 0.990]"), "{md}");
+        assert!(md.contains("[0.855, 0.940]"), "{md}");
+        assert!(md.contains("| 0.968 |"), "accuracy at 3 dp: {md}");
+        assert!(md.contains("| 0.968 (cov 100%) |"), "summary at 3 dp: {md}");
     }
 
     /// The `i`th cell (0 = model) of a table line.
