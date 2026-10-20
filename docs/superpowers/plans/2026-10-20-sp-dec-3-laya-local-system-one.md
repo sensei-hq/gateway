@@ -1103,3 +1103,64 @@ git push origin develop
 ```
 
 - [ ] **Step 5: Checkpoint and clean up.** Run `/sensei:checkpoint`, rewrite `docs/CHECKPOINT.md` (SP-DEC-3 done, carry-forwards: in-process CoreML Laya, CLM on Metal, a System One gate slice per the 2026-10-20 gate experiment, `/v1/systemone/batch`), and commit it. Then remove the scratch files: `rm -rf /tmp/laya-bench /tmp/laya-src /tmp/clm-src /tmp/sp-dec-3*.log` (nothing in them is tracked). `develop → main` goes as a batched PR for human review, so don't open it from this slice.
+
+---
+
+## Addendum — whole-slice review fixes (2026-10-20, user chose option 2)
+
+The Task 8 whole-slice review found that Laya silently cuts long question heads (HIGH), that input-caused refusals trip the circuit breaker and are retried (MEDIUM), and that a misspelled checkpoint is silently re-routed (MEDIUM). Spec D5–D7 and AC8–AC10 record the design. These tasks run before Task 8 resumes (its Steps 1–5 are re-run on the result). Same ground rules; red first; mutation-check every guard in a scratch copy or with a `/tmp` backup.
+
+### Task R1: `GatewayError::InputRejected` in the kernel (D5)
+
+**Files:** `crates/kernel/src/types/error.rs`, `crates/gateway/src/engine/util.rs` (`stream_error_code`), and any other exhaustive `match` the compiler names.
+
+- Variant (after `ProviderError`), with a doc comment stating D5's meaning:
+  ```rust
+      /// The candidate cannot serve this request's INPUT — the endpoint is healthy (SP-DEC-3 D5):
+      /// an image to a host that ignores images, an over-window state or question, … Falls back
+      /// whatever the trigger set, is never retryable, and is never recorded as an endpoint failure.
+      #[error("adapter '{adapter}' cannot serve this input: {message}")]
+      InputRejected { adapter: String, message: String },
+  ```
+- `should_trigger_fallback`: return `true` for `InputRejected` BEFORE the `triggers.is_empty()` early return.
+- `is_retryable`: `false` (it is not in the `matches!` list — assert it in a test).
+- `stream_error_code`: `GatewayError::InputRejected { .. } => "input_rejected".to_string()`.
+- Red-first unit tests in `error.rs`'s test module: falls back with `&[]` and with `&[FallbackTrigger::RateLimit]`; not retryable; Display names the adapter and message.
+- `crates/gateway/tests/docs_sync_capabilities.rs::the_fallback_table_answers_for_every_gateway_error_variant` will now fail until the fallback table in the docs gains an `InputRejected` row — add it (find the table the test reads) in this task.
+
+### Task R2: the engine treats `InputRejected` as a skip, not a fault (D5, AC8)
+
+**Files:** `crates/gateway/src/engine/execute.rs`, `crates/gateway/src/engine/exhaustion.rs`, tests in `crates/gateway/src/engine/decision_tests.rs` (and `tests.rs` if helpers live there).
+
+- In the `Err(err)` arm: if `err` is `InputRejected`, do NOT call `record_outcome`; still push the `Attempt` (`fallback_triggered` from `should_trigger_fallback`, which is now `true`); push `GateContribution::InputRejected`.
+- `GateContribution::InputRejected` (new): not `HardFailure` (so not retryable); `all_gated_error` returns `None` if any contribution is `InputRejected`.
+- `contribution_for` must not be the path for it (or must map it to the new variant) — keep one source of truth.
+- Red-first tests:
+  1. Breaker neutrality: a gateway whose breaker threshold is 1, a `Decider` double that returns `InputRejected` on the first call and succeeds after; two calls to the same router → the second is DISPATCHED (decider call count 2), not skipped as breaker-open.
+  2. Fallback with empty triggers: chain `[rejecting, ok]` with `fallback_triggers: vec![]` → served by `ok`, attempts `[rejecting, ok]`.
+  3. Exhaustion: chain `[rejecting]` only → `AllAttemptsFailed { retryable: false, .. }`, not `AllGated`.
+- Mutation-check each: re-add `record_outcome` for it (1 goes red); drop the early `true` in fallback (2 red); count it as `HardFailure` (3 red).
+
+### Task R3: producers use it; D6 budget; D7 re-route; test gaps (D2, D3, D5–D7, AC2/4/9/10)
+
+**Files:** `crates/cloud-providers/src/systemone.rs`, `crates/cloud-providers/tests/systemone_mock.rs`, `crates/cloud-providers/tests/cloudflare_mock.rs`, `crates/gateway/src/facade.rs` (test), `crates/gateway/tests/decision_laya.rs`.
+
+- Red first: change the existing expectations to `InputRejected` — `laya_refuses_images_before_any_request`, `an_unrecognisable_image_fails_before_any_request`, the four truncation tests (laya, no-detail, missing-answers, ollama, cloudflare), the facade test's image assertion, `decision_laya.rs`'s attempt-error check (its fallback now needs no `ProviderError` trigger — keep the trigger set as is; also add a variant with `fallback_triggers: vec![]` that still falls back).
+- Then switch the producers: `encode_images` errors and the truncation branch return `GatewayError::InputRejected { adapter, message }` (no status).
+- D6: a private `fn laya_head_budget(model: &str) -> usize` (`"english"` → 192; `"multilingual" | "typed-decisions"` → 256; `_` → 192) and `fn estimated_head_tokens(q: &DecisionQuestion) -> usize` per the spec formula (instructions rendered as the JSON-to-text the wire uses: a string as-is, an object/array as its JSON text). In `SystemOneAdapter::decide`, for `self.id == "laya"`, refuse the first question over budget BEFORE `decide(...)` with `InputRejected` naming the question, its estimate and the budget. Red tests: an 808-char instruction on `english` → `InputRejected`, wiremock `expect(0)`; the same on `multilingual` (budget 256, estimate ≈ 275) → refused; a 288-char one → sent; a choice with many long options counts the options; id `llamacpp` with the 808-char instruction → sent (no budget).
+- D7: `WireResponse` gains `#[serde(default)] routing: Option<WireRouting>` with `struct WireRouting { #[serde(default)] model: Option<String> }`; after the truncation check, if `routing.model` is `Some(m)` and `m != body_model` → `ProviderError { status: Some(status) }` "the host served checkpoint '{m}' instead of the requested '{body_model}' — check the model's api_model_id against the server's loaded checkpoints". Red tests: mismatch → error; equal → success; absent → success. Check `body_model` vs the Workers AI short name so Cloudflare is unaffected.
+- Test gaps (review MEDIUMs): a success case with `truncated:false, state_tokens_dropped:5, truncated_questions:["q"]`; a `truncated: null` case → `ProviderError` whose message contains "failed to parse System One response".
+- Live (ignored) additions in `live_laya_answers_every_type_and_reports_truncation`: the 808-char instruction is refused (`InputRejected`) and `model: "englsh"` is refused (`ProviderError` naming `english`). Run against `LAYA_URL=http://127.0.0.1:8766`.
+
+### Task R4: docs, spec, upgrading (D4–D7)
+
+- Every surface that says truncation / image refusal is a `ProviderError` → `InputRejected`; describe D5 (falls back regardless of triggers, not retried, not a breaker signal) — and REMOVE the now-false breaker/retry caveat for truncation and images (spec carry-forward too).
+- D6: Laya's per-question budget (english 192, multilingual / typed-decisions 256 tokens, estimate `chars/3`, conservative) on `local.md`, `providers.md`, `capabilities-and-adapters.md`, `recipes.md`, SKILL.
+- D7: a misspelled `api_model_id` is refused (re-routed checkpoint), check names against `/health`'s `loaded`.
+- The LOW security note while here: Laya's default `LAYA_HOST` is `0.0.0.0` with no auth unless `LAYA_API_KEY` — keep `127.0.0.1` or set a key and the router's `api_key_env`.
+- `upgrading.md`: retitle the Unreleased section as **breaking** (target 0.12.0): new `GatewayError::InputRejected` variant (add an arm to exhaustive matches); the D2/D3/unrecognisable-image refusals are now `InputRejected` (callers matching `ProviderError` for them must change); the D6 and D7 refusals.
+- `cargo test -p sensei-gateway --test docs_sync_capabilities`, `cargo doc`, `cd site && bun run check`.
+
+### Task R5: re-verify (Task 8 Steps 1–3 again)
+
+Full workspace tests, stable clippy, fmt, both live tests against the running server, then a re-review of the R1–R4 diff (fixes introduce defects) before the commit gate.
