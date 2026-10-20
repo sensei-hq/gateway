@@ -299,6 +299,7 @@ async fn fetch_rows_saving(
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let mut requested = false;
+    let mut any_resumed = false;
     let mut features: Option<Vec<Feature>> = None;
     let mut total: Option<u64> = None;
     let mut rows: Vec<Row> = Vec::new();
@@ -341,31 +342,22 @@ async fn fetch_rows_saving(
             ),
             None => what.clone(),
         })?;
-        match total {
-            None => total = Some(page.num_rows_total),
-            Some(t) if t != page.num_rows_total => bail!(
-                "{what}: num_rows_total changed from {t} to {} mid-fetch",
-                page.num_rows_total
-            ),
-            Some(_) => {}
-        }
-        match &features {
-            None => features = Some(page.features),
-            Some(f) if *f != page.features => bail!("{what}: features changed mid-fetch"),
-            Some(_) => {}
-        }
-        if page.rows.is_empty() && offset < page.num_rows_total {
-            bail!(
-                "{what}: no rows returned before num_rows_total {}",
-                page.num_rows_total
-            );
-        }
-        for (i, r) in page.rows.iter().enumerate() {
-            let want = offset + i as u64;
-            if r.row_idx != want {
-                bail!("{what}: expected row_idx {want}, got {}", r.row_idx);
+        any_resumed |= resumed.is_some();
+        if let Err(e) = check_page(&what, offset, total, features.as_deref(), &page) {
+            // A saved page from an earlier run disagrees with the live one; kept,
+            // it would fail every later fetch identically.
+            if let (true, Some(dir)) = (any_resumed, pages) {
+                let cleanup = discard_pages(dir);
+                return Err(e.context(format!(
+                    "saved pages {} from an earlier run disagree with the live dataset; \
+                     discarded them{cleanup}, re-run to fetch afresh",
+                    dir.display()
+                )));
             }
+            return Err(e);
         }
+        total.get_or_insert(page.num_rows_total);
+        features.get_or_insert(page.features);
         offset += page.rows.len() as u64;
         rows.extend(page.rows);
     }
@@ -374,6 +366,53 @@ async fn fetch_rows_saving(
         rows,
         num_rows_total: total.unwrap_or(0),
     })
+}
+
+/// `page` (at `offset`) agrees with the pages before it: the same
+/// `num_rows_total` and features, rows before the total, and contiguous
+/// `row_idx`.
+fn check_page(
+    what: &str,
+    offset: u64,
+    total: Option<u64>,
+    features: Option<&[Feature]>,
+    page: &RowsPage,
+) -> anyhow::Result<()> {
+    if let Some(t) = total
+        && t != page.num_rows_total
+    {
+        bail!(
+            "{what}: num_rows_total changed from {t} to {} mid-fetch",
+            page.num_rows_total
+        );
+    }
+    if let Some(f) = features
+        && *f != page.features[..]
+    {
+        bail!("{what}: features changed mid-fetch");
+    }
+    if page.rows.is_empty() && offset < page.num_rows_total {
+        bail!(
+            "{what}: no rows returned before num_rows_total {}",
+            page.num_rows_total
+        );
+    }
+    for (i, r) in page.rows.iter().enumerate() {
+        let want = offset + i as u64;
+        if r.row_idx != want {
+            bail!("{what}: expected row_idx {want}, got {}", r.row_idx);
+        }
+    }
+    Ok(())
+}
+
+/// Remove the saved pages `dir`; empty on success, otherwise a note naming
+/// the failure for the caller's error.
+fn discard_pages(dir: &Path) -> String {
+    std::fs::remove_dir_all(dir)
+        .err()
+        .map(|e| format!(" (and removing {} failed: {e})", dir.display()))
+        .unwrap_or_default()
 }
 
 /// `<user cache dir>/decision-bench`.
@@ -516,10 +555,7 @@ async fn load_or_fetch(
     let page = fetch_rows_saving(hf, id, config, split, Some(&pages_dir)).await?;
     let after = hub_info(hf, id).await?;
     if after.sha != hub.sha {
-        let cleanup = std::fs::remove_dir_all(&pages_dir)
-            .err()
-            .map(|e| format!(" (and removing {} failed: {e})", pages_dir.display()))
-            .unwrap_or_default();
+        let cleanup = discard_pages(&pages_dir);
         bail!(
             "{id}: the hub revision moved from {} to {} during the fetch; re-run{cleanup}",
             hub.sha,
@@ -1308,6 +1344,40 @@ mod tests {
                 && err.contains("delete it to re-fetch"),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_stale_resumed_page_is_discarded_so_a_retry_succeeds() {
+        let hub = hub_with_sha("s1").await;
+        let ds = MockServer::start().await;
+        Mock::given(path("/rows"))
+            .respond_with(Pager(300))
+            .mount(&ds)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let pages = root.path().join("org__ds@s1").join("plain-test.pages");
+        std::fs::create_dir_all(&pages).unwrap();
+        // Saved by an earlier run when the split had 250 rows.
+        std::fs::write(pages.join("0.json"), page(250, 0, 100).to_string()).unwrap();
+        let h = hf(&ds.uri(), &hub.uri());
+        let err = format!(
+            "{:#}",
+            h.load_or_fetch(root.path(), "org/ds", "plain", "test")
+                .await
+                .unwrap_err()
+        );
+        assert!(
+            err.contains("num_rows_total changed from 250 to 300")
+                && err.contains(&pages.display().to_string())
+                && err.contains("discarded"),
+            "{err}"
+        );
+        assert!(!pages.exists(), "the stale pages were kept");
+        let got = h
+            .load_or_fetch(root.path(), "org/ds", "plain", "test")
+            .await
+            .unwrap();
+        assert_eq!(got.rows.len(), 300);
     }
 
     #[tokio::test]
