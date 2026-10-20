@@ -114,6 +114,8 @@ wiremock = "0.6"
 tempfile = "3"
 ```
 
+**As built (T1 review):** edition 2024, `reqwest` 0.13 with feature `rustls`, and `dirs` 6, which are the workspace's own versions. The snippet above predates that check. `gateway_config_for` returns `anyhow::Result<GatewayConfig>`, built through the public `GatewayBuilder`, and rejects routers the facade does not register.
+
 Before choosing versions, check each dependency's workspace pin (`rg -n '^(reqwest|tokio|serde|wiremock|rand|toml|clap|anyhow|dirs|tempfile) ' crates/*/Cargo.toml`). Reuse the workspace's version and features wherever one already exists, so the lockfile gains no second major version.
 
 - [ ] **Step 2 — Red test.** Put this in `config.rs` under `#[cfg(test)]`:
@@ -175,7 +177,7 @@ pub struct Case {
 
 - [ ] **Step 2 — Red tests.**
   - `case_round_trips_through_jsonl`: write two cases with `write_jsonl` and read them back with `read_jsonl`; they must be equal.
-  - `a_header_line_is_returned_separately`: the first line of an S4 file is `{"labels_reviewed_by": null, "notes": "..."}`; `read_case_file` returns `(Option<String>, Vec<Case>)`.
+  - `a_header_line_is_returned_separately`: the first line of an S4 file is `{"labels_reviewed_by": null, "notes": "..."}`; `read_case_file` returns `(Header, Vec<Case>)` as built (`Header { labels_reviewed_by, notes }`); the original text said `(Option<String>, Vec<Case>)`.
   - `expected_must_match_the_question_type`: a `Choice` expectation whose option is not among the question's criteria is rejected with an error naming the case id. Do the same for a `Score` level out of range.
 - [ ] **Step 3 — Implement.** Write `read_jsonl`, `write_jsonl`, `read_case_file` and `Case::validate()`. `read_case_file` calls `validate` on every case.
 - [ ] **Step 4 — Green, mutation, commit.** For the mutation, remove the validate call and confirm the test goes red. Commit as `feat(decision-bench): Case/Expected types, JSONL io, expectation validation (SP-DEC-4 T2)`.
@@ -211,6 +213,7 @@ pub struct Case {
     - S2: `Score { instructions: json!("What is the sentiment of this text?"), criteria: vec!["negative","neutral","positive"] }`.
     - S3: `Noul { instructions: json!("Does the hypothesis follow from the premise?"), criteria: None }`.
   - For S1a and S1b, the state is the text as a JSON string.
+- [ ] **Record versions.** Record the `rand` crate version next to the seed, in each case's `source` metadata and in `results.json`, because `StdRng`'s algorithm is not stable across rand majors. That way a report states exactly how to reproduce its sample.
 - [ ] **Step 5 — `fetch` command.** `main.rs fetch --per-scenario N --seed S --out <dir, default crates/decision-bench/cases>` writes `s1a.jsonl`, `s1b.jsonl`, `s2.jsonl` and `s3.jsonl`. Add `crates/decision-bench/cases/` to `.gitignore`, because public data is never committed.
 - [ ] **Step 6 — Green.** Mutate the seed handling (use a constant seed) and the oos rule, and confirm the tests go red. Commit as `feat(decision-bench): datasets-server fetch with sha guard + seeded S1a/S1b/S2/S3 builders (SP-DEC-4 T3)`.
 
@@ -258,7 +261,10 @@ pub const INPUT_REJECTED_MARKER: &str = "cannot serve this input: ";
   - `pub fn classify(err: &GatewayError) -> Outcome`
   - `pub fn score(case: &Case, answer: &DecisionAnswer) -> (bool, f64, Option<f64>)`
   - `pub async fn run(cfg: &BenchConfig, cases: &[Case], models: &[String]) -> Vec<ResultRow>`. For each model:
-    - build `FacadeBuilder::new(cfg.gateway_config_for(m)).build().await.gateway`;
+    - build `FacadeBuilder::new(cfg.gateway_config_for(m)?).circuit_breaker(CircuitBreakerConfig { threshold: usize::MAX, timeout: Duration::from_secs(1), half_open_max_requests: 1 }).build().await.gateway`.
+      - **The breaker must be off for bench runs** (T1 review). With the default threshold of 5, five real server failures in a row gate every later case into a ~0 ms skip that never reaches the server, so cases are dropped silently.
+      - Build one facade per model, and pin `chain: Some(chain_id(m))` on every request.
+      - T8 proves this: a mock returns 500 six times, and the sixth case still reaches the server.
     - send one warm-up call (the first case, result discarded);
     - then for each case, build an `InferenceRequest` (`Capability::Decision`, `chain: Some(chain_id(m))`, `payload: Payload::Decision { state, questions: {"q": question}, images: vec![], keep_alive: None }`, `allow_fallback: false`, the other fields as in `crates/gateway/tests/decision_laya.rs`), time `gw.execute`, and classify the result.
   - A result whose `decisions` is missing `"q"` is `Error` with `detail: "no answer"`.
