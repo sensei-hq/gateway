@@ -385,6 +385,89 @@ mod tests {
 
     const CRATE: &str = env!("CARGO_MANIFEST_DIR");
 
+    /// Split like a POSIX shell for the one quoting form the footer emits:
+    /// whitespace separates words, `'...'` is literal, `\'` is a bare quote.
+    fn shell_split(line: &str) -> Vec<String> {
+        let (mut words, mut cur, mut in_word, mut quoted) =
+            (Vec::new(), String::new(), false, false);
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            match (quoted, c) {
+                (true, '\'') => quoted = false,
+                (true, c) => cur.push(c),
+                (false, '\'') => {
+                    quoted = true;
+                    in_word = true;
+                }
+                (false, '\\') => {
+                    cur.push(chars.next().expect("dangling backslash"));
+                    in_word = true;
+                }
+                (false, c) if c.is_whitespace() => {
+                    if in_word {
+                        words.push(std::mem::take(&mut cur));
+                        in_word = false;
+                    }
+                }
+                (false, c) => {
+                    cur.push(c);
+                    in_word = true;
+                }
+            }
+        }
+        assert!(!quoted, "unterminated quote in {line}");
+        if in_word {
+            words.push(cur);
+        }
+        words
+    }
+
+    /// SP-DEC-4 T7 nit: a path with a space or a quote must survive copy-paste.
+    #[test]
+    fn every_reproduce_line_parses_when_a_path_has_a_space_or_a_quote() {
+        use decision_bench::run::{Results, RunPaths};
+        let results = Results {
+            generated_at: 0,
+            manifest: None,
+            not_run: vec![],
+            roster: vec![],
+            labels_reviewed: vec![],
+            completed: vec![],
+            paths: Some(RunPaths {
+                config: Some("my bench.toml".into()),
+                cases: "my cases".into(),
+                results: "it's out/r.json".into(),
+                report: Some("my report.md".into()),
+            }),
+            rows: vec![],
+        };
+        let md = render(&results, 7);
+        let block = md
+            .split("```sh\n")
+            .nth(1)
+            .and_then(|b| b.split("```").next())
+            .expect("a sh block");
+        let mut seen = Vec::new();
+        for line in block.lines().filter(|l| !l.is_empty()) {
+            let words = shell_split(line);
+            let prefix = ["cargo", "run", "--release", "-p", "decision-bench", "--"];
+            assert_eq!(&words[..6], prefix, "{line}");
+            Cli::try_parse_from(
+                std::iter::once("decision-bench".to_string()).chain(words[6..].iter().cloned()),
+            )
+            .unwrap_or_else(|e| panic!("{line}: {e}"));
+            seen.extend(words);
+        }
+        for want in [
+            "my cases",
+            "my bench.toml",
+            "it's out/r.json",
+            "my report.md",
+        ] {
+            assert!(seen.iter().any(|w| w == want), "{want} not a single word");
+        }
+    }
+
     #[test]
     fn relative_paths_resolve_against_the_crate_dir_and_absolute_ones_are_kept() {
         assert_eq!(resolve(Path::new("cases")), Path::new(CRATE).join("cases"));
