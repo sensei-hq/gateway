@@ -510,7 +510,9 @@ pub async fn fetch_cases(
         datasets,
         files,
     };
-    write_case_set(opts.out, &built, &manifest)?;
+    for warning in write_case_set(opts.out, &built, &manifest)? {
+        eprintln!("warning: {warning}");
+    }
     Ok(manifest)
 }
 
@@ -520,70 +522,150 @@ fn sibling(dir: &std::path::Path, suffix: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(s)
 }
 
+/// The filesystem calls the case-set swap makes, injectable so tests can fail
+/// them.
+struct SwapFs {
+    rename: fn(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+    remove_dir_all: fn(&std::path::Path) -> std::io::Result<()>,
+}
+
+fn real_rename(a: &std::path::Path, b: &std::path::Path) -> std::io::Result<()> {
+    std::fs::rename(a, b)
+}
+
+fn real_remove_dir_all(p: &std::path::Path) -> std::io::Result<()> {
+    std::fs::remove_dir_all(p)
+}
+
+impl SwapFs {
+    const REAL: SwapFs = SwapFs {
+        rename: real_rename,
+        remove_dir_all: real_remove_dir_all,
+    };
+}
+
+/// A directory this tool may replace or delete: empty, or holding a
+/// `manifest.json` (a case set, or our own staging dir, which gets its
+/// manifest first).
+fn is_ours(dir: &std::path::Path) -> anyhow::Result<bool> {
+    Ok(dir.join("manifest.json").exists()
+        || std::fs::read_dir(dir)
+            .with_context(|| format!("reading {}", dir.display()))?
+            .next()
+            .is_none())
+}
+
 /// Write every case file plus `manifest.json` into `<out>.tmp/`, then swap it
-/// in for `out`, so the files in `out` always come from one run. An existing
-/// `out` is replaced only if it is empty or holds a `manifest.json` (a
-/// previous case set), never an unrelated directory.
+/// in for `out` (`out` → `<out>.old`, `<out>.tmp` → `out`, delete `.old`), so
+/// the files in `out` always come from one run. Returns warnings that do not
+/// make the run a failure.
+///
+/// Safety rules:
+/// - a crash between the two renames leaves no `out` and the previous set in
+///   `<out>.old`; the next run renames it back before anything else;
+/// - an existing `out`, `.tmp` or `.old` is replaced or deleted only if
+///   [`is_ours`]; anything else is an error naming it.
 fn write_case_set(
     out: &std::path::Path,
     built: &[(DatasetSpec, Vec<Case>)],
     manifest: &Manifest,
-) -> anyhow::Result<()> {
-    let replaces = out.exists();
-    if replaces {
-        let is_case_set = out.join("manifest.json").exists()
-            || std::fs::read_dir(out)
-                .with_context(|| format!("reading {}", out.display()))?
-                .next()
-                .is_none();
-        if !is_case_set {
-            bail!(
-                "refusing to replace {}: it is not empty and has no manifest.json, so it is not \
-                 a decision-bench case set",
+) -> anyhow::Result<Vec<String>> {
+    write_case_set_with(&SwapFs::REAL, out, built, manifest)
+}
+
+fn write_case_set_with(
+    fs: &SwapFs,
+    out: &std::path::Path,
+    built: &[(DatasetSpec, Vec<Case>)],
+    manifest: &Manifest,
+) -> anyhow::Result<Vec<String>> {
+    let mut warnings = Vec::new();
+    let tmp = sibling(out, ".tmp");
+    let old = sibling(out, ".old");
+    if !out.exists() && old.join("manifest.json").exists() {
+        (fs.rename)(&old, out).with_context(|| {
+            format!(
+                "restoring the previous case set from {} to {}",
+                old.display(),
                 out.display()
-            );
-        }
+            )
+        })?;
+        warnings.push(format!(
+            "restored the previous case set from {} (an earlier run stopped mid-swap)",
+            old.display()
+        ));
+    }
+    let replaces = out.exists();
+    if replaces && !is_ours(out)? {
+        bail!(
+            "refusing to replace {}: it is not empty and has no manifest.json, so it is not \
+             a decision-bench case set",
+            out.display()
+        );
     }
     if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let tmp = sibling(out, ".tmp");
-    let old = sibling(out, ".old");
     for leftover in [&tmp, &old] {
-        if leftover.exists() {
-            std::fs::remove_dir_all(leftover)
-                .with_context(|| format!("removing leftover {}", leftover.display()))?;
+        if !leftover.exists() {
+            continue;
         }
+        if !is_ours(leftover)? {
+            bail!(
+                "refusing to delete {}: it is not empty and has no manifest.json, so it is not \
+                 a leftover of this tool; move it away",
+                leftover.display()
+            );
+        }
+        (fs.remove_dir_all)(leftover)
+            .with_context(|| format!("removing leftover {}", leftover.display()))?;
     }
     let staged = (|| -> anyhow::Result<()> {
         std::fs::create_dir(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        // The manifest goes in first, so a staging dir left by a crash is
+        // recognisably ours (see `is_ours`).
+        let mut bytes = serde_json::to_vec_pretty(manifest)?;
+        bytes.push(b'\n');
+        crate::fetch::write_atomic(&tmp.join("manifest.json"), &bytes)?;
         for (spec, cases) in built {
             crate::case::write_jsonl(&tmp.join(spec.file), cases)?;
         }
-        let mut bytes = serde_json::to_vec_pretty(manifest)?;
-        bytes.push(b'\n');
-        crate::fetch::write_atomic(&tmp.join("manifest.json"), &bytes)
+        Ok(())
     })();
     if let Err(e) = staged {
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = (fs.remove_dir_all)(&tmp);
         return Err(e);
     }
-    // Two renames: no portable call swaps two directories atomically. If the
-    // second fails, the previous set is put back.
+    // Two renames: no portable call swaps two directories atomically.
     if replaces {
-        std::fs::rename(out, &old).with_context(|| format!("moving {} aside", out.display()))?;
+        (fs.rename)(out, &old)
+            .with_context(|| format!("moving {} aside to {}", out.display(), old.display()))?;
     }
-    if let Err(e) = std::fs::rename(&tmp, out) {
+    if let Err(e) = (fs.rename)(&tmp, out) {
+        let swap = format!("renaming {} to {}: {e}", tmp.display(), out.display());
         if replaces {
-            let _ = std::fs::rename(&old, out);
+            if let Err(back) = (fs.rename)(&old, out) {
+                bail!(
+                    "{swap}; restoring the previous set from {} also failed: {back}. The \
+                     previous set is still in {}, and the new one in {}",
+                    old.display(),
+                    old.display(),
+                    tmp.display()
+                );
+            }
+            bail!("{swap}; the previous set was put back");
         }
-        return Err(e).with_context(|| format!("renaming {} to {}", tmp.display(), out.display()));
+        bail!("{swap}");
     }
-    if replaces {
-        std::fs::remove_dir_all(&old).with_context(|| format!("removing {}", old.display()))?;
+    if replaces && let Err(e) = (fs.remove_dir_all)(&old) {
+        warnings.push(format!(
+            "the new case set is in place, but removing the previous one at {} failed: {e}; \
+             delete it by hand",
+            old.display()
+        ));
     }
-    Ok(())
+    Ok(warnings)
 }
 
 #[cfg(test)]
@@ -1262,5 +1344,178 @@ mod tests {
         let empty = root.path().join("empty");
         std::fs::create_dir_all(&empty).unwrap();
         fetch_into(&hf, cache.path(), &empty, 1).await.unwrap();
+    }
+
+    // --- write_case_set: crash recovery and honest failure paths ---
+
+    fn tiny_set() -> (Vec<(DatasetSpec, Vec<Case>)>, Manifest) {
+        let (rows, names) = intent_set("label", false);
+        let cases = build_s1b(SRC, &rows, &names, 1, 2).unwrap();
+        let manifest = Manifest {
+            seed: 1,
+            per_scenario: 2,
+            rand_version: RAND_VERSION.into(),
+            datasets: vec![],
+            files: vec![],
+        };
+        (vec![(DATASETS[1], cases)], manifest)
+    }
+
+    /// A previous case set: `manifest.json` + `s1b.jsonl` holding `marker`.
+    fn old_set(dir: &std::path::Path, marker: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), "{}").unwrap();
+        std::fs::write(dir.join("s1b.jsonl"), marker).unwrap();
+    }
+
+    fn injected() -> std::io::Error {
+        std::io::Error::other("injected failure")
+    }
+    fn ends(p: &std::path::Path, suffix: &str) -> bool {
+        p.to_string_lossy().ends_with(suffix)
+    }
+    fn rename_fails_from_tmp(a: &std::path::Path, b: &std::path::Path) -> std::io::Result<()> {
+        if ends(a, ".tmp") {
+            return Err(injected());
+        }
+        std::fs::rename(a, b)
+    }
+    fn rename_fails_from_tmp_and_old(
+        a: &std::path::Path,
+        b: &std::path::Path,
+    ) -> std::io::Result<()> {
+        if ends(a, ".tmp") || ends(a, ".old") {
+            return Err(injected());
+        }
+        std::fs::rename(a, b)
+    }
+    fn remove_fails_on_old(p: &std::path::Path) -> std::io::Result<()> {
+        if ends(p, ".old") {
+            return Err(injected());
+        }
+        std::fs::remove_dir_all(p)
+    }
+
+    #[test]
+    fn a_set_stranded_in_old_by_a_crash_is_restored_not_deleted() {
+        // Crash between `rename(out, old)` and `rename(tmp, out)`: no `out`,
+        // the only copy of the previous set in `<out>.old`. Make this run's
+        // swap fail too: the previous set must come back as `out`.
+        let root = tempfile::tempdir().unwrap();
+        let out = root.path().join("cases");
+        old_set(&root.path().join("cases.old"), "previous");
+        let (built, m) = tiny_set();
+        let fs = SwapFs {
+            rename: rename_fails_from_tmp,
+            ..SwapFs::REAL
+        };
+        assert!(write_case_set_with(&fs, &out, &built, &m).is_err());
+        assert_eq!(
+            std::fs::read_to_string(out.join("s1b.jsonl")).unwrap(),
+            "previous"
+        );
+
+        // And a normal run after the crash replaces it, leaving no scratch.
+        let root = tempfile::tempdir().unwrap();
+        let out = root.path().join("cases");
+        old_set(&root.path().join("cases.old"), "previous");
+        let warnings = write_case_set(&out, &built, &m).unwrap();
+        assert!(
+            warnings.iter().any(|w| w.contains("restored")),
+            "{warnings:?}"
+        );
+        assert_ne!(
+            std::fs::read_to_string(out.join("s1b.jsonl")).unwrap(),
+            "previous"
+        );
+        assert_eq!(listing(root.path()), ["cases"]);
+    }
+
+    #[test]
+    fn a_leftover_tmp_or_old_that_is_not_ours_is_never_deleted() {
+        for suffix in [".old", ".tmp"] {
+            let root = tempfile::tempdir().unwrap();
+            let out = root.path().join("cases");
+            old_set(&out, "current");
+            let theirs = root.path().join(format!("cases{suffix}"));
+            std::fs::create_dir_all(&theirs).unwrap();
+            std::fs::write(theirs.join("notes.txt"), "keep me").unwrap();
+            let (built, m) = tiny_set();
+            let err = write_case_set(&out, &built, &m).unwrap_err().to_string();
+            assert!(
+                err.contains(&theirs.display().to_string()) && err.contains("manifest.json"),
+                "{err}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(theirs.join("notes.txt")).unwrap(),
+                "keep me"
+            );
+            assert_eq!(
+                std::fs::read_to_string(out.join("s1b.jsonl")).unwrap(),
+                "current"
+            );
+        }
+        // Our own leftovers (empty, or holding a manifest) are cleared.
+        let root = tempfile::tempdir().unwrap();
+        let out = root.path().join("cases");
+        old_set(&out, "current");
+        old_set(&root.path().join("cases.old"), "stale");
+        std::fs::create_dir_all(root.path().join("cases.tmp")).unwrap();
+        let (built, m) = tiny_set();
+        write_case_set(&out, &built, &m).unwrap();
+        assert_eq!(listing(root.path()), ["cases"]);
+    }
+
+    #[test]
+    fn a_failed_rollback_reports_both_errors_and_where_the_old_set_is() {
+        let root = tempfile::tempdir().unwrap();
+        let out = root.path().join("cases");
+        old_set(&out, "current");
+        let (built, m) = tiny_set();
+        let fs = SwapFs {
+            rename: rename_fails_from_tmp_and_old,
+            ..SwapFs::REAL
+        };
+        // The first rename (out -> old) must succeed: it is not from .tmp/.old.
+        let err = format!(
+            "{:#}",
+            write_case_set_with(&fs, &out, &built, &m).unwrap_err()
+        );
+        let old = root.path().join("cases.old");
+        assert!(
+            err.matches("injected failure").count() == 2
+                && err.contains(&old.display().to_string())
+                && err.contains("restoring"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(old.join("s1b.jsonl")).unwrap(),
+            "current"
+        );
+    }
+
+    #[test]
+    fn a_failed_cleanup_after_a_successful_swap_is_a_warning_not_an_error() {
+        let root = tempfile::tempdir().unwrap();
+        let out = root.path().join("cases");
+        old_set(&out, "current");
+        let (built, m) = tiny_set();
+        let fs = SwapFs {
+            remove_dir_all: remove_fails_on_old,
+            ..SwapFs::REAL
+        };
+        let warnings = write_case_set_with(&fs, &out, &built, &m).unwrap();
+        let old = root.path().join("cases.old");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains(&old.display().to_string()) && w.contains("injected failure")),
+            "{warnings:?}"
+        );
+        assert!(out.join("manifest.json").exists());
+        assert_ne!(
+            std::fs::read_to_string(out.join("s1b.jsonl")).unwrap(),
+            "current"
+        );
     }
 }
