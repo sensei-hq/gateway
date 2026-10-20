@@ -118,8 +118,9 @@ pub struct Loaded {
 
 impl BenchConfig {
     /// Load `explicit` (relative paths resolve under `crate_dir`), or else
-    /// `crate_dir/bench.toml`, or else `crate_dir/bench.example.toml`. Every
-    /// model must build a valid gateway config.
+    /// `crate_dir/bench.toml`, or else `crate_dir/bench.example.toml`. Only an
+    /// unreadable or unparsable file is an error; model entries are checked by
+    /// `check`.
     pub fn load(
         explicit: Option<&std::path::Path>,
         crate_dir: &std::path::Path,
@@ -138,13 +139,10 @@ impl BenchConfig {
         };
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading config {}", path.display()))?;
+        // Structural errors only: a model entry the gateway rejects is
+        // reported NOT RUN by `check`, so one bad entry cannot stop the rest.
         let config =
             Self::from_toml(&text).with_context(|| format!("parsing config {}", path.display()))?;
-        for m in &config.models {
-            config
-                .gateway_config_for(m)
-                .with_context(|| format!("config {}", path.display()))?;
-        }
         Ok(Loaded {
             config,
             path,
@@ -292,16 +290,18 @@ context_window = 8192
         assert!(format!("{err:#}").contains("gone.toml"), "{err:#}");
     }
 
+    /// T7 review M3: one bad model entry must not abort every model; `check`
+    /// reports it NOT RUN. Only structural errors fail the load.
     #[test]
-    fn load_rejects_an_invalid_model_and_unparsable_toml_naming_the_file() {
+    fn load_keeps_an_invalid_model_and_rejects_unparsable_toml_naming_the_file() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("bench.toml"),
             ONE.replace("llamacpp", "nope"),
         )
         .unwrap();
-        let err = format!("{:#}", BenchConfig::load(None, dir.path()).unwrap_err());
-        assert!(err.contains("solo") && err.contains("nope"), "{err}");
+        let l = BenchConfig::load(None, dir.path()).unwrap();
+        assert_eq!(l.config.models[0].router, "nope");
         std::fs::write(dir.path().join("bench.toml"), "models = 3").unwrap();
         let err = format!("{:#}", BenchConfig::load(None, dir.path()).unwrap_err());
         assert!(err.contains("bench.toml"), "{err}");

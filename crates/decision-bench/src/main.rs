@@ -619,6 +619,46 @@ mod tests {
         );
     }
 
+    /// T7 review M3: an invalid model entry is a NOT RUN row, not an abort.
+    #[tokio::test]
+    async fn an_invalid_model_entry_is_not_run_and_the_rest_still_run() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "model": "good-api",
+                "answers": {"q": {"type": "noul", "noul": 0.9}},
+                "usage": {"input_tokens": 30, "output_tokens": 0}
+            })))
+            .mount(&server)
+            .await;
+        let mut bad = spec("bad", &server.uri());
+        bad.router = "nope".into();
+        let dir = crate_dir(&[bad, spec("good", &server.uri())]);
+        let select = Select {
+            config: None,
+            models: None,
+        };
+        let results = run_command(
+            &select,
+            Path::new("cases"),
+            Some("s3"),
+            Path::new("results.json"),
+            dir.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.not_run.len(), 1, "{:?}", results.not_run);
+        assert_eq!(results.not_run[0].model, "bad");
+        assert!(
+            results.not_run[0].reason.contains("nope"),
+            "{:?}",
+            results.not_run
+        );
+        assert_eq!(results.completed, ["good"]);
+    }
+
     #[tokio::test]
     async fn check_reports_not_run_and_returns_normally_but_a_bad_config_is_an_error() {
         let dir = crate_dir(&[spec("down", "http://127.0.0.1:9")]);

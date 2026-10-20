@@ -5,7 +5,9 @@
 
 use std::time::Duration;
 
+use gateway::GatewayError;
 use gateway::types::decision::DecisionQuestion;
+use gateway::types::error::HumanAction;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -38,54 +40,42 @@ pub async fn check(cfg: &BenchConfig, model_ids: &[String]) -> Vec<CheckResult> 
     check_with_timeout(cfg, model_ids, PROBE_TIMEOUT).await
 }
 
-/// Probe each of `model_ids` (config order; ids not in the config last, each
-/// NOT RUN) with one noul decision, `state: "x"`, through
-/// [`gateway_with_timeout`]: its router timeout is `timeout`, and the whole
-/// call is cut off shortly after it in case a server holds the connection.
-///
-/// - `Reachable`: an answer, or a refusal of the input that came back after
-///   the request was dispatched (`InputRejected`, e.g. server-side
-///   truncation): the server answered.
-/// - A refusal before anything was sent (the gateway's context-window gate;
-///   the tiniest probe is estimated at well over 96 tokens) proves nothing
-///   about the server. Such a model is `Reachable` iff another probed model
-///   with the same router and URL answered, else NOT RUN.
-/// - `NotRun { reason }`: an invalid model config, a network failure, a
-///   timeout, a 5xx and every other error.
+/// [`check_with_timeouts`] with the router timeout `timeout` and a hard
+/// cut-off [`CUTOFF_GRACE`] after it, in case a server holds the connection.
 pub async fn check_with_timeout(
     cfg: &BenchConfig,
     model_ids: &[String],
     timeout: Duration,
 ) -> Vec<CheckResult> {
-    let mut probed: Vec<(&ModelSpec, Probe)> = Vec::new();
+    check_with_timeouts(cfg, model_ids, timeout, timeout + CUTOFF_GRACE).await
+}
+
+/// Probe each of `model_ids` (config order; ids not in the config last, each
+/// NOT RUN) with one noul decision, `state: "x"`, through
+/// [`gateway_with_timeout`] (router timeout `router_timeout`), abandoning the
+/// call outright after `cut_off`.
+///
+/// - `Reachable`: an answer, or a refusal of the input that came back after
+///   the request was dispatched (`InputRejected`, e.g. server-side
+///   truncation): the server answered.
+/// - NOT RUN, "no input fits: …": the gateway's context-window gate refused
+///   the minimal decision before sending, so no case could ever be sent (the
+///   example roster's `laya-ane`, 96 tokens).
+/// - NOT RUN with its reason: an invalid model entry, any other pre-send
+///   gate, a network failure, a timeout, a 5xx and every other error.
+pub async fn check_with_timeouts(
+    cfg: &BenchConfig,
+    model_ids: &[String],
+    router_timeout: Duration,
+    cut_off: Duration,
+) -> Vec<CheckResult> {
+    let mut out = Vec::with_capacity(model_ids.len());
     for m in cfg.models.iter().filter(|m| model_ids.contains(&m.id)) {
-        probed.push((m, probe(cfg, m, timeout).await));
-    }
-    let server_up = |m: &ModelSpec| {
-        probed
-            .iter()
-            .any(|(o, p)| matches!(p, Probe::Answered) && o.router == m.router && o.url == m.url)
-    };
-    let mut out: Vec<CheckResult> = probed
-        .iter()
-        .map(|(m, p)| CheckResult {
+        out.push(CheckResult {
             model: m.id.clone(),
-            status: match p {
-                Probe::Answered => CheckStatus::Reachable,
-                Probe::Gated(_) if server_up(m) => CheckStatus::Reachable,
-                Probe::Gated(reason) => CheckStatus::NotRun {
-                    reason: format!(
-                        "the probe never reached the server: {reason}; and no other model \
-                         on the same {} server answered, so the server is unverified",
-                        m.router
-                    ),
-                },
-                Probe::Failed(reason) => CheckStatus::NotRun {
-                    reason: reason.clone(),
-                },
-            },
-        })
-        .collect();
+            status: probe(cfg, m, router_timeout, cut_off).await,
+        });
+    }
     for id in model_ids {
         if !cfg.models.iter().any(|m| &m.id == id) {
             out.push(CheckResult {
@@ -99,13 +89,27 @@ pub async fn check_with_timeout(
     out
 }
 
-/// What one probe showed.
-enum Probe {
-    /// The server answered (a decision, or a refusal after dispatch).
-    Answered,
-    /// Refused before dispatch; the reason.
-    Gated(String),
-    Failed(String),
+/// `(estimate, window)` from the context-window gate's skip text, e.g.
+/// `"… estimated 182 input tokens exceeds the model's 96-token context window"`.
+fn parse_window_gate(text: &str) -> Option<(u64, u64)> {
+    const EST: &str = "estimated ";
+    let after = &text[text.find(EST)? + EST.len()..];
+    let estimate = after.split(' ').next()?.parse().ok()?;
+    let before = &text[..text.find("-token context window")?];
+    let window = before.rsplit(' ').next()?.parse().ok()?;
+    Some((estimate, window))
+}
+
+/// The NOT RUN reason for a probe the context-window gate refused.
+fn no_fit_reason(skipped: &[String], m: &ModelSpec) -> String {
+    let text = skipped.join("; ");
+    match parse_window_gate(&text) {
+        Some((estimate, window)) => format!(
+            "no input fits: the gateway estimates the minimal decision at {estimate} input \
+             tokens > the model's {window}-token context window"
+        ),
+        None => format!("no input fits: {}", redact(&text, m)),
+    }
 }
 
 /// The probe case: a yes/no question on a one-character state.
@@ -123,27 +127,37 @@ pub fn probe_case() -> Case {
     }
 }
 
-async fn probe(cfg: &BenchConfig, m: &ModelSpec, timeout: Duration) -> Probe {
-    let gw = match gateway_with_timeout(cfg, m, timeout).await {
+async fn probe(
+    cfg: &BenchConfig,
+    m: &ModelSpec,
+    router_timeout: Duration,
+    cut_off: Duration,
+) -> CheckStatus {
+    let not_run = |reason: String| CheckStatus::NotRun { reason };
+    let gw = match gateway_with_timeout(cfg, m, router_timeout).await {
         Ok(gw) => gw,
-        Err(e) => return Probe::Failed(redact(&format!("invalid config: {e:#}"), m)),
+        Err(e) => return not_run(redact(&format!("invalid config: {e:#}"), m)),
     };
     let case = probe_case();
     let request = request_for(&case, m);
-    let result = match tokio::time::timeout(timeout + CUTOFF_GRACE, gw.execute(&request)).await {
-        Err(_) => {
-            return Probe::Failed(format!("no answer within {}s", timeout.as_secs_f64()));
-        }
-        Ok(Ok(_)) => return Probe::Answered,
+    let result = match tokio::time::timeout(cut_off, gw.execute(&request)).await {
+        Err(_) => return not_run(format!("no answer within {}s", cut_off.as_secs_f64())),
+        Ok(Ok(_)) => return CheckStatus::Reachable,
         Ok(result) => result,
     };
-    // `row_for` owns the "did this reach the server" rules for an error.
+    if let Err(GatewayError::AllGated {
+        human_action: Some(HumanAction::UseLargerContextWindow),
+        skipped,
+        ..
+    }) = &result
+    {
+        return not_run(no_fit_reason(skipped, m));
+    }
+    // `row_for_model` owns the "did this reach the server" rules for an error.
     let row = row_for_model(&case, m, &result, 0);
-    let reason = row.detail.unwrap_or_default();
     match (row.outcome, row.reached_server) {
-        (Outcome::NotApplicable, true) => Probe::Answered,
-        (Outcome::NotApplicable, false) => Probe::Gated(reason),
-        _ => Probe::Failed(reason),
+        (Outcome::NotApplicable, true) => CheckStatus::Reachable,
+        _ => not_run(row.detail.unwrap_or_else(|| "the probe failed".into())),
     }
 }
 
@@ -279,39 +293,103 @@ mod tests {
         assert_eq!(got[0].status, CheckStatus::Reachable, "{got:?}");
     }
 
-    /// A probe the gateway refuses before sending (context window) says
-    /// nothing about the server: alone, and with the server down, the model is
-    /// NOT RUN, not reachable.
-    #[tokio::test]
-    async fn a_probe_gated_before_sending_does_not_prove_the_server_is_up() {
-        let mut tiny = spec("tiny", "http://127.0.0.1:9");
-        tiny.context_window = 1;
-        let cfg = BenchConfig { models: vec![tiny] };
-        let got = check(&cfg, &ids(&["tiny"])).await;
-        let reason = not_run_reason(&got[0]);
-        assert!(reason.contains("never reached the server"), "{reason}");
-        assert!(reason.contains("context window"), "{reason}");
-    }
+    const NO_FIT: &str = "no input fits: the gateway estimates the minimal decision at ";
 
-    /// ...but a sibling on the same router and URL that answered shows the
-    /// server is up, so the gated model is reachable (its cases will be
-    /// recorded as not_applicable where they do not fit).
+    /// T7 review I3 (user decision, option 1): a probe the context-window gate
+    /// refuses before sending means no case can ever be sent, so the model is
+    /// NOT RUN with that reason, even though its server is up and answers
+    /// other models.
     #[tokio::test]
-    async fn a_gated_probe_is_reachable_when_a_sibling_on_the_same_server_answered() {
+    async fn a_context_window_gated_probe_is_not_run_even_when_the_server_is_up() {
         let good = serving(ResponseTemplate::new(200).set_body_json(noul_answer())).await;
         let mut tiny = spec("tiny", &good.uri());
         tiny.context_window = 1;
-        let mut elsewhere = spec("elsewhere", "http://127.0.0.1:9");
-        elsewhere.context_window = 1;
         let cfg = BenchConfig {
-            models: vec![tiny, spec("big", &good.uri()), elsewhere],
+            models: vec![tiny, spec("big", &good.uri())],
         };
-        let got = check(&cfg, &ids(&["tiny", "big", "elsewhere"])).await;
-        assert_eq!(got[0].status, CheckStatus::Reachable, "{got:?}");
+        let got = check(&cfg, &ids(&["tiny", "big"])).await;
+        let reason = not_run_reason(&got[0]);
+        assert!(reason.starts_with(NO_FIT), "{reason}");
+        assert!(
+            reason.ends_with(" input tokens > the model's 1-token context window"),
+            "{reason}"
+        );
         assert_eq!(got[1].status, CheckStatus::Reachable, "{got:?}");
-        assert!(not_run_reason(&got[2]).contains("never reached the server"));
-        // Only `big`'s probe was sent.
-        assert_eq!(good.received_requests().await.unwrap().len(), 1);
+        assert_eq!(
+            good.received_requests().await.unwrap().len(),
+            1,
+            "only big's"
+        );
+    }
+
+    /// The example roster's `laya-ane` (96-token window) can never be sent
+    /// anything; against a live server it is still NOT RUN, and says why.
+    #[tokio::test]
+    async fn the_example_laya_ane_is_not_run_because_no_input_fits() {
+        let cfg = BenchConfig::from_toml(include_str!("../bench.example.toml")).unwrap();
+        let mut ane = cfg
+            .models
+            .iter()
+            .find(|m| m.id == "laya-ane")
+            .unwrap()
+            .clone();
+        assert_eq!(ane.context_window, 96);
+        let server = serving(ResponseTemplate::new(200).set_body_json(noul_answer())).await;
+        ane.url = server.uri();
+        let cfg = BenchConfig { models: vec![ane] };
+        let got = check(&cfg, &ids(&["laya-ane"])).await;
+        let reason = not_run_reason(&got[0]);
+        assert!(reason.starts_with(NO_FIT), "{reason}");
+        assert!(
+            reason.contains("> the model's 96-token context window"),
+            "{reason}"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_gate_text_yields_the_estimate_and_window() {
+        assert_eq!(
+            parse_window_gate(
+                "laya:laya-ane — estimated 182 input tokens exceeds the model's 96-token \
+                 context window"
+            ),
+            Some((182, 96))
+        );
+        assert_eq!(parse_window_gate("something else entirely"), None);
+        assert_eq!(parse_window_gate("estimated x input tokens"), None);
+    }
+
+    /// T7 review M4: the hard cut-off fires on its own when the router
+    /// timeout is longer.
+    #[tokio::test]
+    async fn the_hard_cut_off_fires_when_the_router_timeout_is_longer() {
+        let slow = serving(
+            ResponseTemplate::new(200)
+                .set_body_json(noul_answer())
+                .set_delay(Duration::from_secs(5)),
+        )
+        .await;
+        let cfg = BenchConfig {
+            models: vec![spec("slow", &slow.uri())],
+        };
+        let started = Instant::now();
+        let got = check_with_timeouts(
+            &cfg,
+            &ids(&["slow"]),
+            Duration::from_secs(30),
+            Duration::from_millis(300),
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            not_run_reason(&got[0]).starts_with("no answer within"),
+            "{got:?}"
+        );
     }
 
     #[tokio::test]
