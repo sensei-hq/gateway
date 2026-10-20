@@ -102,37 +102,34 @@ pub(crate) enum ImageEncoding {
 /// bytes; an image that is no known format cannot be labelled truthfully, so
 /// it is an error (before anything is sent) rather than a guessed type.
 fn encode_images(images: &[String], encoding: ImageEncoding) -> Result<Vec<String>, String> {
-    if encoding == ImageEncoding::Unsupported {
-        return match images.len() {
-            0 => Ok(vec![]),
-            n => Err(format!(
-                "this host does not read images ({n} sent) — it would answer as if they were \
-                 absent; route image decisions to a vision-capable System One host"
-            )),
-        };
+    match encoding {
+        ImageEncoding::Unsupported if images.is_empty() => Ok(vec![]),
+        ImageEncoding::Unsupported => Err(format!(
+            "this host does not read images ({} sent) — it would answer as if they were \
+             absent; route image decisions to a vision-capable System One host",
+            images.len()
+        )),
+        ImageEncoding::Bare => Ok(images.to_vec()),
+        ImageEncoding::DataUrl => images
+            .iter()
+            .enumerate()
+            .map(|(i, img)| {
+                if img.starts_with("data:") {
+                    return Ok(img.clone());
+                }
+                let mime = sniff_image_mime(img).ok_or_else(|| {
+                    format!(
+                        "image {} is not PNG, JPEG, WebP or GIF base64 — cannot build a data URL for it",
+                        i + 1
+                    )
+                })?;
+                // The sniffer reads past line breaks (MIME/PEM-wrapped base64);
+                // the URL must not carry them into the request.
+                let b64: String = img.chars().filter(|c| !c.is_whitespace()).collect();
+                Ok(format!("data:{mime};base64,{b64}"))
+            })
+            .collect()
     }
-    if encoding == ImageEncoding::Bare {
-        return Ok(images.to_vec());
-    }
-    images
-        .iter()
-        .enumerate()
-        .map(|(i, img)| {
-            if img.starts_with("data:") {
-                return Ok(img.clone());
-            }
-            let mime = sniff_image_mime(img).ok_or_else(|| {
-                format!(
-                    "image {} is not PNG, JPEG, WebP or GIF base64 — cannot build a data URL for it",
-                    i + 1
-                )
-            })?;
-            // The sniffer reads past line breaks (MIME/PEM-wrapped base64);
-            // the URL must not carry them into the request.
-            let b64: String = img.chars().filter(|c| !c.is_whitespace()).collect();
-            Ok(format!("data:{mime};base64,{b64}"))
-        })
-        .collect()
 }
 
 /// The image encoding the generic adapter uses for a router id: `laya`

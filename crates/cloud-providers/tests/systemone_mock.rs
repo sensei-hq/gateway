@@ -840,7 +840,8 @@ async fn live_llama_cpp_answers_and_takes_data_url_images() {
 
 /// Laya ignores `images` (verified live: 200, text-only answers), so a `laya`
 /// call with images fails BEFORE sending — a ProviderError the chain falls
-/// back on — while `llamacpp` keeps sending data URLs (AC2).
+/// back on — the `llamacpp` half of AC2 is pinned by
+/// `the_generic_adapter_sends_images_as_data_urls_with_the_sniffed_mime` above.
 #[tokio::test]
 async fn laya_refuses_images_before_any_request() {
     let server = MockServer::start().await;
