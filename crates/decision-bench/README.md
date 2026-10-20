@@ -104,16 +104,43 @@ cargo run --release -p decision-bench -- report
 
 - **Cases**: `crates/decision-bench/cases/` (`s1a.jsonl`, `s1b.jsonl`, `s2.jsonl`, `s3.jsonl`,
   `manifest.json`). `fetch` replaces the directory as a whole.
-- **Raw-row cache**: `<user cache dir>/decision-bench/<dataset>@<sha>/`, outside the repo (override
-  with `--cache-dir`). `fetch` records the hub revision sha and refuses to reuse a cache built
-  from a different one.
+- **Raw-row cache**: `<user cache dir>/decision-bench/<id with / → __>@<sha>/<config>-<split>.jsonl`
+  plus that directory's `meta.json`, outside the repo (`--cache-dir` replaces
+  `<user cache dir>/decision-bench`). `fetch` records the hub revision sha and refuses to reuse
+  a cache built from a different one.
 - **Results**: `crates/decision-bench/results.json`; **report**: `report.md` by default.
 - **S4 cases**: `crates/decision-bench/scenarios/s4-*.jsonl`, hand-curated and committed.
 
-Everything under `crates/decision-bench/` except `src/`, `tests/` and `scenarios/` is
-gitignored (plus `bench.toml`, `results*.json` and `report*.md`), so fetched public data cannot
-be committed by accident. A report worth keeping is committed by passing `--out` under
-`docs/benchmarks/`.
+Every subdirectory of `crates/decision-bench/` except `src/`, `tests/` and `scenarios/` is
+gitignored (`crates/decision-bench/*/` with `!` exceptions in the root `.gitignore`), so fetched
+public data cannot be committed by accident. Of the files directly in it, `bench.toml`,
+`results*.json` and `report*.md` are gitignored; the rest (this README, `Cargo.toml`,
+`bench.example.toml`) are tracked. A report worth keeping goes to `docs/benchmarks/` at the repo
+root; since a relative `--out` resolves under `crates/decision-bench/`, climb out of it (or pass
+an absolute path):
+
+```sh
+cargo run --release -p decision-bench -- report --out ../../docs/benchmarks/<date>-system-one-local.md
+```
+
+### `results.json`
+
+Top level: `generated_at` (Unix seconds), `manifest` (the cases' `manifest.json`, or null),
+`not_run` (`model`, `reason`), `roster` (`id`, `router`, `api_model_id`, `context_window`; no
+URL), `labels_reviewed` (`scenario`, `reviewed_by`), `completed` (models whose every row is
+present), `paths` (`config`, `cases`, `results`, `report`) and `rows`. One row per (case, model):
+
+- `case_id`, `scenario`, `model`.
+- `outcome`: `ok`, `not_applicable` or `error`.
+- `correct`, `answer`, `probabilities`: set only when `outcome` is `ok`. `answer` is the chosen
+  option key, `"yes"` / `"no"` for noul (decided at 0.5), or the argmax level's key for a score;
+  `probabilities` maps each option or level key to its probability (noul: `{"yes": p}`).
+- `top_probability`: the probability of the answer (noul: `max(p, 1 - p)`).
+- `score_value` (the probability-weighted level) and `expected_level` (the gold level): score
+  cases only.
+- `latency_ms`.
+- `reached_server`: see "Rows that never reached the server" below.
+- `detail`: the reason for `not_applicable` / `error`, URL-redacted and clipped to 300 chars.
 
 ## Datasets
 
@@ -175,22 +202,27 @@ Reproduce.
   p50 latency, but the verdict does not depend on that tiebreak. A **Winner** ("Use X for
   Sn") must be separated from every head-to-head model: its CI lower bound exceeds every other
   ranked model's CI upper bound. Otherwise the report says **Tie** and lists the top model and
-  each model whose CI overlaps it. Winner and Tie are exact complements.
+  each model whose CI overlaps it. Fewer than 2 head-to-head models, or
+  fewer than 20 shared cases, is **Insufficient** (no verdict, with the reason). Otherwise
+  Winner and Tie are exact complements.
 - **Confident-wrong**: the share of answers that were wrong with a top probability of at least
   0.8. High accuracy with a high confident-wrong rate means confidence cannot be trusted.
 - **ECE**: expected calibration error of the top probability, in 10 equal-width bins. Lower is
   better calibrated.
 - **Score scenarios (S2)** also report exact-level accuracy (argmax) and the mean absolute error
   of the expected level. **Latency** is p50/p95 in ms.
-- **"Rows that never reached the server"**: per model and scenario, rows refused before any
-  request was sent (a gateway fit refusal or an error before the call) and rows whose transport
-  failed before any reply (a refused or dropped connection, a DNS failure), with their outcomes.
-  A server-side truncation, and a case that ran out the router timeout, do reach the server and
-  are not listed here.
+- **"Rows that never reached the server"**: per model and scenario, with their outcomes, rows
+  the gateway refused before dispatch (a context-window gate, a cooldown, lockout or breaker, or
+  an error before the call) and rows whose transport failed before any reply and before the
+  router timeout (a refused or dropped connection, a DNS failure). Not listed, because they are
+  a recorded attempt: an adapter's own pre-send `InputRejected` (Laya head budget, images),
+  although nothing was sent; a server-side truncation; a case that ran out the router timeout;
+  and a connect that hangs for the whole timeout (a blackholed host), which reads as a timeout.
+  The kernel keeps only each attempt's error text, so the bench cannot tell these apart.
 - **INCOMPLETE RUN**: a banner naming roster models that neither finished nor were NOT RUN, i.e.
   the run stopped early. Their rows are partial, so this is not a complete ranking.
-- **NOT RUN**: models `check` could not run (unreachable, or no input fits their context
-  window), with the reason. They have no results; they are named at the top of the report,
+- **NOT RUN**: models `check` could not run (no answer to its probe, or no input fits their
+  context window), with the reason. They have no results; they are named at the top of the report,
   never silently skipped.
 
 ## Known limitations
