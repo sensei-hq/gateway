@@ -12,6 +12,11 @@ pub(crate) enum GateContribution {
     Terminal(HumanAction),
     /// Attempted, failed with a non-limit fault (500 / network / unclassified).
     HardFailure,
+    /// Attempted, but the candidate cannot serve this request's input
+    /// (`GatewayError::InputRejected`, SP-DEC-3 D5). Neither a fault nor a gate:
+    /// it does not make exhaustion retryable (the same input fails the same way
+    /// again), and it vetoes `AllGated` (no deadline or human remedy clears it).
+    InputRejected,
 }
 
 /// Anchor a monotonic `Instant` deadline to wall-clock. Past/elapsed ⇒ now.
@@ -27,6 +32,11 @@ pub(super) fn contribution_for(
     written_until: Option<Instant>,
 ) -> GateContribution {
     use crate::gates::lockout::{LockReason, classify};
+    // SP-DEC-3 D5: decided before `classify`, which returns `None` for it and would
+    // otherwise land it on `HardFailure` — a retryable fault it is not.
+    if matches!(err, GatewayError::InputRejected { .. }) {
+        return GateContribution::InputRejected;
+    }
     match classify(err) {
         Some(r) if r.is_recoverable() => match written_until {
             Some(u) => GateContribution::Timed(u),
@@ -58,16 +68,21 @@ pub(crate) fn render_skipped(skipped: &[SkippedCandidate]) -> Vec<String> {
 }
 
 /// Build the terminal error at chain exhaustion. `Some(AllGated)` iff every
-/// candidate was gated (health-skip or classified limit) and none hard-failed;
-/// `None` ⇒ "not all-gated — use the existing terminal error".
+/// candidate was gated (health-skip or classified limit) and none hard-failed
+/// or was input-rejected; `None` ⇒ "not all-gated — use the existing terminal
+/// error".
 pub(crate) fn all_gated_error(
     skipped: &[SkippedCandidate],
     contributions: &[GateContribution],
 ) -> Option<GatewayError> {
-    if contributions
-        .iter()
-        .any(|c| matches!(c, GateContribution::HardFailure))
-    {
+    // An input rejection vetoes too (SP-DEC-3 D5): `AllGated` tells the caller to
+    // wait or act, and neither changes an input this candidate cannot serve.
+    if contributions.iter().any(|c| {
+        matches!(
+            c,
+            GateContribution::HardFailure | GateContribution::InputRejected
+        )
+    }) {
         return None;
     }
     let mut timed: Vec<Instant> = Vec::new();
@@ -98,7 +113,8 @@ pub(crate) fn all_gated_error(
                 any_gate = true;
                 let _ = human.get_or_insert(*h);
             }
-            GateContribution::HardFailure => {}
+            // Both vetoed above; listed so a new variant must choose here too.
+            GateContribution::HardFailure | GateContribution::InputRejected => {}
         }
     }
     if !any_gate {

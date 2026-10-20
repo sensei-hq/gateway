@@ -2137,4 +2137,33 @@ mod tests {
             GatewayDisposition::Fail(_)
         ));
     }
+
+    /// SP-DEC-3 D5 / AC8, end to end: an exhaustion made only of input rejections is
+    /// `retryable: false`, so even with transient-retry budget left (`max_attempts = 3`)
+    /// the run FAILS rather than re-sending an input no candidate can serve. The engine's
+    /// `an_exhaustion_of_input_rejections_is_not_retryable_and_not_all_gated` is what
+    /// proves the gateway produces `retryable: false`; this pins what the executor does
+    /// with it.
+    #[test]
+    fn an_input_rejected_exhaustion_fails_instead_of_retrying() {
+        use kernel::types::error::GatewayError;
+        let exhausted = GatewayError::AllAttemptsFailed {
+            attempts: 1,
+            errors: "[laya:english] adapter 'laya' cannot serve this input: image".into(),
+            attempts_detail: vec![],
+            retryable: false,
+        };
+        assert!(matches!(
+            classify_gateway_error(&exhausted, 0, 3, chrono::Utc::now()),
+            GatewayDisposition::Fail(_)
+        ));
+        let bare = GatewayError::InputRejected {
+            adapter: "laya".into(),
+            message: "image input".into(),
+        };
+        assert!(matches!(
+            classify_gateway_error(&bare, 0, 3, chrono::Utc::now()),
+            GatewayDisposition::Fail(_)
+        ));
+    }
 }
