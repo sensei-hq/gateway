@@ -1,0 +1,981 @@
+//! Seeded builders turning datasets-server rows into benchmark cases
+//! (S1a/S1b/S2/S3), and the fetch manifest.
+
+use anyhow::{Context, bail};
+use gateway::types::decision::DecisionQuestion;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+use crate::case::{Case, Expected, Scenario};
+use crate::fetch::Row;
+
+/// Where a row set came from; feeds each case's `source`.
+#[derive(Debug, Clone, Copy)]
+pub struct Source<'a> {
+    pub dataset: &'a str,
+    pub sha: &'a str,
+    pub split: &'a str,
+}
+
+/// The `rand` release the sample was drawn with.
+pub const RAND_VERSION: &str = "0.8.7";
+
+pub const SENTIMENT_LEVELS: [&str; 3] = ["negative", "neutral", "positive"];
+
+/// Distractors offered beside the gold label in S1a/S1b.
+pub const DISTRACTORS: usize = 7;
+
+const S1_INSTRUCTIONS: &str = "Which intent does this request express?";
+const S2_INSTRUCTIONS: &str = "What is the sentiment of this text?";
+const S3_INSTRUCTIONS: &str = "Does the hypothesis follow from the premise?";
+
+fn scenario_name(s: Scenario) -> String {
+    serde_json::to_value(s)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_else(|| format!("{s:?}"))
+}
+
+fn case_id(s: Scenario, r: &Row) -> String {
+    format!("{}-{}", scenario_name(s), r.row_idx)
+}
+
+fn source(src: Source<'_>, r: &Row) -> String {
+    let sha10 = src.sha.get(..10).unwrap_or(src.sha);
+    format!("{}@{sha10}:{}#{}", src.dataset, src.split, r.row_idx)
+}
+
+/// A row's text field: `None` when it is null or blank (the row is skipped;
+/// Sp1786 test row 3751 has `"text": null`), an error when it is missing or
+/// not a string.
+fn text<'r>(r: &'r Row, field: &str) -> anyhow::Result<Option<&'r str>> {
+    match r.row.get(field) {
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s.as_str()).filter(|s| !s.trim().is_empty())),
+        _ => bail!(
+            "row {}: field {field:?} is missing or not a string",
+            r.row_idx
+        ),
+    }
+}
+
+fn label(r: &Row, field: &str) -> anyhow::Result<i64> {
+    r.row.get(field).and_then(|v| v.as_i64()).with_context(|| {
+        format!(
+            "row {}: field {field:?} is missing or not an integer",
+            r.row_idx
+        )
+    })
+}
+
+/// The label index of `r`, which must name one of `names`.
+fn class(r: &Row, field: &str, names: &[String]) -> anyhow::Result<usize> {
+    let l = label(r, field)?;
+    usize::try_from(l)
+        .ok()
+        .filter(|&i| i < names.len())
+        .with_context(|| {
+            format!(
+                "row {}: label {l} is outside the {} label names",
+                r.row_idx,
+                names.len()
+            )
+        })
+}
+
+/// Draw `n` of `eligible` indices without replacement from a generator seeded
+/// with `seed ^ scenario.tag()`, sorted so the output follows row order. The
+/// generator is returned so per-case draws continue the same stream.
+fn sample(
+    scenario: Scenario,
+    seed: u64,
+    eligible: usize,
+    n: usize,
+) -> anyhow::Result<(StdRng, Vec<usize>)> {
+    if n > eligible {
+        bail!(
+            "{}: asked for {n} cases but only {eligible} rows are eligible",
+            scenario_name(scenario)
+        );
+    }
+    let mut rng = StdRng::seed_from_u64(seed ^ scenario.tag());
+    let mut picked = rand::seq::index::sample(&mut rng, eligible, n).into_vec();
+    picked.sort_unstable();
+    Ok((rng, picked))
+}
+
+fn unique_names(names: &[String]) -> anyhow::Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    if let Some(dup) = names.iter().find(|n| !seen.insert(n.as_str())) {
+        bail!("label name {dup:?} appears twice");
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_choice(
+    scenario: Scenario,
+    src: Source<'_>,
+    rows: &[Row],
+    field: &str,
+    names: &[String],
+    with_oos: bool,
+    seed: u64,
+    n: usize,
+) -> anyhow::Result<Vec<Case>> {
+    unique_names(names)?;
+    let oos = if with_oos {
+        Some(
+            names
+                .iter()
+                .position(|l| l == "oos")
+                .context("S1a needs an `oos` label among the label names")?,
+        )
+    } else {
+        None
+    };
+    let pool_size = names.len() - 1 - usize::from(oos.is_some());
+    if pool_size < DISTRACTORS {
+        bail!(
+            "{}: {} labels leave {pool_size} distractor candidates; need {DISTRACTORS}",
+            scenario_name(scenario),
+            names.len()
+        );
+    }
+    let mut eligible = Vec::new();
+    for r in rows {
+        let t = text(r, "text")?;
+        let gold = class(r, field, names)?;
+        if let Some(t) = t {
+            eligible.push((r, t, gold));
+        }
+    }
+    let (mut rng, picked) = sample(scenario, seed, eligible.len(), n)?;
+    let mut out = Vec::with_capacity(picked.len());
+    for i in picked {
+        let (r, t, gold) = eligible[i];
+        let pool: Vec<usize> = (0..names.len())
+            .filter(|&l| l != gold && Some(l) != oos)
+            .collect();
+        let mut options: Vec<usize> = vec![gold];
+        options.extend(
+            rand::seq::index::sample(&mut rng, pool.len(), DISTRACTORS)
+                .into_iter()
+                .map(|k| pool[k]),
+        );
+        if let Some(o) = oos
+            && o != gold
+        {
+            options.push(o);
+        }
+        options.shuffle(&mut rng);
+        out.push(Case {
+            id: case_id(scenario, r),
+            scenario,
+            state: serde_json::Value::String(t.to_string()),
+            question: DecisionQuestion::Choice {
+                instructions: json!(S1_INSTRUCTIONS),
+                criteria: options.iter().map(|&l| (names[l].clone(), None)).collect(),
+            },
+            expected: Expected::Choice {
+                option: names[gold].clone(),
+            },
+            source: source(src, r),
+        });
+    }
+    Ok(out)
+}
+
+/// S1a (CLINC `plus`): gold + 7 distractors + `oos`, shuffled; 8 options when
+/// gold is `oos` itself.
+pub fn build_s1a(
+    src: Source<'_>,
+    rows: &[Row],
+    label_names: &[String],
+    seed: u64,
+    n: usize,
+) -> anyhow::Result<Vec<Case>> {
+    build_choice(
+        Scenario::S1aIntentOos,
+        src,
+        rows,
+        "intent",
+        label_names,
+        true,
+        seed,
+        n,
+    )
+}
+
+/// S1b (banking77): gold + 7 distractors, shuffled.
+pub fn build_s1b(
+    src: Source<'_>,
+    rows: &[Row],
+    label_names: &[String],
+    seed: u64,
+    n: usize,
+) -> anyhow::Result<Vec<Case>> {
+    build_choice(
+        Scenario::S1bBanking77,
+        src,
+        rows,
+        "label",
+        label_names,
+        false,
+        seed,
+        n,
+    )
+}
+
+/// S2 (sentiment): `label` 0/1/2 is the score level over `label_names`
+/// (normally [`SENTIMENT_LEVELS`]). A row whose `sentiment` string disagrees
+/// with its label is an error.
+pub fn build_s2(
+    src: Source<'_>,
+    rows: &[Row],
+    label_names: &[String],
+    seed: u64,
+    n: usize,
+) -> anyhow::Result<Vec<Case>> {
+    let scenario = Scenario::S2Sentiment;
+    let mut eligible = Vec::new();
+    for r in rows {
+        let t = text(r, "text")?;
+        let level = class(r, "label", label_names)?;
+        if let Some(s) = r.row.get("sentiment")
+            && s.as_str() != Some(label_names[level].as_str())
+        {
+            bail!(
+                "row {}: sentiment {s} disagrees with label {level} ({:?})",
+                r.row_idx,
+                label_names[level]
+            );
+        }
+        if let Some(t) = t {
+            eligible.push((r, t, level));
+        }
+    }
+    let (_, picked) = sample(scenario, seed, eligible.len(), n)?;
+    Ok(picked
+        .into_iter()
+        .map(|i| {
+            let (r, t, level) = eligible[i];
+            Case {
+                id: case_id(scenario, r),
+                scenario,
+                state: serde_json::Value::String(t.to_string()),
+                question: DecisionQuestion::Score {
+                    instructions: json!(S2_INSTRUCTIONS),
+                    criteria: label_names.to_vec(),
+                },
+                expected: Expected::Score { level },
+                source: source(src, r),
+            }
+        })
+        .collect())
+}
+
+/// S3 (SNLI): entailment → yes, contradiction → no; neutral and unlabelled
+/// (−1) rows are dropped before sampling.
+pub fn build_s3(
+    src: Source<'_>,
+    rows: &[Row],
+    label_names: &[String],
+    seed: u64,
+    n: usize,
+) -> anyhow::Result<Vec<Case>> {
+    let scenario = Scenario::S3Entailment;
+    let find = |name: &str| {
+        label_names
+            .iter()
+            .position(|l| l == name)
+            .with_context(|| format!("S3 needs a {name:?} label, got {label_names:?}"))
+    };
+    let (yes, no) = (find("entailment")? as i64, find("contradiction")? as i64);
+    let mut eligible = Vec::new();
+    for r in rows {
+        let l = label(r, "label")?;
+        let value = if l == yes {
+            true
+        } else if l == no {
+            false
+        } else {
+            continue;
+        };
+        let (p, h) = (text(r, "premise")?, text(r, "hypothesis")?);
+        if let (Some(p), Some(h)) = (p, h) {
+            eligible.push((r, p, h, value));
+        }
+    }
+    let (_, picked) = sample(scenario, seed, eligible.len(), n)?;
+    Ok(picked
+        .into_iter()
+        .map(|i| {
+            let (r, p, h, value) = eligible[i];
+            Case {
+                id: case_id(scenario, r),
+                scenario,
+                state: json!({"premise": p, "hypothesis": h}),
+                question: DecisionQuestion::Noul {
+                    instructions: json!(S3_INSTRUCTIONS),
+                    criteria: None,
+                },
+                expected: Expected::Noul { value },
+                source: source(src, r),
+            }
+        })
+        .collect())
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManifestDataset {
+    pub id: String,
+    pub sha: String,
+    pub license: String,
+    pub config: String,
+    pub split: String,
+    pub num_rows: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManifestFile {
+    pub file: String,
+    pub scenario: Scenario,
+    pub dataset: String,
+    pub cases: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Manifest {
+    pub seed: u64,
+    pub per_scenario: usize,
+    pub rand_version: String,
+    pub datasets: Vec<ManifestDataset>,
+    pub files: Vec<ManifestFile>,
+}
+
+/// One public dataset and the scenario built from it.
+#[derive(Debug, Clone, Copy)]
+pub struct DatasetSpec {
+    pub scenario: Scenario,
+    pub file: &'static str,
+    pub id: &'static str,
+    pub config: &'static str,
+    pub split: &'static str,
+}
+
+pub const DATASETS: [DatasetSpec; 4] = [
+    DatasetSpec {
+        scenario: Scenario::S1aIntentOos,
+        file: "s1a.jsonl",
+        id: "clinc/clinc_oos",
+        config: "plus",
+        split: "test",
+    },
+    DatasetSpec {
+        scenario: Scenario::S1bBanking77,
+        file: "s1b.jsonl",
+        id: "legacy-datasets/banking77",
+        config: "default",
+        split: "test",
+    },
+    DatasetSpec {
+        scenario: Scenario::S2Sentiment,
+        file: "s2.jsonl",
+        id: "Sp1786/multiclass-sentiment-analysis-dataset",
+        config: "default",
+        split: "test",
+    },
+    DatasetSpec {
+        scenario: Scenario::S3Entailment,
+        file: "s3.jsonl",
+        id: "stanfordnlp/snli",
+        config: "plain_text",
+        split: "test",
+    },
+];
+
+/// Where `fetch_cases` reads from and writes to.
+pub struct FetchOptions<'a> {
+    pub ds_base: &'a str,
+    pub hub_base: &'a str,
+    pub cache_root: &'a std::path::Path,
+    pub out: &'a std::path::Path,
+    pub seed: u64,
+    pub per_scenario: usize,
+}
+
+/// Fetch (or load from cache) every dataset in [`DATASETS`], build its
+/// scenario's cases, validate them, and write `<out>/s1a.jsonl` …
+/// `s3.jsonl` plus `manifest.json`.
+pub async fn fetch_cases(
+    client: &reqwest::Client,
+    opts: &FetchOptions<'_>,
+) -> anyhow::Result<Manifest> {
+    let mut datasets = Vec::new();
+    let mut built = Vec::new();
+    for spec in DATASETS {
+        let ds = crate::fetch::load_or_fetch(
+            client,
+            opts.ds_base,
+            opts.hub_base,
+            opts.cache_root,
+            spec.id,
+            spec.config,
+            spec.split,
+        )
+        .await?;
+        let src = Source {
+            dataset: spec.id,
+            sha: &ds.meta.sha,
+            split: spec.split,
+        };
+        let (seed, n) = (opts.seed, opts.per_scenario);
+        let class = |field| crate::fetch::class_names(&ds.meta.features, field);
+        let cases = match spec.scenario {
+            Scenario::S1aIntentOos => build_s1a(src, &ds.rows, &class("intent")?, seed, n),
+            Scenario::S1bBanking77 => build_s1b(src, &ds.rows, &class("label")?, seed, n),
+            Scenario::S2Sentiment => {
+                let levels: Vec<String> = SENTIMENT_LEVELS.iter().map(|s| s.to_string()).collect();
+                build_s2(src, &ds.rows, &levels, seed, n)
+            }
+            Scenario::S3Entailment => build_s3(src, &ds.rows, &class("label")?, seed, n),
+            other => bail!("{other:?} is not built from a public dataset"),
+        }
+        .with_context(|| format!("building {} from {}", spec.file, spec.id))?;
+        for c in &cases {
+            c.validate()?;
+        }
+        datasets.push(ManifestDataset {
+            id: ds.meta.id.clone(),
+            sha: ds.meta.sha.clone(),
+            license: ds.meta.license.clone(),
+            config: ds.meta.config.clone(),
+            split: ds.meta.split.clone(),
+            num_rows: ds.meta.num_rows,
+        });
+        built.push((spec, cases));
+    }
+    // Write only once every dataset has built, so a failure leaves no
+    // half-updated case set.
+    let mut files = Vec::new();
+    for (spec, cases) in &built {
+        crate::case::write_jsonl(&opts.out.join(spec.file), cases)?;
+        files.push(ManifestFile {
+            file: spec.file.to_string(),
+            scenario: spec.scenario,
+            dataset: spec.id.to_string(),
+            cases: cases.len(),
+        });
+    }
+    let manifest = Manifest {
+        seed: opts.seed,
+        per_scenario: opts.per_scenario,
+        rand_version: RAND_VERSION.to_string(),
+        datasets,
+        files,
+    };
+    let mut bytes = serde_json::to_vec_pretty(&manifest)?;
+    bytes.push(b'\n');
+    crate::fetch::write_atomic(&opts.out.join("manifest.json"), &bytes)?;
+    Ok(manifest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::case::write_jsonl;
+
+    const SRC: Source<'static> = Source {
+        dataset: "org/ds",
+        sha: "0123456789abcdef",
+        split: "test",
+    };
+
+    fn row(idx: u64, fields: serde_json::Value) -> Row {
+        Row {
+            row_idx: idx,
+            row: fields.as_object().unwrap().clone(),
+        }
+    }
+
+    /// 20 intents with `oos` at index 7; 40 rows cycling through them.
+    fn intent_set(field: &str, with_oos: bool) -> (Vec<Row>, Vec<String>) {
+        let names: Vec<String> = (0..20)
+            .map(|i| {
+                if with_oos && i == 7 {
+                    "oos".to_string()
+                } else {
+                    format!("intent_{i}")
+                }
+            })
+            .collect();
+        let rows = (0..40)
+            .map(|i| {
+                row(
+                    i,
+                    json!({"text": format!("request number {i}"), field: i % 20}),
+                )
+            })
+            .collect();
+        (rows, names)
+    }
+
+    fn options(c: &Case) -> Vec<String> {
+        let DecisionQuestion::Choice {
+            instructions,
+            criteria,
+        } = &c.question
+        else {
+            panic!("{}: not a choice", c.id)
+        };
+        assert_eq!(
+            instructions,
+            &json!("Which intent does this request express?")
+        );
+        assert!(criteria.values().all(Option::is_none));
+        criteria.keys().cloned().collect()
+    }
+
+    fn gold(c: &Case) -> String {
+        let Expected::Choice { option } = &c.expected else {
+            panic!("{}: not a choice expectation", c.id)
+        };
+        option.clone()
+    }
+
+    #[test]
+    fn s1a_case_offers_gold_plus_seven_distractors_plus_oos() {
+        let (rows, names) = intent_set("intent", true);
+        let mut gold_positions = std::collections::BTreeSet::new();
+        let mut saw_oos_gold = false;
+        for seed in 0..8 {
+            let cases = build_s1a(SRC, &rows, &names, seed, 40).unwrap();
+            assert_eq!(cases.len(), 40);
+            for c in &cases {
+                assert_eq!(c.scenario, Scenario::S1aIntentOos);
+                let idx: u64 = c.id.rsplit('-').next().unwrap().parse().unwrap();
+                let want = &names[(idx % 20) as usize];
+                assert_eq!(&gold(c), want, "{}", c.id);
+                assert_eq!(c.state, json!(format!("request number {idx}")));
+                let opts = options(c);
+                let unique: std::collections::BTreeSet<_> = opts.iter().collect();
+                assert_eq!(
+                    unique.len(),
+                    opts.len(),
+                    "{}: duplicate option {opts:?}",
+                    c.id
+                );
+                assert!(opts.contains(want));
+                assert!(opts.iter().any(|o| o == "oos"), "{}: no oos {opts:?}", c.id);
+                if want == "oos" {
+                    saw_oos_gold = true;
+                    assert_eq!(opts.len(), 8, "{}: {opts:?}", c.id);
+                } else {
+                    assert_eq!(opts.len(), 9, "{}: {opts:?}", c.id);
+                }
+                gold_positions.insert(opts.iter().position(|o| o == want).unwrap());
+            }
+        }
+        assert!(saw_oos_gold);
+        assert!(
+            gold_positions.len() > 3,
+            "gold is not shuffled: positions {gold_positions:?}"
+        );
+    }
+
+    #[test]
+    fn s1b_has_eight_options() {
+        let (rows, names) = intent_set("label", false);
+        let mut gold_positions = std::collections::BTreeSet::new();
+        for seed in 0..8 {
+            let cases = build_s1b(SRC, &rows, &names, seed, 40).unwrap();
+            assert_eq!(cases.len(), 40);
+            for c in &cases {
+                assert_eq!(c.scenario, Scenario::S1bBanking77);
+                let idx: u64 = c.id.rsplit('-').next().unwrap().parse().unwrap();
+                let want = &names[(idx % 20) as usize];
+                assert_eq!(&gold(c), want);
+                assert_eq!(c.state, json!(format!("request number {idx}")));
+                let opts = options(c);
+                assert_eq!(opts.len(), 8, "{}: {opts:?}", c.id);
+                let unique: std::collections::BTreeSet<_> = opts.iter().collect();
+                assert_eq!(unique.len(), 8);
+                assert!(opts.contains(want));
+                gold_positions.insert(opts.iter().position(|o| o == want).unwrap());
+            }
+        }
+        assert!(gold_positions.len() > 3, "{gold_positions:?}");
+    }
+
+    #[test]
+    fn s1a_rejects_a_label_set_without_oos_and_s1b_one_with_too_few_labels() {
+        let (rows, names) = intent_set("intent", false);
+        let err = build_s1a(SRC, &rows, &names, 1, 5).unwrap_err().to_string();
+        assert!(err.contains("oos"), "{err}");
+        let few: Vec<String> = names[..7].to_vec();
+        let rows: Vec<Row> = (0..7)
+            .map(|i| row(i, json!({"text": "x", "label": i})))
+            .collect();
+        let err = build_s1b(SRC, &rows, &few, 1, 5).unwrap_err().to_string();
+        assert!(err.contains("distractor"), "{err}");
+    }
+
+    fn sentiment_rows() -> Vec<Row> {
+        (0..30)
+            .map(|i| {
+                let label = i % 3;
+                row(
+                    i,
+                    json!({"id": 1000 + i, "text": format!("feeling {i}"), "label": label,
+                           "sentiment": SENTIMENT_LEVELS[label as usize]}),
+                )
+            })
+            .collect()
+    }
+
+    fn levels() -> Vec<String> {
+        SENTIMENT_LEVELS.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn s2_maps_0_1_2_to_score_levels() {
+        let cases = build_s2(SRC, &sentiment_rows(), &levels(), 7, 30).unwrap();
+        assert_eq!(cases.len(), 30);
+        for c in &cases {
+            let idx: u64 = c.id.rsplit('-').next().unwrap().parse().unwrap();
+            assert_eq!(c.scenario, Scenario::S2Sentiment);
+            assert_eq!(c.state, json!(format!("feeling {idx}")));
+            assert_eq!(
+                c.question,
+                DecisionQuestion::Score {
+                    instructions: json!("What is the sentiment of this text?"),
+                    criteria: levels(),
+                }
+            );
+            assert_eq!(
+                c.expected,
+                Expected::Score {
+                    level: (idx % 3) as usize
+                }
+            );
+        }
+        // `sentiment` disagreeing with `label` is a data error, not a guess.
+        let mut rows = sentiment_rows();
+        rows[4].row.insert("sentiment".into(), json!("positive"));
+        let err = build_s2(SRC, &rows, &levels(), 7, 30)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("row 4"), "{err}");
+    }
+
+    fn snli_names() -> Vec<String> {
+        ["entailment", "neutral", "contradiction"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    fn snli_rows() -> Vec<Row> {
+        // labels cycle 0, 1, 2, -1
+        (0..40)
+            .map(|i| {
+                let label = [0, 1, 2, -1][(i % 4) as usize];
+                row(
+                    i,
+                    json!({"premise": format!("p{i}"), "hypothesis": format!("h{i}"), "label": label}),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn s3_maps_entailment_yes_contradiction_no_and_drops_neutral_and_unlabelled() {
+        // 20 of the 40 rows are entailment/contradiction; asking for all 20.
+        let cases = build_s3(SRC, &snli_rows(), &snli_names(), 3, 20).unwrap();
+        assert_eq!(cases.len(), 20);
+        for c in &cases {
+            let idx: u64 = c.id.rsplit('-').next().unwrap().parse().unwrap();
+            assert_eq!(c.scenario, Scenario::S3Entailment);
+            assert_eq!(
+                c.state,
+                json!({"premise": format!("p{idx}"), "hypothesis": format!("h{idx}")})
+            );
+            assert_eq!(
+                c.question,
+                DecisionQuestion::Noul {
+                    instructions: json!("Does the hypothesis follow from the premise?"),
+                    criteria: None,
+                }
+            );
+            match idx % 4 {
+                0 => assert_eq!(c.expected, Expected::Noul { value: true }),
+                2 => assert_eq!(c.expected, Expected::Noul { value: false }),
+                other => panic!("{}: label class {other} should have been dropped", c.id),
+            }
+        }
+        // Asking for more than the eligible rows is an error, not a silent shortfall.
+        let err = build_s3(SRC, &snli_rows(), &snli_names(), 3, 21)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("21") && err.contains("20"), "{err}");
+    }
+
+    #[test]
+    fn case_ids_and_sources_name_the_scenario_dataset_sha_and_row() {
+        let (rows, names) = intent_set("intent", true);
+        let cases = build_s1a(SRC, &rows, &names, 1, 40).unwrap();
+        let c = cases.iter().find(|c| c.id.ends_with("-13")).unwrap();
+        assert_eq!(c.id, "s1a_intent_oos-13");
+        assert_eq!(c.source, "org/ds@0123456789:test#13");
+    }
+
+    fn jsonl_bytes(cases: &[Case]) -> Vec<u8> {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        write_jsonl(f.path(), cases).unwrap();
+        std::fs::read(f.path()).unwrap()
+    }
+
+    fn all_builders(seed: u64, n: usize) -> Vec<Vec<Case>> {
+        let (r1a, n1a) = intent_set("intent", true);
+        let (r1b, n1b) = intent_set("label", false);
+        vec![
+            build_s1a(SRC, &r1a, &n1a, seed, n).unwrap(),
+            build_s1b(SRC, &r1b, &n1b, seed, n).unwrap(),
+            build_s2(SRC, &sentiment_rows(), &levels(), seed, n).unwrap(),
+            build_s3(SRC, &snli_rows(), &snli_names(), seed, n).unwrap(),
+        ]
+    }
+
+    #[test]
+    fn sampling_is_reproducible() {
+        let a = all_builders(2026, 10);
+        let b = all_builders(2026, 10);
+        let c = all_builders(2027, 10);
+        for i in 0..4 {
+            assert_eq!(a[i].len(), 10);
+            assert_eq!(jsonl_bytes(&a[i]), jsonl_bytes(&b[i]), "builder {i}");
+            assert_ne!(jsonl_bytes(&a[i]), jsonl_bytes(&c[i]), "builder {i}");
+        }
+    }
+
+    #[test]
+    fn cases_come_out_in_row_order() {
+        for seed in [0, 5, 2026] {
+            for cases in all_builders(seed, 10) {
+                let idx: Vec<u64> = cases
+                    .iter()
+                    .map(|c| c.id.rsplit('-').next().unwrap().parse().unwrap())
+                    .collect();
+                assert!(idx.windows(2).all(|w| w[0] < w[1]), "seed {seed}: {idx:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_built_case_validates() {
+        for seed in [0, 1, 2026] {
+            for cases in all_builders(seed, 15) {
+                assert!(!cases.is_empty());
+                for c in &cases {
+                    c.validate().unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rows_with_blank_text_are_never_sampled() {
+        let (mut rows, names) = intent_set("label", false);
+        for r in rows.iter_mut().filter(|r| r.row_idx % 2 == 0) {
+            r.row.insert("text".into(), json!("   "));
+        }
+        let cases = build_s1b(SRC, &rows, &names, 9, 20).unwrap();
+        assert!(
+            cases
+                .iter()
+                .all(|c| c.id.ends_with(|ch: char| "13579".contains(ch)))
+        );
+        assert!(build_s1b(SRC, &rows, &names, 9, 21).is_err());
+    }
+
+    #[test]
+    fn a_null_text_is_skipped_like_a_blank_one_but_a_missing_or_numeric_one_is_an_error() {
+        // Seen live: Sp1786 test row 3751 has `"text": null`.
+        let mut rows = sentiment_rows();
+        rows[3].row.insert("text".into(), json!(null));
+        let cases = build_s2(SRC, &rows, &levels(), 1, 29).unwrap();
+        assert!(cases.iter().all(|c| c.id != "s2_sentiment-3"));
+        assert!(build_s2(SRC, &rows, &levels(), 1, 30).is_err());
+
+        let (mut rows, names) = intent_set("label", false);
+        rows[3].row.insert("text".into(), json!(null));
+        assert_eq!(build_s1b(SRC, &rows, &names, 1, 39).unwrap().len(), 39);
+
+        for bad in [json!(7), json!(["x"])] {
+            let mut rows = sentiment_rows();
+            rows[3].row.insert("text".into(), bad);
+            let err = build_s2(SRC, &rows, &levels(), 1, 5)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("row 3") && err.contains("text"), "{err}");
+        }
+        let mut rows = sentiment_rows();
+        rows[3].row.remove("text");
+        assert!(build_s2(SRC, &rows, &levels(), 1, 5).is_err());
+    }
+
+    #[test]
+    fn rand_version_matches_the_lockfile() {
+        let lock =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))
+                .unwrap();
+        let block = lock
+            .split("[[package]]")
+            .find(|b| b.contains("name = \"decision-bench\""))
+            .expect("decision-bench in Cargo.lock");
+        assert!(
+            block.contains(&format!("\"rand {RAND_VERSION}\"")),
+            "RAND_VERSION {RAND_VERSION} is stale:\n{block}"
+        );
+    }
+
+    struct FakeDs;
+    impl wiremock::Respond for FakeDs {
+        fn respond(&self, req: &wiremock::Request) -> wiremock::ResponseTemplate {
+            let q: std::collections::HashMap<_, _> = req.url.query_pairs().into_owned().collect();
+            let (features, rows): (serde_json::Value, Vec<serde_json::Value>) =
+                match q["dataset"].as_str() {
+                    "clinc/clinc_oos" => {
+                        let mut names: Vec<String> = (0..19).map(|i| format!("i{i}")).collect();
+                        names.push("oos".into());
+                        (
+                            json!([{"name":"text","type":{"_type":"Value"}},{"name":"intent","type":{"names":names,"_type":"ClassLabel"}}]),
+                            (0..30).map(|i| json!({"text": format!("c{i}"), "intent": i % 20})).collect(),
+                        )
+                    }
+                    "legacy-datasets/banking77" => {
+                        let names: Vec<String> = (0..12).map(|i| format!("b{i}")).collect();
+                        (
+                            json!([{"name":"text","type":{"_type":"Value"}},{"name":"label","type":{"names":names,"_type":"ClassLabel"}}]),
+                            (0..30).map(|i| json!({"text": format!("b{i}"), "label": i % 12})).collect(),
+                        )
+                    }
+                    "Sp1786/multiclass-sentiment-analysis-dataset" => (
+                        json!([{"name":"text","type":{"_type":"Value"}},{"name":"label","type":{"dtype":"int64","_type":"Value"}}]),
+                        (0..30).map(|i| json!({"text": format!("s{i}"), "label": i % 3, "sentiment": SENTIMENT_LEVELS[i % 3]})).collect(),
+                    ),
+                    "stanfordnlp/snli" => (
+                        json!([{"name":"premise","type":{"_type":"Value"}},{"name":"hypothesis","type":{"_type":"Value"}},{"name":"label","type":{"names":["entailment","neutral","contradiction"],"_type":"ClassLabel"}}]),
+                        (0..30).map(|i| json!({"premise": format!("p{i}"), "hypothesis": format!("h{i}"), "label": ([0, 1, 2, -1])[i % 4]})).collect(),
+                    ),
+                    other => panic!("unexpected dataset {other}"),
+                };
+            let offset: usize = q["offset"].parse().unwrap();
+            let length: usize = q["length"].parse().unwrap();
+            let page: Vec<_> = rows
+                .iter()
+                .enumerate()
+                .skip(offset)
+                .take(length)
+                .map(|(i, r)| json!({"row_idx": i, "row": r, "truncated_cells": []}))
+                .collect();
+            wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "features": features, "rows": page, "num_rows_total": rows.len(),
+                "num_rows_per_page": 100, "partial": false
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_cases_writes_four_case_files_and_a_reproducible_manifest() {
+        use wiremock::matchers::{path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let ds = MockServer::start().await;
+        Mock::given(path("/rows"))
+            .respond_with(FakeDs)
+            .mount(&ds)
+            .await;
+        let hub = MockServer::start().await;
+        Mock::given(path_regex("^/api/datasets/.+"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"sha": "feedfacecafe0001", "cardData": {"license": ["cc-by-4.0"]}}),
+            ))
+            .mount(&hub)
+            .await;
+        let cache = tempfile::tempdir().unwrap();
+        let client = reqwest::Client::new();
+        let run = |out: std::path::PathBuf, seed: u64| {
+            let (client, ds, hub, cache) =
+                (client.clone(), ds.uri(), hub.uri(), cache.path().to_owned());
+            async move {
+                std::fs::create_dir_all(&out).unwrap();
+                let opts = FetchOptions {
+                    ds_base: &ds,
+                    hub_base: &hub,
+                    cache_root: &cache,
+                    out: &out,
+                    seed,
+                    per_scenario: 5,
+                };
+                fetch_cases(&client, &opts).await.unwrap()
+            }
+        };
+        let root = tempfile::tempdir().unwrap();
+        let (a, b, c) = (
+            root.path().join("a"),
+            root.path().join("b"),
+            root.path().join("c"),
+        );
+        let m = run(a.clone(), 2026).await;
+        run(b.clone(), 2026).await;
+        run(c.clone(), 1).await;
+
+        assert_eq!(m.seed, 2026);
+        assert_eq!(m.per_scenario, 5);
+        assert_eq!(m.rand_version, RAND_VERSION);
+        assert_eq!(m.datasets.len(), 4);
+        assert!(
+            m.datasets
+                .iter()
+                .all(|d| d.sha == "feedfacecafe0001" && d.license == "cc-by-4.0")
+        );
+        assert_eq!(
+            m.files
+                .iter()
+                .map(|f| (f.file.as_str(), f.cases))
+                .collect::<Vec<_>>(),
+            [
+                ("s1a.jsonl", 5),
+                ("s1b.jsonl", 5),
+                ("s2.jsonl", 5),
+                ("s3.jsonl", 5)
+            ]
+        );
+        for f in [
+            "s1a.jsonl",
+            "s1b.jsonl",
+            "s2.jsonl",
+            "s3.jsonl",
+            "manifest.json",
+        ] {
+            let bytes = std::fs::read(a.join(f)).unwrap();
+            assert_eq!(bytes, std::fs::read(b.join(f)).unwrap(), "{f}");
+            if f != "manifest.json" {
+                assert_ne!(bytes, std::fs::read(c.join(f)).unwrap(), "{f}");
+                let (_, cases) = crate::case::read_case_file(&a.join(f)).unwrap();
+                assert_eq!(cases.len(), 5);
+                assert!(cases[0].source.starts_with(&format!(
+                    "{}@feedfaceca:test#",
+                    DATASETS.iter().find(|d| d.file == f).unwrap().id
+                )));
+            }
+        }
+        let on_disk: Manifest =
+            serde_json::from_slice(&std::fs::read(a.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(on_disk, m);
+    }
+}
