@@ -1283,6 +1283,41 @@ async fn a_re_routed_laya_checkpoint_is_a_provider_error_naming_both() {
     }
 }
 
+/// Laya accepts its own aliases, any case and spacing, and the published Hub
+/// ids (`router.py` `_ALIASES`, `serve.py` `_resolve_model`) and reports the
+/// canonical name in `routing.model` — verified live: `ml`, `English` and `en`
+/// come back `reason: "explicit model=…"`. Those are no re-route. The bundle id
+/// `convaiinnovations/laya` asks Laya to choose, so whatever it chose is no
+/// re-route either.
+#[tokio::test]
+async fn laya_aliases_of_the_served_checkpoint_are_no_re_route() {
+    for (requested, served) in [
+        ("ml", "multilingual"),
+        ("English", "english"),
+        (" en ", "english"),
+        ("typed_decisions", "typed-decisions"),
+        ("convaiinnovations/laya-multilingual", "multilingual"),
+        ("convaiinnovations/laya", "multilingual"),
+    ] {
+        let mut body = laya_ok_body();
+        body["routing"] = json!({"model": served, "reason": format!("explicit model='{served}'")});
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut req = request(Some(requested), vec![], None);
+        req.questions = laya_questions();
+        SystemOneAdapter::with_id("laya")
+            .unwrap()
+            .decide(&keyless(&server.uri()), &req)
+            .await
+            .unwrap_or_else(|e| panic!("{requested:?} served as {served:?}: {e:?}"));
+    }
+}
+
 /// A `routing` with no (or a null, or a non-string) `model` says nothing about
 /// a re-route — and another host's `routing` of any other shape (a string, a
 /// list) must never fail the parse of an otherwise good answer.
