@@ -466,8 +466,10 @@ fn never_reached(md: &mut String, results: &Results, models: &[String]) {
     let _ = writeln!(md, "## Rows that never reached the server\n");
     let _ = writeln!(
         md,
-        "Refused before dispatch: a context-window gate (not_applicable), or a lockout from \
-         a real `Retry-After` or an auth failure (error, counted as wrong).\n"
+        "Refused before dispatch by a context-window gate (not_applicable), or by a lockout \
+         from a real `Retry-After` or an auth failure (error, counted as wrong); or a \
+         transport failure before any reply: a refused or dropped connection, or a DNS \
+         failure (error, counted as wrong).\n"
     );
     for l in lines {
         let _ = writeln!(md, "{l}");

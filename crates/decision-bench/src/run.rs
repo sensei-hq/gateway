@@ -12,13 +12,14 @@ use gateway::types::config::GatewayConfig;
 use gateway::types::decision::{DecisionAnswer, DecisionQuestion, DecisionQuestions};
 use gateway::types::error::HumanAction;
 use gateway::types::request::Payload;
+use gateway::types::trace::Attempt;
 use gateway::{
     Capability, FacadeBuilder, Gateway, GatewayError, InferenceRequest, InferenceResponse,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::case::{Case, Expected, Scenario};
-use crate::config::{BenchConfig, ModelSpec, chain_id};
+use crate::config::{BenchConfig, ModelSpec, ROUTER_TIMEOUT, chain_id};
 use crate::scenarios::Manifest;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -44,17 +45,24 @@ pub struct ResultRow {
     /// Score cases: the gold level, for MAE.
     pub expected_level: Option<usize>,
     pub latency_ms: u64,
-    /// Whether the gateway dispatched at least one attempt to the adapter
-    /// (the chain has exactly one candidate):
-    /// - `true` for an answer, an `AllAttemptsFailed` with attempts, and an
-    ///   `AllGated` whose `skipped` is empty — the engine also returns
-    ///   `AllGated` *after* an attempt, e.g. a 429 whose lockout makes the
-    ///   chain timed-gated.
-    /// - `false` for an `AllGated` that lists the candidate in `skipped` (a gate
-    ///   — cooldown, lockout, breaker, context window — refused it before
-    ///   dispatch) and for every other pre-dispatch error.
+    /// Whether the call reached the model's server (the chain has exactly
+    /// one candidate):
+    /// - `true` for an answer; an `AllAttemptsFailed` whose attempt got a
+    ///   reply or timed out (a timeout is a request the server was still
+    ///   working on); and an `AllGated` whose `skipped` is empty — the engine
+    ///   also returns `AllGated` *after* an attempt, e.g. a 429 whose lockout
+    ///   makes the chain timed-gated.
+    /// - `false` for a transport failure before any reply: a refused
+    ///   connection, a DNS failure, or a connection dropped unanswered. The
+    ///   kernel keeps only the error's text, and all of these (and a timeout)
+    ///   read [`NETWORK_SEND_MARKER`]; an attempt that failed so before the
+    ///   router timeout is one of these, one that lasted the whole timeout is
+    ///   a timeout. Also `false` for an `AllGated` that lists the candidate in
+    ///   `skipped` (a gate — cooldown, lockout, breaker, context window —
+    ///   refused it before dispatch) and for every other pre-dispatch error.
     ///
-    /// Caveat: an adapter's own pre-send `InputRejected`
+    /// Caveats: a connect that hangs until the router timeout (a blackholed
+    /// host) reads `true`. An adapter's own pre-send `InputRejected`
     /// (Laya head budget, images) is a recorded attempt and so reads `true`
     /// although no bytes reached the server; the error text cannot tell it
     /// apart from a server-side truncation.
@@ -66,6 +74,12 @@ pub struct ResultRow {
 /// The kernel's `InputRejected` Display marker — pinned by
 /// `the_input_rejected_marker_matches_the_kernel` against the real type.
 pub const INPUT_REJECTED_MARKER: &str = "cannot serve this input: ";
+
+/// How the kernel renders a `Network` error whose request got no reply
+/// (`network error: ` + reqwest's `error sending request`): a refused or
+/// dropped connection, a DNS failure, or a timeout alike. Pinned by
+/// `the_network_send_marker_matches_the_kernel` against the real types.
+pub const NETWORK_SEND_MARKER: &str = "network error: error sending request";
 
 /// Longest `detail` kept on a row, in chars.
 pub const DETAIL_MAX_CHARS: usize = 300;
@@ -454,21 +468,22 @@ pub fn row_for(
     result: &Result<InferenceResponse, GatewayError>,
     latency_ms: u64,
 ) -> ResultRow {
-    let mut row = row_unclipped(case, model, result, latency_ms);
+    let mut row = row_unclipped(case, model, result, latency_ms, ROUTER_TIMEOUT);
     row.detail = row.detail.map(|d| clip(&d));
     row
 }
 
-/// [`row_for`] for `m`, with `m`'s URL [`redact`]ed from the detail before it
-/// is clipped (so a clip cannot cut a URL past recognition). Every row a run
-/// records goes through this.
+/// [`row_for`] for `m` called with router timeout `router_timeout`, with `m`'s
+/// URL [`redact`]ed from the detail before it is clipped (so a clip cannot cut
+/// a URL past recognition). Every row a run records goes through this.
 pub fn row_for_model(
     case: &Case,
     m: &ModelSpec,
     result: &Result<InferenceResponse, GatewayError>,
     latency_ms: u64,
+    router_timeout: Duration,
 ) -> ResultRow {
-    let mut row = row_unclipped(case, &m.id, result, latency_ms);
+    let mut row = row_unclipped(case, &m.id, result, latency_ms, router_timeout);
     row.detail = row.detail.map(|d| clip(&redact(&d, m)));
     row
 }
@@ -478,6 +493,7 @@ fn row_unclipped(
     model: &str,
     result: &Result<InferenceResponse, GatewayError>,
     latency_ms: u64,
+    router_timeout: Duration,
 ) -> ResultRow {
     let mut row = ResultRow {
         case_id: case.id.clone(),
@@ -489,17 +505,7 @@ fn row_unclipped(
         score_value: None,
         expected_level: None,
         latency_ms,
-        reached_server: match result {
-            Ok(_) => true,
-            Err(GatewayError::AllAttemptsFailed {
-                attempts_detail, ..
-            }) => !attempts_detail.is_empty(),
-            // Single-candidate chain: the candidate is either skipped by a gate
-            // (listed in `skipped`, never dispatched) or was attempted and its
-            // outcome made the chain gated (a 429 → timed lockout).
-            Err(GatewayError::AllGated { skipped, .. }) => skipped.is_empty(),
-            Err(_) => false,
-        },
+        reached_server: reached_server(result, router_timeout),
         detail: None,
     };
     let answer = match result {
@@ -526,6 +532,36 @@ fn row_unclipped(
         Err(e) => row.detail = Some(format!("{e:#}")),
     }
     row
+}
+
+/// See [`ResultRow::reached_server`].
+fn reached_server(
+    result: &Result<InferenceResponse, GatewayError>,
+    router_timeout: Duration,
+) -> bool {
+    match result {
+        Ok(_) => true,
+        Err(GatewayError::AllAttemptsFailed {
+            attempts_detail, ..
+        }) => attempts_detail
+            .iter()
+            .any(|a| attempt_reached_server(a, router_timeout)),
+        // Single-candidate chain: the candidate is either skipped by a gate
+        // (listed in `skipped`, never dispatched) or was attempted and its
+        // outcome made the chain gated (a 429 → timed lockout).
+        Err(GatewayError::AllGated { skipped, .. }) => skipped.is_empty(),
+        Err(_) => false,
+    }
+}
+
+/// An attempt reached the server unless it failed with
+/// [`NETWORK_SEND_MARKER`] before the router timeout ran out.
+fn attempt_reached_server(a: &Attempt, router_timeout: Duration) -> bool {
+    let unanswered = a
+        .error
+        .as_deref()
+        .is_some_and(|e| e.starts_with(NETWORK_SEND_MARKER));
+    !unanswered || u128::from(a.duration_ms) >= router_timeout.as_millis()
 }
 
 /// Run every case on every model in `model_ids`, in config order, one case at
@@ -572,7 +608,7 @@ pub async fn run_with_progress(
             let started = Instant::now();
             let result = execute_watched(&gw, &req, &m.id, &case.id).await;
             let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-            rows.push(row_for_model(case, m, &result, latency_ms));
+            rows.push(row_for_model(case, m, &result, latency_ms, ROUTER_TIMEOUT));
         }
         let done = &rows[first..];
         let count = |o: Outcome| done.iter().filter(|r| r.outcome == o).count();
@@ -664,7 +700,7 @@ pub async fn run_saving(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gateway::types::trace::{Attempt, AttemptStatus};
+    use gateway::types::trace::AttemptStatus;
     use serde_json::json;
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1293,13 +1329,96 @@ mod tests {
         assert_eq!(rows.len(), 5);
         for r in &rows {
             assert_eq!(r.outcome, Outcome::Error, "{r:?}");
-            assert!(r.reached_server, "{r:?}");
+            // Dropped unanswered: no reply, so not a result of the model (A1).
+            assert!(!r.reached_server, "{r:?}");
         }
         assert_eq!(
             accepted.load(std::sync::atomic::Ordering::SeqCst),
             6,
             "warm-up + 5 cases must each reach the server; rows: {rows:?}"
         );
+    }
+
+    /// SP-DEC-4 review A1: a refused connection sends nothing, so its rows
+    /// never reached the server, and the report says so instead of ranking a
+    /// dead port at accuracy 0.00 with no warning.
+    #[tokio::test]
+    async fn a_run_against_a_closed_port_never_reaches_the_server() {
+        let m = spec("http://127.0.0.1:9");
+        let cfg = BenchConfig {
+            models: vec![m.clone()],
+        };
+        let rows = run(&cfg, &noul_cases(3), std::slice::from_ref(&m.id))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        for r in &rows {
+            assert_eq!(r.outcome, Outcome::Error, "{r:?}");
+            assert!(
+                !r.reached_server,
+                "a refused connection reached nothing: {r:?}"
+            );
+        }
+        let results = Results {
+            generated_at: 0,
+            manifest: None,
+            not_run: vec![],
+            roster: vec![RosterEntry::from(&m)],
+            labels_reviewed: vec![],
+            completed: vec![m.id.clone()],
+            paths: None,
+            rows,
+        };
+        let md = crate::report::render(&results, 7);
+        let never = md
+            .split("## Rows that never reached the server")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no never-reached section:\n{md}"));
+        assert!(
+            never.contains("nimble-v3 on S3: 3 rows never reached the server (3 error)"),
+            "{never}"
+        );
+    }
+
+    /// A1: the marker is what the kernel makes of a real reqwest connect
+    /// failure, so a kernel or reqwest wording change fails here, not
+    /// silently in a run.
+    #[tokio::test]
+    async fn the_network_send_marker_matches_the_kernel() {
+        let refused = reqwest::Client::new()
+            .post("http://127.0.0.1:9/v1/systemone")
+            .send()
+            .await
+            .expect_err("nothing listens on port 9");
+        let text = GatewayError::Network(refused).to_string();
+        assert!(text.starts_with(NETWORK_SEND_MARKER), "{text}");
+    }
+
+    /// A1: a case that runs out the router timeout was sent and the server
+    /// was working on it, so it reached the server — although the kernel
+    /// renders the timeout with the same text as a refused connection.
+    #[tokio::test]
+    async fn a_case_that_times_out_reached_the_server() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+            .mount(&server)
+            .await;
+        let m = spec(&server.uri());
+        let cfg = BenchConfig {
+            models: vec![m.clone()],
+        };
+        let timeout = Duration::from_millis(300);
+        let gw = gateway_with_timeout(&cfg, &m, timeout).await.unwrap();
+        let case = noul_case(true);
+        let result = gw.execute(&request_for(&case, &m)).await;
+        let row = row_for_model(&case, &m, &result, 300, timeout);
+        assert_eq!(row.outcome, Outcome::Error, "{row:?}");
+        assert!(
+            row.detail.as_deref().unwrap().contains(NETWORK_SEND_MARKER),
+            "{row:?}"
+        );
+        assert!(row.reached_server, "{row:?}");
     }
 
     /// C1: a 429 without `Retry-After` must not lock the model out for the
