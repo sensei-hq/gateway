@@ -443,9 +443,11 @@ Routers:
     response (Ollama and Cloudflare included; only Laya sends it today); `true` is a `ProviderError` (status `Some(200)`), not a success. Set the
     model's `context_window` to its real token window so the context-window gate
     refuses oversize requests before sending. Truncation is input-determined, so with
-    no other candidate the engine returns `AllAttemptsFailed { retryable: true }` and an
-    orchestrator agent node retries the identical request up to its `max_attempts`;
-    each truncation counts toward the router's circuit breaker — chain a second decision router.
+    no other candidate the engine returns `AllAttemptsFailed { retryable: true }`; an
+    orchestrator node (ModelCall or Agent) retries the identical request only if the
+    executor was built with `with_max_transient_attempts(n > 1)` (default 1 = no retry),
+    and each repeat fails the same way. Each truncation counts toward the router's
+    circuit breaker — chain a second decision router.
     Keep Laya's default payload: `LAYA_JEV_STRICT` strips `truncated` and disables the
     check.
   - Errors are FastAPI `{"detail": …}`: 401 → `Authentication`; 400/413/422/500/503 →

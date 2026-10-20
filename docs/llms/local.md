@@ -70,9 +70,11 @@ feature below, and a chat adapter you register under the same id is left untouch
   `usage.truncated: true`); the gateway turns that into a `ProviderError` so the chain
   falls back — set the model's `context_window` to its real window so oversize requests
   are refused up front, and keep Laya's default payload (`LAYA_JEV_STRICT` strips the
-  flag). Truncation is input-determined, so chain a second decision router or the same
-  request ends in `AllAttemptsFailed { retryable: true }`, an orchestrator agent node
-  retries it up to its `max_attempts`, and each truncation counts toward the breaker. The response `model` is
+  flag). Truncation is input-determined, so chain a second decision router: with no other
+  candidate the engine returns `AllAttemptsFailed { retryable: true }`; an orchestrator
+  node (ModelCall or Agent) retries the identical request only if the executor was built
+  with `with_max_transient_attempts(n > 1)` (default 1 = no retry), and each repeat fails
+  the same way. Every truncation counts toward the breaker. The response `model` is
   always `laya-rl-agent`; `usage.output_tokens` is 0. No `/v1/systemone/batch`.
 - **vLLM** — no upstream `/v1/systemone` (PR #59299 open; only an example proxy); not
   supported, no `vllm` id.

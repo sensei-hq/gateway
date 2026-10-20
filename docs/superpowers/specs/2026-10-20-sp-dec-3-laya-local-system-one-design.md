@@ -11,7 +11,9 @@ Not in scope (carry-forwards):
 - `POST /v1/systemone/batch`, Laya's `max_len` / `task` / `lang` / `min_confidence` body controls.
 - **Truncation is input-determined but classified like any provider fault** (found in T2 review). The same
   over-window request truncates on every retry: with no other candidate it returns `AllAttemptsFailed
-  { retryable: true }` and the orchestrator retries it up to `max_attempts`, and every truncation counts
+  { retryable: true }`; an orchestrator node (ModelCall or Agent) retries the identical request only if the
+  executor was built with `with_max_transient_attempts(n > 1)` (default 1 = no retry), and each repeat fails
+  the same way. Every truncation counts
   toward the router's circuit breaker (a burst can open it for valid short requests). Mitigation today:
   set `context_window` so the gate refuses first, and chain a second decision router. A typed
   non-retryable, breaker-neutral marker is the follow-up.

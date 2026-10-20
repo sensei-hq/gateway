@@ -167,10 +167,11 @@ CLM-8B (needs vLLM / CUDA).
   token window (or lower it if it already is)". Keep Laya's default payload:
   `LAYA_JEV_STRICT` strips `truncated`, which disables the check.
 - **Known limit:** truncation is input-determined. With no other candidate in the
-  chain the engine tries nothing else and returns `AllAttemptsFailed { retryable: true }`;
-  an orchestrator agent node then retries the identical request up to its
-  `max_attempts`, and every truncation counts toward the router's circuit breaker. Set `context_window` and chain a second
-  decision router.
+  chain the engine returns `AllAttemptsFailed { retryable: true }`; an orchestrator node
+  (ModelCall or Agent) retries the identical request only if the executor was built with
+  `with_max_transient_attempts(n > 1)` (default 1 = no retry), and each repeat fails the
+  same way. Every truncation counts toward the router's circuit breaker. Set
+  `context_window` and chain a second decision router.
 - **Overhead:** measured on an M4 Max, HTTP adds about 0.35 ms per decision — about
   8% on the ANE checkpoint (4.1 ms), negligible on CPU+GPU (~50 ms).
 
