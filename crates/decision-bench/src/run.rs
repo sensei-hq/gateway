@@ -1,0 +1,895 @@
+//! Send every case through the gateway facade, one model at a time, and record
+//! exactly one [`ResultRow`] per (case, model) — `ok`, `not_applicable` or
+//! `error` (spec D2/D2a, AC3). Nothing is retried and nothing is dropped.
+
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, bail};
+use gateway::circuit_breaker::CircuitBreakerConfig;
+use gateway::types::decision::{DecisionAnswer, DecisionQuestions};
+use gateway::types::error::HumanAction;
+use gateway::types::request::Payload;
+use gateway::{Capability, FacadeBuilder, GatewayError, InferenceRequest, InferenceResponse};
+use serde::{Deserialize, Serialize};
+
+use crate::case::{Case, Expected, Scenario};
+use crate::config::{BenchConfig, ModelSpec, chain_id};
+use crate::scenarios::Manifest;
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
+    Ok,
+    NotApplicable,
+    Error,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ResultRow {
+    pub case_id: String,
+    pub scenario: Scenario,
+    pub model: String,
+    pub outcome: Outcome,
+    /// `Some` only when `outcome` is `Ok`.
+    pub correct: Option<bool>,
+    /// Probability of the answered option (noul: `max(p, 1 - p)`).
+    pub top_probability: Option<f64>,
+    /// Score answers: the probability-weighted level.
+    pub score_value: Option<f64>,
+    /// Score cases: the gold level, for MAE.
+    pub expected_level: Option<usize>,
+    pub latency_ms: u64,
+    /// Reason for `NotApplicable` / `Error`, clipped to [`DETAIL_MAX_CHARS`].
+    pub detail: Option<String>,
+}
+
+/// The kernel's `InputRejected` Display marker — pinned by
+/// `the_input_rejected_marker_matches_the_kernel` against the real type.
+pub const INPUT_REJECTED_MARKER: &str = "cannot serve this input: ";
+
+/// Longest `detail` kept on a row, in chars.
+pub const DETAIL_MAX_CHARS: usize = 300;
+
+/// A model that `check` found unreachable, so it was not run (filled by T7).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct NotRun {
+    pub model: String,
+    pub reason: String,
+}
+
+/// The whole of `results.json`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Results {
+    /// Unix seconds.
+    pub generated_at: u64,
+    pub manifest: Option<Manifest>,
+    pub not_run: Vec<NotRun>,
+    pub rows: Vec<ResultRow>,
+}
+
+/// What [`score`] makes of an answer to a case.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Scored {
+    pub correct: bool,
+    pub top_probability: f64,
+    pub score_value: Option<f64>,
+    pub expected_level: Option<usize>,
+}
+
+/// Classify a failed `execute` for a single-candidate, no-fallback chain.
+///
+/// - `AllGated` with `UseLargerContextWindow`: the gateway refused before
+///   sending because the input does not fit the window → `NotApplicable`.
+/// - `AllAttemptsFailed` where every attempt failed with the kernel's
+///   `InputRejected` Display (`adapter '…' cannot serve this input: …`) →
+///   `NotApplicable`. An empty attempt list is not evidence of a rejection.
+/// - Anything else → `Error`.
+///
+/// The `String` is the reason, unclipped.
+pub fn classify(err: &GatewayError) -> (Outcome, String) {
+    match err {
+        GatewayError::AllGated {
+            human_action: Some(HumanAction::UseLargerContextWindow),
+            ..
+        } => (Outcome::NotApplicable, err.to_string()),
+        GatewayError::AllAttemptsFailed {
+            attempts_detail, ..
+        } if !attempts_detail.is_empty()
+            && attempts_detail
+                .iter()
+                .all(|a| a.error.as_deref().is_some_and(is_input_rejected)) =>
+        {
+            let reasons: Vec<&str> = attempts_detail
+                .iter()
+                .filter_map(|a| a.error.as_deref())
+                .collect();
+            (Outcome::NotApplicable, reasons.join("; "))
+        }
+        _ => (Outcome::Error, err.to_string()),
+    }
+}
+
+/// The kernel renders `InputRejected` as `adapter '<id>' cannot serve this
+/// input: <message>`. Requiring the `adapter '` prefix as well keeps a
+/// `ProviderError` (`provider error from adapter …`) whose upstream body
+/// happens to quote the marker from counting as a rejection.
+fn is_input_rejected(error: &str) -> bool {
+    error.starts_with("adapter '")
+        && error
+            .find(INPUT_REJECTED_MARKER)
+            .is_some_and(|at| error[..at].ends_with("' "))
+}
+
+/// Score an answer against the case's expectation.
+///
+/// - Choice: correct iff the chosen key is the expected option;
+///   `top_probability` is the chosen option's probability.
+/// - Noul: decided at 0.5 (`p >= 0.5` is `true`); `top_probability` is
+///   `max(p, 1 - p)`.
+/// - Score: correct iff the argmax level of `probabilities` is the expected
+///   level. **A tie goes to the lower level.** `score_value` is the answer's
+///   probability-weighted `score`; `top_probability` is the argmax level's
+///   probability; `expected_level` is the gold level.
+///
+/// An answer of the wrong type for the question, or one missing the
+/// probability it needs, is an `Err`.
+pub fn score(case: &Case, answer: &DecisionAnswer) -> anyhow::Result<Scored> {
+    let id = &case.id;
+    match (&case.expected, answer) {
+        (
+            Expected::Choice { option },
+            DecisionAnswer::Choice {
+                choice,
+                probabilities,
+                ..
+            },
+        ) => {
+            let p = *probabilities.get(choice).with_context(|| {
+                format!("case {id}: answer chose {choice:?} but gave it no probability")
+            })?;
+            Ok(Scored {
+                correct: choice == option,
+                top_probability: p,
+                score_value: None,
+                expected_level: None,
+            })
+        }
+        (Expected::Noul { value }, DecisionAnswer::Noul { noul }) => {
+            let p = *noul;
+            if !(0.0..=1.0).contains(&p) {
+                bail!("case {id}: noul probability {p} is not within 0..=1");
+            }
+            Ok(Scored {
+                correct: (p >= 0.5) == *value,
+                top_probability: p.max(1.0 - p),
+                score_value: None,
+                expected_level: None,
+            })
+        }
+        (
+            Expected::Score { level },
+            DecisionAnswer::Score {
+                score,
+                probabilities,
+                ..
+            },
+        ) => {
+            // Argmax over levels; a tie goes to the LOWER level (levels are
+            // visited in ascending order and only a strictly greater
+            // probability replaces the incumbent).
+            let mut levels = Vec::with_capacity(probabilities.len());
+            for (k, p) in probabilities {
+                let l: usize = k.parse().with_context(|| {
+                    format!("case {id}: score probability key {k:?} is not a level index")
+                })?;
+                levels.push((l, *p));
+            }
+            levels.sort_by_key(|(l, _)| *l);
+            let mut best: Option<(usize, f64)> = None;
+            for (l, p) in levels {
+                if best.is_none_or(|(_, bp)| p > bp) {
+                    best = Some((l, p));
+                }
+            }
+            let (argmax, p) =
+                best.with_context(|| format!("case {id}: score answer has no probabilities"))?;
+            Ok(Scored {
+                correct: argmax == *level,
+                top_probability: p,
+                score_value: Some(*score),
+                expected_level: Some(*level),
+            })
+        }
+        (e, a) => bail!(
+            "case {id}: answer type {} does not match the expected {e:?}",
+            match a {
+                DecisionAnswer::Choice { .. } => "choice",
+                DecisionAnswer::Noul { .. } => "noul",
+                DecisionAnswer::Score { .. } => "score",
+            }
+        ),
+    }
+}
+
+/// The facade builder for `m`: its single-entry chain, with the circuit
+/// breaker effectively OFF (`threshold: usize::MAX`). With the default
+/// threshold, five consecutive real failures would open the breaker and every
+/// later case would be a ~0 ms gated skip that never reaches the server.
+pub fn facade_for(cfg: &BenchConfig, m: &ModelSpec) -> anyhow::Result<FacadeBuilder> {
+    Ok(
+        FacadeBuilder::new(cfg.gateway_config_for(m)?).circuit_breaker(CircuitBreakerConfig {
+            threshold: usize::MAX,
+            timeout: Duration::from_secs(1),
+            half_open_max_requests: 1,
+        }),
+    )
+}
+
+/// The request for `case` on `m`'s chain, with fallback off.
+pub fn request_for(case: &Case, m: &ModelSpec) -> InferenceRequest {
+    InferenceRequest {
+        capability: Capability::Decision,
+        model: None,
+        router: None,
+        chain: Some(chain_id(m)),
+        payload: Payload::Decision {
+            state: case.state.clone(),
+            questions: DecisionQuestions::from([("q".to_string(), case.question.clone())]),
+            images: vec![],
+            keep_alive: None,
+        },
+        budget: None,
+        auth: None,
+        panel: None,
+        consensus: None,
+        allow_fallback: false,
+        credentials: Default::default(),
+        routing: None,
+    }
+}
+
+fn clip(s: &str) -> String {
+    s.chars().take(DETAIL_MAX_CHARS).collect()
+}
+
+/// The one row for (`case`, `model`) from the result of `execute`.
+pub fn row_for(
+    case: &Case,
+    model: &str,
+    result: &Result<InferenceResponse, GatewayError>,
+    latency_ms: u64,
+) -> ResultRow {
+    let mut row = ResultRow {
+        case_id: case.id.clone(),
+        scenario: case.scenario,
+        model: model.to_string(),
+        outcome: Outcome::Error,
+        correct: None,
+        top_probability: None,
+        score_value: None,
+        expected_level: None,
+        latency_ms,
+        detail: None,
+    };
+    let answer = match result {
+        Err(e) => {
+            let (outcome, reason) = classify(e);
+            row.outcome = outcome;
+            row.detail = Some(clip(&reason));
+            return row;
+        }
+        Ok(resp) => resp.decisions.as_ref().and_then(|d| d.get("q")),
+    };
+    let Some(answer) = answer else {
+        row.detail = Some("no answer for q".into());
+        return row;
+    };
+    match score(case, answer) {
+        Ok(s) => {
+            row.outcome = Outcome::Ok;
+            row.correct = Some(s.correct);
+            row.top_probability = Some(s.top_probability);
+            row.score_value = s.score_value;
+            row.expected_level = s.expected_level;
+        }
+        Err(e) => row.detail = Some(clip(&format!("{e:#}"))),
+    }
+    row
+}
+
+/// Run every case on every model in `model_ids`, in config order, one case at
+/// a time. Each model gets one discarded warm-up call (the first case) first.
+/// An id not in the config is an error naming it; an empty `model_ids` runs
+/// nothing.
+pub async fn run(
+    cfg: &BenchConfig,
+    cases: &[Case],
+    model_ids: &[String],
+) -> anyhow::Result<Vec<ResultRow>> {
+    if let Some(unknown) = model_ids
+        .iter()
+        .find(|id| !cfg.models.iter().any(|m| &m.id == *id))
+    {
+        bail!("unknown model id '{unknown}': not in the bench config");
+    }
+    let mut rows = Vec::with_capacity(cases.len() * model_ids.len());
+    for m in cfg.models.iter().filter(|m| model_ids.contains(&m.id)) {
+        let gw = facade_for(cfg, m)?.build().await.gateway;
+        if let Some(first) = cases.first() {
+            // Warm-up: loads the model; its result is never recorded.
+            let _ = gw.execute(&request_for(first, m)).await;
+        }
+        for case in cases {
+            let req = request_for(case, m);
+            let started = Instant::now();
+            let result = gw.execute(&req).await;
+            let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            rows.push(row_for(case, &m.id, &result, latency_ms));
+        }
+    }
+    Ok(rows)
+}
+
+/// Write `results` as pretty JSON to `path` atomically (a sibling temp file,
+/// then a rename).
+pub fn write_results(path: &Path, results: &Results) -> anyhow::Result<()> {
+    let name = path
+        .file_name()
+        .with_context(|| format!("{} has no file name", path.display()))?;
+    let mut tmp_name = name.to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    let mut json = serde_json::to_string_pretty(results)?;
+    json.push('\n');
+    std::fs::write(&tmp, json).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gateway::types::decision::DecisionQuestion;
+    use gateway::types::trace::{Attempt, AttemptStatus};
+    use serde_json::json;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn attempt(error: &str) -> Attempt {
+        Attempt {
+            sequence: 1,
+            adapter: "laya".into(),
+            model: "english".into(),
+            api_model_id: "english".into(),
+            status: AttemptStatus::Failed,
+            duration_ms: 3,
+            tokens: None,
+            cost: None,
+            error: Some(error.into()),
+            fallback_triggered: false,
+        }
+    }
+
+    fn all_failed(errors: &[&str]) -> GatewayError {
+        GatewayError::AllAttemptsFailed {
+            attempts: errors.len(),
+            errors: errors.join("; "),
+            attempts_detail: errors.iter().map(|e| attempt(e)).collect(),
+            retryable: false,
+        }
+    }
+
+    fn gated(human_action: Option<HumanAction>) -> GatewayError {
+        GatewayError::AllGated {
+            resume_after: None,
+            skipped: vec!["laya:english — over window".into()],
+            human_action,
+        }
+    }
+
+    fn input_rejected_text() -> String {
+        GatewayError::InputRejected {
+            adapter: "laya".into(),
+            message: "state truncated".into(),
+        }
+        .to_string()
+    }
+
+    fn provider_error_text() -> String {
+        GatewayError::ProviderError {
+            adapter: "laya".into(),
+            message: "boom".into(),
+            status: Some(500),
+        }
+        .to_string()
+    }
+
+    fn case(question: DecisionQuestion, expected: Expected) -> Case {
+        Case {
+            id: "c1".into(),
+            scenario: Scenario::S3Entailment,
+            state: json!("some state"),
+            question,
+            expected,
+            source: "test".into(),
+        }
+    }
+
+    fn choice_case(expected: &str) -> Case {
+        case(
+            DecisionQuestion::Choice {
+                instructions: json!("pick"),
+                criteria: [("a".to_string(), None), ("b".to_string(), None)]
+                    .into_iter()
+                    .collect(),
+            },
+            Expected::Choice {
+                option: expected.into(),
+            },
+        )
+    }
+
+    fn noul_case(value: bool) -> Case {
+        case(
+            DecisionQuestion::Noul {
+                instructions: json!("holds?"),
+                criteria: None,
+            },
+            Expected::Noul { value },
+        )
+    }
+
+    fn score_case(level: usize) -> Case {
+        case(
+            DecisionQuestion::Score {
+                instructions: json!("how much?"),
+                criteria: vec!["low".into(), "mid".into(), "high".into()],
+            },
+            Expected::Score { level },
+        )
+    }
+
+    fn choice(choice: &str, probs: &[(&str, f64)]) -> DecisionAnswer {
+        DecisionAnswer::Choice {
+            choice: choice.into(),
+            probabilities: probs.iter().map(|(k, p)| (k.to_string(), *p)).collect(),
+            confidence: 0.5,
+        }
+    }
+
+    fn score_answer(score: f64, probs: &[f64]) -> DecisionAnswer {
+        DecisionAnswer::Score {
+            score,
+            legend: (0..probs.len())
+                .map(|i| (i.to_string(), format!("level {i}")))
+                .collect(),
+            probabilities: probs
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (i.to_string(), *p))
+                .collect(),
+            confidence: 0.5,
+        }
+    }
+
+    fn spec(url: &str) -> ModelSpec {
+        ModelSpec {
+            id: "nimble-v3".into(),
+            router: "llamacpp".into(),
+            url: url.into(),
+            api_model_id: "nimble-v3".into(),
+            context_window: 8192,
+            api_key_env: None,
+        }
+    }
+
+    fn response(decisions: serde_json::Value) -> InferenceResponse {
+        serde_json::from_value(json!({
+            "success": true,
+            "decisions": decisions,
+            "attempts": [],
+        }))
+        .unwrap()
+    }
+
+    // --- marker pin -------------------------------------------------------
+
+    #[test]
+    fn the_input_rejected_marker_matches_the_kernel() {
+        let text = GatewayError::InputRejected {
+            adapter: "laya".into(),
+            message: "m".into(),
+        }
+        .to_string();
+        assert!(text.contains(INPUT_REJECTED_MARKER), "{text}");
+        assert!(text.starts_with("adapter 'laya' "), "{text}");
+    }
+
+    // --- classify ---------------------------------------------------------
+
+    #[test]
+    fn a_context_window_refusal_is_not_applicable() {
+        let (o, d) = classify(&gated(Some(HumanAction::UseLargerContextWindow)));
+        assert_eq!(o, Outcome::NotApplicable);
+        assert!(!d.is_empty());
+    }
+
+    #[test]
+    fn an_all_gated_with_another_or_no_human_action_is_an_error() {
+        assert_eq!(
+            classify(&gated(Some(HumanAction::TopUpCredits))).0,
+            Outcome::Error
+        );
+        assert_eq!(classify(&gated(None)).0, Outcome::Error);
+    }
+
+    #[test]
+    fn an_input_rejected_attempt_is_not_applicable_with_its_reason() {
+        let (o, d) = classify(&all_failed(&[&input_rejected_text()]));
+        assert_eq!(o, Outcome::NotApplicable);
+        assert!(d.contains("state truncated"), "{d}");
+    }
+
+    #[test]
+    fn a_provider_error_attempt_is_an_error() {
+        let (o, d) = classify(&all_failed(&[&provider_error_text()]));
+        assert_eq!(o, Outcome::Error);
+        assert!(d.contains("boom"), "{d}");
+    }
+
+    #[test]
+    fn a_provider_error_beside_an_input_rejection_is_an_error() {
+        let e = all_failed(&[&provider_error_text(), &input_rejected_text()]);
+        assert_eq!(classify(&e).0, Outcome::Error);
+    }
+
+    #[test]
+    fn a_provider_error_quoting_the_marker_is_still_an_error() {
+        let quoted = GatewayError::ProviderError {
+            adapter: "laya".into(),
+            message: format!("upstream said: {INPUT_REJECTED_MARKER}x"),
+            status: Some(400),
+        }
+        .to_string();
+        assert_eq!(classify(&all_failed(&[&quoted])).0, Outcome::Error);
+    }
+
+    #[test]
+    fn an_all_attempts_failed_with_no_attempts_is_an_error() {
+        assert_eq!(classify(&all_failed(&[])).0, Outcome::Error);
+    }
+
+    #[test]
+    fn timeout_and_network_errors_are_errors() {
+        let t = GatewayError::Timeout {
+            adapter: "laya".into(),
+            model: "english".into(),
+            duration_ms: 120_000,
+        };
+        assert_eq!(classify(&t).0, Outcome::Error);
+        let network = reqwest::Client::new()
+            .get("http://[::1")
+            .build()
+            .expect_err("an unparseable URL is a reqwest::Error");
+        assert_eq!(classify(&GatewayError::Network(network)).0, Outcome::Error);
+    }
+
+    // --- score ------------------------------------------------------------
+
+    #[test]
+    fn a_choice_equal_to_the_expected_option_is_correct_with_its_probability() {
+        let s = score(&choice_case("a"), &choice("a", &[("a", 0.7), ("b", 0.3)])).unwrap();
+        assert_eq!(
+            s,
+            Scored {
+                correct: true,
+                top_probability: 0.7,
+                score_value: None,
+                expected_level: None
+            }
+        );
+        let s = score(&choice_case("a"), &choice("b", &[("a", 0.4), ("b", 0.6)])).unwrap();
+        assert!(!s.correct);
+        assert_eq!(s.top_probability, 0.6);
+    }
+
+    #[test]
+    fn a_choice_without_a_probability_for_its_pick_is_an_err() {
+        assert!(score(&choice_case("a"), &choice("a", &[("b", 1.0)])).is_err());
+    }
+
+    #[test]
+    fn noul_is_decided_at_one_half() {
+        let s = score(&noul_case(true), &DecisionAnswer::Noul { noul: 0.5 }).unwrap();
+        assert!(s.correct, "p = 0.5 decides true");
+        let s = score(&noul_case(true), &DecisionAnswer::Noul { noul: 0.49 }).unwrap();
+        assert!(!s.correct);
+        let s = score(&noul_case(false), &DecisionAnswer::Noul { noul: 0.2 }).unwrap();
+        assert!(s.correct);
+    }
+
+    #[test]
+    fn noul_top_probability_is_the_decided_sides_probability() {
+        let s = score(&noul_case(false), &DecisionAnswer::Noul { noul: 0.2 }).unwrap();
+        assert!((s.top_probability - 0.8).abs() < 1e-12, "{s:?}");
+        let s = score(&noul_case(true), &DecisionAnswer::Noul { noul: 0.9 }).unwrap();
+        assert!((s.top_probability - 0.9).abs() < 1e-12, "{s:?}");
+    }
+
+    #[test]
+    fn a_noul_outside_zero_to_one_is_an_err() {
+        assert!(score(&noul_case(true), &DecisionAnswer::Noul { noul: 1.5 }).is_err());
+        assert!(score(&noul_case(true), &DecisionAnswer::Noul { noul: f64::NAN }).is_err());
+    }
+
+    #[test]
+    fn score_correctness_is_the_argmax_level_and_records_value_and_gold() {
+        let s = score(&score_case(2), &score_answer(1.6, &[0.1, 0.2, 0.7])).unwrap();
+        assert_eq!(
+            s,
+            Scored {
+                correct: true,
+                top_probability: 0.7,
+                score_value: Some(1.6),
+                expected_level: Some(2)
+            }
+        );
+        let s = score(&score_case(1), &score_answer(1.6, &[0.1, 0.2, 0.7])).unwrap();
+        assert!(!s.correct);
+        assert_eq!(s.expected_level, Some(1));
+    }
+
+    #[test]
+    fn a_score_tie_goes_to_the_lower_level() {
+        let lower = score(&score_case(0), &score_answer(1.0, &[0.4, 0.2, 0.4])).unwrap();
+        assert!(lower.correct, "tie between 0 and 2 picks 0");
+        let higher = score(&score_case(2), &score_answer(1.0, &[0.4, 0.2, 0.4])).unwrap();
+        assert!(!higher.correct);
+    }
+
+    #[test]
+    fn a_score_with_a_non_numeric_or_no_level_is_an_err() {
+        let bad = DecisionAnswer::Score {
+            score: 0.0,
+            legend: Default::default(),
+            probabilities: [("low".to_string(), 1.0)].into_iter().collect(),
+            confidence: 1.0,
+        };
+        assert!(score(&score_case(0), &bad).is_err());
+        assert!(score(&score_case(0), &score_answer(0.0, &[])).is_err());
+    }
+
+    #[test]
+    fn an_answer_of_the_wrong_type_is_an_err() {
+        let e = score(&choice_case("a"), &DecisionAnswer::Noul { noul: 0.9 }).unwrap_err();
+        assert!(e.to_string().contains("c1"), "names the case: {e}");
+        assert!(score(&noul_case(true), &choice("a", &[("a", 1.0)])).is_err());
+        assert!(score(&score_case(0), &DecisionAnswer::Noul { noul: 0.9 }).is_err());
+    }
+
+    // --- rows -------------------------------------------------------------
+
+    #[test]
+    fn a_missing_q_answer_is_an_error() {
+        let resp = response(json!({"other": {"type": "noul", "noul": 0.9}}));
+        let row = row_for(&noul_case(true), "m", &Ok(resp), 12);
+        assert_eq!(row.outcome, Outcome::Error);
+        assert_eq!(row.detail.as_deref(), Some("no answer for q"));
+        assert_eq!(row.correct, None);
+
+        let mut none = response(json!({}));
+        none.decisions = None;
+        let row = row_for(&noul_case(true), "m", &Ok(none), 12);
+        assert_eq!(row.outcome, Outcome::Error);
+        assert_eq!(row.detail.as_deref(), Some("no answer for q"));
+    }
+
+    #[test]
+    fn an_answered_case_is_an_ok_row() {
+        let resp = response(json!({"q": {"type": "noul", "noul": 0.2}}));
+        let row = row_for(&noul_case(false), "nimble", &Ok(resp), 42);
+        assert_eq!(
+            row,
+            ResultRow {
+                case_id: "c1".into(),
+                scenario: Scenario::S3Entailment,
+                model: "nimble".into(),
+                outcome: Outcome::Ok,
+                correct: Some(true),
+                top_probability: Some(0.8),
+                score_value: None,
+                expected_level: None,
+                latency_ms: 42,
+                detail: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_mistyped_answer_is_an_error_row_not_a_dropped_one() {
+        let resp = response(json!({"q": {"type": "noul", "noul": 0.2}}));
+        let row = row_for(&choice_case("a"), "m", &Ok(resp), 1);
+        assert_eq!(row.outcome, Outcome::Error);
+        assert_eq!(row.correct, None);
+        assert!(row.detail.is_some());
+    }
+
+    #[test]
+    fn a_failed_call_row_carries_the_class_and_a_clipped_reason() {
+        let long = GatewayError::InputRejected {
+            adapter: "laya".into(),
+            message: "é".repeat(1000),
+        }
+        .to_string();
+        let row = row_for(&noul_case(true), "m", &Err(all_failed(&[&long])), 5);
+        assert_eq!(row.outcome, Outcome::NotApplicable);
+        assert_eq!(row.correct, None);
+        assert_eq!(row.top_probability, None);
+        assert_eq!(row.latency_ms, 5);
+        assert_eq!(row.detail.unwrap().chars().count(), DETAIL_MAX_CHARS);
+    }
+
+    #[test]
+    fn the_request_pins_the_models_chain_without_fallback() {
+        let m = spec("http://127.0.0.1:1");
+        let c = noul_case(true);
+        let req = request_for(&c, &m);
+        assert_eq!(req.capability, Capability::Decision);
+        assert_eq!(req.chain.as_deref(), Some("bench-nimble-v3"));
+        assert!(!req.allow_fallback);
+        assert!(req.model.is_none() && req.router.is_none());
+        match &req.payload {
+            Payload::Decision {
+                state,
+                questions,
+                images,
+                keep_alive,
+            } => {
+                assert_eq!(state, &c.state);
+                assert_eq!(questions.len(), 1);
+                assert_eq!(questions["q"], c.question);
+                assert!(images.is_empty() && keep_alive.is_none());
+            }
+            other => panic!("not a decision payload: {other:?}"),
+        }
+    }
+
+    // --- breaker / run ----------------------------------------------------
+
+    /// The builder's breaker is not readable, so this proves it by behaviour:
+    /// the default threshold (5) would open the breaker and the later calls
+    /// would never reach the server.
+    #[tokio::test]
+    async fn every_call_reaches_the_server_after_many_failures() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("down"))
+            .mount(&server)
+            .await;
+        let m = spec(&server.uri());
+        let cfg = BenchConfig {
+            models: vec![m.clone()],
+        };
+        let gw = facade_for(&cfg, &m).unwrap().build().await.gateway;
+        let req = request_for(&noul_case(true), &m);
+        let mut seen = 0;
+        for i in 0..8 {
+            let err = gw.execute(&req).await.expect_err("server answers 500");
+            let now = server.received_requests().await.unwrap().len();
+            assert!(now > seen, "call {i} never reached the server: {err}");
+            seen = now;
+            assert_eq!(classify(&err).0, Outcome::Error, "call {i}: {err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn run_yields_one_row_per_case_and_model_after_a_discarded_warm_up() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "nimble-v3",
+                "answers": {"q": {"type": "noul", "noul": 0.9}},
+                "usage": {"input_tokens": 30, "output_tokens": 0}
+            })))
+            .mount(&server)
+            .await;
+        let mut a = spec(&server.uri());
+        a.id = "a".into();
+        let mut b = spec(&server.uri());
+        b.id = "b".into();
+        let cfg = BenchConfig { models: vec![a, b] };
+        let mut c2 = noul_case(false);
+        c2.id = "c2".into();
+        let cases = vec![noul_case(true), c2];
+        // Selection order is ignored: rows follow config order.
+        let rows = run(&cfg, &cases, &["b".into(), "a".into()]).await.unwrap();
+        let got: Vec<_> = rows
+            .iter()
+            .map(|r| (r.model.as_str(), r.case_id.as_str(), r.correct))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("a", "c1", Some(true)),
+                ("a", "c2", Some(false)),
+                ("b", "c1", Some(true)),
+                ("b", "c2", Some(false)),
+            ]
+        );
+        assert!(rows.iter().all(|r| r.outcome == Outcome::Ok));
+        // 2 models × (1 warm-up + 2 cases).
+        assert_eq!(server.received_requests().await.unwrap().len(), 6);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_model_id_is_an_error_naming_it() {
+        let cfg = BenchConfig {
+            models: vec![spec("http://127.0.0.1:1")],
+        };
+        let err = run(&cfg, &[noul_case(true)], &["nope".into()])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nope"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_empty_selection_runs_nothing() {
+        let cfg = BenchConfig {
+            models: vec![spec("http://127.0.0.1:1")],
+        };
+        assert!(run(&cfg, &[noul_case(true)], &[]).await.unwrap().is_empty());
+    }
+
+    // --- results file -----------------------------------------------------
+
+    #[test]
+    fn results_are_written_atomically_with_stable_field_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("results.json");
+        std::fs::write(&path, "stale").unwrap();
+        let results = Results {
+            generated_at: 1_760_000_000,
+            manifest: None,
+            not_run: vec![],
+            rows: vec![row_for(
+                &noul_case(true),
+                "m",
+                &Err(gated(Some(HumanAction::UseLargerContextWindow))),
+                7,
+            )],
+        };
+        write_results(&path, &results).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let mut keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["generated_at", "manifest", "not_run", "rows"]);
+        let mut row_keys: Vec<_> = v["rows"][0].as_object().unwrap().keys().cloned().collect();
+        row_keys.sort();
+        assert_eq!(
+            row_keys,
+            [
+                "case_id",
+                "correct",
+                "detail",
+                "expected_level",
+                "latency_ms",
+                "model",
+                "outcome",
+                "scenario",
+                "score_value",
+                "top_probability"
+            ]
+        );
+        assert_eq!(v["rows"][0]["outcome"], "not_applicable");
+        let back: Results = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, results);
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, vec![std::ffi::OsString::from("results.json")]);
+    }
+}
