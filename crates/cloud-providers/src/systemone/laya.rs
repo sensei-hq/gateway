@@ -1,0 +1,484 @@
+//! Laya's per-question head budget (SP-DEC-3 D6): Laya's `build_head`
+//! silently cuts each question's head to the checkpoint's `head_max_len` and
+//! reports nothing, so the generic adapter estimates the head and refuses an
+//! over-budget question before sending.
+
+use kernel::types::decision::{DecisionContent, DecisionQuestion, DecisionQuestions};
+use kernel::types::error::GatewayError;
+
+/// Laya's per-question head budget for a checkpoint (SP-DEC-3 D6): its
+/// `head_max_len` from `rl_agent_config.json` — `english` 192, `multilingual` /
+/// `typed-decisions` 256. Any other name (an operator-registered checkpoint, a
+/// typo) gets the smallest, never room it may not have.
+fn laya_head_budget(model: &str) -> usize {
+    match model {
+        "multilingual" | "typed-decisions" => 256,
+        _ => 192,
+    }
+}
+
+/// A conservative estimate of the tokens Laya's `build_head` spends on one
+/// question (SP-DEC-3 D6). Laya renders `"<type> question: <instructions>"` and
+/// one `[MASK]`-prefixed span per option (capped at 48 tokens each), then cuts
+/// the instruction SILENTLY so the whole head fits `head_max_len` — `truncated`
+/// never reports it.
+///
+/// It counts the same text Laya renders (`render_options` in
+/// `laya_coreml/common.py`) with [`laya_text_tokens`]: a choice option is
+/// `"key: description"` or the bare key; a score level is
+/// `"level i: description"`; a noul side is `"false: …"` / `"true: …"` with
+/// Laya's default text when undescribed. Non-string instructions are Laya's
+/// `json.dumps` text, separators included.
+///
+/// Measured 2026-10-20 against both real tokenizers (`english`, which
+/// typed-decisions shares, and `multilingual`, which -ane shares) on 27 varied
+/// samples — English, JSON (compact, Python, pretty), Japanese, Chinese,
+/// Korean, Cyrillic, Arabic, Hindi, Thai, German, emoji, astral CJK, code,
+/// URLs, numbers, hex, base64, gibberish, mixed case, ALLCAPS, camelCase,
+/// symbols, whitespace, long words: the estimate is never below the real
+/// count; the tightest margins are +0 (astral CJK as an option: a byte bound)
+/// and +2 (whitespace, numbers). On 21 000 seeded random strings, 6 short ones
+/// were under by 1 token. The price is over-counting: about 1.6× on English
+/// (the 288-char D6 instruction: 180 estimated, 109 real on `english`; the
+/// 548-char one that really fits, 300 vs 189, refused) and 2–7× on non-Latin
+/// scripts, whose every char is counted at its UTF-8 bytes. Refusing a head
+/// that would fit costs a fallback; sending one that does not returns a
+/// confident answer to a question the model never read.
+fn estimated_head_tokens(q: &DecisionQuestion) -> usize {
+    let tokens = laya_text_tokens;
+    fn option(text: &str) -> usize {
+        1 + laya_text_tokens(text).min(48)
+    }
+    let (kind, instructions) = match q {
+        DecisionQuestion::Choice { instructions, .. } => ("choice", instructions),
+        DecisionQuestion::Noul { instructions, .. } => ("noul", instructions),
+        DecisionQuestion::Score { instructions, .. } => ("score", instructions),
+    };
+    let head = tokens(&format!(
+        "{kind} question: {}",
+        laya_instruction_text(instructions)
+    ));
+    let options: usize = match q {
+        DecisionQuestion::Choice { criteria, .. } => criteria
+            .iter()
+            .map(|(key, desc)| match desc.as_deref() {
+                None | Some("") => option(key),
+                Some(desc) => option(&format!("{key}: {desc}")),
+            })
+            .sum(),
+        DecisionQuestion::Score { criteria, .. } => criteria
+            .iter()
+            .enumerate()
+            .map(|(i, desc)| option(&format!("level {i}: {desc}")))
+            .sum(),
+        DecisionQuestion::Noul { criteria, .. } => {
+            let side = |label: &str, desc: Option<&str>, default: &str| {
+                option(&format!(
+                    "{label}: {}",
+                    desc.filter(|d| !d.is_empty()).unwrap_or(default)
+                ))
+            };
+            let c = criteria.as_ref();
+            side(
+                "false",
+                c.and_then(|c| c.r#false.as_deref()),
+                "no, the statement does not hold",
+            ) + side(
+                "true",
+                c.and_then(|c| c.r#true.as_deref()),
+                "yes, the statement holds",
+            )
+        }
+    };
+    head + options
+}
+
+/// An upper estimate of the tokens one piece of Laya head text costs, on
+/// either shipped tokenizer (SP-DEC-3 D6). Each rule is a bound or errs high:
+/// - a non-ASCII char costs its UTF-8 byte count — both tokenizers fall back
+///   to single bytes for a char they do not know (measured: `𠜎` is 4 tokens on
+///   multilingual), so no char can cost more;
+/// - an ASCII digit, punctuation, symbol or non-space whitespace char costs 1
+///   (multilingual splits digits one per token and gives each extra space its
+///   own token);
+/// - a space costs nothing before an ASCII letter (it merges into the word),
+///   else 1;
+/// - an ASCII word costs [`laya_word_tokens`].
+fn laya_text_tokens(text: &str) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let (mut n, mut i) = (0, 0);
+    while i < chars.len() {
+        let c = chars[i];
+        if !c.is_ascii() {
+            n += c.len_utf8();
+            i += 1;
+        } else if c.is_ascii_alphabetic() {
+            let start = i;
+            while i < chars.len() && chars[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            n += laya_word_tokens(&chars[start..i]);
+        } else {
+            let merges = c == ' ' && chars.get(i + 1).is_some_and(char::is_ascii_alphabetic);
+            n += usize::from(!merges);
+            i += 1;
+        }
+    }
+    n
+}
+
+/// One run of ASCII letters. A word with an uppercase letter after its first
+/// (camelCase, ALLCAPS, base64) costs one token per letter — those split
+/// almost letter by letter. Any other word costs `max(ceil(len / 2), vowel
+/// groups, min(len, 2))` plus one per three consecutive vowels or consonants
+/// and one per `j q x z v k`: letter strings that are not words (ids, hashes,
+/// typos) split at rare letters and long consonant runs, and English words
+/// rarely have either.
+fn laya_word_tokens(word: &[char]) -> usize {
+    if word.iter().skip(1).any(char::is_ascii_uppercase) {
+        return word.len();
+    }
+    let (mut groups, mut runs, mut run, mut prev) = (0, 0, 0, None);
+    for c in word.iter().map(char::to_ascii_lowercase) {
+        let vowel = matches!(c, 'a' | 'e' | 'i' | 'o' | 'u' | 'y');
+        if vowel && prev != Some(true) {
+            groups += 1;
+        }
+        if prev != Some(vowel) {
+            runs += run / 3;
+            run = 0;
+        }
+        run += 1;
+        prev = Some(vowel);
+    }
+    runs += run / 3;
+    let rare = word
+        .iter()
+        .filter(|c| matches!(c.to_ascii_lowercase(), 'j' | 'q' | 'x' | 'z' | 'v' | 'k'))
+        .count();
+    word.len().div_ceil(2).max(groups).max(word.len().min(2)) + runs + rare
+}
+
+/// Instructions as Laya reads them: a string as-is, anything else as Python's
+/// `json.dumps(…, ensure_ascii=False)` — whose `", "` / `": "` separators are
+/// longer than serde_json's compact form, so they are reproduced here.
+fn laya_instruction_text(instructions: &DecisionContent) -> String {
+    struct PythonJson;
+    impl serde_json::ser::Formatter for PythonJson {
+        fn begin_array_value<W: ?Sized + std::io::Write>(
+            &mut self,
+            w: &mut W,
+            first: bool,
+        ) -> std::io::Result<()> {
+            if first { Ok(()) } else { w.write_all(b", ") }
+        }
+        fn begin_object_key<W: ?Sized + std::io::Write>(
+            &mut self,
+            w: &mut W,
+            first: bool,
+        ) -> std::io::Result<()> {
+            if first { Ok(()) } else { w.write_all(b", ") }
+        }
+        fn begin_object_value<W: ?Sized + std::io::Write>(
+            &mut self,
+            w: &mut W,
+        ) -> std::io::Result<()> {
+            w.write_all(b": ")
+        }
+    }
+    match instructions {
+        serde_json::Value::String(s) => s.clone(),
+        other => {
+            let mut out = Vec::new();
+            let mut ser = serde_json::Serializer::with_formatter(&mut out, PythonJson);
+            match serde::Serialize::serialize(other, &mut ser) {
+                Ok(()) => String::from_utf8(out).unwrap_or_else(|_| other.to_string()),
+                Err(_) => other.to_string(),
+            }
+        }
+    }
+}
+
+/// The first question whose estimated head exceeds Laya's budget for
+/// `model`, refused before anything is sent (SP-DEC-3 D6).
+pub(super) fn check_laya_head_budget(
+    adapter: &str,
+    model: &str,
+    questions: &DecisionQuestions,
+) -> Result<(), GatewayError> {
+    let budget = laya_head_budget(model);
+    for (name, q) in questions {
+        let estimate = estimated_head_tokens(q);
+        if estimate > budget {
+            return Err(GatewayError::InputRejected {
+                adapter: adapter.into(),
+                message: format!(
+                    "question '{name}' needs ≈{estimate} tokens of head but checkpoint \
+                     '{model}' allows {budget} — Laya would silently cut it; shorten the \
+                     instructions/options"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SP-DEC-3 D6: each checkpoint's `head_max_len` (its `rl_agent_config.json`);
+    /// an unknown name gets the smallest, so a misspelled or operator-registered
+    /// checkpoint is never assumed to have room it may not have.
+    #[test]
+    fn laya_head_budget_is_the_checkpoints_head_max_len() {
+        assert_eq!(laya_head_budget("english"), 192);
+        assert_eq!(laya_head_budget("multilingual"), 256);
+        assert_eq!(laya_head_budget("typed-decisions"), 256);
+        for unknown in ["ane", "englsh", "", "MULTILINGUAL"] {
+            assert_eq!(laya_head_budget(unknown), 192, "{unknown:?}");
+        }
+    }
+
+    /// The estimate counts the text Laya renders (`build_head` / `render_options`
+    /// in laya_coreml/common.py) — each piece through `laya_text_tokens` — plus
+    /// one `[MASK]` per option and Laya's 48-token option cap.
+    #[test]
+    fn estimated_head_tokens_counts_what_laya_renders() {
+        use kernel::types::decision::{DecisionQuestion, NoulCriteria};
+        let t = laya_text_tokens;
+        let (no, yes) = (
+            1 + t("false: no, the statement does not hold"),
+            1 + t("true: yes, the statement holds"),
+        );
+        // Laya's default noul options when a side is undescribed.
+        let noul = DecisionQuestion::Noul {
+            instructions: serde_json::json!("abcdef"),
+            criteria: None,
+        };
+        assert_eq!(
+            estimated_head_tokens(&noul),
+            t("noul question: abcdef") + no + yes
+        );
+        // A described side replaces the default; an empty description is no
+        // description (Laya: `not in (None, "")`).
+        let noul = DecisionQuestion::Noul {
+            instructions: serde_json::json!("abcdef"),
+            criteria: Some(NoulCriteria {
+                r#false: Some(String::new()),
+                r#true: Some("x".into()),
+            }),
+        };
+        assert_eq!(
+            estimated_head_tokens(&noul),
+            t("noul question: abcdef") + no + 1 + t("true: x")
+        );
+        // "key: description", or the bare key.
+        let choice = DecisionQuestion::Choice {
+            instructions: serde_json::json!("Pick"),
+            criteria: [
+                ("a".to_string(), Some("bb".to_string())),
+                ("c".to_string(), None),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        assert_eq!(
+            estimated_head_tokens(&choice),
+            t("choice question: Pick") + 1 + t("a: bb") + 1 + t("c")
+        );
+        // Non-string instructions are Laya's `json.dumps` text, WITH its default
+        // ", " / ": " separators; score levels are "level i: description".
+        let score = DecisionQuestion::Score {
+            instructions: serde_json::json!({"k": 1, "j": [1, 2]}),
+            criteria: vec!["lo".into(), "hi".into()],
+        };
+        let json_text = laya_instruction_text(&serde_json::json!({"k": 1, "j": [1, 2]}));
+        assert!(
+            json_text == r#"{"j": [1, 2], "k": 1}"# || json_text == r#"{"k": 1, "j": [1, 2]}"#,
+            "{json_text}"
+        );
+        assert_eq!(
+            estimated_head_tokens(&score),
+            t(&format!("score question: {json_text}"))
+                + 1
+                + t("level 0: lo")
+                + 1
+                + t("level 1: hi")
+        );
+        // An option is capped at 48 tokens (+1 [MASK]) however long it is.
+        let long = DecisionQuestion::Choice {
+            instructions: serde_json::json!("Pick"),
+            criteria: [("k".to_string(), Some("d".repeat(300)))]
+                .into_iter()
+                .collect(),
+        };
+        assert_eq!(
+            estimated_head_tokens(&long),
+            t("choice question: Pick") + 49
+        );
+    }
+
+    /// The counting rule itself, worked by hand.
+    #[test]
+    fn laya_text_tokens_follows_its_rules() {
+        let t = laya_text_tokens;
+        assert_eq!(t(""), 0);
+        // noul: max(⌈4/2⌉, 1 vowel group, 2) = 2; the space before a letter is
+        // free; question: max(4, 2, 2) + 1 (q) = 5; ':' 1; abcdef: max(3, 2, 2)
+        // + 1 (the "bcd" consonant run) = 4.
+        assert_eq!(t("noul question: abcdef"), 2 + 5 + 1 + 4);
+        // A word with a later capital costs a token per letter; a digit is 1.
+        assert_eq!(t("XK9"), 2 + 1);
+        assert_eq!(t("getUserById"), 11);
+        // Non-ASCII costs its UTF-8 bytes: 3 each for 日本, 4 for 𠜎.
+        assert_eq!(t("日本"), 6);
+        assert_eq!(t("𠜎"), 4);
+        // A space not before a letter costs 1: 'a' 1, ' ' 1, ' '+'b' 0, 'b' 1.
+        assert_eq!(t("a  b"), 3);
+        // Rare letters and long runs: "zzkk" = max(2, 0, 2) + 1 (run of 4) + 4.
+        assert_eq!(t("zzkk"), 2 + 1 + 4);
+    }
+
+    /// SP-DEC-3 D6: the estimate must never be BELOW what Laya really spends —
+    /// an under-count is a silent cut. Real counts measured 2026-10-20 with each
+    /// checkpoint's own `tokenizer.json` (`english` = laya-coreml, also used by
+    /// typed-decisions; `multilingual` = laya-multilingual-coreml, also -ane) by
+    /// `/tmp/r3-scripts/measure.py` / `rust_cases.py` (the `tokenizers` package,
+    /// `add_special_tokens=False`, exactly as `build_head` encodes the head).
+    #[test]
+    fn the_text_estimate_is_at_least_the_real_count_on_both_tokenizers() {
+        // (head text, real english tokens, real multilingual tokens)
+        let cases: [(&str, usize, usize); _] = [
+            (
+                "noul question: Does the customer want a refund for the duplicate charge on their invoice?",
+                18,
+                18,
+            ), // english
+            (
+                "noul question: {\"rubric\":\"refund\",\"weight\":3,\"tags\":[\"billing\",\"urgent\"],\"nested\":{\"a\":1,\"b\":[1,2,3]}}",
+                39,
+                36,
+            ), // json_compact
+            (
+                "noul question: {\"rubric\": \"refund\", \"weight\": 3, \"tags\": [\"billing\", \"urgent\"], \"nested\": {\"a\": 1, \"b\": [1, 2, 3]}}",
+                47,
+                48,
+            ), // json_python
+            (
+                "noul question: {\n  \"rubric\": \"refund\",\n  \"weight\": 3,\n  \"tags\": [\n    \"billing\",\n    \"urgent\"\n  ],\n  \"nested\": {\n    \"a\": 1,\n    \"b\": [\n      1,\n      2,\n      3\n    ]\n  }\n}",
+                81,
+                105,
+            ), // json_pretty
+            (
+                "noul question: 顧客は返金を求めていますか？請求書が二重に発行されました。",
+                31,
+                22,
+            ), // japanese
+            (
+                "noul question: 客户是否要求退款？发票被重复开具了。",
+                30,
+                17,
+            ), // chinese
+            (
+                "noul question: 고객이 환불을 원합니까? 송장이 두 번 발행되었습니다.",
+                53,
+                24,
+            ), // korean
+            (
+                "noul question: Хочет ли клиент вернуть деньги за двойное списание?",
+                32,
+                16,
+            ), // cyrillic
+            (
+                "noul question: هل يريد العميل استرداد المبلغ بسبب الخصم المزدوج؟",
+                40,
+                21,
+            ), // arabic
+            ("noul question: क्या ग्राहक धनवापसी चाहता है?", 32, 13), // hindi
+            ("noul question: ลูกค้าต้องการขอคืนเงินหรือไม่", 38, 12),     // thai
+            (
+                "noul question: Möchte der Kunde eine Rückerstattung für die doppelte Abbuchung? Straße",
+                29,
+                21,
+            ), // german
+            (
+                "noul question: Is the user happy 😀😃🎉🔥👍🏽👨‍👩‍👧 or angry 😡🤬?",
+                46,
+                25,
+            ), // emoji
+            ("noul question: 𠜎𠜱𡃁 𓀀𓀁𓀂", 30, 30),                 // rare_cjk
+            ("noul question: fn f(x) -> u8 { x + 1 }", 17, 18),    // code
+            (
+                "noul question: See https://example.com/api/v1/refunds?id=12345&sort=desc#top for details",
+                30,
+                34,
+            ), // url
+            (
+                "noul question: Order 1234567890 cost 98765.4321 on 2026-10-20 at 23:59:59, ref 000111222333",
+                36,
+                65,
+            ), // numbers
+            (
+                "noul question: deadbeef0123456789abcdefABCDEF 3f2a9c7e1b",
+                24,
+                29,
+            ), // hex
+            (
+                "noul question: aGVsbG8gd29ybGQgdGhpcyBpcyBiYXNlNjQ=",
+                31,
+                26,
+            ), // base64
+            (
+                "noul question: qxzvbnmkjhgfdsawrtyp zzkkqqxxvv bcdfghjklmnpqrstvwxz",
+                33,
+                30,
+            ), // gibberish
+            (
+                "noul question: aBcDeFgHiJkLmNoPqRsTuVwXyZ qWeRtYuIoP",
+                32,
+                25,
+            ), // mixed_case
+            ("noul question: URGENT REFUND REQUEST XK9QZT7WPL", 21, 16), // all_caps
+            (
+                "noul question: HTTPServerError getUserById snake_case_identifier_name",
+                18,
+                15,
+            ), // camel
+            (
+                "noul question: !!??..,,;;::--__==++**&&||^^%%$$##@@~~``''\"\"<<>>//\\\\",
+                30,
+                30,
+            ), // symbols
+            ("noul question: a  b   c\n\n\td    e\t\t\tf", 17, 20), // whitespace
+            (
+                "noul question: Pneumonoultramicroscopicsilicovolcanoconiosis antidisestablishmentarianism supercalifragilisticexpialidocious",
+                38,
+                31,
+            ), // longword
+            ("noul question: aeiou aeiouaeiou ooooo eeeee iaiaia", 21, 19), // vowelly
+        ];
+        for (text, english, multilingual) in cases {
+            let estimate = laya_text_tokens(text);
+            assert!(
+                estimate >= english.max(multilingual),
+                "{text:?}: estimate {estimate} < real (english {english}, multilingual {multilingual})"
+            );
+        }
+    }
+
+    /// The whole head — instruction plus Laya's default noul options — for the
+    /// Japanese sample: measured 49 real tokens on `english`, 40 on `multilingual`
+    /// (`/tmp/r3-scripts/heads.py`).
+    #[test]
+    fn a_japanese_question_is_not_under_counted() {
+        let q = DecisionQuestion::Noul {
+            instructions: serde_json::json!(
+                "顧客は返金を求めていますか？請求書が二重に発行されました。"
+            ),
+            criteria: None,
+        };
+        let estimate = estimated_head_tokens(&q);
+        assert!(estimate >= 49, "estimate {estimate} < 49 real tokens");
+    }
+}
