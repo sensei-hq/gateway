@@ -1,26 +1,25 @@
 # Checkpoint
 
-**Last slice: SP-DEC-3 — DONE, merged to develop (`4955595`, pushed 2026-10-20).** Local open-weight
-System One via Laya-CoreML (`laya` router) + `GatewayError::InputRejected`. **Breaking → next release
-0.12.0** (torii re-pin: exhaustive `GatewayError` matches). Spec
-`docs/superpowers/specs/2026-10-20-sp-dec-3-laya-local-system-one-design.md` (D1–D7, AC1–AC10).
+**Last release: v0.12.0 (2026-10-20)** — PR #92 → tag on main `6aa26e0`, GitHub release published
+(v0.11.0's backfilled too). SP-DEC-3: Laya local System One (`laya` router) + `GatewayError::InputRejected`
+[breaking]; plus quinn-proto 0.11.19 / rustls 0.23.46 for new RUSTSEC advisories. **Current slice: SP-DEC-4.**
 
 ## Done
 
-- SP-DEC-3: D5 InputRejected (falls back always, never retried, breaker/health-neutral, neutral to AllGated);
-  D6 Laya per-question head budget (conservative estimate, fixture-measured); D7 re-routed checkpoint.
-  Gate on merged develop: `cargo test --workspace` 1869 passed, stable clippy, fmt, live, docs-sync.
+- v0.12.0: gates green (1869 tests, stable clippy, fmt, cargo audit, local `qlty check` clean); consumer crate
+  pinned to `tag = "v0.12.0"` builds and uses `InputRejected` + the `laya` adapter.
 - torii#45: Phase 1 → v0.11.0; Phase 2 wave A → torii #57.
 
 ## Todo
 
-- [ ] SP-DEC-4: System One benchmark harness + per-scenario ranking report (option 1; no routing by score).
-- [ ] Release 0.12.0 (release checklist) + torii re-pin — when the user calls it.
+- [ ] SP-DEC-4: System One benchmark harness + per-scenario ranking report (no routing by score).
+      Data: MIXED — public labelled datasets fetched at run time + hand-curated gate sets the user signs off.
+- [ ] torii re-pin to v0.12.0 (add the `InputRejected` arm to exhaustive `GatewayError` matches).
 - [ ] torii#45 Phase 2 wave B (#46 #49 #55), then wave C #47.
 
 ## Next
 
-Brainstorm SP-DEC-4 (`superpowers:brainstorming`). Laya venv kept at `/tmp/laya-bench/env`
+SP-DEC-4 brainstorming: next clarifying question after the data source. Laya venv at `/tmp/laya-bench/env`
 (`LAYA_HOST=127.0.0.1 LAYA_PORT=8766 LAYA_MODELS=english,multilingual …/laya-coreml-serve`; 8765 is taken).
 
 ## Open questions
@@ -32,6 +31,6 @@ Brainstorm SP-DEC-4 (`superpowers:brainstorming`). Laya venv kept at `/tmp/laya-
 
 - SP-DEC-3: Laya 413/422 still `ProviderError`; no per-model `head_max_len` override; exact tokenizer
   counts; unmetered truncated hosted calls; image guard keyed on id `laya`; estimate errs ~1.7× high.
-- Flaky: `orchestrator agent::sandbox::tests::a_backgrounded_straggler_is_reaped_on_clean_exit` timed out
-  (8.0s > 5s) once under full-workspace load on a cold build; passed alone 3/3 and in the next full run.
+- Qlty Cloud statuses fail on billing (qlty.sh workspace) — local `qlty check` is the accepted substitute.
+- Flaky: `orchestrator agent::sandbox::tests::a_backgrounded_straggler_is_reaped_on_clean_exit` (timing).
 - sensei daemon `update_phase` 404 (2026-10-20). torii DB-gated tests don't run in CI (#55).
