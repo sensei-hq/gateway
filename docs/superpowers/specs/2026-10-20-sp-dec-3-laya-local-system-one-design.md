@@ -1,0 +1,79 @@
+# SP-DEC-3 — local open-weight System One: Laya-CoreML
+
+Follows SP-DEC-2 (self-hosted `llamacpp` / `sglang` routes). Scope chosen by the user 2026-10-20:
+**Laya-CoreML over its HTTP server** — no cloud key, runs on Apple Silicon (CoreML: CPU+GPU or ANE).
+
+Not in scope (carry-forwards):
+- **In-process Laya** (load the CoreML bundle from Rust, no server) — a future slice; the measured HTTP cost
+  below does not justify it yet.
+- **CLM-8B** (Stanford/NVIDIA, `Contrastive-LM/CLM`) — wire-compatible, but its encoder is vLLM + Qwen3-8B
+  (CUDA/CPU). Reconsider if it is ported to Metal.
+- `POST /v1/systemone/batch`, Laya's `max_len` / `task` / `lang` / `min_confidence` body controls.
+
+## Contract (verified 2026-10-20 against `laya-coreml` 0.5.1 from PyPI, live on an M4 Max)
+
+- `laya-coreml-serve` (extra `serve`) — `POST /v1/systemone`, TypeSafe's wire. Port `LAYA_PORT` (default 8000).
+  Bearer only if `LAYA_API_KEY` is set (`Authorization: Bearer <key>`); public Hub weights, offline after first
+  download. No torch installed; `/health` reports `device: coreml:cpu_gpu`.
+- Body: `model` names a checkpoint — `english` (512 tokens), `multilingual` (1024), `typed-decisions` (1024), or
+  an operator-registered one (`LAYA_EXTRA_MODELS='{"ane":"aac6fef/laya-multilingual-coreml-ane"}'`, 96 tokens).
+  Unknown body keys (`images`, `keep_alive`) are **ignored silently**.
+- Response: `{model, answers, usage, routing}`. Answers are `type`-tagged like ours; the default (non-strict)
+  payload adds `confidence`/`answer_confidence`/`action` on answers, `x_jev_confidence` on choice/score, a root
+  `routing`, and in `usage` the extra keys `state_tokens`, `state_tokens_dropped`, `truncated`, `truncated_questions`.
+  The response `model` is `laya-rl-agent`, not the requested checkpoint. `usage.output_tokens` is 0.
+- A state over the checkpoint's window is **truncated and answered 200**; the only signal is `usage.truncated`.
+- Errors: FastAPI `{"detail": "<string>"}` — 400 (missing state, questions not an object), 413 (too many
+  questions/options), 422 (bad controls), 401 (bad key), fixed 500 on inference failure, 503 over
+  `LAYA_MAX_CONCURRENT`.
+
+**Measured HTTP cost** (median of 200 warm calls, one noul question, keep-alive): multilingual CPU+GPU 50.1 ms
+in-process vs 46.9 ms HTTP (noise); ANE 4.12 ms vs 4.47 ms (+0.35 ms ≈ 8%); bare `/health` round trip 0.35 ms.
+
+## Decisions
+
+- **D1 Facade id `laya`.** The facade auto-registers `laya` as a decision-only `SystemOneAdapter` — one more arm
+  beside `llamacpp | sglang` (`facade.rs`). No default `url` and no default model (consistent with the other
+  self-hosted ids): the operator sets `url` and pins `api_model_id`. A chat adapter registered under `laya` is left
+  untouched (separate registry map).
+- **D2 Images are refused before any request.** `ImageEncoding` gains `Unsupported`; `encode_images` returns an
+  error for a non-empty `images` under it, which `decide` already maps to `ProviderError` (status `None`) before
+  sending — fallback-eligible, the same rule SP-DEC-2 D1 applies to an unrecognisable image. The adapter selects
+  the encoding by id: `laya` → `Unsupported`, every other id unchanged (`DataUrl`). The message names the router
+  and says it does not read images.
+- **D3 A truncated answer is a provider fault, not a success.** `WireUsage` reads an optional `truncated: bool`
+  (absent → `false`, so every other host is unaffected). `true` → `ProviderError` (status `None`) naming the router
+  and the dropped token count when present, so the call falls back instead of returning answers about a state the
+  model never fully read. Primary defence remains the existing `ContextWindowGate`: the docs tell the operator to
+  set the model's `context_window` to the checkpoint's window, so oversize requests are refused before they are sent
+  (SP-DEC-2 D5). D3 catches what the gate's character estimate misses (e.g. non-English text tokenising denser).
+  Requires Laya's default payload — `LAYA_JEV_STRICT` strips `truncated`; documented.
+- **D4 No breaking change.** `RouterConfig`, `DecisionRequest`, `DecisionResponse` and the public types are
+  untouched; `ImageEncoding`/`WireUsage` are crate-private. Additive only.
+
+## Acceptance criteria
+
+- **AC1** A gateway with a `laya` router (url only) can make a decision: the facade registers a
+  `SystemOneAdapter` with id `laya` for decisions and no chat adapter.
+- **AC2** A `laya` decision with ≥ 1 image returns `ProviderError` and **no HTTP request is sent** (wiremock
+  expects 0 calls); the same request on `llamacpp` still sends data-URL images.
+- **AC3** Laya's real default response (captured live, including `routing`, `x_jev_confidence`, noul `confidence`,
+  extended `usage`) decodes into the right `DecisionAnswers`, `model`, and usage tokens.
+- **AC4** A 200 with `usage.truncated: true` is a `ProviderError` that triggers fallback under the
+  `ProviderError` trigger; `truncated: false` or absent is a success.
+- **AC5** Laya's errors map: 401 → `Authentication`; 400 / 413 / 422 / 500 / 503 → `ProviderError` with the
+  `detail` string as the message.
+- **AC6** Ignored live test against a real `laya-coreml-serve` (`LAYA_URL`, optional `LAYA_MODEL`, default
+  `multilingual`): a choice, a noul and a score answer through the engine; an over-window state sent with the
+  model's `context_window` deliberately overstated (so the gate lets it through) comes back as the D3
+  `ProviderError`, never as answers.
+- **AC7** Docs list `laya` everywhere `llamacpp`/`sglang` are listed (`docs/llms/local.md`, `recipes.md`,
+  `docs/features/inference/providers.md`, `capabilities-and-adapters.md`, `docs/features/README.md`, both
+  `SKILL.md` copies, upgrading notes and their site copy), `docs_sync_capabilities` passes, CHANGELOG updated.
+
+## Testing
+
+Red-first per task. Unit: `encode_images` under `Unsupported`; adapter picks the encoding by id. Wiremock
+(`tests/systemone_mock.rs`): AC2–AC5 against bodies captured from the live server. Facade: AC1 alongside the
+SP-DEC-2 "which adapter each id gets" test. Engine fallback: AC4 with a second decision router. Live: AC6,
+run on this machine before merge. Mutation-check the image guard and the truncation check.
