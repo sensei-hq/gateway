@@ -338,6 +338,34 @@ mod tests {
         );
     }
 
+    /// SP-DEC-4 re-review R4: a listed file with MORE cases than the
+    /// manifest records is damaged too.
+    #[test]
+    fn a_case_file_longer_than_its_manifest_count_is_an_error() {
+        let (_root, cases, s4) = layout();
+        let mut m = manifest_json();
+        m["files"] = json!([
+            {"file": "s3.jsonl", "scenario": "s3_entailment", "dataset": "d", "cases": 2}
+        ]);
+        std::fs::write(cases.join("manifest.json"), m.to_string()).unwrap();
+        let file = cases.join("s3.jsonl");
+        write_cases(
+            &file,
+            &[
+                noul("a", Scenario::S3Entailment),
+                noul("b", Scenario::S3Entailment),
+                noul("c", Scenario::S3Entailment),
+            ],
+        );
+        let err = format!("{:#}", load(&cases, &s4, None).unwrap_err());
+        assert!(
+            err.contains(&file.display().to_string())
+                && err.contains("3 cases")
+                && err.contains("records 2"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn the_scenario_filter_keeps_only_the_named_scenarios_and_reports_missing_ones() {
         let (_root, cases, s4) = layout();

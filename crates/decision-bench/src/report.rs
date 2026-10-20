@@ -1066,6 +1066,26 @@ mod tests {
         );
     }
 
+    /// SP-DEC-4 re-review R4: on a tie for the most common detail, the
+    /// first seen is quoted.
+    #[test]
+    fn a_tie_for_the_most_common_reason_quotes_the_first_seen() {
+        let mut f = fixture();
+        for (i, r) in f
+            .rows
+            .iter_mut()
+            .filter(|r| r.model == "ane" && r.outcome == Outcome::NotApplicable)
+            .enumerate()
+        {
+            r.detail = Some(if i < 15 { "seen first" } else { "seen second" }.into());
+        }
+        let md = render(&f, 7);
+        assert!(
+            md.contains("- ane: 15 of 30 not applicable: seen first"),
+            "{md}"
+        );
+    }
+
     /// SP-DEC-4 review A5: a model under the coverage floor is shown with
     /// why its cases were not applicable (the most common detail, counted),
     /// so 0% coverage is not left unexplained.
