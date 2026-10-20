@@ -9,14 +9,18 @@ Not in scope (carry-forwards):
 - **CLM-8B** (Stanford/NVIDIA, `Contrastive-LM/CLM`) — wire-compatible, but its encoder is vLLM + Qwen3-8B
   (CUDA/CPU). Reconsider if it is ported to Metal.
 - `POST /v1/systemone/batch`, Laya's `max_len` / `task` / `lang` / `min_confidence` body controls.
-- **Truncation is input-determined but classified like any provider fault** (found in T2 review). The same
-  over-window request truncates on every retry: with no other candidate it returns `AllAttemptsFailed
-  { retryable: true }`; an orchestrator node (ModelCall or Agent) retries the identical request only if the
-  executor was built with `with_max_transient_attempts(n > 1)` (default 1 = no retry), and each repeat fails
-  the same way. Every truncation counts
-  toward the router's circuit breaker (a burst can open it for valid short requests). Mitigation today:
-  set `context_window` so the gate refuses first, and chain a second decision router. A typed
-  non-retryable, breaker-neutral marker is the follow-up.
+- **Truncation was input-determined but classified like any provider fault** (found in T2 review) — **resolved by
+  D5**: it is now an `InputRejected`, never retried, breaker-neutral, and falls back with any trigger set.
+- **Laya 413 / 422 input faults are still `ProviderError`** (breaker-counted): too many questions/options, and
+  "exceeds the exported max_options" (CoreML caps at 32 options). Mapping them to `InputRejected` is the follow-up.
+- **A per-model `head_max_len` override** for `LAYA_EXTRA_MODELS` checkpoints: the gateway knows only the three
+  published budgets, so an extra checkpoint with `head_max_len` below 192 can still be cut silently.
+- **Exact token counts** via the checkpoint's `tokenizer.json` (the `tokenizers` crate) instead of D6's
+  conservative estimate, which would remove its 1.6x (English) to 2-7x (non-Latin) over-refusal.
+- **Ask Laya upstream to report head truncation** (as `usage.truncated` does for the state), which would make the
+  D6 estimate unnecessary.
+- **Usage for a dispatched-but-truncated call on a hosted provider is not metered**: `InputRejected` carries no
+  usage, so a Cloudflare or Ollama call that was sent and came back truncated is not recorded.
 - **The image guard keys on the exact router id `laya`** (T1 review): a Laya server under another id gets
   data URLs it silently ignores. A capability-level "no images" router setting is the follow-up.
 
@@ -79,18 +83,36 @@ in-process vs 46.9 ms HTTP (noise); ANE 4.12 ms vs 4.47 ms (+0.35 ms ≈ 8%); ba
   - **No health signal:** the engine's one recorder fan-out (`dispatch_outcome`) drops it — the breaker, lockout, cooldown and
     performance recorders never see it. The `Attempt` is still recorded (`status: Failed`, `error`,
     `fallback_triggered: true`).
-  - **Producers:** D2 (image to `laya`), SP-DEC-2's unrecognisable-image refusal, D3 (`usage.truncated`), D6.
+  - **Producers:** D2 (image to `laya`), SP-DEC-2's unrecognisable-image refusal (every data-URL host), D3
+    (`usage.truncated`, every decision host), D6, and a 200 whose `usage.options` has an entry with
+    `distinct < total` (collapsed options; every decision host, only Laya sends it).
     Stream code `"input_rejected"`.
 - **D6 Laya's per-question budget is enforced before sending** (found live in the whole-slice review). Laya's
   `build_head` silently cuts each question's head (`<type> question: <instructions>` plus its options) to
   `head_max_len` tokens and reports nothing — `truncated` covers only the state. On `english` an 808-character
   instruction lost the question at its end and the answer flipped from 0.90 to 0.15 with `truncated: false`.
-  For router id `laya` the adapter estimates each question's head as `ceil(chars / 3)` over
-  `"<type> question: <instructions as text>"` plus, per option, `1 + min(48, ceil(chars / 3))` (Laya caps each
-  option at 48 tokens), and refuses with `InputRejected` if it exceeds the checkpoint's budget: `english` 192,
-  `multilingual` / `typed-decisions` 256 (from each checkpoint's `rl_agent_config.json`), any other name 192.
-  `chars / 3` over-counts English (≈ 4 chars/token), so an instruction just under the real limit may be refused
-  and fall back — the safe direction.
+  For router id `laya` (checked before sending) the adapter refuses with `InputRejected` any question whose
+  estimated head exceeds the checkpoint's budget — `english` 192, `multilingual` / `typed-decisions` 256 (each
+  checkpoint's `head_max_len` from `rl_agent_config.json`), any other name 192 — **or** whose options' estimate
+  exceeds `budget − 16`: Laya also trims every option when the options leave fewer than 16 tokens.
+  - **Canonical name.** The requested model is canonicalised first with Laya's own resolution: trim + lowercase,
+    then the aliases `en` / `laya` / `default` → `english`; `multi` / `ml` / `laya-multilingual` →
+    `multilingual`; `typed` / `typed_decisions` / `laya-typed-decisions` / `decisions` → `typed-decisions`;
+    the Hub ids `convaiinnovations/laya-multilingual` and `convaiinnovations/laya-typed-decisions` map to their
+    checkpoints. The bundle id `convaiinnovations/laya` means "let Laya choose" and gets 192 (and skips D7).
+  - **Estimator.** A conservative character-class token count, not `ceil(chars / 3)`: non-ASCII characters count
+    their UTF-8 bytes, symbols and digits 1 each, and so on (`laya.rs`, `laya_text_tokens`). The head is
+    `"<type> question: <instructions as text>"`; options are counted as Laya renders them — `" " + text`, capped at
+    48 tokens, plus 1 per option.
+  - **Measured.** Against both checkpoints' real tokenizers (committed fixture
+    `crates/cloud-providers/tests/fixtures/laya_head_tokens.py`) it was never under across 52 option and 30 head
+    samples; known under-count: 6 of 21 000 short random strings, by 1 token.
+  - **Cost.** It errs high: about 1.6x on English (usable instruction length on `english` is about 330
+    characters against a real limit of about 560) and 2-7x on non-Latin scripts (Chinese on `multilingual`
+    allows about 70 characters). An instruction just under the real limit may be refused and fall back — the safe
+    direction.
+  - **Limitation.** A `LAYA_EXTRA_MODELS` checkpoint with `head_max_len` below 192 is not known to the gateway
+    and can still be cut silently (carry-forward).
 - **D7 A re-routed checkpoint is a failed attempt.** Laya treats an unknown `model` name as "no explicit
   checkpoint" and auto-routes it (200, `routing.reason` explains), so a misspelled `api_model_id` silently
   lands on a checkpoint with a different window. When a System One response carries `routing.model` and it
@@ -106,7 +128,9 @@ in-process vs 46.9 ms HTTP (noise); ANE 4.12 ms vs 4.47 ms (+0.35 ms ≈ 8%); ba
 - **AC3** Laya's real default response (captured live, including `routing`, `x_jev_confidence`, noul `confidence`,
   extended `usage`) decodes into the right `DecisionAnswers`, `model`, and usage tokens.
 - **AC4** A 200 with `usage.truncated: true` is an `InputRejected` (D5) that falls back; `truncated: false` (even
-  with `state_tokens_dropped > 0`) or absent is a success; `truncated: null` fails the parse (`ProviderError`).
+  with `state_tokens_dropped > 0`) or absent is a success; `truncated: null` fails the parse (`ProviderError`). A 200
+  whose `usage.options` has an entry with `distinct < total` is likewise an `InputRejected`; other `options` shapes
+  are ignored.
 - **AC5** Laya's errors map: 401 → `Authentication`; 400 / 413 / 422 / 500 / 503 → `ProviderError` with the
   `detail` string as the message.
 - **AC6** Ignored live tests against a real `laya-coreml-serve` (`LAYA_URL`; `LAYA_MODEL`, default `english`):
@@ -123,10 +147,11 @@ in-process vs 46.9 ms HTTP (noise); ANE 4.12 ms vs 4.47 ms (+0.35 ms ≈ 8%); ba
   an exhaustion made only of input rejections is `AllAttemptsFailed { retryable: false }`; beside a gated candidate
   it is `AllGated` on that gate; beside a hard failure it is retryable.
 - **AC9 (D6)** A `laya` question whose estimated head exceeds the checkpoint's budget is refused with
-  `InputRejected` before any request (wiremock `expect(0)`); a head under it is sent; other ids are never
-  budget-checked. Live: the 808-character instruction on `english` is refused, the 288-character one is answered.
+  `InputRejected` before any request (wiremock `expect(0)`), as is one whose options' estimate exceeds `budget − 16`;
+  a head or options estimated at exactly the limit are sent; model names are canonicalised through Laya's aliases
+  and the bundle id gets 192; other ids are never budget-checked. Live: the 808-character instruction on `english` is refused, the 288-character one is answered.
 - **AC10 (D7)** A 200 whose `routing.model` differs from the requested model is a `ProviderError` naming both;
-  an equal or absent `routing` is a success. Live: `model: "englsh"` is refused.
+  an equal (after canonicalisation), absent, or malformed `routing` is a success, and the bundle id skips the check. Live: `model: "englsh"` is refused.
 
 ## Testing
 
