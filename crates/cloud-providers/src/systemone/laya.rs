@@ -252,6 +252,12 @@ pub(super) fn check_laya_head_budget(
     questions: &DecisionQuestions,
 ) -> Result<(), GatewayError> {
     let budget = laya_head_budget(model);
+    // "'ml' (multilingual)": the name as configured and, when Laya resolves it
+    // to another, the checkpoint it will serve.
+    let checkpoint = match laya_canonical_model(model) {
+        Some(canonical) if canonical != model => format!("'{model}' ({canonical})"),
+        _ => format!("'{model}'"),
+    };
     // Laya's `build_head` cuts EVERY option to `max(4, (head_max_len − 16) / n)`
     // tokens once `head_max_len − Σ options < 16` — options that shared a prefix
     // then collapse into the same tokens and cannot be told apart.
@@ -262,8 +268,8 @@ pub(super) fn check_laya_head_budget(
             return Err(GatewayError::InputRejected {
                 adapter: adapter.into(),
                 message: format!(
-                    "question '{name}''s options need ≈{options} tokens but checkpoint \
-                     '{model}' leaves options {option_room} of its {budget} — the options \
+                    "the options of question '{name}' need ≈{options} tokens but checkpoint \
+                     {checkpoint} leaves options {option_room} of its {budget} — the options \
                      would be cut (Laya trims every option to fit, until some cannot be told \
                      apart); use fewer or shorter options"
                 ),
@@ -275,7 +281,7 @@ pub(super) fn check_laya_head_budget(
                 adapter: adapter.into(),
                 message: format!(
                     "question '{name}' needs ≈{estimate} tokens of head but checkpoint \
-                     '{model}' allows {budget} — Laya would silently cut it; shorten the \
+                     {checkpoint} allows {budget} — Laya would silently cut it; shorten the \
                      instructions/options"
                 ),
             });
@@ -594,6 +600,77 @@ mod tests {
             check_laya_head_budget("laya", "english", &questions(n + 1)),
             Err(GatewayError::InputRejected { .. })
         ));
+    }
+
+    /// The option rule is inclusive too: options estimated at exactly
+    /// `budget − 16` leave Laya its 16 tokens of slack and are sent; one more
+    /// token triggers its per-option cut and is refused.
+    #[test]
+    fn options_estimated_at_exactly_the_option_room_are_sent() {
+        // 17 eight-digit keys at 10 each, plus one short key: "1234" costs 6
+        // ([MASK], the leading space, 4 digits), "12345" costs 7.
+        let choice = |last: &str| {
+            let mut criteria: Vec<(String, Option<String>)> = (0..17)
+                .map(|i| (format!("{}", 10_000_000 + i), None))
+                .collect();
+            criteria.push((last.to_string(), None));
+            DecisionQuestion::Choice {
+                instructions: serde_json::json!("a"),
+                criteria: criteria.into_iter().collect(),
+            }
+        };
+        let (instruction, at_room) = estimated_head_parts(&choice("1234"));
+        assert_eq!(at_room, 192 - 16);
+        let (_, over) = estimated_head_parts(&choice("12345"));
+        assert_eq!(over, 192 - 16 + 1);
+        assert!(
+            instruction + over <= 192,
+            "the whole head fits: only the option rule is in play"
+        );
+        let questions = |last| DecisionQuestions::from([("q".to_string(), choice(last))]);
+        assert!(check_laya_head_budget("laya", "english", &questions("1234")).is_ok());
+        assert!(matches!(
+            check_laya_head_budget("laya", "english", &questions("12345")),
+            Err(GatewayError::InputRejected { message, .. }) if message.contains("options would be cut")
+        ));
+    }
+
+    /// Refusals name the checkpoint as requested and, when Laya resolves it to
+    /// another name, as Laya will serve it.
+    #[test]
+    fn refusals_name_the_canonical_checkpoint() {
+        let long = |n: usize| DecisionQuestion::Noul {
+            instructions: serde_json::json!(vec!["a"; n].join(" ")),
+            criteria: None,
+        };
+        let message = |model: &str, q: DecisionQuestion| match check_laya_head_budget(
+            "laya",
+            model,
+            &DecisionQuestions::from([("q".to_string(), q)]),
+        ) {
+            Err(GatewayError::InputRejected { message, .. }) => message,
+            other => panic!("{model}: expected a refusal, got {other:?}"),
+        };
+        let m = message("ml", long(300));
+        assert!(
+            m.contains("checkpoint 'ml' (multilingual) allows 256"),
+            "{m}"
+        );
+        let m = message("english", long(300));
+        assert!(m.contains("checkpoint 'english' allows 192"), "{m}");
+        assert!(!m.contains("(english)"), "shown once when equal: {m}");
+        let many = DecisionQuestion::Choice {
+            instructions: serde_json::json!("Pick"),
+            criteria: (0..25)
+                .map(|i| (format!("{}", 10_000_000 + i), None))
+                .collect(),
+        };
+        let m = message("ml", many);
+        assert!(
+            m.contains("the options of question 'q' need")
+                && m.contains("checkpoint 'ml' (multilingual) leaves options 240 of its 256"),
+            "{m}"
+        );
     }
 
     /// Laya renders an empty description as none (`v is None or v == ""`): the

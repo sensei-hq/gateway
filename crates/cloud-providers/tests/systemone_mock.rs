@@ -1074,10 +1074,47 @@ async fn a_collapsed_options_answer_is_an_input_rejection() {
     {
         GatewayError::InputRejected { adapter, message } => {
             assert_eq!(adapter, "laya");
-            assert!(message.contains("question 'label'"), "{message}");
-            assert!(message.contains("3 distinct of 25"), "{message}");
+            assert!(
+                message.contains("collapsed the options of question 'label' (3 distinct of 25)"),
+                "{message}"
+            );
         }
         other => panic!("expected the collapsed-options InputRejected, got {other:?}"),
+    }
+}
+
+/// `usage.options` is read leniently: only an entry that says `distinct <
+/// total` is a collapse. Another host's differently-shaped `options`, or an
+/// entry with nothing collapsed, never refuses a valid answer.
+#[tokio::test]
+async fn only_an_options_entry_with_distinct_below_total_is_a_collapse() {
+    for (options, collapsed) in [
+        (json!({"label": {"total": 25, "distinct": 3}}), true),
+        (json!({"label": {"total": 4, "distinct": 4}}), false),
+        (json!({"label": "whatever"}), false),
+        (json!({"label": {"total": 25}}), false),
+        (json!({"label": {"total": "25", "distinct": "3"}}), false),
+        (json!(["label"]), false),
+    ] {
+        let mut body = ok_body("laya-rl-agent");
+        body["usage"]["options"] = options.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        let result = SystemOneAdapter::with_id("laya")
+            .unwrap()
+            .decide(
+                &keyless(&server.uri()),
+                &request(Some("english"), vec![], None),
+            )
+            .await;
+        match (collapsed, result) {
+            (true, Err(GatewayError::InputRejected { .. })) | (false, Ok(_)) => {}
+            (_, other) => panic!("{options}: collapsed={collapsed}, got {other:?}"),
+        }
     }
 }
 
@@ -1514,7 +1551,10 @@ async fn laya_counts_a_choices_options_against_the_head_budget() {
     {
         GatewayError::InputRejected { adapter, message } => {
             assert_eq!(adapter, "laya");
-            assert!(message.contains("question 'team''s options"), "{message}");
+            assert!(
+                message.contains("the options of question 'team' need"),
+                "{message}"
+            );
             assert!(
                 message.contains("leaves options 176 of its 192"),
                 "{message}"

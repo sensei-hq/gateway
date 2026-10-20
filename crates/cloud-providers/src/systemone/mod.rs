@@ -277,7 +277,8 @@ struct WireUsage {
     /// Laya's per-question report of options it cut to fit its head budget
     /// until some collapsed into the same tokens — `{"q": {"total": 25,
     /// "distinct": 3, "tokens_per_option": 9}}`, present only when that
-    /// happened. Raw JSON so no other host's `options` can fail the parse.
+    /// happened. Raw JSON so no other host's `options` can fail the parse; only
+    /// an entry with a numeric `distinct < total` is acted on.
     #[serde(default)]
     options: Option<serde_json::Value>,
 }
@@ -429,35 +430,33 @@ pub(crate) async fn decide(
 
     // The host cut the options until some became indistinguishable (Laya's
     // `usage.options`): the answer cannot tell them apart. Input-determined
-    // like truncation, so an InputRejected (D5).
-    if let Some(collapsed) = wire
+    // like truncation, so an InputRejected (D5). Read leniently: only an entry
+    // whose numeric `distinct` is below its numeric `total` is a collapse, so
+    // another host's differently-shaped `options` never refuses an answer.
+    let collapsed: Vec<String> = wire
         .usage
         .as_ref()
         .and_then(|u| u.options.as_ref())
         .and_then(serde_json::Value::as_object)
-        .filter(|o| !o.is_empty())
-    {
-        let count = |v: &serde_json::Value, key: &str| {
-            v.get(key)
-                .and_then(serde_json::Value::as_u64)
-                .map_or_else(|| "?".to_string(), |n| n.to_string())
-        };
-        let questions: Vec<String> = collapsed
-            .iter()
-            .map(|(name, v)| {
-                format!(
-                    "question '{name}''s options ({} distinct of {})",
-                    count(v, "distinct"),
-                    count(v, "total")
-                )
-            })
-            .collect();
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, v)| {
+            let count = |key| v.get(key).and_then(serde_json::Value::as_u64);
+            match (count("distinct"), count("total")) {
+                (Some(distinct), Some(total)) if distinct < total => Some(format!(
+                    "the options of question '{name}' ({distinct} distinct of {total})"
+                )),
+                _ => None,
+            }
+        })
+        .collect();
+    if !collapsed.is_empty() {
         return Err(GatewayError::InputRejected {
             adapter: adapter.into(),
             message: format!(
                 "the host collapsed {} to fit its budget — its answers cannot tell those \
                  options apart; use fewer or shorter options",
-                questions.join(", ")
+                collapsed.join(", ")
             ),
         });
     }
