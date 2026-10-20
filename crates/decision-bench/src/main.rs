@@ -24,10 +24,10 @@ enum Command {
 
 fn main() {
     let task = match Cli::parse().command {
-        Command::Check => 2,
+        Command::Check => 7,
         Command::Fetch => 3,
         Command::Run => 4,
-        Command::Report => 5,
+        Command::Report => 7,
     };
     eprintln!("not implemented yet (SP-DEC-4 T{task})");
     std::process::exit(2);

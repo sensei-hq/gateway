@@ -1,13 +1,22 @@
 # decision-bench example config. Copy to bench.toml (gitignored) and edit.
 #
-# Starting each server:
-#   Laya (serves english / multilingual / typed-decisions / ane on ONE port).
-#     Use port 8766: 8765 is taken on this machine.
-#       <laya-binary> serve --port 8766
-#   Ollama (the `nimble` model must be pulled/created first):
-#       ollama serve            # listens on 127.0.0.1:11434
-#   llama-server (llama.cpp; the nimble-v3 GGUF):
-#       llama-server -m <nimble-v3.gguf> --host 127.0.0.1 --port 8091
+# Starting each server (verified on this machine):
+#
+#   Laya, one server for english / multilingual / typed-decisions / ane.
+#   venv at /tmp/laya-bench/env, installed with
+#   `pip install "laya-coreml[serve]==0.5.1"`. Port 8765 is taken here, so 8766:
+#     LAYA_HOST=127.0.0.1 LAYA_PORT=8766 \
+#     LAYA_MODELS=english,multilingual,typed-decisions \
+#     LAYA_EXTRA_MODELS='{"ane":"aac6fef/laya-multilingual-coreml-ane"}' \
+#     /tmp/laya-bench/env/.venv/bin/laya-coreml-serve
+#
+#   Ollama (>= 0.35; pull the model once with `ollama pull nimble`):
+#     ollama serve
+#
+#   llama.cpp b11381:
+#     ~/opt/llamacpp-systemone/bin-b11381/llama-b11381/llama-server \
+#       -m ~/opt/llamacpp-systemone/models/Bespoke-Nimble-9B-v3-Q4_K_M.gguf \
+#       --alias nimble-v3 --port 8091 -c 8192
 
 [[models]]
 id = "laya-english"
