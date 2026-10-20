@@ -1347,7 +1347,7 @@ fn assert_head_refusal(
     }
 }
 
-/// AC9: the 808-character instruction (estimate 300 tokens with its two
+/// AC9: the 808-character instruction (estimate 420 tokens with its two
 /// options) is over `english`'s 192 — refused, nothing sent.
 #[tokio::test]
 async fn laya_refuses_a_question_over_the_checkpoints_head_budget_before_sending() {
@@ -1361,9 +1361,9 @@ async fn laya_refuses_a_question_over_the_checkpoints_head_budget_before_sending
         .await
         .unwrap_err();
     let message = assert_head_refusal(err, "refund", "english", 192);
-    // ceil(823 / 3) = 275 for "noul question: <808 chars>", plus Laya's two
-    // default noul options at 14 and 11.
-    assert!(message.contains("needs ≈300 tokens"), "{message}");
+    // The whole noul head: "noul question: <808 chars>" plus Laya's two
+    // default options (`/tmp/r3-scripts/measure.py`: 420; real 269 on english).
+    assert!(message.contains("needs ≈420 tokens"), "{message}");
 }
 
 /// `multilingual`'s budget is 256 — still under the 808-character estimate.
@@ -1381,7 +1381,7 @@ async fn laya_refuses_the_long_instruction_on_multilingual_too() {
     assert_head_refusal(err, "refund", "multilingual", 256);
 }
 
-/// A 288-character instruction (estimate 126) fits `english` and is sent.
+/// A 288-character instruction (estimate 180; real 109) fits `english` and is sent.
 #[tokio::test]
 async fn laya_sends_a_question_within_the_head_budget() {
     let server = answering_server().await;
