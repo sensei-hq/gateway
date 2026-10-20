@@ -185,6 +185,13 @@ Two guards to keep in mind:
   always advances (D5).** A chain with no `fallback_triggers` (or a
   direct/capability path that resolved no chain — see §4) treats every other
   failure as fatal and stops on the first failing candidate.
+- **`InputRejected` is neutral to exhaustion (D5).** It is not a gate and not an
+  endpoint fault: a chain whose other candidates were gated pauses on *those*
+  gates (`AllGated`); a chain with only rejections ends
+  `AllAttemptsFailed { retryable: false }`; a rejection beside a hard failure
+  stays retryable. It is never recorded by the circuit breaker, lockout,
+  cooldown or performance recorders, and its stream error code is
+  `"input_rejected"`.
 - **`Authentication` is the canonical stop.** Even with all five triggers
   listed, an auth error breaks the loop immediately. This is asserted directly
   by `auth_error_never_triggers_fallback` in `error.rs` and

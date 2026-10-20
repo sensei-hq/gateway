@@ -117,7 +117,7 @@ Send requests by capability; seven are live (via `kernel` capability traits):
 - **text-to-speech** (`TtsModel`) — openai, grok (cloud), kokoro (local)
 - **decision / System One** (`DecisionModel`) — ollama (≥ 0.35, local models), openrouter,
   typesafe, cloudflare (Workers AI `clef` / `clef-flash`; seed `context_window: 65_536`
-  — it truncates long state silently), self-hosted llamacpp / sglang servers, and a local laya (laya-coreml-serve, CoreML; refuses images, truncated answers fail the attempt); all
+  — it truncates long state silently), self-hosted llamacpp / sglang servers, and a local laya (laya-coreml-serve, CoreML; keep `LAYA_HOST=127.0.0.1`; refuses images, over-budget questions and truncated or collapsed answers as `InputRejected`, which falls back even with empty triggers, is never retried and never trips the breaker; a misspelled model is refused); all
   but ollama need a pinned model, and the facade auto-registers every one. No vllm
   (no upstream route). Images go in as bare base64 and are sent as data URLs to every
   host except Ollama (and laya, which refuses images). `Capability::Decision` + `Payload::Decision { state, questions, images,

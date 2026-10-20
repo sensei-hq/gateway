@@ -322,7 +322,7 @@ if let Some(DecisionAnswer::Noul { noul }) = resp.decisions.as_ref().and_then(|d
 - `images` are always bare base64 from you; the adapter encodes them per host —
   verbatim for Ollama, `data:<sniffed mime>;base64,…` for every other host (except `laya`,
   which refuses any image before sending). An image that is not PNG / JPEG / WebP / GIF
-  is a `ProviderError` before anything is sent.
+  is an `InputRejected` before anything is sent (falls back whatever the triggers).
 
 ### Cloudflare Workers AI (`clef`, `clef-flash`)
 
@@ -396,9 +396,16 @@ colon-free name. vLLM has no `/v1/systemone` and is not supported.
 
 A local `laya-coreml-serve` is configured the same way under the `laya` id:
 `url: "http://127.0.0.1:8000"`, `api_model_id: Some("english".into())`, and
-`context_window: 512` (1024 for `multilingual` / `typed-decisions`). Laya ignores images,
-so a `laya` decision with images is refused before sending; it truncates over-window
-input silently, and the gateway fails that attempt (`usage.truncated: true` is a
-`ProviderError`) so the chain falls back.
+`context_window: 512` (1024 for `multilingual` / `typed-decisions`). Keep `LAYA_HOST=127.0.0.1`
+(the default `0.0.0.0` has no auth unless `LAYA_API_KEY` is set). Laya ignores images
+and silently cuts over-long questions, so the gateway refuses a `laya` decision with
+images, or with a question estimated over the checkpoint's head budget (192 tokens
+`english`, 256 `multilingual` / `typed-decisions`; a conservative estimate, so about
+330 usable instruction chars on `english`), before sending. A 200 with `usage.truncated:
+true` or collapsed `usage.options` is refused too. All of these are
+`GatewayError::InputRejected`: the chain falls back even with empty `fallback_triggers`,
+and they are never retried or counted by the breaker. A misspelled `api_model_id` (Laya
+would auto-route it) fails with a `ProviderError`; check `/health`'s `loaded` list.
+Details: `docs/llms/local.md`.
 
 Full reference: `docs/features/inference/capabilities-and-adapters.md#decision-system-one`.
