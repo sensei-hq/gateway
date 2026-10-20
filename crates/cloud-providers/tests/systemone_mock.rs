@@ -1156,6 +1156,73 @@ async fn laya_errors_surface_the_servers_detail() {
 }
 
 // ---------------------------------------------------------------------------
+// SP-DEC-3 D7 — a re-routed checkpoint is a failed attempt
+// ---------------------------------------------------------------------------
+
+/// AC10: Laya auto-routes an unknown `model` (200, `routing.model` says where it
+/// went), so a misspelled `api_model_id` would silently run on a checkpoint
+/// with another window. A configuration fault: ProviderError naming both. The
+/// equal case is `laya_default_payload_decodes_into_typed_answers` (requests
+/// `english`, `routing.model: "english"`); the absent case is
+/// `untruncated_and_truncation_unaware_answers_stay_successes` (`ok_body` has
+/// no `routing`).
+#[tokio::test]
+async fn a_re_routed_laya_checkpoint_is_a_provider_error_naming_both() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .and(body_partial_json(json!({"model": "englsh"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(laya_ok_body()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut req = request(Some("englsh"), vec![], None);
+    req.questions = laya_questions();
+    match SystemOneAdapter::with_id("laya")
+        .unwrap()
+        .decide(&keyless(&server.uri()), &req)
+        .await
+        .unwrap_err()
+    {
+        GatewayError::ProviderError {
+            adapter,
+            message,
+            status: Some(200),
+        } => {
+            assert_eq!(adapter, "laya");
+            assert!(
+                message.contains("served checkpoint 'english' instead of the requested 'englsh'"),
+                "{message}"
+            );
+            assert!(message.contains("api_model_id"), "{message}");
+        }
+        other => panic!("expected the D7 ProviderError, got {other:?}"),
+    }
+}
+
+/// A `routing` with no (or a null) `model` says nothing about a re-route.
+#[tokio::test]
+async fn a_routing_block_without_a_model_is_a_success() {
+    for routing in [json!({}), json!({"model": null, "reason": "explicit"})] {
+        let mut body = laya_ok_body();
+        body["routing"] = routing;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        let mut req = request(Some("english"), vec![], None);
+        req.questions = laya_questions();
+        SystemOneAdapter::with_id("laya")
+            .unwrap()
+            .decide(&keyless(&server.uri()), &req)
+            .await
+            .expect("no routed model, no re-route");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SP-DEC-3 D6 — Laya's per-question head budget, checked before sending
 // ---------------------------------------------------------------------------
 
@@ -1390,6 +1457,22 @@ async fn live_laya_answers_every_type_and_reports_truncation() {
             )
         }
         other => panic!("expected the D3 truncation error, got {other:?}"),
+    }
+
+    // D7 / AC10: a misspelled checkpoint is auto-routed by Laya, and refused here.
+    let mut typo = request(Some("englsh"), vec![], None);
+    typo.questions = laya_questions();
+    match adapter.decide(&cfg, &typo).await.unwrap_err() {
+        GatewayError::ProviderError {
+            status: Some(200),
+            message,
+            ..
+        } => {
+            eprintln!("LIVE D7 refusal: {message}");
+            assert!(message.contains("'englsh'"), "{message}");
+            assert!(message.contains("'english'"), "{message}");
+        }
+        other => panic!("expected the D7 re-route refusal, got {other:?}"),
     }
 
     // An image is refused client-side (the mock test `laya_refuses_images_before_any_request`

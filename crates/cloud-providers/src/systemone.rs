@@ -390,6 +390,18 @@ struct WireResponse {
     answers: DecisionAnswers,
     #[serde(default)]
     usage: Option<WireUsage>,
+    /// Laya's report of the checkpoint that actually served the call (SP-DEC-3
+    /// D7). Absent on every other host.
+    #[serde(default)]
+    routing: Option<WireRouting>,
+}
+
+/// Laya auto-routes a `model` it does not know (200, no error), so the served
+/// checkpoint is the only sign of a misspelled `api_model_id`.
+#[derive(Deserialize)]
+struct WireRouting {
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -571,6 +583,23 @@ pub(crate) async fn decide(
         return Err(GatewayError::ProviderError {
             adapter: adapter.into(),
             message: format!("System One response has no answer for {missing:?}"),
+            status: Some(status.as_u16()),
+        });
+    }
+
+    // SP-DEC-3 D7: the host served another checkpoint than the one asked for
+    // (Laya auto-routes an unknown name) — answers from a model with another
+    // window. A configuration fault, so a ProviderError like any endpoint-wide
+    // fault. Compared with the BODY model: Workers AI's is the short name.
+    if let Some(served) = wire.routing.as_ref().and_then(|r| r.model.as_deref())
+        && served != body_model
+    {
+        return Err(GatewayError::ProviderError {
+            adapter: adapter.into(),
+            message: format!(
+                "the host served checkpoint '{served}' instead of the requested '{body_model}' \
+                 — check the model's api_model_id against the server's loaded checkpoints"
+            ),
             status: Some(status.as_u16()),
         });
     }
