@@ -71,7 +71,8 @@ feature below, and a chat adapter you register under the same id is left untouch
   falls back — set the model's `context_window` to its real window so oversize requests
   are refused up front, and keep Laya's default payload (`LAYA_JEV_STRICT` strips the
   flag). Truncation is input-determined, so chain a second decision router or the same
-  request is retried to `max_attempts` and trips the breaker. The response `model` is
+  request ends in `AllAttemptsFailed { retryable: true }`, an orchestrator agent node
+  retries it up to its `max_attempts`, and each truncation counts toward the breaker. The response `model` is
   always `laya-rl-agent`; `usage.output_tokens` is 0. No `/v1/systemone/batch`.
 - **vLLM** — no upstream `/v1/systemone` (PR #59299 open; only an example proxy); not
   supported, no `vllm` id.

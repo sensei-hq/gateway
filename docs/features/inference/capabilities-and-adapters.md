@@ -439,12 +439,13 @@ Routers:
     back). The guard keys on the exact router id `laya` — a Laya server registered
     under another id would receive images it silently ignores.
   - *Truncation:* Laya truncates over-window input **silently** (200 with
-    `usage.truncated: true`). The gateway reads that flag on every System One
-    response; `true` is a `ProviderError` (status `Some(200)`), not a success. Set the
+    `usage.truncated: true`). The gateway reads that flag on every decision host
+    response (Ollama and Cloudflare included; only Laya sends it today); `true` is a `ProviderError` (status `Some(200)`), not a success. Set the
     model's `context_window` to its real token window so the context-window gate
     refuses oversize requests before sending. Truncation is input-determined, so with
-    no other candidate the same request is retried up to `max_attempts` and each one
-    counts toward the router's circuit breaker — chain a second decision router.
+    no other candidate the engine returns `AllAttemptsFailed { retryable: true }` and an
+    orchestrator agent node retries the identical request up to its `max_attempts`;
+    each truncation counts toward the router's circuit breaker — chain a second decision router.
     Keep Laya's default payload: `LAYA_JEV_STRICT` strips `truncated` and disables the
     check.
   - Errors are FastAPI `{"detail": …}`: 401 → `Authentication`; 400/413/422/500/503 →
@@ -473,11 +474,13 @@ receives it verbatim (it rejects data URLs). Every `SystemOneAdapter` id and
 `CloudflareAdapter` send `data:<mime>;base64,…` with the mime sniffed from the
 decoded magic bytes (PNG / JPEG / WebP / GIF); a value already starting `data:`
 passes through. An unrecognisable image is a `ProviderError` before any request is
-sent (so a chain listing that trigger falls back), never a guessed type.
+sent (so a chain listing that trigger falls back), never a guessed type. The exception
+is `laya`, which refuses any image before sending (`ProviderError`, `status: None`).
 
 **Error messages** from every System One host are the provider's extracted message
 (`{error:{message}}`, a Cloudflare `{errors:[{message}]}` array, a flat `{message}`, or
-a FastAPI `{detail:[{loc,msg}]}` list), falling back to the raw body.
+a FastAPI `{detail:"…"}` string — what Laya sends — or `{detail:[{loc,msg}]}` list),
+falling back to the raw body.
 
 ---
 

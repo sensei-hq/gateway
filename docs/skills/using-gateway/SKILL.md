@@ -120,7 +120,7 @@ Send requests by capability; seven are live (via `kernel` capability traits):
   — it truncates long state silently), self-hosted llamacpp / sglang servers, and a local laya (laya-coreml-serve, CoreML; refuses images, truncated answers fail the attempt); all
   but ollama need a pinned model, and the facade auto-registers every one. No vllm
   (no upstream route). Images go in as bare base64 and are sent as data URLs to every
-  host except Ollama. `Capability::Decision` + `Payload::Decision { state, questions, images,
+  host except Ollama (and laya, which refuses images). `Capability::Decision` + `Payload::Decision { state, questions, images,
   keep_alive }` → `resp.decisions` (probabilities, keyed by question name). Not
   streamable. A malformed call fails up front with `GatewayError::InvalidRequest`.
   **`confidence` is probability concentration, not correctness** — never show it as

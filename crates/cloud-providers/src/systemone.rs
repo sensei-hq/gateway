@@ -34,7 +34,7 @@ const PATH: &str = "/v1/systemone";
 pub(crate) enum Dialect {
     /// TypeSafe's API verbatim: `POST {base}/v1/systemone`, the body `model`
     /// as given, the response body is the result. Ollama, OpenRouter,
-    /// TypeSafe, llama.cpp, SGLang.
+    /// TypeSafe, llama.cpp, SGLang, Laya.
     SystemOne,
     /// Cloudflare Workers AI REST (verified 2026-10-03): `POST
     /// {base}/run/@cf/cloudflare/{model}` with `base = .../accounts/<id>/ai`;
@@ -439,7 +439,7 @@ pub(crate) async fn decide(
 }
 
 /// Generic System One adapter for any bearer-auth host of the endpoint —
-/// OpenRouter, TypeSafe, or a self-hosted server (llama.cpp, SGLang) via `url`.
+/// OpenRouter, TypeSafe, or a self-hosted server (llama.cpp, SGLang, Laya — `laya`, which refuses images) via `url`.
 /// Decision-only: register a chat adapter under the same id separately.
 pub struct SystemOneAdapter {
     client: Client,

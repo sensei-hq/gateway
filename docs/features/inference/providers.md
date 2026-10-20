@@ -102,11 +102,12 @@ for the request/answer types and how to read `confidence`, `noul` and `score`.
 
 **Images are encoded per host.** The caller passes bare base64 in
 `DecisionRequest.images`. Ollama receives it verbatim (it rejects data URLs).
-`SystemOneAdapter` (every id: `openrouter`, `typesafe`, `llamacpp`, `sglang`, `laya`, custom)
+`SystemOneAdapter` (every id: `openrouter`, `typesafe`, `llamacpp`, `sglang`, custom)
 and `CloudflareAdapter` send `data:<mime>;base64,…`, with the mime sniffed from the
 decoded magic bytes (PNG / JPEG / WebP / GIF); a value already starting `data:` passes
 through. An image that is none of those four is a `ProviderError` **before any
-request is sent** — never a guessed type.
+request is sent** — never a guessed type. The exception is `laya`, which refuses any
+image before sending (`ProviderError`, `status: None`).
 
 **Error messages** from these hosts are the extracted message, not the raw body:
 `base::extract_error_message` reads `{error:{message}}`, `{error:"…"}`,
@@ -158,7 +159,7 @@ CLM-8B (needs vLLM / CUDA).
   it silently ignores.
 - **Truncation:** Laya truncates over-window input **silently** — still a 200, with
   only `usage.truncated: true` to show it. The adapter reads `usage.truncated` on
-  every System One response (every id; only Laya sends it today); `true` is a
+  every decision host (`SystemOneAdapter` ids, `OllamaAdapter`, `CloudflareAdapter`; only Laya sends it today); `true` is a
   `ProviderError` (status `Some(200)`), so the chain falls back. Set the model's
   `context_window` to its real token window (english 512, multilingual /
   typed-decisions 1024) so the `ContextWindowGate` refuses oversize requests before
@@ -166,8 +167,9 @@ CLM-8B (needs vLLM / CUDA).
   token window (or lower it if it already is)". Keep Laya's default payload:
   `LAYA_JEV_STRICT` strips `truncated`, which disables the check.
 - **Known limit:** truncation is input-determined. With no other candidate in the
-  chain the same request is retried up to `max_attempts`, and every truncation counts
-  toward the router's circuit breaker. Set `context_window` and chain a second
+  chain the engine tries nothing else and returns `AllAttemptsFailed { retryable: true }`;
+  an orchestrator agent node then retries the identical request up to its
+  `max_attempts`, and every truncation counts toward the router's circuit breaker. Set `context_window` and chain a second
   decision router.
 - **Overhead:** measured on an M4 Max, HTTP adds about 0.35 ms per decision — about
   8% on the ANE checkpoint (4.1 ms), negligible on CPU+GPU (~50 ms).
