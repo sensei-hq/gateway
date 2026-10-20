@@ -227,7 +227,7 @@ route by score. The roster, how to start each server, dataset licences and how t
 are in `crates/decision-bench/README.md`.
 
 ```sh
-cargo run --release -p decision-bench -- check                      # probe each model; unreachable ones are NOT RUN
+cargo run --release -p decision-bench -- check                      # probe each model; unreachable or unfittable ones are NOT RUN
 cargo run --release -p decision-bench -- fetch --per-scenario 40    # download public datasets, build seeded cases
 cargo run --release -p decision-bench -- run                        # run every reachable model, write results.json
 cargo run --release -p decision-bench -- report                     # render report.md from results.json
