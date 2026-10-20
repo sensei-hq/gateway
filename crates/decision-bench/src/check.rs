@@ -11,7 +11,7 @@ use serde_json::json;
 
 use crate::case::{Case, Expected, Scenario};
 use crate::config::{BenchConfig, ModelSpec};
-use crate::run::{Outcome, gateway_with_timeout, request_for, row_for};
+use crate::run::{Outcome, gateway_with_timeout, redact, request_for, row_for_model};
 
 /// How long one probe may take. A cold model load (Ollama loads lazily) can
 /// take several seconds; this is long enough for that, and far shorter than
@@ -76,8 +76,8 @@ pub async fn check_with_timeout(
                 Probe::Gated(reason) => CheckStatus::NotRun {
                     reason: format!(
                         "the probe never reached the server: {reason}; and no other model \
-                         on {} {} answered, so the server is unverified",
-                        m.router, m.url
+                         on the same {} server answered, so the server is unverified",
+                        m.router
                     ),
                 },
                 Probe::Failed(reason) => CheckStatus::NotRun {
@@ -126,7 +126,7 @@ pub fn probe_case() -> Case {
 async fn probe(cfg: &BenchConfig, m: &ModelSpec, timeout: Duration) -> Probe {
     let gw = match gateway_with_timeout(cfg, m, timeout).await {
         Ok(gw) => gw,
-        Err(e) => return Probe::Failed(format!("invalid config: {e:#}")),
+        Err(e) => return Probe::Failed(redact(&format!("invalid config: {e:#}"), m)),
     };
     let case = probe_case();
     let request = request_for(&case, m);
@@ -138,7 +138,7 @@ async fn probe(cfg: &BenchConfig, m: &ModelSpec, timeout: Duration) -> Probe {
         Ok(result) => result,
     };
     // `row_for` owns the "did this reach the server" rules for an error.
-    let row = row_for(&case, &m.id, &result, 0);
+    let row = row_for_model(&case, m, &result, 0);
     let reason = row.detail.unwrap_or_default();
     match (row.outcome, row.reached_server) {
         (Outcome::NotApplicable, true) => Probe::Answered,
@@ -211,6 +211,35 @@ mod tests {
         assert_eq!(got[0].status, CheckStatus::Reachable);
         assert_eq!(got[1].model, "down");
         assert!(!not_run_reason(&got[1]).is_empty());
+    }
+
+    /// T7 review I1: neither the NOT RUN reason nor the report carries the
+    /// model URL (a hosted one can hold a token).
+    #[tokio::test]
+    async fn a_not_run_reason_and_its_report_never_carry_the_url() {
+        let cfg = BenchConfig {
+            models: vec![spec("down", "http://127.0.0.1:9/?token=SECRET")],
+        };
+        let got = check(&cfg, &ids(&["down"])).await;
+        let reason = not_run_reason(&got[0]).to_string();
+        assert!(!reason.contains("SECRET"), "{reason}");
+        let results = crate::run::Results {
+            generated_at: 0,
+            manifest: None,
+            not_run: vec![crate::run::NotRun {
+                model: "down".into(),
+                reason,
+            }],
+            roster: vec![(&cfg.models[0]).into()],
+            labels_reviewed: vec![],
+            completed: vec![],
+            rows: vec![],
+        };
+        let md = crate::report::render(&results, 1);
+        assert!(md.contains("**down**"), "{md}");
+        assert!(!md.contains("SECRET"), "{md}");
+        let json = serde_json::to_string(&results).unwrap();
+        assert!(!json.contains("SECRET"), "{json}");
     }
 
     #[tokio::test]

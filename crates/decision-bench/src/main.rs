@@ -296,6 +296,7 @@ async fn run_command(
             .map(RosterEntry::from)
             .collect(),
         labels_reviewed: loaded.labels_reviewed,
+        completed: vec![],
         rows: vec![],
     };
     let out = resolve_under(out, crate_dir);
@@ -570,7 +571,13 @@ mod tests {
         assert_eq!(results.not_run[0].model, "down");
         let roster: Vec<_> = results.roster.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(roster, ["good", "down"]);
-        assert_eq!(results.labels_reviewed, vec![(Scenario::S4FixCheck, None)]);
+        assert_eq!(
+            results.labels_reviewed,
+            vec![decision_bench::run::LabelReview {
+                scenario: Scenario::S4FixCheck,
+                reviewed_by: None
+            }]
+        );
         assert_eq!(results.manifest.as_ref().unwrap().seed, 2026);
         assert_eq!(results.rows.len(), 5);
         assert!(results.rows.iter().all(|r| r.model == "good"));

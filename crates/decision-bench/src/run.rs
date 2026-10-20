@@ -115,10 +115,50 @@ pub struct Results {
     #[serde(default)]
     pub roster: Vec<RosterEntry>,
     /// Each hand-curated (S4) scenario run, with its file header's
-    /// `labels_reviewed_by`; `None` means the labels are unreviewed.
+    /// `labels_reviewed_by`.
     #[serde(default)]
-    pub labels_reviewed: Vec<(Scenario, Option<String>)>,
+    pub labels_reviewed: Vec<LabelReview>,
+    /// Models whose every row is in `rows`, in the order they finished. A
+    /// roster model in neither this nor `not_run` never finished (the run
+    /// stopped early).
+    #[serde(default)]
+    pub completed: Vec<String>,
     pub rows: Vec<ResultRow>,
+}
+
+/// The sign-off state of one hand-curated scenario's labels.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct LabelReview {
+    pub scenario: Scenario,
+    /// `None`: the labels are unreviewed.
+    pub reviewed_by: Option<String>,
+}
+
+/// `text` with `m.url`, and every `url (…)` segment (how transport errors
+/// quote the request URL), replaced by `<url>`: a URL can carry a token, and
+/// reasons and details end up in `results.json` and the committed report.
+pub fn redact(text: &str, m: &ModelSpec) -> String {
+    let mut out = text.to_string();
+    let bare = m.url.trim_end_matches('/');
+    for url in [m.url.as_str(), bare] {
+        if !url.is_empty() {
+            out = out.replace(url, "<url>");
+        }
+    }
+    const SEGMENT: &str = "url (";
+    let mut redacted = String::with_capacity(out.len());
+    let mut rest = out.as_str();
+    while let Some(at) = rest.find(SEGMENT) {
+        let start = at + SEGMENT.len();
+        redacted.push_str(&rest[..start]);
+        redacted.push_str("<url>");
+        // Up to the closing paren; a clipped segment runs to the end.
+        rest = rest[start..]
+            .find(')')
+            .map_or("", |end| &rest[start + end..]);
+    }
+    redacted.push_str(rest);
+    redacted
 }
 
 /// What [`score`] makes of an answer to a case.
@@ -389,8 +429,34 @@ fn clip(s: &str) -> String {
     s.chars().take(DETAIL_MAX_CHARS).collect()
 }
 
-/// The one row for (`case`, `model`) from the result of `execute`.
+/// The one row for (`case`, `model`) from the result of `execute`, its
+/// `detail` clipped to [`DETAIL_MAX_CHARS`].
 pub fn row_for(
+    case: &Case,
+    model: &str,
+    result: &Result<InferenceResponse, GatewayError>,
+    latency_ms: u64,
+) -> ResultRow {
+    let mut row = row_unclipped(case, model, result, latency_ms);
+    row.detail = row.detail.map(|d| clip(&d));
+    row
+}
+
+/// [`row_for`] for `m`, with `m`'s URL [`redact`]ed from the detail before it
+/// is clipped (so a clip cannot cut a URL past recognition). Every row a run
+/// records goes through this.
+pub fn row_for_model(
+    case: &Case,
+    m: &ModelSpec,
+    result: &Result<InferenceResponse, GatewayError>,
+    latency_ms: u64,
+) -> ResultRow {
+    let mut row = row_unclipped(case, &m.id, result, latency_ms);
+    row.detail = row.detail.map(|d| clip(&redact(&d, m)));
+    row
+}
+
+fn row_unclipped(
     case: &Case,
     model: &str,
     result: &Result<InferenceResponse, GatewayError>,
@@ -423,7 +489,7 @@ pub fn row_for(
         Err(e) => {
             let (outcome, reason) = classify(e);
             row.outcome = outcome;
-            row.detail = Some(clip(&reason));
+            row.detail = Some(reason);
             return row;
         }
         Ok(resp) => resp.decisions.as_ref().and_then(|d| d.get("q")),
@@ -440,7 +506,7 @@ pub fn row_for(
             row.score_value = s.score_value;
             row.expected_level = s.expected_level;
         }
-        Err(e) => row.detail = Some(clip(&format!("{e:#}"))),
+        Err(e) => row.detail = Some(format!("{e:#}")),
     }
     row
 }
@@ -489,7 +555,7 @@ pub async fn run_with_progress(
             let started = Instant::now();
             let result = execute_watched(&gw, &req, &m.id, &case.id).await;
             let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-            rows.push(row_for(case, &m.id, &result, latency_ms));
+            rows.push(row_for_model(case, m, &result, latency_ms));
         }
         let done = &rows[first..];
         let count = |o: Outcome| done.iter().filter(|r| r.outcome == o).count();
@@ -538,20 +604,12 @@ pub async fn run(
     run_with_progress(cfg, cases, model_ids, |_, _| {}).await
 }
 
-/// Write `results` as pretty JSON to `path` atomically (a sibling temp file,
-/// then a rename).
+/// Write `results` as pretty JSON to `path` atomically
+/// ([`crate::fetch::write_atomic`]: a unique synced temp file, then a rename).
 pub fn write_results(path: &Path, results: &Results) -> anyhow::Result<()> {
-    let name = path
-        .file_name()
-        .with_context(|| format!("{} has no file name", path.display()))?;
-    let mut tmp_name = name.to_os_string();
-    tmp_name.push(".tmp");
-    let tmp = path.with_file_name(tmp_name);
     let mut json = serde_json::to_string_pretty(results)?;
     json.push('\n');
-    std::fs::write(&tmp, json).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))
+    crate::fetch::write_atomic(path, json.as_bytes())
 }
 
 /// Run `model_ids` one model at a time (config order) via
@@ -580,6 +638,7 @@ pub async fn run_saving(
             .await
             .with_context(|| format!("running model '{}'", m.id))?;
         results.rows.extend(rows);
+        results.completed.push(m.id.clone());
         write_results(out, &results)?;
     }
     Ok(results)
@@ -1097,7 +1156,11 @@ mod tests {
                 api_model_id: "nimble-v3".into(),
                 context_window: 8192,
             }],
-            labels_reviewed: vec![(Scenario::S4FixCheck, None)],
+            labels_reviewed: vec![LabelReview {
+                scenario: Scenario::S4FixCheck,
+                reviewed_by: None,
+            }],
+            completed: vec!["m".into()],
             rows: vec![row_for(
                 &noul_case(true),
                 "m",
@@ -1113,6 +1176,7 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "completed",
                 "generated_at",
                 "labels_reviewed",
                 "manifest",
@@ -1162,6 +1226,7 @@ mod tests {
         .unwrap();
         assert!(back.roster.is_empty());
         assert!(back.labels_reviewed.is_empty());
+        assert!(back.completed.is_empty());
     }
 
     // --- T4 review ---------------------------------------------------------
@@ -1382,6 +1447,7 @@ mod tests {
             }],
             roster: vec![],
             labels_reviewed: vec![],
+            completed: vec![],
             rows: vec![],
         }
     }
@@ -1429,6 +1495,8 @@ mod tests {
         let on_disk = read_results(&out);
         assert_eq!(on_disk.rows.len(), 3, "{on_disk:?}");
         assert!(on_disk.rows.iter().all(|r| r.model == "first"));
+        // T7 review I2: the file says which models finished.
+        assert_eq!(on_disk.completed, ["first"]);
         assert_eq!(on_disk.not_run, base_results().not_run);
     }
 
@@ -1452,6 +1520,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(got.rows.len(), 4);
+        assert_eq!(got.completed, ["a", "b"]);
         assert_eq!(read_results(&out), got);
     }
 
@@ -1464,6 +1533,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read_results(&out), base_results());
+    }
+
+    // --- T7 review I1: redaction ----------------------------------------------
+
+    const SECRET_URL: &str = "http://127.0.0.1:9/?token=SECRETTOK";
+
+    #[test]
+    fn redact_removes_the_model_url_and_every_url_segment() {
+        let m = spec(SECRET_URL);
+        let text = format!(
+            "error sending request for url (http://127.0.0.1:9/?token=SECRETTOK/v1/systemone) \
+             at {SECRET_URL} or url (http://other/?k=SECRETTOK"
+        );
+        let out = redact(&text, &m);
+        assert!(!out.contains("SECRETTOK"), "{out}");
+        assert_eq!(
+            out,
+            "error sending request for url (<url>) at <url> or url (<url>"
+        );
+        assert_eq!(redact("no urls here", &m), "no urls here");
+    }
+
+    #[tokio::test]
+    async fn row_details_and_the_results_file_never_carry_the_model_url() {
+        let m = spec(SECRET_URL);
+        let cfg = BenchConfig {
+            models: vec![m.clone()],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("results.json");
+        let got = run_saving(
+            &cfg,
+            &noul_cases(2),
+            std::slice::from_ref(&m.id),
+            base_results(),
+            &out,
+        )
+        .await
+        .unwrap();
+        assert!(got.rows.iter().all(|r| r.outcome == Outcome::Error));
+        assert!(got.rows.iter().all(|r| r.detail.is_some()));
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(!text.contains("SECRETTOK"), "{text}");
+        assert!(text.contains("<url>"), "{text}");
     }
 
     /// M4: the warm-up is the cheapest case, not whichever comes first.
