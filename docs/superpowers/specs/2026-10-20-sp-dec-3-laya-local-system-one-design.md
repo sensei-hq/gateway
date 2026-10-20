@@ -9,6 +9,14 @@ Not in scope (carry-forwards):
 - **CLM-8B** (Stanford/NVIDIA, `Contrastive-LM/CLM`) — wire-compatible, but its encoder is vLLM + Qwen3-8B
   (CUDA/CPU). Reconsider if it is ported to Metal.
 - `POST /v1/systemone/batch`, Laya's `max_len` / `task` / `lang` / `min_confidence` body controls.
+- **Truncation is input-determined but classified like any provider fault** (found in T2 review). The same
+  over-window request truncates on every retry: with no other candidate it returns `AllAttemptsFailed
+  { retryable: true }` and the orchestrator retries it up to `max_attempts`, and every truncation counts
+  toward the router's circuit breaker (a burst can open it for valid short requests). Mitigation today:
+  set `context_window` so the gate refuses first, and chain a second decision router. A typed
+  non-retryable, breaker-neutral marker is the follow-up.
+- **The image guard keys on the exact router id `laya`** (T1 review): a Laya server under another id gets
+  data URLs it silently ignores. A capability-level "no images" router setting is the follow-up.
 
 ## Contract (verified 2026-10-20 against `laya-coreml` 0.5.1 from PyPI, live on an M4 Max)
 
@@ -42,7 +50,7 @@ in-process vs 46.9 ms HTTP (noise); ANE 4.12 ms vs 4.47 ms (+0.35 ms ≈ 8%); ba
   the encoding by id: `laya` → `Unsupported`, every other id unchanged (`DataUrl`). The message names the router
   and says it does not read images.
 - **D3 A truncated answer is a provider fault, not a success.** `WireUsage` reads an optional `truncated: bool`
-  (absent → `false`, so every other host is unaffected). `true` → `ProviderError` (status `None`) naming the router
+  (absent → `false`, so every other host is unaffected). `true` → `ProviderError` (status `Some(200)`, as for the existing missing-answer check) naming the router
   and the dropped token count when present, so the call falls back instead of returning answers about a state the
   model never fully read. Primary defence remains the existing `ContextWindowGate`: the docs tell the operator to
   set the model's `context_window` to the checkpoint's window, so oversize requests are refused before they are sent
