@@ -92,6 +92,9 @@ pub(crate) enum ImageEncoding {
     /// `data:<sniffed mime>;base64,<b64>` — what llama.cpp (bare → 400),
     /// Cloudflare, vLLM's example and SGLang all accept.
     DataUrl,
+    /// The host does not read images and IGNORES the field (Laya: 200 with
+    /// text-only answers), so any image is refused before sending (SP-DEC-3 D2).
+    Unsupported,
 }
 
 /// Encode the caller's images for a host. A value already in data-URL form
@@ -99,6 +102,15 @@ pub(crate) enum ImageEncoding {
 /// bytes; an image that is no known format cannot be labelled truthfully, so
 /// it is an error (before anything is sent) rather than a guessed type.
 fn encode_images(images: &[String], encoding: ImageEncoding) -> Result<Vec<String>, String> {
+    if encoding == ImageEncoding::Unsupported {
+        return match images.len() {
+            0 => Ok(vec![]),
+            n => Err(format!(
+                "this host does not read images ({n} sent) — it would answer as if they were \
+                 absent; route image decisions to a vision-capable System One host"
+            )),
+        };
+    }
     if encoding == ImageEncoding::Bare {
         return Ok(images.to_vec());
     }
@@ -121,6 +133,16 @@ fn encode_images(images: &[String], encoding: ImageEncoding) -> Result<Vec<Strin
             Ok(format!("data:{mime};base64,{b64}"))
         })
         .collect()
+}
+
+/// The image encoding the generic adapter uses for a router id: `laya`
+/// ignores images (SP-DEC-3 D2); every other `/v1/systemone` host that takes
+/// images accepts data URLs (SP-DEC-2 D1).
+fn image_encoding(id: &str) -> ImageEncoding {
+    match id {
+        "laya" => ImageEncoding::Unsupported,
+        _ => ImageEncoding::DataUrl,
+    }
 }
 
 /// The image type from the first decoded bytes of a base64 string.
@@ -450,7 +472,7 @@ impl kernel::adapters::capability::DecisionModel for SystemOneAdapter {
         let host = Host {
             adapter: &self.id,
             dialect: Dialect::SystemOne,
-            images: ImageEncoding::DataUrl,
+            images: image_encoding(&self.id),
         };
         decide(&self.client, base_url, host, model, config, req)
             .await?
@@ -481,6 +503,28 @@ mod tests {
             enabled: true,
             timeout_ms: None,
             headers: HashMap::new(),
+        }
+    }
+
+    /// SP-DEC-3 D2: a host that ignores `images` must never receive them —
+    /// the answers would silently describe a text-only request.
+    #[test]
+    fn an_unsupported_host_refuses_images_and_passes_text_only_calls() {
+        assert_eq!(encode_images(&[], ImageEncoding::Unsupported), Ok(vec![]));
+        let err = encode_images(
+            &["iVBORw0KGgo=".to_string(), "iVBORw0KGgo=".to_string()],
+            ImageEncoding::Unsupported,
+        )
+        .unwrap_err();
+        assert!(err.contains("does not read images"), "{err}");
+        assert!(err.contains('2'), "says how many were refused: {err}");
+    }
+
+    #[test]
+    fn laya_is_the_only_generic_id_that_refuses_images() {
+        assert_eq!(image_encoding("laya"), ImageEncoding::Unsupported);
+        for id in ["openrouter", "typesafe", "llamacpp", "sglang", "custom"] {
+            assert_eq!(image_encoding(id), ImageEncoding::DataUrl, "{id}");
         }
     }
 

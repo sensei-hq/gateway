@@ -833,3 +833,39 @@ async fn live_llama_cpp_answers_and_takes_data_url_images() {
         other => panic!("expected the 501 that follows a valid data URL, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// SP-DEC-3 — Laya (`laya-coreml-serve`) through the generic adapter
+// ---------------------------------------------------------------------------
+
+/// Laya ignores `images` (verified live: 200, text-only answers), so a `laya`
+/// call with images fails BEFORE sending — a ProviderError the chain falls
+/// back on — while `llamacpp` keeps sending data URLs (AC2).
+#[tokio::test]
+async fn laya_refuses_images_before_any_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(ok_body("laya-rl-agent")))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let err = SystemOneAdapter::with_id("laya")
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &request(Some("english"), vec![PNG_B64.to_string()], None),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        GatewayError::ProviderError {
+            adapter,
+            message,
+            status: None,
+        } => {
+            assert_eq!(adapter, "laya");
+            assert!(message.contains("does not read images"), "{message}");
+        }
+        other => panic!("expected ProviderError before sending, got {other:?}"),
+    }
+}
