@@ -45,6 +45,10 @@ url = "http://127.0.0.1:8766"
 api_model_id = "typed-decisions"
 context_window = 1024
 
+# laya-ane is reported NOT RUN by `check` (and so by `run` and the report): the
+# gateway estimates even the minimal decision at ~182 input tokens, over this
+# model's 96-token window, so nothing can ever be sent to it. It stays in the
+# roster so the report says so, rather than hiding it.
 [[models]]
 id = "laya-ane"
 router = "laya"
