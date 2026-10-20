@@ -7,10 +7,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use gateway::circuit_breaker::CircuitBreakerConfig;
-use gateway::types::decision::{DecisionAnswer, DecisionQuestions};
+use gateway::resilience::ResilienceConfig;
+use gateway::types::decision::{DecisionAnswer, DecisionQuestion, DecisionQuestions};
 use gateway::types::error::HumanAction;
 use gateway::types::request::Payload;
-use gateway::{Capability, FacadeBuilder, GatewayError, InferenceRequest, InferenceResponse};
+use gateway::{
+    Capability, FacadeBuilder, Gateway, GatewayError, InferenceRequest, InferenceResponse,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::case::{Case, Expected, Scenario};
@@ -40,6 +43,21 @@ pub struct ResultRow {
     /// Score cases: the gold level, for MAE.
     pub expected_level: Option<usize>,
     pub latency_ms: u64,
+    /// Whether the gateway dispatched at least one attempt to the adapter
+    /// (the chain has exactly one candidate):
+    /// - `true` for an answer, an `AllAttemptsFailed` with attempts, and an
+    ///   `AllGated` whose `skipped` is empty — the engine also returns
+    ///   `AllGated` *after* an attempt, e.g. a 429 whose lockout makes the
+    ///   chain timed-gated.
+    /// - `false` for an `AllGated` that lists the candidate in `skipped` (a gate
+    ///   — cooldown, lockout, breaker, context window — refused it before
+    ///   dispatch) and for every other pre-dispatch error.
+    ///
+    /// Caveat: an adapter's own pre-send `InputRejected`
+    /// (Laya head budget, images) is a recorded attempt and so reads `true`
+    /// although no bytes reached the server; the error text cannot tell it
+    /// apart from a server-side truncation.
+    pub reached_server: bool,
     /// Reason for `NotApplicable` / `Error`, clipped to [`DETAIL_MAX_CHARS`].
     pub detail: Option<String>,
 }
@@ -50,6 +68,10 @@ pub const INPUT_REJECTED_MARKER: &str = "cannot serve this input: ";
 
 /// Longest `detail` kept on a row, in chars.
 pub const DETAIL_MAX_CHARS: usize = 300;
+
+/// A case still in flight after this long gets a progress line on stderr
+/// (and another each further interval), so a hung server is visible.
+pub const SLOW_CASE: Duration = Duration::from_secs(30);
 
 /// A model that `check` found unreachable, so it was not run (filled by T7).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -145,6 +167,7 @@ pub fn score(case: &Case, answer: &DecisionAnswer) -> anyhow::Result<Scored> {
                 ..
             },
         ) => {
+            check_probabilities(id, probabilities)?;
             let p = *probabilities.get(choice).with_context(|| {
                 format!("case {id}: answer chose {choice:?} but gave it no probability")
             })?;
@@ -157,9 +180,7 @@ pub fn score(case: &Case, answer: &DecisionAnswer) -> anyhow::Result<Scored> {
         }
         (Expected::Noul { value }, DecisionAnswer::Noul { noul }) => {
             let p = *noul;
-            if !(0.0..=1.0).contains(&p) {
-                bail!("case {id}: noul probability {p} is not within 0..=1");
-            }
+            check_probability(id, "noul", p)?;
             Ok(Scored {
                 correct: (p >= 0.5) == *value,
                 top_probability: p.max(1.0 - p),
@@ -175,6 +196,10 @@ pub fn score(case: &Case, answer: &DecisionAnswer) -> anyhow::Result<Scored> {
                 ..
             },
         ) => {
+            check_probabilities(id, probabilities)?;
+            let DecisionQuestion::Score { criteria, .. } = &case.question else {
+                bail!("case {id}: expects a score but its question is not a score question");
+            };
             // Argmax over levels; a tie goes to the LOWER level (levels are
             // visited in ascending order and only a strictly greater
             // probability replaces the incumbent).
@@ -194,6 +219,12 @@ pub fn score(case: &Case, answer: &DecisionAnswer) -> anyhow::Result<Scored> {
             }
             let (argmax, p) =
                 best.with_context(|| format!("case {id}: score answer has no probabilities"))?;
+            if argmax >= criteria.len() {
+                bail!(
+                    "case {id}: answer's most probable level {argmax} is beyond the question's {} levels",
+                    criteria.len()
+                );
+            }
             Ok(Scored {
                 correct: argmax == *level,
                 top_probability: p,
@@ -212,6 +243,25 @@ pub fn score(case: &Case, answer: &DecisionAnswer) -> anyhow::Result<Scored> {
     }
 }
 
+/// `p` must be a number within 0..=1 (NaN is not).
+fn check_probability(id: &str, what: &str, p: f64) -> anyhow::Result<()> {
+    if !(0.0..=1.0).contains(&p) {
+        bail!("case {id}: {what} probability {p} is not within 0..=1");
+    }
+    Ok(())
+}
+
+/// Every per-option / per-level probability must be a number within 0..=1.
+fn check_probabilities<'a>(
+    id: &str,
+    probabilities: impl IntoIterator<Item = (&'a String, &'a f64)>,
+) -> anyhow::Result<()> {
+    for (k, p) in probabilities {
+        check_probability(id, &format!("{k:?}"), *p)?;
+    }
+    Ok(())
+}
+
 /// The facade builder for `m`: its single-entry chain, with the circuit
 /// breaker effectively OFF (`threshold: usize::MAX`). With the default
 /// threshold, five consecutive real failures would open the breaker and every
@@ -224,6 +274,44 @@ pub fn facade_for(cfg: &BenchConfig, m: &ModelSpec) -> anyhow::Result<FacadeBuil
             half_open_max_requests: 1,
         }),
     )
+}
+
+/// The gateway a bench run uses for `m`: [`facade_for`] (breaker off) plus a
+/// resilience policy with no transport cooldown and no synthetic lockout.
+///
+/// Turning the breaker off is not enough. With the default
+/// [`ResilienceConfig`], one `Network`/`Timeout` failure (a cold model load
+/// timing out on the warm-up is the likeliest) cools the whole router for
+/// 30 s, and a 429 locks the model out for 60 s; every case in that window is
+/// skipped as a 0 ms `AllGated` that never reaches the server. So:
+///
+/// - `cooldown_base = 0`: a transport fault cools nothing.
+/// - `lockout.rate_limit_base = 0` and `lockout.quota_default = 0`: a 429 or
+///   403-quota *without* `Retry-After` locks nothing; each later case goes to
+///   the server and is recorded as whatever it answers.
+///
+/// What this cannot turn off: a real upstream `Retry-After` is honoured
+/// verbatim by the gateway (never clamped), and an auth / credits failure
+/// locks the model terminally. Cases skipped by either are rows with
+/// `reached_server: false`. All other resilience fields keep their defaults.
+pub async fn gateway_for(cfg: &BenchConfig, m: &ModelSpec) -> anyhow::Result<Gateway> {
+    let mut resilience = ResilienceConfig::default();
+    resilience.cooldown_base = Duration::ZERO;
+    resilience.lockout.rate_limit_base = Duration::ZERO;
+    resilience.lockout.quota_default = Duration::ZERO;
+    Ok(facade_for(cfg, m)?
+        .build()
+        .await
+        .gateway
+        .with_resilience(resilience))
+}
+
+/// The warm-up case: the one with the shortest serialized `state` (first on a
+/// tie), so loading the model costs as little as possible.
+pub fn warm_up_case(cases: &[Case]) -> Option<&Case> {
+    cases
+        .iter()
+        .min_by_key(|c| serde_json::to_string(&c.state).map_or(usize::MAX, |s| s.len()))
 }
 
 /// The request for `case` on `m`'s chain, with fallback off.
@@ -270,6 +358,17 @@ pub fn row_for(
         score_value: None,
         expected_level: None,
         latency_ms,
+        reached_server: match result {
+            Ok(_) => true,
+            Err(GatewayError::AllAttemptsFailed {
+                attempts_detail, ..
+            }) => !attempts_detail.is_empty(),
+            // Single-candidate chain: the candidate is either skipped by a gate
+            // (listed in `skipped`, never dispatched) or was attempted and its
+            // outcome made the chain gated (a 429 → timed lockout).
+            Err(GatewayError::AllGated { skipped, .. }) => skipped.is_empty(),
+            Err(_) => false,
+        },
         detail: None,
     };
     let answer = match result {
@@ -299,13 +398,22 @@ pub fn row_for(
 }
 
 /// Run every case on every model in `model_ids`, in config order, one case at
-/// a time. Each model gets one discarded warm-up call (the first case) first.
+/// a time, calling `on_model_done(model_id, rows)` with that model's rows as
+/// soon as it finishes (so a caller can persist partial results). Returns every
+/// row.
+///
+/// Each model first gets one warm-up call ([`warm_up_case`]); its result is
+/// never recorded, and a failed warm-up is logged to stderr. Progress goes to
+/// stderr: a line when a model starts and finishes, and a line for any case
+/// still in flight after each [`SLOW_CASE`].
+///
 /// An id not in the config is an error naming it; an empty `model_ids` runs
 /// nothing.
-pub async fn run(
+pub async fn run_with_progress(
     cfg: &BenchConfig,
     cases: &[Case],
     model_ids: &[String],
+    mut on_model_done: impl FnMut(&str, &[ResultRow]),
 ) -> anyhow::Result<Vec<ResultRow>> {
     if let Some(unknown) = model_ids
         .iter()
@@ -315,20 +423,71 @@ pub async fn run(
     }
     let mut rows = Vec::with_capacity(cases.len() * model_ids.len());
     for m in cfg.models.iter().filter(|m| model_ids.contains(&m.id)) {
-        let gw = facade_for(cfg, m)?.build().await.gateway;
-        if let Some(first) = cases.first() {
-            // Warm-up: loads the model; its result is never recorded.
-            let _ = gw.execute(&request_for(first, m)).await;
+        let started_model = Instant::now();
+        eprintln!("decision-bench: {}: {} cases", m.id, cases.len());
+        let gw = gateway_for(cfg, m).await?;
+        if let Some(warm) = warm_up_case(cases) {
+            // Loads the model; the result is never recorded.
+            if let Err(e) = execute_watched(&gw, &request_for(warm, m), &m.id, "warm-up").await {
+                eprintln!(
+                    "decision-bench: {}: warm-up failed (not recorded): {e}",
+                    m.id
+                );
+            }
         }
+        let first = rows.len();
         for case in cases {
             let req = request_for(case, m);
             let started = Instant::now();
-            let result = gw.execute(&req).await;
+            let result = execute_watched(&gw, &req, &m.id, &case.id).await;
             let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             rows.push(row_for(case, &m.id, &result, latency_ms));
         }
+        let done = &rows[first..];
+        let count = |o: Outcome| done.iter().filter(|r| r.outcome == o).count();
+        eprintln!(
+            "decision-bench: {}: done in {:.1}s — {} ok, {} not_applicable, {} error ({} never reached the server)",
+            m.id,
+            started_model.elapsed().as_secs_f64(),
+            count(Outcome::Ok),
+            count(Outcome::NotApplicable),
+            count(Outcome::Error),
+            done.iter().filter(|r| !r.reached_server).count(),
+        );
+        on_model_done(&m.id, done);
     }
     Ok(rows)
+}
+
+/// `gw.execute(req)`, with a stderr line for every [`SLOW_CASE`] it is still
+/// in flight.
+async fn execute_watched(
+    gw: &Gateway,
+    req: &InferenceRequest,
+    model: &str,
+    what: &str,
+) -> Result<InferenceResponse, GatewayError> {
+    let started = Instant::now();
+    let call = gw.execute(req);
+    tokio::pin!(call);
+    loop {
+        tokio::select! {
+            result = &mut call => return result,
+            _ = tokio::time::sleep(SLOW_CASE) => eprintln!(
+                "decision-bench: {model}: {what} still waiting after {}s",
+                started.elapsed().as_secs()
+            ),
+        }
+    }
+}
+
+/// [`run_with_progress`] without a per-model callback.
+pub async fn run(
+    cfg: &BenchConfig,
+    cases: &[Case],
+    model_ids: &[String],
+) -> anyhow::Result<Vec<ResultRow>> {
+    run_with_progress(cfg, cases, model_ids, |_, _| {}).await
 }
 
 /// Write `results` as pretty JSON to `path` atomically (a sibling temp file,
@@ -350,7 +509,6 @@ pub fn write_results(path: &Path, results: &Results) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gateway::types::decision::DecisionQuestion;
     use gateway::types::trace::{Attempt, AttemptStatus};
     use serde_json::json;
     use wiremock::matchers::method;
@@ -701,6 +859,7 @@ mod tests {
                 score_value: None,
                 expected_level: None,
                 latency_ms: 42,
+                reached_server: true,
                 detail: None,
             }
         );
@@ -774,7 +933,7 @@ mod tests {
         let gw = facade_for(&cfg, &m).unwrap().build().await.gateway;
         let req = request_for(&noul_case(true), &m);
         let mut seen = 0;
-        for i in 0..8 {
+        for i in 0..20 {
             let err = gw.execute(&req).await.expect_err("server answers 500");
             let now = server.received_requests().await.unwrap().len();
             assert!(now > seen, "call {i} never reached the server: {err}");
@@ -878,6 +1037,7 @@ mod tests {
                 "latency_ms",
                 "model",
                 "outcome",
+                "reached_server",
                 "scenario",
                 "score_value",
                 "top_probability"
@@ -891,5 +1051,252 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(leftovers, vec![std::ffi::OsString::from("results.json")]);
+    }
+
+    // --- T4 review ---------------------------------------------------------
+
+    /// A listener that accepts each connection and drops it at once, so every
+    /// call is a transport (`Network`) failure. Returns its URL and the count
+    /// of connections it accepted.
+    fn accept_and_drop() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        (url, accepted)
+    }
+
+    fn noul_cases(n: usize) -> Vec<Case> {
+        (0..n)
+            .map(|i| {
+                let mut c = noul_case(true);
+                c.id = format!("c{i}");
+                c
+            })
+            .collect()
+    }
+
+    /// C1: one transport failure must not cool the router for the rest of the
+    /// run — every case (and the warm-up) reaches the server.
+    #[tokio::test]
+    async fn a_transport_failure_does_not_cool_the_router_for_later_cases() {
+        let (url, accepted) = accept_and_drop();
+        let m = spec(&url);
+        let cfg = BenchConfig {
+            models: vec![m.clone()],
+        };
+        let rows = run(&cfg, &noul_cases(5), std::slice::from_ref(&m.id))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        for r in &rows {
+            assert_eq!(r.outcome, Outcome::Error, "{r:?}");
+            assert!(r.reached_server, "{r:?}");
+        }
+        assert_eq!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst),
+            6,
+            "warm-up + 5 cases must each reach the server; rows: {rows:?}"
+        );
+    }
+
+    /// C1: a 429 without `Retry-After` must not lock the model out for the
+    /// rest of the run.
+    #[tokio::test]
+    async fn a_rate_limit_without_retry_after_does_not_lock_later_cases_out() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("slow down"))
+            .mount(&server)
+            .await;
+        let m = spec(&server.uri());
+        let cfg = BenchConfig {
+            models: vec![m.clone()],
+        };
+        let rows = run(&cfg, &noul_cases(4), std::slice::from_ref(&m.id))
+            .await
+            .unwrap();
+        assert!(rows.iter().all(|r| r.reached_server), "{rows:?}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 5);
+    }
+
+    /// The one lock the bench cannot turn off: a real `Retry-After` is honoured
+    /// verbatim. The skipped cases are not dropped or disguised — each is an
+    /// `Error` row with `reached_server: false`.
+    #[tokio::test]
+    async fn a_real_retry_after_still_gates_and_the_rows_say_so() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "120")
+                    .set_body_string("slow down"),
+            )
+            .mount(&server)
+            .await;
+        let m = spec(&server.uri());
+        let cfg = BenchConfig {
+            models: vec![m.clone()],
+        };
+        let rows = run(&cfg, &noul_cases(3), std::slice::from_ref(&m.id))
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "warm-up only"
+        );
+        for r in &rows {
+            assert_eq!(r.outcome, Outcome::Error, "{r:?}");
+            assert!(!r.reached_server, "{r:?}");
+        }
+    }
+
+    /// I1: a gate skip (here a cooling router) never reached the server.
+    #[test]
+    fn a_gated_row_is_marked_as_not_reaching_the_server() {
+        let err = GatewayError::AllGated {
+            resume_after: None,
+            skipped: vec!["llamacpp:nimble-v3 — router cooling down".into()],
+            human_action: None,
+        };
+        let row = row_for(&noul_case(true), "m", &Err(err), 0);
+        assert_eq!(row.outcome, Outcome::Error);
+        assert!(!row.reached_server);
+        assert!(row.detail.unwrap().contains("cooling"));
+        let na = row_for(
+            &noul_case(true),
+            "m",
+            &Err(gated(Some(HumanAction::UseLargerContextWindow))),
+            0,
+        );
+        assert_eq!(na.outcome, Outcome::NotApplicable);
+        assert!(!na.reached_server);
+    }
+
+    /// The engine also answers `AllGated` AFTER a dispatched attempt: a 429
+    /// adds a timed gate contribution, and the single candidate is then not in
+    /// `skipped`. That call did reach the server.
+    #[test]
+    fn an_all_gated_after_an_attempt_reached_the_server() {
+        let err = GatewayError::AllGated {
+            resume_after: None,
+            skipped: vec![],
+            human_action: None,
+        };
+        let row = row_for(&noul_case(true), "m", &Err(err), 4);
+        assert_eq!(row.outcome, Outcome::Error);
+        assert!(row.reached_server);
+    }
+
+    #[test]
+    fn an_attempted_call_is_marked_as_reaching_the_server() {
+        let failed = row_for(
+            &noul_case(true),
+            "m",
+            &Err(all_failed(&[&provider_error_text()])),
+            3,
+        );
+        assert!(failed.reached_server);
+        let ok = row_for(
+            &noul_case(true),
+            "m",
+            &Ok(response(json!({"q": {"type": "noul", "noul": 0.9}}))),
+            3,
+        );
+        assert!(ok.reached_server);
+        let missing = row_for(&noul_case(true), "m", &Ok(response(json!({}))), 3);
+        assert!(missing.reached_server, "the server answered, just not q");
+        assert!(!row_for(&noul_case(true), "m", &Err(all_failed(&[])), 0).reached_server);
+        assert!(
+            !row_for(&noul_case(true), "m", &Err(GatewayError::NotConfigured), 0).reached_server
+        );
+    }
+
+    /// I2: the callback sees each model once, in config order, with exactly
+    /// that model's rows, and the return value is every row.
+    #[tokio::test]
+    async fn run_with_progress_reports_each_model_once_with_its_rows() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "nimble-v3",
+                "answers": {"q": {"type": "noul", "noul": 0.9}},
+                "usage": {"input_tokens": 30, "output_tokens": 0}
+            })))
+            .mount(&server)
+            .await;
+        let mut a = spec(&server.uri());
+        a.id = "a".into();
+        let mut b = spec(&server.uri());
+        b.id = "b".into();
+        let cfg = BenchConfig { models: vec![a, b] };
+        let mut seen: Vec<(String, Vec<String>)> = vec![];
+        let rows = run_with_progress(
+            &cfg,
+            &noul_cases(3),
+            &["a".into(), "b".into()],
+            |model, rows| {
+                assert!(rows.iter().all(|r| r.model == model), "{model}: {rows:?}");
+                seen.push((
+                    model.into(),
+                    rows.iter().map(|r| r.case_id.clone()).collect(),
+                ));
+            },
+        )
+        .await
+        .unwrap();
+        let ids = vec!["c0".to_string(), "c1".into(), "c2".into()];
+        assert_eq!(seen, vec![("a".into(), ids.clone()), ("b".into(), ids)]);
+        assert_eq!(rows.len(), 6);
+    }
+
+    /// M4: the warm-up is the cheapest case, not whichever comes first.
+    #[test]
+    fn the_warm_up_is_the_case_with_the_shortest_state() {
+        let mut long = noul_case(true);
+        long.id = "long".into();
+        long.state = json!("x".repeat(500));
+        let mut short = noul_case(true);
+        short.id = "short".into();
+        short.state = json!("tiny");
+        let mut mid = noul_case(true);
+        mid.id = "mid".into();
+        mid.state = json!("x".repeat(50));
+        let cases = [long, short, mid];
+        assert_eq!(warm_up_case(&cases).unwrap().id, "short");
+        assert!(warm_up_case(&[]).is_none());
+    }
+
+    /// M2: probabilities are range- and NaN-checked like noul.
+    #[test]
+    fn a_choice_or_score_probability_outside_zero_to_one_is_an_err() {
+        assert!(
+            score(
+                &choice_case("a"),
+                &choice("a", &[("a", f64::NAN), ("b", 0.1)])
+            )
+            .is_err()
+        );
+        assert!(score(&choice_case("a"), &choice("a", &[("a", 0.9), ("b", 1.5)])).is_err());
+        assert!(score(&choice_case("a"), &choice("a", &[("a", 0.9), ("b", -0.1)])).is_err());
+        assert!(score(&score_case(0), &score_answer(0.0, &[0.5, f64::NAN, 0.1])).is_err());
+        assert!(score(&score_case(0), &score_answer(0.0, &[2.0, 0.0, 0.0])).is_err());
+    }
+
+    /// M3: an argmax level the question does not have is an Err.
+    #[test]
+    fn a_score_argmax_level_beyond_the_criteria_is_an_err() {
+        // score_case has 3 levels (0..=2); level 3 wins here.
+        let e = score(&score_case(2), &score_answer(3.0, &[0.0, 0.1, 0.2, 0.7])).unwrap_err();
+        assert!(e.to_string().contains("level 3"), "{e}");
     }
 }
