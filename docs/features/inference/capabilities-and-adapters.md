@@ -463,9 +463,11 @@ Routers:
     token count (non-ASCII counts its UTF-8 bytes, symbols and digits 1, options as
     rendered: `" " + text` capped at 48, +1 per option), checked against both checkpoints'
     real tokenizers (never under across 52 option and 30 head samples; fixture
-    `crates/cloud-providers/tests/fixtures/laya_head_tokens.py`; known under-count: 6 of
-    21 000 short random strings, by 1 token). It errs high: about 1.6x on English (about
-    330 usable instruction chars on `english` against a real limit near 560), 2-7x on
+    `crates/cloud-providers/tests/fixtures/laya_head_tokens.py`), with safety margins of 2
+    tokens per option and 1 on the head (0 under-counts per option across 900 000 random
+    keys at margin 2, against 15 at margin 1 and 833+ at 0). It errs high: about 1.7x on
+    English (about 300 instruction chars fit on `english`; a 288-character instruction
+    estimates 185 of 192, against a real limit near 560), 2-7x on
     non-Latin scripts (Chinese on `multilingual` allows about 70 chars). A
     `LAYA_EXTRA_MODELS` checkpoint with `head_max_len` below 192 is unknown to the gateway
     and can still be cut silently.
@@ -482,9 +484,13 @@ Routers:
     check.
   - *Re-routed checkpoint (D7):* Laya auto-routes an unknown model name and returns 200.
     If the response's `routing.model` differs from the requested model (both
-    canonicalised), the gateway returns a `ProviderError` (status 200) naming both, so a
-    misspelled `api_model_id` is refused; check names against the server's `/health`
-    `loaded` list. The bundle id skips the check; a `routing` that is not an object or has
+    canonicalised), the gateway returns a `ProviderError` (status 200) naming both and the
+    valid names, so a misspelled `api_model_id` is refused. Valid names: `english`,
+    `multilingual`, `typed-decisions`, their aliases, the two `convaiinnovations/laya-*`
+    ids, or a key of the server's `LAYA_EXTRA_MODELS`; `/health` `loaded` shows only the
+    checkpoints resident now (`LAYA_MAX_LOADED`, default 2), not the servable names. The
+    check runs first: a response both re-routed and truncated is this `ProviderError`.
+    The bundle id skips the check; a `routing` that is not an object or has
     no string `model` is ignored.
   - Errors are FastAPI `{"detail": …}`: 401 → `Authentication`; 400/413/422/500/503 →
     `ProviderError` carrying the detail (Laya's 413 and 422 therefore still count toward the breaker). `/v1/systemone/batch` is not used.

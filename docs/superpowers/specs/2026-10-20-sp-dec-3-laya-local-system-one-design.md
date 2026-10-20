@@ -16,7 +16,7 @@ Not in scope (carry-forwards):
 - **A per-model `head_max_len` override** for `LAYA_EXTRA_MODELS` checkpoints: the gateway knows only the three
   published budgets, so an extra checkpoint with `head_max_len` below 192 can still be cut silently.
 - **Exact token counts** via the checkpoint's `tokenizer.json` (the `tokenizers` crate) instead of D6's
-  conservative estimate, which would remove its 1.6x (English) to 2-7x (non-Latin) over-refusal.
+  conservative estimate, which would remove its 1.7x (English) to 2-7x (non-Latin) over-refusal.
 - **Ask Laya upstream to report head truncation** (as `usage.truncated` does for the state), which would make the
   D6 estimate unnecessary.
 - **Usage for a dispatched-but-truncated call on a hosted provider is not metered**: `InputRejected` carries no
@@ -50,12 +50,12 @@ in-process vs 46.9 ms HTTP (noise); ANE 4.12 ms vs 4.47 ms (+0.35 ms ≈ 8%); ba
   beside `llamacpp | sglang` (`facade.rs`). No default `url` and no default model (consistent with the other
   self-hosted ids): the operator sets `url` and pins `api_model_id`. A chat adapter registered under `laya` is left
   untouched (separate registry map).
-- **D2 Images are refused before any request.** `ImageEncoding` gains `Unsupported`; `encode_images` returns an
+- **D2 Images are refused before any request** (error class superseded by D5: `InputRejected`, no status). `ImageEncoding` gains `Unsupported`; `encode_images` returns an
   error for a non-empty `images` under it, which `decide` already maps to `ProviderError` (status `None`) before
   sending — fallback-eligible, the same rule SP-DEC-2 D1 applies to an unrecognisable image. The adapter selects
   the encoding by id: `laya` → `Unsupported`, every other id unchanged (`DataUrl`). The message names the router
   and says it does not read images.
-- **D3 A truncated answer is a provider fault, not a success.** `WireUsage` reads an optional `truncated: bool`
+- **D3 A truncated answer is a provider fault, not a success** (error class superseded by D5: `InputRejected`, no status). `WireUsage` reads an optional `truncated: bool`
   (absent → `false`, so every other host is unaffected). `true` → `ProviderError` (status `Some(200)`, as for the existing missing-answer check) naming the router
   and the dropped token count when present, so the call falls back instead of returning answers about a state the
   model never fully read. Primary defence remains the existing `ContextWindowGate`: the docs tell the operator to
@@ -100,15 +100,17 @@ in-process vs 46.9 ms HTTP (noise); ANE 4.12 ms vs 4.47 ms (+0.35 ms ≈ 8%); ba
     `multilingual`; `typed` / `typed_decisions` / `laya-typed-decisions` / `decisions` → `typed-decisions`;
     the Hub ids `convaiinnovations/laya-multilingual` and `convaiinnovations/laya-typed-decisions` map to their
     checkpoints. The bundle id `convaiinnovations/laya` means "let Laya choose" and gets 192 (and skips D7).
-  - **Estimator.** A conservative character-class token count, not `ceil(chars / 3)`: non-ASCII characters count
+  - **Estimator.** A conservative character-class token count, not the first draft's `ceil(chars / 3)`: non-ASCII characters count
     their UTF-8 bytes, symbols and digits 1 each, and so on (`laya.rs`, `laya_text_tokens`). The head is
-    `"<type> question: <instructions as text>"`; options are counted as Laya renders them — `" " + text`, capped at
-    48 tokens, plus 1 per option.
+    `"<type> question: <instructions as text>"` plus `INSTRUCTION_MARGIN` (1); options are counted as Laya renders
+    them — `" " + text`, capped at 48 tokens, plus 1 per option plus `OPTION_MARGIN` (2).
   - **Measured.** Against both checkpoints' real tokenizers (committed fixture
-    `crates/cloud-providers/tests/fixtures/laya_head_tokens.py`) it was never under across 52 option and 30 head
-    samples; known under-count: 6 of 21 000 short random strings, by 1 token.
-  - **Cost.** It errs high: about 1.6x on English (usable instruction length on `english` is about 330
-    characters against a real limit of about 560) and 2-7x on non-Latin scripts (Chinese on `multilingual`
+    `crates/cloud-providers/tests/fixtures/laya_head_tokens.py`): never under across 52 option and 30 head samples,
+    and, for the per-option margin, 0 under-counts across 900 000 random keys at margin 2, against 15 at margin 1
+    and 833+ at margin 0 — hence the margins above.
+  - **Cost.** It errs high: about 1.7x on English (about 300 instruction characters fit on `english`; the
+    288-character instruction estimates 185 of 192 and is sent, the 808-character one estimates 425 and is refused,
+    against a real limit of about 560 characters) and 2-7x on non-Latin scripts (Chinese on `multilingual`
     allows about 70 characters). An instruction just under the real limit may be refused and fall back — the safe
     direction.
   - **Limitation.** A `LAYA_EXTRA_MODELS` checkpoint with `head_max_len` below 192 is not known to the gateway
@@ -116,8 +118,17 @@ in-process vs 46.9 ms HTTP (noise); ANE 4.12 ms vs 4.47 ms (+0.35 ms ≈ 8%); ba
 - **D7 A re-routed checkpoint is a failed attempt.** Laya treats an unknown `model` name as "no explicit
   checkpoint" and auto-routes it (200, `routing.reason` explains), so a misspelled `api_model_id` silently
   lands on a checkpoint with a different window. When a System One response carries `routing.model` and it
-  differs from the requested model, the adapter returns `ProviderError` (status `Some(200)`) naming both — a
+  differs from the requested model, the adapter returns `ProviderError` (status `Some(200)`) naming both and the valid names ("…check the model's api_model_id (valid names: english, multilingual,
+  typed-decisions, their aliases, or a LAYA_EXTRA_MODELS key)") — a
   configuration fault, so it counts toward the breaker like any endpoint-wide fault. Only Laya sends `routing`.
+  Both names are canonicalised as in D6; the bundle id skips the check; a `routing` that is not an object, or has no
+  string `model`, is ignored. `/health` `loaded` is NOT the set of servable names (it lists only checkpoints resident
+  now, `LAYA_MAX_LOADED`, default 2; Laya has no listing endpoint), so the docs state the valid names instead.
+  **Ordering:** D7 runs first, before D3's truncation check, the collapsed-options check and the missing-answer
+  check, so a response that is both re-routed and truncated is the D7 `ProviderError`: a wrong checkpoint is an
+  endpoint fault whatever else the response says.
+- **Security note (LOW).** Laya's default `LAYA_HOST` is `0.0.0.0` with no auth unless `LAYA_API_KEY` is set;
+  the docs say to keep `LAYA_HOST=127.0.0.1`, or set a key and the router's `api_key_env`.
 
 ## Acceptance criteria
 
@@ -151,7 +162,9 @@ in-process vs 46.9 ms HTTP (noise); ANE 4.12 ms vs 4.47 ms (+0.35 ms ≈ 8%); ba
   a head or options estimated at exactly the limit are sent; model names are canonicalised through Laya's aliases
   and the bundle id gets 192; other ids are never budget-checked. Live: the 808-character instruction on `english` is refused, the 288-character one is answered.
 - **AC10 (D7)** A 200 whose `routing.model` differs from the requested model is a `ProviderError` naming both;
-  an equal (after canonicalisation), absent, or malformed `routing` is a success, and the bundle id skips the check. Live: `model: "englsh"` is refused.
+  an equal (after canonicalisation), absent, or malformed `routing` is a success, and the bundle id skips the check;
+  a re-routed response that is also truncated, or also has collapsed options, is still the D7 `ProviderError`
+  (D7 runs first), and its message names the valid names. Live: `model: "englsh"` is refused.
 
 ## Testing
 

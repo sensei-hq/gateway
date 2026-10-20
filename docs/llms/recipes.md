@@ -401,11 +401,11 @@ A local `laya-coreml-serve` is configured the same way under the `laya` id:
 and silently cuts over-long questions, so the gateway refuses a `laya` decision with
 images, or with a question estimated over the checkpoint's head budget (192 tokens
 `english`, 256 `multilingual` / `typed-decisions`; a conservative estimate, so about
-330 usable instruction chars on `english`), before sending. A 200 with `usage.truncated:
+300 instruction chars fit on `english`), before sending. A 200 with `usage.truncated:
 true` or collapsed `usage.options` is refused too. All of these are
 `GatewayError::InputRejected`: the chain falls back even with empty `fallback_triggers`,
 and they are never retried or counted by the breaker. A misspelled `api_model_id` (Laya
-would auto-route it) fails with a `ProviderError`; check `/health`'s `loaded` list.
+would auto-route it) fails with a `ProviderError`; valid names are `english`, `multilingual`, `typed-decisions`, their aliases, the `convaiinnovations/laya-*` ids, or the server's `LAYA_EXTRA_MODELS` keys (`/health` `loaded` shows only resident checkpoints, not valid names).
 Details: `docs/llms/local.md`.
 
 Full reference: `docs/features/inference/capabilities-and-adapters.md#decision-system-one`.
