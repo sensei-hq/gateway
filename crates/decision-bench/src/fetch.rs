@@ -11,6 +11,75 @@ use serde::{Deserialize, Serialize};
 pub const DATASETS_SERVER: &str = "https://datasets-server.huggingface.co";
 pub const HUB: &str = "https://huggingface.co";
 
+/// The waits a fetch makes: between page requests, and before the single
+/// retry of a transient status. Defaults to [`PAGE_GAP`] / [`RETRY_AFTER`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Pacing {
+    pub page_gap: Duration,
+    pub retry_after: Duration,
+}
+
+impl Default for Pacing {
+    fn default() -> Self {
+        Pacing {
+            page_gap: PAGE_GAP,
+            retry_after: RETRY_AFTER,
+        }
+    }
+}
+
+impl Pacing {
+    /// No waits (tests).
+    pub const ZERO: Pacing = Pacing {
+        page_gap: Duration::ZERO,
+        retry_after: Duration::ZERO,
+    };
+}
+
+/// A Hugging Face endpoint pair (datasets-server + hub) and how to pace it.
+#[derive(Debug, Clone)]
+pub struct Hf {
+    pub client: reqwest::Client,
+    pub ds_base: String,
+    pub hub_base: String,
+    pub pacing: Pacing,
+}
+
+impl Hf {
+    /// The real endpoints with the default pacing.
+    pub fn live(client: reqwest::Client) -> Self {
+        Hf {
+            client,
+            ds_base: DATASETS_SERVER.to_string(),
+            hub_base: HUB.to_string(),
+            pacing: Pacing::default(),
+        }
+    }
+
+    pub async fn hub_info(&self, id: &str) -> anyhow::Result<HubInfo> {
+        hub_info(self, id).await
+    }
+
+    pub async fn fetch_rows(
+        &self,
+        id: &str,
+        config: &str,
+        split: &str,
+    ) -> anyhow::Result<RowsPage> {
+        fetch_rows_saving(self, id, config, split, None).await
+    }
+
+    pub async fn load_or_fetch(
+        &self,
+        cache_root: &Path,
+        id: &str,
+        config: &str,
+        split: &str,
+    ) -> anyhow::Result<Dataset> {
+        load_or_fetch(self, cache_root, id, config, split).await
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Feature {
     pub name: String,
@@ -48,6 +117,10 @@ pub struct Meta {
     pub fetched_at: u64,
     pub num_rows: u64,
     pub features: Vec<Feature>,
+    /// sha256 (hex) of the cached `<config>-<split>.jsonl`. Absent in a cache
+    /// written before it was recorded; backfilled on the next load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -58,6 +131,8 @@ pub struct Dataset {
 
 #[derive(Deserialize)]
 struct RawPage {
+    #[serde(default)]
+    partial: bool,
     features: Vec<Feature>,
     rows: Vec<RawRow>,
     num_rows_total: u64,
@@ -76,6 +151,9 @@ struct RawRow {
 pub fn parse_rows_page(json: &str) -> anyhow::Result<RowsPage> {
     let raw: RawPage =
         serde_json::from_str(json).context("parsing a datasets-server /rows page")?;
+    if raw.partial {
+        bail!("datasets-server marked the page partial (an incomplete conversion); refusing it");
+    }
     let mut rows = Vec::with_capacity(raw.rows.len());
     for r in raw.rows {
         if !r.truncated_cells.is_empty() {
@@ -129,10 +207,14 @@ fn is_transient(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 429 | 502 | 503 | 504)
 }
 
-/// Send `req`, retrying once after [`RETRY_AFTER`] on a transient status. Any other
+/// Send `req`, retrying once after `retry_after` on a transient status. Any other
 /// non-success status, or a second transient one, is an error carrying status
 /// and body.
-async fn get_text(req: reqwest::RequestBuilder, what: &str) -> anyhow::Result<String> {
+async fn get_text(
+    req: reqwest::RequestBuilder,
+    what: &str,
+    retry_after: Duration,
+) -> anyhow::Result<String> {
     let mut retried = false;
     loop {
         let attempt = req
@@ -144,7 +226,7 @@ async fn get_text(req: reqwest::RequestBuilder, what: &str) -> anyhow::Result<St
         let status = attempt.status();
         if is_transient(status) && !retried {
             retried = true;
-            tokio::time::sleep(RETRY_AFTER).await;
+            tokio::time::sleep(retry_after).await;
             continue;
         }
         let body = attempt
@@ -168,13 +250,10 @@ struct RawHub {
 
 /// The dataset's current revision sha and its card licence (a list is joined
 /// with ", ").
-pub async fn hub_info(
-    client: &reqwest::Client,
-    hub_base: &str,
-    id: &str,
-) -> anyhow::Result<HubInfo> {
+async fn hub_info(hf: &Hf, id: &str) -> anyhow::Result<HubInfo> {
     let what = format!("hub info for {id}");
-    let body = get_text(client.get(format!("{hub_base}/api/datasets/{id}")), &what).await?;
+    let req = hf.client.get(format!("{}/api/datasets/{id}", hf.hub_base));
+    let body = get_text(req, &what, hf.pacing.retry_after).await?;
     let raw: RawHub = serde_json::from_str(&body).with_context(|| format!("{what}: parsing"))?;
     let license = match raw.card_data.as_ref().and_then(|c| c.get("license")) {
         Some(serde_json::Value::String(s)) => s.clone(),
@@ -205,23 +284,12 @@ pub const PAGE_LEN: u64 = 100;
 pub const PAGE_GAP: Duration = Duration::from_secs(1);
 
 /// Every row of `config`/`split`, paged `PAGE_LEN` at a time until the first
-/// page's `num_rows_total` is reached.
-pub async fn fetch_rows(
-    client: &reqwest::Client,
-    ds_base: &str,
-    id: &str,
-    config: &str,
-    split: &str,
-) -> anyhow::Result<RowsPage> {
-    fetch_rows_saving(client, ds_base, id, config, split, None).await
-}
-
-/// [`fetch_rows`], saving each page body verbatim as `<pages>/<offset>.json`
-/// and reading an already-saved page instead of requesting it again, so a
-/// run stopped by a rate limit resumes where it failed.
-pub async fn fetch_rows_saving(
-    client: &reqwest::Client,
-    ds_base: &str,
+/// page's `num_rows_total` is reached, `hf.pacing.page_gap` apart. With
+/// `pages`, each page body is saved verbatim as `<pages>/<offset>.json` and an
+/// already-saved page is read instead of requested again, so a run stopped by
+/// a rate limit resumes where it failed.
+async fn fetch_rows_saving(
+    hf: &Hf,
     id: &str,
     config: &str,
     split: &str,
@@ -238,8 +306,8 @@ pub async fn fetch_rows_saving(
     while total.is_none_or(|t| offset < t) {
         let length = total.map_or(PAGE_LEN, |t| PAGE_LEN.min(t - offset));
         let what = format!("{id} {config}/{split} rows at offset {offset}");
-        let mut url = reqwest::Url::parse(&format!("{ds_base}/rows"))
-            .with_context(|| format!("bad datasets-server base {ds_base:?}"))?;
+        let mut url = reqwest::Url::parse(&format!("{}/rows", hf.ds_base))
+            .with_context(|| format!("bad datasets-server base {:?}", hf.ds_base))?;
         url.query_pairs_mut()
             .append_pair("dataset", id)
             .append_pair("config", config)
@@ -247,16 +315,17 @@ pub async fn fetch_rows_saving(
             .append_pair("offset", &offset.to_string())
             .append_pair("length", &length.to_string());
         let saved = pages.map(|d| d.join(format!("{offset}.json")));
-        let body = match saved.as_deref().filter(|p| p.exists()) {
+        let resumed = saved.as_deref().filter(|p| p.exists());
+        let body = match resumed {
             Some(p) => {
                 std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?
             }
             None => {
                 if requested {
-                    tokio::time::sleep(PAGE_GAP).await;
+                    tokio::time::sleep(hf.pacing.page_gap).await;
                 }
                 requested = true;
-                let body = get_text(client.get(url), &what).await?;
+                let body = get_text(hf.client.get(url), &what, hf.pacing.retry_after).await?;
                 if let Some(p) = &saved {
                     // Validate before saving, so a bad page is never resumed from.
                     parse_rows_page(&body).with_context(|| what.clone())?;
@@ -265,7 +334,13 @@ pub async fn fetch_rows_saving(
                 body
             }
         };
-        let page = parse_rows_page(&body).with_context(|| what.clone())?;
+        let page = parse_rows_page(&body).with_context(|| match resumed {
+            Some(p) => format!(
+                "{what}: saved page {} is corrupt; delete it to re-fetch",
+                p.display()
+            ),
+            None => what.clone(),
+        })?;
         match total {
             None => total = Some(page.num_rows_total),
             Some(t) if t != page.num_rows_total => bail!(
@@ -345,24 +420,43 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))
 }
 
+/// sha256 of `bytes`, lowercase hex.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn write_meta(dir: &Path, meta: &Meta) -> anyhow::Result<()> {
+    write_atomic(&dir.join("meta.json"), &serde_json::to_vec_pretty(meta)?)
+}
+
 /// Load `id` `config`/`split` from the cache for the hub's current sha, or
-/// fetch it from datasets-server and cache it. The hub sha is read before and
-/// after a fetch; if it moved, the rows may mix revisions and nothing is
-/// cached. `meta.json` is written last, so its presence marks a complete
-/// cache.
-pub async fn load_or_fetch(
-    client: &reqwest::Client,
-    ds_base: &str,
-    hub_base: &str,
+/// fetch it from datasets-server and cache it. `meta.json` is written last, so
+/// its presence marks a complete cache; it records the sha256 of the rows
+/// file, which is checked on every load.
+///
+/// The hub sha is read before and after a fetch; if it moved, the rows may mix
+/// revisions, so nothing (not even the saved pages) is kept.
+///
+/// Blind spot: datasets-server converts a revision some time after it is
+/// pushed to the hub, and serves only its latest conversion. In that window
+/// the hub already reports the new sha while datasets-server still serves the
+/// old rows, and neither check can tell: the rows get cached under the new
+/// sha. Nothing in either API ties a `/rows` response to a revision.
+async fn load_or_fetch(
+    hf: &Hf,
     cache_root: &Path,
     id: &str,
     config: &str,
     split: &str,
 ) -> anyhow::Result<Dataset> {
-    let hub = hub_info(client, hub_base, id).await?;
+    let hub = hub_info(hf, id).await?;
     let dir = cache_dir(cache_root, id, &hub.sha);
     let rows_path = dir.join(format!("{config}-{split}.jsonl"));
-    if let Some(meta) = check_cached_sha(&dir, &hub.sha)? {
+    if let Some(mut meta) = check_cached_sha(&dir, &hub.sha)? {
         if meta.id != id || meta.config != config || meta.split != split {
             bail!(
                 "{}: meta.json records {} {}/{}, not {id} {config}/{split}",
@@ -371,6 +465,23 @@ pub async fn load_or_fetch(
                 meta.config,
                 meta.split
             );
+        }
+        let bytes = std::fs::read(&rows_path)
+            .with_context(|| format!("reading {}", rows_path.display()))?;
+        let actual = sha256_hex(&bytes);
+        match &meta.rows_sha256 {
+            Some(recorded) if *recorded != actual => bail!(
+                "{}: sha256 {actual} but meta.json records {recorded}; the cache was modified, \
+                 delete {} to re-fetch",
+                rows_path.display(),
+                dir.display()
+            ),
+            Some(_) => {}
+            None => {
+                // A cache written before the hash was recorded: record it now.
+                meta.rows_sha256 = Some(actual);
+                write_meta(&dir, &meta)?;
+            }
         }
         let rows: Vec<Row> = crate::case::read_jsonl(&rows_path)?;
         if rows.len() as u64 != meta.num_rows {
@@ -384,11 +495,15 @@ pub async fn load_or_fetch(
         return Ok(Dataset { meta, rows });
     }
     let pages_dir = dir.join(format!("{config}-{split}.pages"));
-    let page = fetch_rows_saving(client, ds_base, id, config, split, Some(&pages_dir)).await?;
-    let after = hub_info(client, hub_base, id).await?;
+    let page = fetch_rows_saving(hf, id, config, split, Some(&pages_dir)).await?;
+    let after = hub_info(hf, id).await?;
     if after.sha != hub.sha {
+        let cleanup = std::fs::remove_dir_all(&pages_dir)
+            .err()
+            .map(|e| format!(" (and removing {} failed: {e})", pages_dir.display()))
+            .unwrap_or_default();
         bail!(
-            "{id}: the hub revision moved from {} to {} during the fetch; re-run",
+            "{id}: the hub revision moved from {} to {} during the fetch; re-run{cleanup}",
             hub.sha,
             after.sha
         );
@@ -397,6 +512,10 @@ pub async fn load_or_fetch(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    crate::case::write_jsonl(&rows_path, &page.rows)?;
+    let bytes =
+        std::fs::read(&rows_path).with_context(|| format!("reading {}", rows_path.display()))?;
     let meta = Meta {
         id: id.to_string(),
         sha: hub.sha,
@@ -406,10 +525,9 @@ pub async fn load_or_fetch(
         fetched_at,
         num_rows: page.rows.len() as u64,
         features: page.features,
+        rows_sha256: Some(sha256_hex(&bytes)),
     };
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    crate::case::write_jsonl(&rows_path, &page.rows)?;
-    write_atomic(&dir.join("meta.json"), &serde_json::to_vec_pretty(&meta)?)?;
+    write_meta(&dir, &meta)?;
     std::fs::remove_dir_all(&pages_dir)
         .with_context(|| format!("removing {}", pages_dir.display()))?;
     Ok(Dataset {
@@ -422,6 +540,7 @@ pub async fn load_or_fetch(
 mod tests {
     use super::*;
     use serde_json::json;
+    use sha2::Digest;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -429,8 +548,29 @@ mod tests {
     const BANKING: &str = include_str!("../tests/fixtures/rows_banking77.json");
     const SENTIMENT: &str = include_str!("../tests/fixtures/rows_sentiment.json");
     const SNLI: &str = include_str!("../tests/fixtures/rows_snli.json");
-    const HUB_CLINC: &str = include_str!("../tests/fixtures/hub_clinc.json");
-    const HUB_SENTIMENT: &str = include_str!("../tests/fixtures/hub_sentiment.json");
+    const HUB_CLINC_REDUCED: &str = include_str!("../tests/fixtures/hub_clinc.reduced.json");
+    const HUB_SENTIMENT_REDUCED: &str =
+        include_str!("../tests/fixtures/hub_sentiment.reduced.json");
+    const HUB_CLINC_FULL: &str = include_str!("../tests/fixtures/hub_clinc.full.json");
+    const HUB_SNLI_FULL: &str = include_str!("../tests/fixtures/hub_snli.full.json");
+
+    /// An `Hf` pointed at mocks, with no waits.
+    fn hf(ds: &str, hub: &str) -> Hf {
+        Hf {
+            client: reqwest::Client::new(),
+            ds_base: ds.to_string(),
+            hub_base: hub.to_string(),
+            pacing: Pacing::ZERO,
+        }
+    }
+
+    /// Independent of the module's `sha256_hex`.
+    fn sha256_ref(bytes: &[u8]) -> String {
+        sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
 
     #[test]
     fn parse_rows_page_reads_every_fixture_and_resolves_class_labels() {
@@ -487,15 +627,28 @@ mod tests {
         assert!(err.contains("truncated") && err.contains("row 1"), "{err}");
     }
 
+    #[test]
+    fn a_partial_page_is_rejected() {
+        let mut v: serde_json::Value = serde_json::from_str(SNLI).unwrap();
+        assert_eq!(v["partial"], json!(false));
+        v["partial"] = json!(true);
+        let err = parse_rows_page(&v.to_string()).unwrap_err().to_string();
+        assert!(err.contains("partial"), "{err}");
+    }
+
+    fn features(names: &[&str]) -> serde_json::Value {
+        json!([
+            {"feature_idx": 0, "name": "text", "type": {"dtype": "string", "_type": "Value"}},
+            {"feature_idx": 1, "name": "label", "type": {"names": names, "_type": "ClassLabel"}}
+        ])
+    }
+
     fn page(total: u64, offset: u64, count: u64) -> serde_json::Value {
         let rows: Vec<_> = (offset..offset + count)
             .map(|i| json!({"row_idx": i, "row": {"text": format!("t{i}"), "label": i % 3}, "truncated_cells": []}))
             .collect();
         json!({
-            "features": [
-                {"feature_idx": 0, "name": "text", "type": {"dtype": "string", "_type": "Value"}},
-                {"feature_idx": 1, "name": "label", "type": {"names": ["a", "b", "c"], "_type": "ClassLabel"}}
-            ],
+            "features": features(&["a", "b", "c"]),
             "rows": rows,
             "num_rows_total": total,
             "num_rows_per_page": 100,
@@ -503,12 +656,16 @@ mod tests {
         })
     }
 
+    fn offset_length(req: &Request) -> (u64, u64) {
+        let q: std::collections::HashMap<_, _> = req.url.query_pairs().into_owned().collect();
+        (q["offset"].parse().unwrap(), q["length"].parse().unwrap())
+    }
+
+    /// A well-behaved datasets-server over `self.0` rows.
     struct Pager(u64);
     impl wiremock::Respond for Pager {
         fn respond(&self, req: &Request) -> ResponseTemplate {
-            let q: std::collections::HashMap<_, _> = req.url.query_pairs().into_owned().collect();
-            let offset: u64 = q["offset"].parse().unwrap();
-            let length: u64 = q["length"].parse().unwrap();
+            let (offset, length) = offset_length(req);
             if length > 100 {
                 return ResponseTemplate::new(422).set_body_json(
                     json!({"error": "Parameter 'length' must not be greater than 100"}),
@@ -519,13 +676,40 @@ mod tests {
         }
     }
 
+    /// A 250-row pager whose page at offset 100 is replaced by `f(page)`.
+    struct Doctored<F>(F);
+    impl<F> wiremock::Respond for Doctored<F>
+    where
+        F: Fn(serde_json::Value) -> serde_json::Value + Send + Sync + 'static,
+    {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let (offset, length) = offset_length(req);
+            let p = page(250, offset, length.min(250 - offset));
+            let p = if offset == 100 { (self.0)(p) } else { p };
+            ResponseTemplate::new(200).set_body_json(p)
+        }
+    }
+
+    async fn doctored_err<F>(f: F) -> String
+    where
+        F: Fn(serde_json::Value) -> serde_json::Value + Send + Sync + 'static,
+    {
+        let ds = MockServer::start().await;
+        Mock::given(path("/rows"))
+            .respond_with(Doctored(f))
+            .mount(&ds)
+            .await;
+        format!(
+            "{:#}",
+            hf(&ds.uri(), "")
+                .fetch_rows("o/d", "c", "s")
+                .await
+                .unwrap_err()
+        )
+    }
+
     fn requests_offsets_and_lengths(reqs: &[Request]) -> Vec<(u64, u64)> {
-        reqs.iter()
-            .map(|r| {
-                let q: std::collections::HashMap<_, _> = r.url.query_pairs().into_owned().collect();
-                (q["offset"].parse().unwrap(), q["length"].parse().unwrap())
-            })
-            .collect()
+        reqs.iter().map(offset_length).collect()
     }
 
     #[tokio::test]
@@ -539,8 +723,8 @@ mod tests {
             .respond_with(Pager(250))
             .mount(&ds)
             .await;
-        let client = reqwest::Client::new();
-        let got = fetch_rows(&client, &ds.uri(), "org/ds", "plain", "test")
+        let got = hf(&ds.uri(), "")
+            .fetch_rows("org/ds", "plain", "test")
             .await
             .unwrap();
         assert_eq!(got.num_rows_total, 250);
@@ -562,23 +746,66 @@ mod tests {
         assert!(ol.iter().all(|(_, l)| *l <= 100 && *l > 0), "{ol:?}");
     }
 
+    #[test]
+    fn default_pacing_is_the_measured_constants() {
+        assert_eq!(
+            Pacing::default(),
+            Pacing {
+                page_gap: Duration::from_secs(1),
+                retry_after: Duration::from_secs(2)
+            }
+        );
+        assert_eq!(Hf::live(reqwest::Client::new()).pacing, Pacing::default());
+    }
+
     #[tokio::test]
-    async fn pages_after_the_first_are_spaced_by_the_page_gap() {
+    async fn zero_pacing_does_not_wait() {
         let ds = MockServer::start().await;
+        Mock::given(path("/rows"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&ds)
+            .await;
         Mock::given(path("/rows"))
             .respond_with(Pager(250))
             .mount(&ds)
             .await;
         let started = std::time::Instant::now();
-        fetch_rows(&reqwest::Client::new(), &ds.uri(), "o/d", "c", "s")
-            .await
-            .unwrap();
-        // Three pages, two gaps of at least a second each.
+        hf(&ds.uri(), "").fetch_rows("o/d", "c", "s").await.unwrap();
         assert!(
-            started.elapsed() >= std::time::Duration::from_secs(2),
+            started.elapsed() < Duration::from_millis(900),
             "{:?}",
             started.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn the_page_gap_and_retry_delay_come_from_the_pacing() {
+        // Real (small) waits: under `start_paused` the clock auto-advances
+        // while the mock's socket IO is pending, so virtual time cannot pin them.
+        let ds = MockServer::start().await;
+        Mock::given(path("/rows"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&ds)
+            .await;
+        Mock::given(path("/rows"))
+            .respond_with(Pager(250))
+            .mount(&ds)
+            .await;
+        let mut h = hf(&ds.uri(), "");
+        h.pacing = Pacing {
+            page_gap: Duration::from_millis(150),
+            retry_after: Duration::from_millis(250),
+        };
+        let started = std::time::Instant::now();
+        h.fetch_rows("o/d", "c", "s").await.unwrap();
+        // One 250 ms retry, then three pages with two 150 ms gaps.
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(550), "{waited:?}");
+        assert!(waited < Duration::from_secs(2), "{waited:?}");
     }
 
     #[tokio::test]
@@ -588,7 +815,8 @@ mod tests {
             .respond_with(ResponseTemplate::new(400).set_body_string("x".repeat(5000)))
             .mount(&ds)
             .await;
-        let err = fetch_rows(&reqwest::Client::new(), &ds.uri(), "o/d", "c", "s")
+        let err = hf(&ds.uri(), "")
+            .fetch_rows("o/d", "c", "s")
             .await
             .unwrap_err()
             .to_string();
@@ -601,22 +829,51 @@ mod tests {
 
     #[tokio::test]
     async fn a_short_page_before_num_rows_total_is_an_error_not_a_hang() {
-        struct Stingy;
-        impl wiremock::Respond for Stingy {
-            fn respond(&self, _req: &Request) -> ResponseTemplate {
-                ResponseTemplate::new(200).set_body_json(page(250, 0, 0))
-            }
-        }
-        let ds = MockServer::start().await;
-        Mock::given(path("/rows"))
-            .respond_with(Stingy)
-            .mount(&ds)
-            .await;
-        let err = fetch_rows(&reqwest::Client::new(), &ds.uri(), "o/d", "c", "s")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("no rows") && err.contains("offset 0"), "{err}");
+        let err = doctored_err(|mut p| {
+            p["rows"] = json!([]);
+            p
+        })
+        .await;
+        assert!(
+            err.contains("no rows") && err.contains("offset 100"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gap_in_row_idx_is_an_error() {
+        let err = doctored_err(|mut p| {
+            p["rows"][5]["row_idx"] = json!(999);
+            p
+        })
+        .await;
+        assert!(
+            err.contains("expected row_idx 105") && err.contains("999"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn num_rows_total_drift_is_an_error() {
+        let err = doctored_err(|mut p| {
+            p["num_rows_total"] = json!(300);
+            p
+        })
+        .await;
+        assert!(
+            err.contains("num_rows_total changed from 250 to 300"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn features_drift_is_an_error() {
+        let err = doctored_err(|mut p| {
+            p["features"] = features(&["a", "b", "zzz"]);
+            p
+        })
+        .await;
+        assert!(err.contains("features changed"), "{err}");
     }
 
     #[tokio::test]
@@ -628,16 +885,17 @@ mod tests {
             .expect(2)
             .mount(&ds)
             .await;
-        let client = reqwest::Client::new();
-        let started = std::time::Instant::now();
         let err = format!(
             "{:#}",
-            fetch_rows(&client, &ds.uri(), "o/d", "c", "s")
+            hf(&ds.uri(), "")
+                .fetch_rows("o/d", "c", "s")
                 .await
                 .unwrap_err()
         );
-        assert!(err.contains("429") && err.contains("offset 0"), "{err}");
-        assert!(started.elapsed() >= std::time::Duration::from_secs(2));
+        assert!(
+            err.contains("429") && err.contains("offset 0") && err.contains("after one retry"),
+            "{err}"
+        );
         ds.verify().await;
 
         // One 429, then success: the retry recovers.
@@ -652,9 +910,7 @@ mod tests {
             .respond_with(Pager(5))
             .mount(&ds)
             .await;
-        let got = fetch_rows(&client, &ds.uri(), "o/d", "c", "s")
-            .await
-            .unwrap();
+        let got = hf(&ds.uri(), "").fetch_rows("o/d", "c", "s").await.unwrap();
         assert_eq!(got.rows.len(), 5);
         assert_eq!(ds.received_requests().await.unwrap().len(), 2);
     }
@@ -673,9 +929,7 @@ mod tests {
                 .respond_with(Pager(3))
                 .mount(&ds)
                 .await;
-            let got = fetch_rows(&reqwest::Client::new(), &ds.uri(), "o/d", "c", "s")
-                .await
-                .unwrap();
+            let got = hf(&ds.uri(), "").fetch_rows("o/d", "c", "s").await.unwrap();
             assert_eq!(got.rows.len(), 3, "{status}");
         }
     }
@@ -690,7 +944,8 @@ mod tests {
             .await;
         let err = format!(
             "{:#}",
-            fetch_rows(&reqwest::Client::new(), &ds.uri(), "o/d", "c", "s")
+            hf(&ds.uri(), "")
+                .fetch_rows("o/d", "c", "s")
                 .await
                 .unwrap_err()
         );
@@ -701,21 +956,20 @@ mod tests {
         ds.verify().await;
     }
 
-    #[tokio::test]
-    async fn hub_info_reads_sha_and_license_as_string_or_list() {
+    async fn hub_serving(id: &str, body: &str) -> MockServer {
         let hub = MockServer::start().await;
-        Mock::given(path("/api/datasets/clinc/clinc_oos"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(HUB_CLINC))
+        Mock::given(path(format!("/api/datasets/{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
             .mount(&hub)
             .await;
-        Mock::given(path(
-            "/api/datasets/Sp1786/multiclass-sentiment-analysis-dataset",
-        ))
-        .respond_with(ResponseTemplate::new(200).set_body_string(HUB_SENTIMENT))
-        .mount(&hub)
-        .await;
-        let client = reqwest::Client::new();
-        let a = hub_info(&client, &hub.uri(), "clinc/clinc_oos")
+        hub
+    }
+
+    #[tokio::test]
+    async fn hub_info_reads_sha_and_license_as_string_or_list() {
+        let hub = hub_serving("clinc/clinc_oos", HUB_CLINC_REDUCED).await;
+        let a = hf("", &hub.uri())
+            .hub_info("clinc/clinc_oos")
             .await
             .unwrap();
         assert_eq!(
@@ -725,15 +979,67 @@ mod tests {
                 license: "cc-by-3.0".into()
             }
         );
-        let b = hub_info(
-            &client,
-            &hub.uri(),
-            "Sp1786/multiclass-sentiment-analysis-dataset",
-        )
-        .await
-        .unwrap();
+        let id = "Sp1786/multiclass-sentiment-analysis-dataset";
+        let hub = hub_serving(id, HUB_SENTIMENT_REDUCED).await;
+        let b = hf("", &hub.uri()).hub_info(id).await.unwrap();
         assert_eq!(b.license, "apache-2.0");
         assert_eq!(b.sha, "a7ede749d4b3e7ef516603cad80bd6b39b0a1fca");
+    }
+
+    #[tokio::test]
+    async fn hub_info_parses_the_full_recorded_hub_responses() {
+        for (id, body, sha, license) in [
+            (
+                "clinc/clinc_oos",
+                HUB_CLINC_FULL,
+                "155b9c710419136e17307b80d0a13e68cd46b4ec",
+                "cc-by-3.0",
+            ),
+            (
+                "stanfordnlp/snli",
+                HUB_SNLI_FULL,
+                "cdb5c3d5eed6ead6e5a341c8e56e669bb666725b",
+                "cc-by-sa-4.0",
+            ),
+        ] {
+            let hub = hub_serving(id, body).await;
+            let got = hf("", &hub.uri()).hub_info(id).await.unwrap();
+            assert_eq!(
+                got,
+                HubInfo {
+                    sha: sha.into(),
+                    license: license.into()
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hub_info_without_a_usable_licence_is_an_error() {
+        for body in [
+            json!({"sha": "s"}),
+            json!({"sha": "s", "cardData": {}}),
+            json!({"sha": "s", "cardData": {"license": []}}),
+        ] {
+            let hub = hub_serving("o/d", &body.to_string()).await;
+            let err = hf("", &hub.uri())
+                .hub_info("o/d")
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("no cardData.license"), "{body}: {err}");
+        }
+        let hub = hub_serving(
+            "o/d",
+            &json!({"sha": "s", "cardData": {"license": ["mit", 3]}}).to_string(),
+        )
+        .await;
+        let err = hf("", &hub.uri())
+            .hub_info("o/d")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("licence 3 is not a string"), "{err}");
     }
 
     #[test]
@@ -756,6 +1062,7 @@ mod tests {
             fetched_at: 1,
             num_rows: 0,
             features: vec![],
+            rows_sha256: None,
         }
     }
 
@@ -798,41 +1105,100 @@ mod tests {
             .mount(&ds)
             .await;
         let root = tempfile::tempdir().unwrap();
-        let client = reqwest::Client::new();
-        let a = load_or_fetch(
-            &client,
-            &ds.uri(),
-            &hub.uri(),
-            root.path(),
-            "org/ds",
-            "plain",
-            "test",
-        )
-        .await
-        .unwrap();
+        let h = hf(&ds.uri(), &hub.uri());
+        let a = h
+            .load_or_fetch(root.path(), "org/ds", "plain", "test")
+            .await
+            .unwrap();
         assert_eq!(a.rows.len(), 150);
         assert_eq!(a.meta.sha, "s1");
         assert_eq!(a.meta.num_rows, 150);
         assert_eq!(a.meta.license, "mit");
         let dir = root.path().join("org__ds@s1");
         assert!(dir.join("meta.json").exists());
-        assert!(dir.join("plain-test.jsonl").exists());
+        let rows_file = std::fs::read(dir.join("plain-test.jsonl")).unwrap();
+        assert_eq!(a.meta.rows_sha256, Some(sha256_ref(&rows_file)));
+        let on_disk: Meta =
+            serde_json::from_slice(&std::fs::read(dir.join("meta.json")).unwrap()).unwrap();
+        assert_eq!(on_disk, a.meta);
 
         // Second load: served from the cache, no further datasets-server calls.
-        let b = load_or_fetch(
-            &client,
-            &ds.uri(),
-            &hub.uri(),
-            root.path(),
-            "org/ds",
-            "plain",
-            "test",
-        )
-        .await
-        .unwrap();
+        let b = h
+            .load_or_fetch(root.path(), "org/ds", "plain", "test")
+            .await
+            .unwrap();
         assert_eq!(a.rows, b.rows);
         assert_eq!(a.meta, b.meta);
         ds.verify().await;
+    }
+
+    /// A complete cache for org/ds@s1 holding `rows` 3-row-file rows, with
+    /// `meta` edited by `edit`.
+    fn seed_cache(root: &Path, edit: impl FnOnce(&mut Meta)) -> PathBuf {
+        let dir = root.join("org__ds@s1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let rows: Vec<Row> = parse_rows_page(&page(3, 0, 3).to_string()).unwrap().rows;
+        crate::case::write_jsonl(&dir.join("plain-test.jsonl"), &rows).unwrap();
+        let mut m = meta("s1");
+        m.num_rows = 3;
+        m.rows_sha256 = Some(sha256_ref(
+            &std::fs::read(dir.join("plain-test.jsonl")).unwrap(),
+        ));
+        edit(&mut m);
+        std::fs::write(dir.join("meta.json"), serde_json::to_vec(&m).unwrap()).unwrap();
+        dir
+    }
+
+    async fn load_cached(root: &Path) -> anyhow::Result<Dataset> {
+        let hub = hub_with_sha("s1").await;
+        // Any datasets-server call would fail: the cache must answer.
+        hf("http://127.0.0.1:9", &hub.uri())
+            .load_or_fetch(root, "org/ds", "plain", "test")
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_cache_whose_meta_names_another_dataset_is_refused() {
+        for edit in [
+            (|m: &mut Meta| m.id = "other/ds".into()) as fn(&mut Meta),
+            |m: &mut Meta| m.config = "other".into(),
+            |m: &mut Meta| m.split = "train".into(),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            seed_cache(root.path(), edit);
+            let err = load_cached(root.path()).await.unwrap_err().to_string();
+            assert!(err.contains("meta.json records"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cache_with_the_wrong_row_count_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        seed_cache(root.path(), |m| m.num_rows = 5);
+        let err = load_cached(root.path()).await.unwrap_err().to_string();
+        assert!(err.contains("3 rows but meta.json records 5"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_cache_whose_rows_file_changed_is_refused_and_an_old_one_is_backfilled() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = seed_cache(root.path(), |m| m.rows_sha256 = Some("00".repeat(32)));
+        let err = load_cached(root.path()).await.unwrap_err().to_string();
+        assert!(
+            err.contains("sha256") && err.contains(&"00".repeat(32)),
+            "{err}"
+        );
+
+        // A cache from before rows_sha256 existed: accepted, and the hash is recorded.
+        let root = tempfile::tempdir().unwrap();
+        let dir2 = seed_cache(root.path(), |m| m.rows_sha256 = None);
+        let got = load_cached(root.path()).await.unwrap();
+        let want = sha256_ref(&std::fs::read(dir2.join("plain-test.jsonl")).unwrap());
+        assert_eq!(got.meta.rows_sha256.as_deref(), Some(want.as_str()));
+        let on_disk: Meta =
+            serde_json::from_slice(&std::fs::read(dir2.join("meta.json")).unwrap()).unwrap();
+        assert_eq!(on_disk.rows_sha256, Some(want));
+        drop(dir);
     }
 
     #[tokio::test]
@@ -851,22 +1217,17 @@ mod tests {
             .mount(&ds)
             .await;
         let root = tempfile::tempdir().unwrap();
-        let client = reqwest::Client::new();
-        let (ds_uri, hub_uri) = (ds.uri(), hub.uri());
-        let load = || {
-            load_or_fetch(
-                &client,
-                &ds_uri,
-                &hub_uri,
-                root.path(),
-                "org/ds",
-                "plain",
-                "test",
-            )
-        };
-        let err = load().await.unwrap_err().to_string();
+        let h = hf(&ds.uri(), &hub.uri());
+        let err = h
+            .load_or_fetch(root.path(), "org/ds", "plain", "test")
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("offset 100"), "{err}");
-        let got = load().await.unwrap();
+        let got = h
+            .load_or_fetch(root.path(), "org/ds", "plain", "test")
+            .await
+            .unwrap();
         assert_eq!(got.rows.len(), 250);
         let idx: Vec<u64> = got.rows.iter().map(|r| r.row_idx).collect();
         assert_eq!(idx, (0..250).collect::<Vec<_>>());
@@ -886,6 +1247,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_invalid_page_is_never_saved() {
+        let hub = hub_with_sha("s1").await;
+        let ds = MockServer::start().await;
+        Mock::given(path("/rows"))
+            .and(query_param("offset", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"bogus": 1})))
+            .with_priority(1)
+            .mount(&ds)
+            .await;
+        Mock::given(path("/rows"))
+            .respond_with(Pager(250))
+            .mount(&ds)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let err = hf(&ds.uri(), &hub.uri())
+            .load_or_fetch(root.path(), "org/ds", "plain", "test")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("offset 100"), "{err:#}");
+        let pages = root.path().join("org__ds@s1").join("plain-test.pages");
+        assert!(pages.join("0.json").exists());
+        assert!(!pages.join("100.json").exists());
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_saved_page_names_its_file_and_how_to_recover() {
+        let hub = hub_with_sha("s1").await;
+        let root = tempfile::tempdir().unwrap();
+        let pages = root.path().join("org__ds@s1").join("plain-test.pages");
+        std::fs::create_dir_all(&pages).unwrap();
+        std::fs::write(pages.join("0.json"), "{not json").unwrap();
+        let err = format!(
+            "{:#}",
+            hf("http://127.0.0.1:9", &hub.uri())
+                .load_or_fetch(root.path(), "org/ds", "plain", "test")
+                .await
+                .unwrap_err()
+        );
+        assert!(
+            err.contains(&pages.join("0.json").display().to_string())
+                && err.contains("delete it to re-fetch"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
     async fn load_or_fetch_refuses_a_cache_whose_meta_disagrees_with_the_hub() {
         let hub = hub_with_sha("bbb").await;
         let root = tempfile::tempdir().unwrap();
@@ -896,23 +1303,16 @@ mod tests {
             serde_json::to_string(&meta("aaa")).unwrap(),
         )
         .unwrap();
-        let err = load_or_fetch(
-            &reqwest::Client::new(),
-            "http://127.0.0.1:9",
-            &hub.uri(),
-            root.path(),
-            "org/ds",
-            "plain",
-            "test",
-        )
-        .await
-        .unwrap_err()
-        .to_string();
+        let err = hf("http://127.0.0.1:9", &hub.uri())
+            .load_or_fetch(root.path(), "org/ds", "plain", "test")
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("aaa") && err.contains("bbb"), "{err}");
     }
 
     #[tokio::test]
-    async fn a_revision_change_during_the_fetch_is_an_error_and_writes_no_cache() {
+    async fn a_revision_change_during_the_fetch_is_an_error_and_keeps_nothing() {
         let hub = MockServer::start().await;
         let body = |sha: &str| {
             ResponseTemplate::new(200)
@@ -934,19 +1334,17 @@ mod tests {
             .mount(&ds)
             .await;
         let root = tempfile::tempdir().unwrap();
-        let err = load_or_fetch(
-            &reqwest::Client::new(),
-            &ds.uri(),
-            &hub.uri(),
-            root.path(),
-            "org/ds",
-            "plain",
-            "test",
-        )
-        .await
-        .unwrap_err()
-        .to_string();
+        let err = hf(&ds.uri(), &hub.uri())
+            .load_or_fetch(root.path(), "org/ds", "plain", "test")
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("old") && err.contains("new"), "{err}");
-        assert!(!root.path().join("org__ds@old").join("meta.json").exists());
+        let dir = root.path().join("org__ds@old");
+        assert!(!dir.join("meta.json").exists());
+        assert!(
+            !dir.join("plain-test.pages").exists(),
+            "pages of a mixed revision were kept"
+        );
     }
 }

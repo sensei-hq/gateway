@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use decision_bench::fetch::{DATASETS_SERVER, HUB, default_cache_root};
+use decision_bench::fetch::{Hf, default_cache_root};
 use decision_bench::scenarios::{FetchOptions, fetch_cases};
 
 #[derive(Parser)]
@@ -56,10 +56,8 @@ async fn fetch(
         .user_agent(concat!("decision-bench/", env!("CARGO_PKG_VERSION")))
         .build()?;
     let manifest = fetch_cases(
-        &client,
+        &Hf::live(client),
         &FetchOptions {
-            ds_base: DATASETS_SERVER,
-            hub_base: HUB,
             cache_root: &cache_root,
             out: &out,
             seed,
