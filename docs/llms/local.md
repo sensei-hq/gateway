@@ -73,13 +73,13 @@ feature below, and a chat adapter you register under the same id is left untouch
   serve this input; the endpoint is healthy"): the chain falls back **whatever
   `fallback_triggers` holds** (even empty), it is never retried and never counts toward
   the breaker. Concretely, a `laya` decision is refused if it carries images, or if a
-  question's head (`<type> question: <instructions>`) is estimated over the checkpoint's
+  question's head (`<type> question: <instructions>` plus its options) is estimated over the checkpoint's
   `head_max_len` (`english` 192 tokens; `multilingual` / `typed-decisions` 256; any other
   name, 192), or its options over that budget minus 16 (Laya also trims every option
   below 16 tokens of room). The estimate is a conservative character-class count measured
   against both checkpoints' real tokenizers (never under in the committed fixture), so it
-  errs high — about 1.6x on English (roughly 330 usable instruction chars on `english`
-  against a real limit near 560), 2-7x on non-Latin scripts (Chinese on `multilingual`
+  errs high (it adds a margin of 2 tokens per option and 1 on the head) — about 1.7x on English (roughly 300 instruction chars fit on `english`, a 288-character
+  instruction estimating 185 of 192, against a real limit near 560), 2-7x on non-Latin scripts (Chinese on `multilingual`
   allows about 70 chars). The model name is canonicalised with Laya's aliases first
   (`en` / `laya` / `default`, `multi` / `ml`, `typed` / `decisions`, the
   `convaiinnovations/laya-*` ids). A `LAYA_EXTRA_MODELS` checkpoint with `head_max_len`
@@ -91,7 +91,7 @@ feature below, and a chat adapter you register under the same id is left untouch
   as well. Laya **auto-routes an unknown model name and still answers 200**, so if the
   response's `routing.model` differs from the one you asked for (both canonicalised), the
   gateway fails the call with a `ProviderError` naming both: a misspelled `api_model_id`
-  is refused — check names against the server's `/health` `loaded` list. Chain a second
+  is refused (the message lists the valid names: `english`, `multilingual`, `typed-decisions`, their aliases, the two `convaiinnovations/laya-*` ids, or a key of the server's `LAYA_EXTRA_MODELS`; `/health` `loaded` shows only the checkpoints resident right now — `LAYA_MAX_LOADED`, default 2 — not the servable names, and Laya has no endpoint that lists them). The check runs first: a re-routed response is this `ProviderError` even if it is also truncated. Chain a second
   decision router for refused requests: with only rejections in the chain the engine
   returns `AllAttemptsFailed { retryable: false }`. Laya's own 413 (too many
   questions/options) and 422 (e.g. over the exported `max_options`; CoreML caps at 32)

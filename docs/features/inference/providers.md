@@ -77,7 +77,7 @@ else const …*: the router's `url` is used whenever it is set.
 | `replicate` | const `https://api.replicate.com/v1`, `config.url` fallback | `bearer_auth` | `VideoGenerate`, `ImageGenerate` | `tencent/hunyuan-video` | Async `predictions` submit + poll. |
 | `runway` | const `https://api.runwayml.com/v1`, `config.url` fallback | `bearer_auth` | `VideoGenerate` | `gen-4` | Async submit + poll. |
 | `sglang` | `RouterConfig.url` (no default — empty is `InvalidConfig`) + `/v1/systemone` | `bearer_auth` **only if a key is present** (the server's optional `--api-key`) | `Decision` | none (a call without a model is `InvalidRequest`) | `SystemOneAdapter::from_config_with_id("sglang", …)`, decision-only, auto-registered by the facade — a self-hosted SGLang server. Server caveats below. |
-| `laya` | `RouterConfig.url` (no default — empty is `InvalidConfig`; e.g. `http://127.0.0.1:8000`) + `/v1/systemone` | `bearer_auth` **only if a key is present** (the server's `LAYA_API_KEY`) | `Decision` | none (a call without a model is `InvalidRequest`; pin a checkpoint such as `english`) | `SystemOneAdapter::from_config_with_id("laya", …)`, decision-only, auto-registered by the facade — a local `laya-coreml-serve` (CoreML). Refuses images; a `usage.truncated: true` answer is a `ProviderError`. Errors are FastAPI `{detail}`. Server caveats below. |
+| `laya` | `RouterConfig.url` (no default — empty is `InvalidConfig`; e.g. `http://127.0.0.1:8000`) + `/v1/systemone` | `bearer_auth` **only if a key is present** (the server's `LAYA_API_KEY`) | `Decision` | none (a call without a model is `InvalidRequest`; pin a checkpoint such as `english`) | `SystemOneAdapter::from_config_with_id("laya", …)`, decision-only, auto-registered by the facade — a local `laya-coreml-serve` (CoreML). Refuses images and over-budget questions; a `usage.truncated: true` or collapsed-options answer is an `InputRejected`; a re-routed checkpoint is a `ProviderError`. Errors are FastAPI `{detail}`. Server caveats below. |
 | `stability` | const `https://api.stability.ai/v2beta`, `config.url` fallback | `bearer_auth` + multipart form | `ImageGenerate` | `sd3.5-large` | Synchronous multipart upload (no polling). |
 | `typesafe` | `RouterConfig.url`, else const `https://api.typesafe.ai`, + `/v1/systemone` | `bearer_auth` | `Decision` | none (a call without a model is `InvalidRequest`) | `SystemOneAdapter`, decision-only, auto-registered by the facade. TypeSafe's System One API is the origin of the decision wire format. |
 | `together` | const `https://api.together.xyz/v1`, `config.url` fallback | `bearer_auth` | `TextChat`, `ImageGenerate` | chat `meta-llama/Llama-3.3-70B-Instruct-Turbo`; image `black-forest-labs/FLUX.1-schnell-Free` | OpenAI-compatible chat + synchronous `/images/generations`. |
@@ -185,9 +185,8 @@ CLM-8B (needs vLLM / CUDA).
   its UTF-8 bytes, symbols and digits 1 each; options are counted as Laya renders them,
   `" " + text` capped at 48 tokens, +1 per option). Measured against both checkpoints'
   real tokenizers it was never under across 52 option and 30 head samples (fixture
-  `crates/cloud-providers/tests/fixtures/laya_head_tokens.py`; known under-count: 6 of
-  21 000 short random strings, by 1 token). **Cost:** it errs high, about 1.6x on English
-  (about 330 usable instruction chars on `english` against a real limit of about 560) and
+  `crates/cloud-providers/tests/fixtures/laya_head_tokens.py`). It adds safety margins — 2 tokens per option and 1 on the head: the fixture found 0 under-counts per option across 900 000 random keys at margin 2, against 15 at margin 1 and 833+ at 0. **Cost:** it errs high, about 1.7x on English
+  (about 300 instruction chars fit on `english`; a 288-character instruction estimates 185 of 192, against a real limit of about 560) and
   2-7x on non-Latin scripts (Chinese on `multilingual` allows about 70 chars).
   **Limitation:** a `LAYA_EXTRA_MODELS` checkpoint with `head_max_len` below 192 is unknown
   to the gateway and can still be cut silently.
@@ -207,8 +206,14 @@ CLM-8B (needs vLLM / CUDA).
 - **Re-routed checkpoint (D7):** Laya auto-routes an unknown model name and still returns
   200. If the response's `routing.model` differs from the requested model (both
   canonicalised as above) the gateway fails the call with a `ProviderError` (status 200)
-  naming both, so a misspelled `api_model_id` is refused; check names against the
-  server's `/health` `loaded` list. The bundle id skips this check, and a `routing` field
+  naming both and the valid names, so a misspelled `api_model_id` is refused. Valid names
+  are `english`, `multilingual`, `typed-decisions`, their aliases, the two
+  `convaiinnovations/laya-*` ids, or a key of the server's `LAYA_EXTRA_MODELS`; `/health`
+  `loaded` shows only the checkpoints resident right now (`LAYA_MAX_LOADED`, default 2),
+  not the servable names, and Laya has no endpoint that lists them. The check runs first,
+  before truncation, collapsed options and missing answers: a response that is both
+  re-routed and truncated is this `ProviderError`, since a wrong checkpoint is an endpoint
+  fault. The bundle id skips this check, and a `routing` field
   that is not an object or has no string `model` is ignored.
 - **Overhead:** measured on an M4 Max, HTTP adds about 0.35 ms per decision — about
   8% on the ANE checkpoint (4.1 ms), negligible on CPU+GPU (~50 ms).
