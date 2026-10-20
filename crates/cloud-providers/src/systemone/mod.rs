@@ -274,6 +274,12 @@ struct WireUsage {
     state_tokens_dropped: Option<u32>,
     #[serde(default)]
     truncated_questions: Option<Vec<String>>,
+    /// Laya's per-question report of options it cut to fit its head budget
+    /// until some collapsed into the same tokens — `{"q": {"total": 25,
+    /// "distinct": 3, "tokens_per_option": 9}}`, present only when that
+    /// happened. Raw JSON so no other host's `options` can fail the parse.
+    #[serde(default)]
+    options: Option<serde_json::Value>,
 }
 
 /// A non-success response, before it becomes a [`GatewayError`] — kept apart
@@ -417,6 +423,41 @@ pub(crate) async fn decide(
                 } else {
                     cut.join("; ")
                 }
+            ),
+        });
+    }
+
+    // The host cut the options until some became indistinguishable (Laya's
+    // `usage.options`): the answer cannot tell them apart. Input-determined
+    // like truncation, so an InputRejected (D5).
+    if let Some(collapsed) = wire
+        .usage
+        .as_ref()
+        .and_then(|u| u.options.as_ref())
+        .and_then(serde_json::Value::as_object)
+        .filter(|o| !o.is_empty())
+    {
+        let count = |v: &serde_json::Value, key: &str| {
+            v.get(key)
+                .and_then(serde_json::Value::as_u64)
+                .map_or_else(|| "?".to_string(), |n| n.to_string())
+        };
+        let questions: Vec<String> = collapsed
+            .iter()
+            .map(|(name, v)| {
+                format!(
+                    "question '{name}''s options ({} distinct of {})",
+                    count(v, "distinct"),
+                    count(v, "total")
+                )
+            })
+            .collect();
+        return Err(GatewayError::InputRejected {
+            adapter: adapter.into(),
+            message: format!(
+                "the host collapsed {} to fit its budget — its answers cannot tell those \
+                 options apart; use fewer or shorter options",
+                questions.join(", ")
             ),
         });
     }
