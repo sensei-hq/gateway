@@ -40,8 +40,10 @@ Sources:
    the same per-candidate `"router:model — reason"` diagnostics `AllGated` does
    (empty when selection had nothing to reject at all).
 4. **Read fallback triggers.** If a chain was resolved, its
-   `fallback_triggers` slice is used; otherwise the trigger set is empty (so a
-   direct, chain-less request never falls back).
+   `fallback_triggers` slice is used; otherwise the trigger set is empty. A
+   direct, chain-less request has a single candidate, so there is nothing to
+   fall back to; empty triggers stop the walk for every error except
+   `InputRejected`, which always advances.
 5. **Walk candidates in order.** For each candidate the engine looks up an
    adapter by `candidate.router`, injects the resolved model (see
    [api_model_id resolution](#api_model_id-vs-registry-model-id)), and calls
@@ -338,7 +340,8 @@ provider. Pin the provider-facing id directly if that matters. Either way,
 
 The caller sets both `request.router` and `request.model`. Resolution goes
 through `resolve_direct`, validating exactly that one pair. This is the most
-explicit mode and never falls back (no chain ⇒ empty `fallback_triggers`).
+explicit mode and has a single candidate, so there is nothing to fall back to (no chain ⇒ empty
+`fallback_triggers`).
 
 ```jsonc
 { "capability": "text_chat", "model": "gemma3:27b", "router": "ollama" }

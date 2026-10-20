@@ -129,6 +129,11 @@ The whole trigger/no-trigger decision lives in one method
 
 ```rust
 pub fn should_trigger_fallback(&self, triggers: &[FallbackTrigger]) -> bool {
+    // SP-DEC-3 D5: an input the candidate cannot serve falls back whatever the trigger set.
+    if matches!(self, GatewayError::InputRejected { .. }) {
+        return true;
+    }
+
     if triggers.is_empty() {
         return false;
     }
@@ -145,6 +150,8 @@ pub fn should_trigger_fallback(&self, triggers: &[FallbackTrigger]) -> bool {
         | GatewayError::NotConfigured
         | GatewayError::Network(_)
         | GatewayError::Serialization(_) => false,
+        // Handled by the early return above (D5); unreachable here.
+        GatewayError::InputRejected { .. } => true,
     }
 }
 ```
@@ -174,8 +181,9 @@ Which errors can vs. cannot advance the walk:
 
 Two guards to keep in mind:
 
-- **Empty `triggers` ⇒ always `false`.** A chain with no `fallback_triggers`
-  (or a direct/capability path that resolved no chain — see §4) treats *every*
+- **Empty `triggers` ⇒ `false` for everything except `InputRejected`, which
+  always advances (D5).** A chain with no `fallback_triggers` (or a
+  direct/capability path that resolved no chain — see §4) treats every other
   failure as fatal and stops on the first failing candidate.
 - **`Authentication` is the canonical stop.** Even with all five triggers
   listed, an auth error breaks the loop immediately. This is asserted directly
@@ -250,7 +258,8 @@ chain/registry selection actually drives the provider model. A caller-pinned
 - **Fall through (continue):** adapter execution returned an error *and*
   `should_trigger_fallback(triggers)` was `true`.
 - **Break (stop):** adapter execution returned an error and
-  `should_trigger_fallback` was `false` (non-trigger error, or empty triggers).
+  `should_trigger_fallback` was `false` (non-trigger error, or empty triggers; `InputRejected` is the one
+  error that never breaks on either count).
   The remaining candidates are **not** tried; the walk falls out to
   `AllAttemptsFailed`.
 - **Special case — unregistered adapter:** if no adapter is registered for
