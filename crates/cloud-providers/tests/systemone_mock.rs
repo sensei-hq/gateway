@@ -1246,10 +1246,19 @@ async fn a_re_routed_laya_checkpoint_is_a_provider_error_naming_both() {
     }
 }
 
-/// A `routing` with no (or a null) `model` says nothing about a re-route.
+/// A `routing` with no (or a null, or a non-string) `model` says nothing about
+/// a re-route — and another host's `routing` of any other shape (a string, a
+/// list) must never fail the parse of an otherwise good answer.
 #[tokio::test]
 async fn a_routing_block_without_a_model_is_a_success() {
-    for routing in [json!({}), json!({"model": null, "reason": "explicit"})] {
+    for routing in [
+        json!({}),
+        json!({"model": null, "reason": "explicit"}),
+        json!({"model": 7}),
+        json!("auto"),
+        json!(["english"]),
+        json!(null),
+    ] {
         let mut body = laya_ok_body();
         body["routing"] = routing;
         let server = MockServer::start().await;

@@ -464,17 +464,12 @@ struct WireResponse {
     #[serde(default)]
     usage: Option<WireUsage>,
     /// Laya's report of the checkpoint that actually served the call (SP-DEC-3
-    /// D7). Absent on every other host.
+    /// D7): Laya auto-routes a `model` it does not know (200, no error), so
+    /// `routing.model` is the only sign of a misspelled `api_model_id`. Read as
+    /// raw JSON so another host's `routing` of any shape never fails the parse;
+    /// only a string `model` in an object is read.
     #[serde(default)]
-    routing: Option<WireRouting>,
-}
-
-/// Laya auto-routes a `model` it does not know (200, no error), so the served
-/// checkpoint is the only sign of a misspelled `api_model_id`.
-#[derive(Deserialize)]
-struct WireRouting {
-    #[serde(default)]
-    model: Option<String>,
+    routing: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -664,7 +659,11 @@ pub(crate) async fn decide(
     // (Laya auto-routes an unknown name) — answers from a model with another
     // window. A configuration fault, so a ProviderError like any endpoint-wide
     // fault. Compared with the BODY model: Workers AI's is the short name.
-    if let Some(served) = wire.routing.as_ref().and_then(|r| r.model.as_deref())
+    if let Some(served) = wire
+        .routing
+        .as_ref()
+        .and_then(|r| r.get("model"))
+        .and_then(serde_json::Value::as_str)
         && served != body_model
     {
         return Err(GatewayError::ProviderError {
