@@ -400,8 +400,39 @@ pub(crate) async fn decide(
             }
         }
     };
-    // SP-DEC-3 D3: a host that truncated the input still answers 200 — about a
-    // state it never fully read. The same input truncates on every retry and
+    // SP-DEC-3 D7: the host served another checkpoint than the one asked for
+    // (Laya auto-routes an unknown name) — answers from a model with another
+    // window. A configuration fault, so a ProviderError like any endpoint-wide
+    // fault. Checked FIRST, before truncation (D3), collapsed options and
+    // missing answers: a wrong checkpoint is an endpoint fault whatever else
+    // the response says, and a misspelled checkpoint with an over-window state
+    // is auto-routed AND truncated in one response — the input rejection would
+    // say "set context_window" (the wrong fix) and keep the fault off the
+    // breaker. Compared with the BODY model (Workers AI's is the short name),
+    // both sides resolved as Laya resolves names — its aliases, case and Hub
+    // ids are the same checkpoint; its bundle id asks it to choose. Only Laya
+    // sends `routing`, so the Laya spelling rules touch no other host.
+    if let Some(served) = wire
+        .routing
+        .as_ref()
+        .and_then(|r| r.get("model"))
+        .and_then(serde_json::Value::as_str)
+        && let Some(requested) = laya::laya_canonical_model(body_model)
+        && laya::laya_canonical_model(served).as_ref() != Some(&requested)
+    {
+        return Err(GatewayError::ProviderError {
+            adapter: adapter.into(),
+            message: format!(
+                "the host served checkpoint '{served}' instead of the requested '{body_model}' \
+                 — check the model's api_model_id (valid names: english, multilingual, \
+                 typed-decisions, their aliases, or a LAYA_EXTRA_MODELS key)"
+            ),
+            status: Some(status.as_u16()),
+        });
+    }
+
+    // SP-DEC-3 D3 (after D7 above): a host that truncated the input still
+    // answers 200 — about a state it never fully read. The same input truncates on every retry and
     // the endpoint is healthy, so it is an InputRejected (D5): the chain falls
     // back, nothing retries it, and the breaker never counts it.
     if let Some(u) = wire.usage.as_ref().filter(|u| u.truncated) {
@@ -474,31 +505,6 @@ pub(crate) async fn decide(
         return Err(GatewayError::ProviderError {
             adapter: adapter.into(),
             message: format!("System One response has no answer for {missing:?}"),
-            status: Some(status.as_u16()),
-        });
-    }
-
-    // SP-DEC-3 D7: the host served another checkpoint than the one asked for
-    // (Laya auto-routes an unknown name) — answers from a model with another
-    // window. A configuration fault, so a ProviderError like any endpoint-wide
-    // fault. Compared with the BODY model (Workers AI's is the short name),
-    // both sides resolved as Laya resolves names — its aliases, case and Hub
-    // ids are the same checkpoint; its bundle id asks it to choose. Only Laya
-    // sends `routing`, so the Laya spelling rules touch no other host.
-    if let Some(served) = wire
-        .routing
-        .as_ref()
-        .and_then(|r| r.get("model"))
-        .and_then(serde_json::Value::as_str)
-        && let Some(requested) = laya::laya_canonical_model(body_model)
-        && laya::laya_canonical_model(served).as_ref() != Some(&requested)
-    {
-        return Err(GatewayError::ProviderError {
-            adapter: adapter.into(),
-            message: format!(
-                "the host served checkpoint '{served}' instead of the requested '{body_model}' \
-                 — check the model's api_model_id against the server's loaded checkpoints"
-            ),
             status: Some(status.as_u16()),
         });
     }
