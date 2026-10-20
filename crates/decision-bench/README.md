@@ -182,8 +182,10 @@ Reproduce.
 - **Score scenarios (S2)** also report exact-level accuracy (argmax) and the mean absolute error
   of the expected level. **Latency** is p50/p95 in ms.
 - **"Rows that never reached the server"**: per model and scenario, rows refused before any
-  request was sent (a gateway fit refusal or an error before the call), with their outcomes. A
-  server-side truncation does reach the server and is not listed here.
+  request was sent (a gateway fit refusal or an error before the call) and rows whose transport
+  failed before any reply (a refused or dropped connection, a DNS failure), with their outcomes.
+  A server-side truncation, and a case that ran out the router timeout, do reach the server and
+  are not listed here.
 - **INCOMPLETE RUN**: a banner naming roster models that neither finished nor were NOT RUN, i.e.
   the run stopped early. Their rows are partial, so this is not a complete ranking.
 - **NOT RUN**: models `check` could not reach, with the reason. They have no results; they are

@@ -154,7 +154,7 @@ async fn probe(
         return not_run(no_fit_reason(skipped, m));
     }
     // `row_for_model` owns the "did this reach the server" rules for an error.
-    let row = row_for_model(&case, m, &result, 0);
+    let row = row_for_model(&case, m, &result, 0, router_timeout);
     match (row.outcome, row.reached_server) {
         (Outcome::NotApplicable, true) => CheckStatus::Reachable,
         _ => not_run(row.detail.unwrap_or_else(|| "the probe failed".into())),

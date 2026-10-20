@@ -2,6 +2,7 @@
 //! gateway chain so a run exercises exactly one model, with no fallback.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use gateway::types::config::{
     ChainEntry, FallbackChainConfig, GatewayConfig, ModelConfig, RouterConfig,
@@ -39,6 +40,10 @@ const DECISION_ROUTERS: &[&str] = &[
     "laya",
 ];
 
+/// The router timeout of every case a run sends (`check` probes with a
+/// shorter one).
+pub const ROUTER_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// The id of the one-model chain built for `m`.
 pub fn chain_id(m: &ModelSpec) -> String {
     format!("bench-{}", m.id)
@@ -67,7 +72,7 @@ impl BenchConfig {
             api_key_env: m.api_key_env.clone(),
             api_key: None,
             enabled: true,
-            timeout_ms: Some(120_000),
+            timeout_ms: Some(ROUTER_TIMEOUT.as_millis() as u64),
             headers: HashMap::new(),
         };
         let model = ModelConfig {
