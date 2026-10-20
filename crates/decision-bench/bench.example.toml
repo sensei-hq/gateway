@@ -1,0 +1,52 @@
+# decision-bench example config. Copy to bench.toml (gitignored) and edit.
+#
+# Starting each server:
+#   Laya (serves english / multilingual / typed-decisions / ane on ONE port).
+#     Use port 8766: 8765 is taken on this machine.
+#       <laya-binary> serve --port 8766
+#   Ollama (the `nimble` model must be pulled/created first):
+#       ollama serve            # listens on 127.0.0.1:11434
+#   llama-server (llama.cpp; the nimble-v3 GGUF):
+#       llama-server -m <nimble-v3.gguf> --host 127.0.0.1 --port 8091
+
+[[models]]
+id = "laya-english"
+router = "laya"
+url = "http://127.0.0.1:8766"
+api_model_id = "english"
+context_window = 512
+
+[[models]]
+id = "laya-multilingual"
+router = "laya"
+url = "http://127.0.0.1:8766"
+api_model_id = "multilingual"
+context_window = 1024
+
+[[models]]
+id = "laya-typed"
+router = "laya"
+url = "http://127.0.0.1:8766"
+api_model_id = "typed-decisions"
+context_window = 1024
+
+[[models]]
+id = "laya-ane"
+router = "laya"
+url = "http://127.0.0.1:8766"
+api_model_id = "ane"
+context_window = 96
+
+[[models]]
+id = "nimble"
+router = "ollama"
+url = "http://127.0.0.1:11434"
+api_model_id = "nimble"
+context_window = 8192
+
+[[models]]
+id = "nimble-v3"
+router = "llamacpp"
+url = "http://127.0.0.1:8091"
+api_model_id = "nimble-v3"
+context_window = 8192
