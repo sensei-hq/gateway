@@ -364,9 +364,10 @@ fn scenario_section(md: &mut String, results: &Results, r: &ScenarioRanking) {
             metrics_row(md, &m.id, &m.own, &m.shared);
         }
         md.push('\n');
-        let ids: Vec<&str> = r.ranked.iter().map(|m| m.id.as_str()).collect();
-        not_applicable_reasons(md, results, r.scenario, &ids);
     }
+    // With or without a table, each ranked model's not-applicable reason.
+    let ids: Vec<&str> = r.ranked.iter().map(|m| m.id.as_str()).collect();
+    not_applicable_reasons(md, results, r.scenario, &ids);
     let verdict = match &r.verdict {
         Verdict::Winner(m) => format!(
             "**Use {m} for {name}** among the head-to-head models: its 95% CI lies above \
@@ -1235,6 +1236,43 @@ mod tests {
         let s3 = section(&md, "## S3");
         assert!(s3.contains("no shared cases"), "{s3}");
         assert!(!s3.contains("| Model | Coverage"), "{s3}");
+    }
+
+    /// SP-DEC-4 re-review R2: with no shared cases there is no table, but
+    /// each ranked model's not-applicable reason is still listed.
+    #[test]
+    fn an_empty_shared_set_still_lists_each_ranked_models_not_applicable_reason() {
+        use Scenario::*;
+        let mut f = fixture();
+        f.rows.retain(|r| r.scenario != S3Entailment);
+        for i in 1..=4 {
+            let (a, b) = if i <= 2 {
+                (Outcome::NotApplicable, Outcome::Ok)
+            } else {
+                (Outcome::Ok, Outcome::NotApplicable)
+            };
+            f.rows.push(ResultRow {
+                correct: (a == Outcome::Ok).then_some(true),
+                detail: (a == Outcome::NotApplicable).then(|| "too long for good".into()),
+                ..row("good", S3Entailment, i, a)
+            });
+            f.rows.push(ResultRow {
+                correct: (b == Outcome::Ok).then_some(true),
+                detail: (b == Outcome::NotApplicable).then(|| "too long for mid".into()),
+                ..row("mid", S3Entailment, i, b)
+            });
+        }
+        let md = render(&f, 7);
+        let s3 = section(&md, "## S3");
+        assert!(s3.contains("no shared cases"), "{s3}");
+        assert!(
+            s3.contains("- good: 2 not applicable: too long for good"),
+            "{s3}"
+        );
+        assert!(
+            s3.contains("- mid: 2 not applicable: too long for mid"),
+            "{s3}"
+        );
     }
 
     #[test]
