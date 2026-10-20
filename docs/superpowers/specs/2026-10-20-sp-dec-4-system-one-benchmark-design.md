@@ -31,14 +31,14 @@ One question per case.
 
 | Id | Scenario | Type | Source | Licence |
 |---|---|---|---|---|
-| S1a | Intent routing with an out-of-scope option: 8 candidates per case (gold + 7 seeded distractors from 151 intents, `oos` always offered) | choice | `clinc/clinc_oos` config `plus` (HF datasets-server) | CC-BY-3.0 |
+| S1a | Intent routing with an out-of-scope option: 9 options per case: `oos` plus 8 intents (gold + 7 seeded distractors, or 8 distractors when gold is `oos`), so every case has the same 1-in-9 chance baseline | choice | `clinc/clinc_oos` config `plus` (HF datasets-server) | CC-BY-3.0 |
 | S1b | Tool/intent routing, 8 candidates per case (gold + 7 seeded distractors from 77 intents) | choice | `legacy-datasets/banking77` | CC-BY-4.0 |
 | S2 | Ordered triage score (negative / neutral / positive as a 3-level score) | score | `Sp1786/multiclass-sentiment-analysis-dataset` | Apache-2.0 |
 | S3 | Does B follow from A? (entailment → yes, contradiction → no; neutral excluded) | noul | `stanfordnlp/snli` | CC-BY-SA-4.0 |
 | S4 | Coding-pipeline gates: test output → continue / fix_code / retry / fix_environment; review finding → block / follow_up / dismiss; "does the change fix the finding?" | choice + noul | hand-curated, committed | repo |
 
 Dataset notes:
-- Verified 2026-10-20: each id exists, is ungated, and has its splits served by `datasets-server.huggingface.co`. `/rows` pages are at most 100 rows long. CLINC `plus` has 151 labels, `oos` among them (looked up by name, never by index). The sentiment set is 0 negative, 1 neutral, 2 positive. datasets-server serves only the current revision, so `fetch` records the hub sha and refuses to reuse a cache built from a different one.
+- Verified 2026-10-20: each id exists, is ungated, and has its splits served by `datasets-server.huggingface.co`. `/rows` pages are at most 100 rows long. CLINC `plus` has 151 labels, `oos` among them (looked up by name, never by index). The sentiment set is 0 negative, 1 neutral, 2 positive. datasets-server serves only the current revision, so `fetch` records the hub sha and refuses to reuse a cache built from a different one. Limitation: datasets-server can lag a hub push, so for a short window it may serve rows of the previous revision under the new sha. The rows sha256 in the manifest makes any such drift visible on re-fetch.
 - `PolyAI/banking77` is not served, so its `legacy-datasets/` copy is used.
 - `SetFit/sst5` was rejected (no licence), and so were Yelp (licence "other") and MultiNLI (mixed licence).
 - Public data is **fetched, never committed**.
@@ -92,7 +92,7 @@ S4 lives in `crates/decision-bench/scenarios/s4-*.jsonl`, 50–100 cases per gat
 ## Acceptance criteria
 
 - **AC1** `cargo run -p decision-bench -- check` reports every configured router as reachable or NOT RUN; an unreachable one never aborts the run silently.
-- **AC2** `fetch` is reproducible: the same seed and revision give byte-identical case files. It parses datasets-server JSON. This is tested against a recorded fixture: a JSON file captured from the API, not real dataset rows. The fetched data is never written inside the repo.
+- **AC2** `fetch` is reproducible: the same seed, revision and row content give byte-identical case files. Each dataset's rows sha256 is recorded in the manifest so this is checkable. `fetch` parses datasets-server JSON, tested against recorded fixtures (API responses, not datasets). Fetched data is never committed: the case dir and cache are gitignored or outside the repo. Every case's `source` carries the seed and rand version.
 - **AC3** `run` records `ok` / `not_applicable` / `error` per case.
   - A context-window refusal is `not_applicable`, and so is any `InputRejected`. The prefix used to detect `InputRejected` is pinned by a unit test against the real kernel type.
   - A D7 re-route and every other error are `error`, and count as wrong.
