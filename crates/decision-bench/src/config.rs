@@ -9,12 +9,12 @@ use gateway::types::config::{
 use gateway::{Capability, GatewayBuilder};
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct BenchConfig {
     pub models: Vec<ModelSpec>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ModelSpec {
     pub id: String,
     pub router: String,
@@ -107,6 +107,61 @@ impl BenchConfig {
     }
 }
 
+/// Where [`BenchConfig::load`] found the config.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Loaded {
+    pub config: BenchConfig,
+    pub path: std::path::PathBuf,
+    /// `bench.toml` was missing, so `bench.example.toml` was used.
+    pub is_example: bool,
+}
+
+impl BenchConfig {
+    /// Load `explicit` (relative paths resolve under `crate_dir`), or else
+    /// `crate_dir/bench.toml`, or else `crate_dir/bench.example.toml`. Every
+    /// model must build a valid gateway config.
+    pub fn load(
+        explicit: Option<&std::path::Path>,
+        crate_dir: &std::path::Path,
+    ) -> anyhow::Result<Loaded> {
+        use anyhow::Context;
+        let (path, is_example) = match explicit {
+            Some(p) => (resolve_under(p, crate_dir), false),
+            None => {
+                let own = crate_dir.join("bench.toml");
+                if own.exists() {
+                    (own, false)
+                } else {
+                    (crate_dir.join("bench.example.toml"), true)
+                }
+            }
+        };
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading config {}", path.display()))?;
+        let config =
+            Self::from_toml(&text).with_context(|| format!("parsing config {}", path.display()))?;
+        for m in &config.models {
+            config
+                .gateway_config_for(m)
+                .with_context(|| format!("config {}", path.display()))?;
+        }
+        Ok(Loaded {
+            config,
+            path,
+            is_example,
+        })
+    }
+}
+
+/// `p` if absolute, else `p` under `dir`.
+pub fn resolve_under(p: &std::path::Path, dir: &std::path::Path) -> std::path::PathBuf {
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        dir.join(p)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +249,62 @@ mod tests {
             cfg.gateway_config_for(m)
                 .unwrap_or_else(|e| panic!("{}: {e:#}", m.id));
         }
+    }
+
+    const ONE: &str = r#"
+[[models]]
+id = "solo"
+router = "llamacpp"
+url = "http://127.0.0.1:8091"
+api_model_id = "nimble-v3"
+context_window = 8192
+"#;
+
+    #[test]
+    fn load_prefers_bench_toml_then_falls_back_to_the_example() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("bench.example.toml"),
+            include_str!("../bench.example.toml"),
+        )
+        .unwrap();
+        let l = BenchConfig::load(None, dir.path()).unwrap();
+        assert!(l.is_example);
+        assert_eq!(l.path, dir.path().join("bench.example.toml"));
+        assert_eq!(l.config.models.len(), 6);
+
+        std::fs::write(dir.path().join("bench.toml"), ONE).unwrap();
+        let l = BenchConfig::load(None, dir.path()).unwrap();
+        assert!(!l.is_example);
+        assert_eq!(l.path, dir.path().join("bench.toml"));
+        assert_eq!(l.config.models[0].id, "solo");
+    }
+
+    #[test]
+    fn an_explicit_config_resolves_under_the_crate_dir_and_must_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mine.toml"), ONE).unwrap();
+        let l = BenchConfig::load(Some(std::path::Path::new("mine.toml")), dir.path()).unwrap();
+        assert_eq!(l.path, dir.path().join("mine.toml"));
+        assert!(!l.is_example);
+        let err =
+            BenchConfig::load(Some(std::path::Path::new("gone.toml")), dir.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("gone.toml"), "{err:#}");
+    }
+
+    #[test]
+    fn load_rejects_an_invalid_model_and_unparsable_toml_naming_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("bench.toml"),
+            ONE.replace("llamacpp", "nope"),
+        )
+        .unwrap();
+        let err = format!("{:#}", BenchConfig::load(None, dir.path()).unwrap_err());
+        assert!(err.contains("solo") && err.contains("nope"), "{err}");
+        std::fs::write(dir.path().join("bench.toml"), "models = 3").unwrap();
+        let err = format!("{:#}", BenchConfig::load(None, dir.path()).unwrap_err());
+        assert!(err.contains("bench.toml"), "{err}");
     }
 
     #[test]

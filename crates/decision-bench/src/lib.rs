@@ -1,7 +1,10 @@
 pub mod case;
+pub mod check;
 pub mod config;
 pub mod fetch;
+pub mod load;
 pub mod metrics;
 pub mod rank;
+pub mod report;
 pub mod run;
 pub mod scenarios;

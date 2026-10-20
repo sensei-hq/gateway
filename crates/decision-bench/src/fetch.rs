@@ -411,7 +411,7 @@ pub fn check_cached_sha(dir: &Path, live_sha: &str) -> anyhow::Result<Option<Met
 }
 
 /// Write `bytes` to `<path>.tmp`, then rename over `path`.
-pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);

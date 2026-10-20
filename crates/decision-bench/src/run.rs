@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use gateway::circuit_breaker::CircuitBreakerConfig;
 use gateway::resilience::ResilienceConfig;
+use gateway::types::config::GatewayConfig;
 use gateway::types::decision::{DecisionAnswer, DecisionQuestion, DecisionQuestions};
 use gateway::types::error::HumanAction;
 use gateway::types::request::Payload;
@@ -73,11 +74,33 @@ pub const DETAIL_MAX_CHARS: usize = 300;
 /// (and another each further interval), so a hung server is visible.
 pub const SLOW_CASE: Duration = Duration::from_secs(30);
 
-/// A model that `check` found unreachable, so it was not run (filled by T7).
+/// A model that `check` found unreachable, so it was not run.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct NotRun {
     pub model: String,
     pub reason: String,
+}
+
+/// One model of the run's roster, as configured, so a report rendered from
+/// `results.json` alone can say what each model id was. The URL is left out
+/// on purpose: a results file is shared, and a hosted URL can carry a token.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct RosterEntry {
+    pub id: String,
+    pub router: String,
+    pub api_model_id: String,
+    pub context_window: u32,
+}
+
+impl From<&ModelSpec> for RosterEntry {
+    fn from(m: &ModelSpec) -> Self {
+        RosterEntry {
+            id: m.id.clone(),
+            router: m.router.clone(),
+            api_model_id: m.api_model_id.clone(),
+            context_window: m.context_window,
+        }
+    }
 }
 
 /// The whole of `results.json`.
@@ -87,6 +110,14 @@ pub struct Results {
     pub generated_at: u64,
     pub manifest: Option<Manifest>,
     pub not_run: Vec<NotRun>,
+    /// Every selected model, NOT RUN ones included, in config order.
+    /// (`default`: files written before T7 have none.)
+    #[serde(default)]
+    pub roster: Vec<RosterEntry>,
+    /// Each hand-curated (S4) scenario run, with its file header's
+    /// `labels_reviewed_by`; `None` means the labels are unreviewed.
+    #[serde(default)]
+    pub labels_reviewed: Vec<(Scenario, Option<String>)>,
     pub rows: Vec<ResultRow>,
 }
 
@@ -267,13 +298,15 @@ fn check_probabilities<'a>(
 /// threshold, five consecutive real failures would open the breaker and every
 /// later case would be a ~0 ms gated skip that never reaches the server.
 pub fn facade_for(cfg: &BenchConfig, m: &ModelSpec) -> anyhow::Result<FacadeBuilder> {
-    Ok(
-        FacadeBuilder::new(cfg.gateway_config_for(m)?).circuit_breaker(CircuitBreakerConfig {
-            threshold: usize::MAX,
-            timeout: Duration::from_secs(1),
-            half_open_max_requests: 1,
-        }),
-    )
+    Ok(facade_from(cfg.gateway_config_for(m)?))
+}
+
+fn facade_from(config: GatewayConfig) -> FacadeBuilder {
+    FacadeBuilder::new(config).circuit_breaker(CircuitBreakerConfig {
+        threshold: usize::MAX,
+        timeout: Duration::from_secs(1),
+        half_open_max_requests: 1,
+    })
 }
 
 /// The gateway a bench run uses for `m`: [`facade_for`] (breaker off) plus a
@@ -295,15 +328,30 @@ pub fn facade_for(cfg: &BenchConfig, m: &ModelSpec) -> anyhow::Result<FacadeBuil
 /// locks the model terminally. Cases skipped by either are rows with
 /// `reached_server: false`. All other resilience fields keep their defaults.
 pub async fn gateway_for(cfg: &BenchConfig, m: &ModelSpec) -> anyhow::Result<Gateway> {
+    Ok(gateway_from(facade_for(cfg, m)?).await)
+}
+
+/// [`gateway_for`], with `m`'s router timeout set to `timeout` instead of the
+/// run's per-case 120 s (`check` probes with a short one).
+pub async fn gateway_with_timeout(
+    cfg: &BenchConfig,
+    m: &ModelSpec,
+    timeout: Duration,
+) -> anyhow::Result<Gateway> {
+    let mut config = cfg.gateway_config_for(m)?;
+    let ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+    for router in config.routers.values_mut() {
+        router.timeout_ms = Some(ms);
+    }
+    Ok(gateway_from(facade_from(config)).await)
+}
+
+async fn gateway_from(facade: FacadeBuilder) -> Gateway {
     let mut resilience = ResilienceConfig::default();
     resilience.cooldown_base = Duration::ZERO;
     resilience.lockout.rate_limit_base = Duration::ZERO;
     resilience.lockout.quota_default = Duration::ZERO;
-    Ok(facade_for(cfg, m)?
-        .build()
-        .await
-        .gateway
-        .with_resilience(resilience))
+    facade.build().await.gateway.with_resilience(resilience)
 }
 
 /// The warm-up case: the one with the shortest serialized `state` (first on a
@@ -504,6 +552,37 @@ pub fn write_results(path: &Path, results: &Results) -> anyhow::Result<()> {
     std::fs::write(&tmp, json).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, path)
         .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))
+}
+
+/// Run `model_ids` one model at a time (config order) via
+/// [`run_with_progress`], appending each model's rows to `results` and
+/// rewriting `out` atomically after every model, so a crash or a failed model
+/// loses at most the model in flight. `out` is first written before any model
+/// runs (so NOT RUN models are on disk even if the first model fails).
+/// Returns the final results; on an error the file holds every model finished
+/// before it.
+pub async fn run_saving(
+    cfg: &BenchConfig,
+    cases: &[Case],
+    model_ids: &[String],
+    mut results: Results,
+    out: &Path,
+) -> anyhow::Result<Results> {
+    if let Some(unknown) = model_ids
+        .iter()
+        .find(|id| !cfg.models.iter().any(|m| &m.id == *id))
+    {
+        bail!("unknown model id '{unknown}': not in the bench config");
+    }
+    write_results(out, &results)?;
+    for m in cfg.models.iter().filter(|m| model_ids.contains(&m.id)) {
+        let rows = run_with_progress(cfg, cases, std::slice::from_ref(&m.id), |_, _| {})
+            .await
+            .with_context(|| format!("running model '{}'", m.id))?;
+        results.rows.extend(rows);
+        write_results(out, &results)?;
+    }
+    Ok(results)
 }
 
 #[cfg(test)]
@@ -1012,6 +1091,13 @@ mod tests {
             generated_at: 1_760_000_000,
             manifest: None,
             not_run: vec![],
+            roster: vec![RosterEntry {
+                id: "m".into(),
+                router: "llamacpp".into(),
+                api_model_id: "nimble-v3".into(),
+                context_window: 8192,
+            }],
+            labels_reviewed: vec![(Scenario::S4FixCheck, None)],
             rows: vec![row_for(
                 &noul_case(true),
                 "m",
@@ -1024,7 +1110,17 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         let mut keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
         keys.sort();
-        assert_eq!(keys, ["generated_at", "manifest", "not_run", "rows"]);
+        assert_eq!(
+            keys,
+            [
+                "generated_at",
+                "labels_reviewed",
+                "manifest",
+                "not_run",
+                "roster",
+                "rows"
+            ]
+        );
         let mut row_keys: Vec<_> = v["rows"][0].as_object().unwrap().keys().cloned().collect();
         row_keys.sort();
         assert_eq!(
@@ -1051,6 +1147,21 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(leftovers, vec![std::ffi::OsString::from("results.json")]);
+    }
+
+    /// Results written before T7 have no roster / labels_reviewed: they still
+    /// parse, with both empty.
+    #[test]
+    fn a_results_file_without_roster_or_labels_still_parses() {
+        let back: Results = serde_json::from_value(json!({
+            "generated_at": 1,
+            "manifest": null,
+            "not_run": [],
+            "rows": [],
+        }))
+        .unwrap();
+        assert!(back.roster.is_empty());
+        assert!(back.labels_reviewed.is_empty());
     }
 
     // --- T4 review ---------------------------------------------------------
@@ -1257,6 +1368,102 @@ mod tests {
         let ids = vec!["c0".to_string(), "c1".into(), "c2".into()];
         assert_eq!(seen, vec![("a".into(), ids.clone()), ("b".into(), ids)]);
         assert_eq!(rows.len(), 6);
+    }
+
+    // --- run_saving ---------------------------------------------------------
+
+    fn base_results() -> Results {
+        Results {
+            generated_at: 1,
+            manifest: None,
+            not_run: vec![NotRun {
+                model: "down".into(),
+                reason: "connection refused".into(),
+            }],
+            roster: vec![],
+            labels_reviewed: vec![],
+            rows: vec![],
+        }
+    }
+
+    fn read_results(path: &Path) -> Results {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    async fn noul_server() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "nimble-v3",
+                "answers": {"q": {"type": "noul", "noul": 0.9}},
+                "usage": {"input_tokens": 30, "output_tokens": 0}
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// A run that fails on model 2 leaves model 1's rows on disk.
+    #[tokio::test]
+    async fn a_run_failing_on_the_second_model_keeps_the_first_models_rows() {
+        let server = noul_server().await;
+        let mut first = spec(&server.uri());
+        first.id = "first".into();
+        let mut broken = spec("");
+        broken.id = "broken".into();
+        let cfg = BenchConfig {
+            models: vec![first, broken],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("results.json");
+        let err = run_saving(
+            &cfg,
+            &noul_cases(3),
+            &["first".into(), "broken".into()],
+            base_results(),
+            &out,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("broken"), "{err:#}");
+        let on_disk = read_results(&out);
+        assert_eq!(on_disk.rows.len(), 3, "{on_disk:?}");
+        assert!(on_disk.rows.iter().all(|r| r.model == "first"));
+        assert_eq!(on_disk.not_run, base_results().not_run);
+    }
+
+    #[tokio::test]
+    async fn run_saving_writes_and_returns_every_row() {
+        let server = noul_server().await;
+        let mut a = spec(&server.uri());
+        a.id = "a".into();
+        let mut b = spec(&server.uri());
+        b.id = "b".into();
+        let cfg = BenchConfig { models: vec![a, b] };
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("results.json");
+        let got = run_saving(
+            &cfg,
+            &noul_cases(2),
+            &["a".into(), "b".into()],
+            base_results(),
+            &out,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.rows.len(), 4);
+        assert_eq!(read_results(&out), got);
+    }
+
+    #[tokio::test]
+    async fn with_no_model_to_run_the_file_still_records_the_not_run_ones() {
+        let cfg = BenchConfig { models: vec![] };
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("results.json");
+        run_saving(&cfg, &noul_cases(2), &[], base_results(), &out)
+            .await
+            .unwrap();
+        assert_eq!(read_results(&out), base_results());
     }
 
     /// M4: the warm-up is the cheapest case, not whichever comes first.
