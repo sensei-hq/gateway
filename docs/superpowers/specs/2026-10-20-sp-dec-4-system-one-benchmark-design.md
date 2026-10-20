@@ -53,8 +53,17 @@ S4 lives in `crates/decision-bench/scenarios/s4-*.jsonl`, 50–100 cases per gat
   - It depends on `gateway` (facade only), `tokio`, `serde`/`serde_json`, `reqwest`, `clap`, `toml`, and a seeded RNG (`rand` with a fixed `StdRng` seed).
   - It adds nothing to `gateway`'s public API and makes no gateway code changes.
 - **D2 Through the facade.** Each model gets a single-entry decision chain with **no fallback**, so a result belongs to exactly one model.
-  - Requests go through `FacadeBuilder` → `Gateway::execute`, so results include alias handling, the D6 budget refusals and `InputRejected`.
-  - An `InputRejected` counts as outcome `refused`. Any other error counts as outcome `error`. Neither is retried or dropped.
+  - Requests go through `FacadeBuilder` → `Gateway::execute`, so results include alias handling and the gateway's own fit rules. No gateway code changes (user decision 2026-10-20, option 2).
+- **D2a A case that does not fit a model is `not_applicable`, not wrong** (user decision 2026-10-20). The outcomes are:
+  - `ok`: answered.
+  - `not_applicable`: the input does not fit this model. This covers two cases.
+    - The gateway's context-window refusal. It is typed: `AllGated { human_action: Some(UseLargerContextWindow) }`.
+    - Any `InputRejected`: Laya head budget, images, server-side truncation, or collapsed options.
+  - `error`: anything else, including a D7 re-routed checkpoint, network errors and 4xx/5xx. It counts as wrong.
+  - Nothing is retried or dropped.
+- **Detecting `InputRejected`.** It is found by the kernel's own `InputRejected` Display prefix (`adapter '…' cannot serve this input:`) on the single attempt's error string.
+  - A bench unit test builds a real `InputRejected` and asserts that prefix. If the kernel format changes, the bench's tests fail instead of silently mis-classifying.
+- **Pre-send refusals never reach the server.** A server-side truncation does, because it is only known after the call.
 - **D3 Config.** `bench.toml` (example committed, local copy gitignored) lists models: id, router, url, `api_model_id`, `context_window`.
 - **D4 Commands.**
   - `check`: probes every configured router. An unreachable one is **NOT RUN** and is named at the top of the report, never silently skipped.
@@ -62,16 +71,18 @@ S4 lives in `crates/decision-bench/scenarios/s4-*.jsonl`, 50–100 cases per gat
   - `run [--scenarios …] [--models …]`: runs cases sequentially, after one warm-up call per model. It writes `results.json`, one row per (case, model): answer, probabilities, correct, latency_ms, outcome.
   - `report`: renders Markdown from `results.json`.
 - **D5 Metrics, per (scenario, model):**
-  - Accuracy two ways: over answered cases, and over all cases (refused or error counts as wrong).
-  - Refusal rate and error rate.
-  - Bootstrap 95% CI for accuracy over all cases: 1000 resamples, seeded.
+  - Coverage: the share of the scenario's cases that are applicable, i.e. not `not_applicable`.
+  - Accuracy over the applicable cases, where `error` counts as wrong. The error rate is reported too.
+  - Bootstrap 95% CI for accuracy, using 1000 seeded resamples.
   - Expected calibration error on the top probability, in 10 equal-width bins.
   - Confident-wrong rate: wrong with top probability ≥ 0.8.
   - For score questions, also exact-level accuracy (argmax) and mean absolute error of the expected level.
   - Noul answers are decided at 0.5.
   - Latency p50/p95.
 - **D6 Ranking.**
-  - Within a scenario, models are ordered by all-cases accuracy, then lower confident-wrong rate, then lower p50 latency.
+  - **Head-to-head on a shared subset.** The ranking within a scenario uses only the cases that are applicable to every model being ranked, so no model is graded on an easier subset.
+  - **Coverage floor.** A model with coverage below 50% is left out of the head-to-head and gets its own table over its own applicable cases. Example: "ANE: 30% coverage, 0.91 accuracy on short checks".
+  - **Ordering.** Inside the head-to-head, models are ordered by accuracy, then lower confident-wrong rate, then lower p50 latency.
   - A model is called the **winner** only if its CI lower bound exceeds the runner-up's CI upper bound. Otherwise the top models are reported as **tied**.
   - The report also has a scenario × model summary table and a "use X for scenario Y" line per scenario (or "tie: X, Y").
 - **D7 Outputs.**
@@ -82,10 +93,19 @@ S4 lives in `crates/decision-bench/scenarios/s4-*.jsonl`, 50–100 cases per gat
 
 - **AC1** `cargo run -p decision-bench -- check` reports every configured router as reachable or NOT RUN; an unreachable one never aborts the run silently.
 - **AC2** `fetch` is reproducible: the same seed and revision give byte-identical case files. It parses datasets-server JSON. This is tested against a recorded fixture: a JSON file captured from the API, not real dataset rows. The fetched data is never written inside the repo.
-- **AC3** `run` records `ok` / `refused` / `error` per case. An `InputRejected` is `refused`, and a refused case counts as wrong in all-cases accuracy. A refusal is never dropped.
+- **AC3** `run` records `ok` / `not_applicable` / `error` per case.
+  - A context-window refusal is `not_applicable`, and so is any `InputRejected`. The prefix used to detect `InputRejected` is pinned by a unit test against the real kernel type.
+  - A D7 re-route and every other error are `error`, and count as wrong.
+  - Nothing is dropped, and coverage is reported per (scenario, model).
 - **AC4** Every metric in D5 has a unit test against hand-computed values: accuracy both ways, bootstrap CI with a seed, ECE, confident-wrong, score MAE, and p50/p95.
-- **AC5** The D6 ranking and tie rule are unit-tested. A test shows overlapping CIs give "tied" and separated CIs give "winner".
-- **AC6** A wiremock end-to-end test runs `run` + `report` over two fake routers, one of which refuses some cases. The report shows the expected ranking, refusal rate and NOT RUN handling.
+- **AC5** The D6 rules are unit-tested:
+  - the shared-subset rule: a case that is not applicable to any one compared model is excluded from that scenario's ranking;
+  - the 50% coverage floor;
+  - the tie rule: overlapping CIs give "tied", separated CIs give "winner".
+- **AC6** A wiremock end-to-end test runs `run` + `report` over two fake routers, one of which refuses some cases with `InputRejected`. The report shows:
+  - the expected coverage;
+  - the shared-subset ranking;
+  - NOT RUN handling.
 - **AC7** The first live local run over S1–S4 against the six-model roster produces the committed report. S4 is marked unreviewed until the user signs off. The report states any model that was NOT RUN.
 - **AC8** Docs: a `docs/llms` page (or a section in `local.md`) explains how to run the bench and read the report. The crate README documents config, commands and dataset licences.
 
@@ -95,7 +115,7 @@ Red-first per task.
 - Unit tests cover metrics, ranking, sampling and parsing.
 - Wiremock covers the end-to-end run.
 - The live run is the acceptance test.
-- Every guard is mutation-checked, e.g. the tie rule, refusal counting and seeded sampling.
+- Every guard is mutation-checked, e.g. the tie rule, `not_applicable` classification, the shared subset and seeded sampling.
 
 ## Not in scope (carry-forwards)
 
