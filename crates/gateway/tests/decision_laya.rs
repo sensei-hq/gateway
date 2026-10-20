@@ -77,8 +77,7 @@ async fn a_truncated_laya_answer_falls_back_to_the_next_router() {
             ("llamacpp".into(), router(next.uri())),
         ]),
         models: HashMap::from([
-            // Window deliberately overstated so the ContextWindowGate lets the
-            // request through and D3 is what catches the truncation.
+            // The gate measures this one-sentence request, which fits any window; the mock's `truncated: true` is what D3 must catch.
             ("english".into(), model("english", "laya", 8_192)),
             ("nimble-v3".into(), model("nimble-v3", "llamacpp", 8_192)),
         ]),
@@ -133,10 +132,21 @@ async fn a_truncated_laya_answer_falls_back_to_the_next_router() {
         .error
         .as_deref()
         .expect("laya attempt error");
-    assert!(laya_error.contains("truncated"), "{laya_error}");
+    assert!(
+        laya_error.contains("the host truncated the input"),
+        "{laya_error}"
+    );
+    assert!(
+        laya_error.contains("718 state tokens dropped"),
+        "{laya_error}"
+    );
     let answers = resp.decisions.expect("decisions");
-    assert!(matches!(
-        answers["q"],
-        DecisionAnswer::Noul { noul } if noul == 0.91
-    ));
+    assert!(
+        matches!(
+            answers["q"],
+            DecisionAnswer::Noul { noul } if noul == 0.91
+        ),
+        "{:?}",
+        answers["q"]
+    );
 }
