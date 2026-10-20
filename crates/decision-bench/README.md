@@ -81,7 +81,7 @@ command works from anywhere.
 
 | Command | What it does | Flags (defaults) |
 |---|---|---|
-| `check` | Probes every selected model with one tiny decision. A model that does not answer is **NOT RUN**; `check` still exits 0. | `--config <path>`, `--models <a,b>` |
+| `check` | Probes every selected model with one tiny decision. A model that does not answer, or that no input fits its context window, is **NOT RUN**; `check` still exits 0. | `--config <path>`, `--models <a,b>` |
 | `fetch` | Downloads the public datasets and builds the seeded S1a/S1b/S2/S3 case files plus `manifest.json`. | `--per-scenario <n>` (200), `--seed <n>` (2026), `--out <dir>` (`cases`), `--cache-dir <dir>` (user cache dir, `decision-bench/`) |
 | `run` | Runs `check`, then every reachable model over the cases, sequentially after one warm-up call per model. Rewrites the results file atomically after each model. | `--config`, `--models`, `--cases <dir>` (`cases`), `--scenarios <list>` (all found), `--out <file>` (`results.json`) |
 | `report` | Renders the Markdown ranking report from a results file. | `--results <file>` (`results.json`), `--out <file>` (`report.md`), `--seed <n>` (the manifest's sampling seed, else 2026) |
@@ -188,8 +188,9 @@ Reproduce.
   are not listed here.
 - **INCOMPLETE RUN**: a banner naming roster models that neither finished nor were NOT RUN, i.e.
   the run stopped early. Their rows are partial, so this is not a complete ranking.
-- **NOT RUN**: models `check` could not reach, with the reason. They have no results; they are
-  named at the top of the report, never silently skipped.
+- **NOT RUN**: models `check` could not run (unreachable, or no input fits their context
+  window), with the reason. They have no results; they are named at the top of the report,
+  never silently skipped.
 
 ## Known limitations
 
