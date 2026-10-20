@@ -3,6 +3,9 @@
 //! (decision-only `SystemOneAdapter`), the `decide` chain selects it, and a
 //! live llama.cpp server answers.
 //!
+//! The `laya` test (`a_decide_chain_routes_to_a_live_laya_server`, `LAYA_URL`) does the same against a real
+//! `laya-coreml-serve`; the server command is in the cloud-providers `systemone_mock` live test.
+//!
 //! Opt-in. Verified with llama.cpp release b11381 serving
 //! ggml-org/Bespoke-Nimble-9B-v3-GGUF (Q4_K_M):
 //!   llama-server -m Bespoke-Nimble-9B-v3-Q4_K_M.gguf --alias nimble-v3 --port 8091 -c 8192
@@ -162,6 +165,9 @@ async fn a_decide_chain_routes_to_a_live_llama_cpp_server() {
 #[ignore = "requires LAYA_URL: a running laya-coreml-serve"]
 async fn a_decide_chain_routes_to_a_live_laya_server() {
     let url = std::env::var("LAYA_URL").expect("LAYA_URL");
+    // The request estimates to ~285 tokens against the 512 window, so the context-window gate
+    // admits laya. The openrouter leg is unroutable and must never be reached; if it is, the
+    // gate skipped laya.
     let config = GatewayConfig {
         routers: HashMap::from([
             ("laya".into(), router(&url)),
@@ -243,6 +249,10 @@ async fn a_decide_chain_routes_to_a_live_laya_server() {
     );
     assert_eq!(resp.attempts[0].adapter, "laya");
     let answers = resp.decisions.expect("decisions");
+    assert_eq!(answers.keys().collect::<Vec<_>>(), ["refund", "urgency"]);
     assert!(matches!(answers["refund"], DecisionAnswer::Noul { .. }));
-    assert!(matches!(answers["urgency"], DecisionAnswer::Score { .. }));
+    let DecisionAnswer::Score { legend, .. } = &answers["urgency"] else {
+        panic!("score answer: {answers:?}");
+    };
+    assert_eq!(legend["2"], "Immediate");
 }
