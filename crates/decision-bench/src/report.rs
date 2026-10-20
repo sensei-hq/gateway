@@ -530,7 +530,11 @@ fn never_reached(md: &mut String, results: &Results, models: &[String]) {
         "Refused before dispatch by a context-window gate (not_applicable), or by a lockout \
          from a real `Retry-After` or an auth failure (error, counted as wrong); or a \
          transport failure before any reply: a refused or dropped connection, or a DNS \
-         failure (error, counted as wrong).\n"
+         failure (error, counted as wrong). An adapter's own pre-send refusal \
+         (`InputRejected`: Laya head budget, images) is a recorded attempt, so it is not \
+         counted here (it is not_applicable, with its reason under the scenario's table); \
+         nor is a connect that hangs for the whole router timeout, which reads as a \
+         timeout.\n"
     );
     for l in lines {
         let _ = writeln!(md, "{l}");
@@ -1181,6 +1185,29 @@ mod tests {
             r.reached_server = true;
         }
         assert!(!render(&all_reached, 7).contains("never reached the server"));
+    }
+
+    /// SP-DEC-4 review C1: an adapter's own pre-send `InputRejected` is a
+    /// recorded attempt (`reached_server: true`), so it is not counted here,
+    /// and the preamble says so instead of claiming every pre-send refusal.
+    #[test]
+    fn the_never_reached_preamble_names_what_it_does_not_count() {
+        use crate::run::INPUT_REJECTED_MARKER;
+        let mut f = fixture();
+        f.rows.push(ResultRow {
+            detail: Some(format!(
+                "adapter 'laya' {INPUT_REJECTED_MARKER}question head over budget"
+            )),
+            ..row("good", Scenario::S1bBanking77, 1, Outcome::NotApplicable)
+        });
+        let md = render(&f, 7);
+        let never = section(&md, "## Rows that never reached the server");
+        assert!(!never.contains("on S1b"), "{never}");
+        assert!(
+            never.contains("An adapter's own pre-send refusal (`InputRejected`"),
+            "{never}"
+        );
+        assert!(never.contains("whole router timeout"), "{never}");
     }
 
     #[test]
