@@ -55,10 +55,26 @@ fn estimated_head_tokens(q: &DecisionQuestion) -> usize {
 
 /// One rendered option: its `[MASK]` plus `" " + text` — Laya encodes the
 /// leading space, which the multilingual tokenizer makes a token of its own
-/// before a digit, symbol or CJK char — capped at Laya's 48.
+/// before a digit, symbol or CJK char — capped at Laya's 48, plus
+/// [`OPTION_MARGIN`].
 fn laya_option_tokens(text: &str) -> usize {
-    1 + laya_text_tokens(&format!(" {text}")).min(48)
+    1 + laya_text_tokens(&format!(" {text}")).min(48) + OPTION_MARGIN
 }
+
+/// Safety margin on every option. [`laya_text_tokens`] can be under on a
+/// short random letter string, and that happens once PER OPTION, so it adds
+/// up: 32 random 5–8 letter keys each one under on `english` sum to 32, enough
+/// for Laya to cut every option while the estimate says they fit. Measured by
+/// `tests/fixtures/laya_head_tokens.py stress-options` over 900 000 random
+/// 1–12 char keys (lowercase, alphanumeric, printable; seeds 1, 7, 42): with a
+/// margin of 1, 15 options were still 1 under (worst −2 before any margin);
+/// with 2, none.
+const OPTION_MARGIN: usize = 2;
+
+/// Safety margin on the instruction head, encoded once per question: the
+/// per-string under-count is at most 1 there (6 of 21 000 short random strings
+/// by 1, `stress 99`), so one token covers it.
+const INSTRUCTION_MARGIN: usize = 1;
 
 /// A conservative estimate of the tokens Laya's `build_head` spends on one
 /// question (SP-DEC-3 D6), as `(instruction part, all options)`. Laya renders
@@ -81,13 +97,15 @@ fn laya_option_tokens(text: &str) -> usize {
 /// Python, pretty), Japanese, Chinese, Korean, Cyrillic, Arabic, Hindi, Thai,
 /// German, emoji, astral CJK, code, URLs, numbers, dates, money, hex, base64,
 /// gibberish, mixed case, ALLCAPS, camelCase, symbols, whitespace, long words,
-/// digit and CJK option keys: never below the real count. The tightest margins
-/// are +0 — digit-only options on multilingual (one token per digit plus the
-/// leading space) and astral CJK (a byte bound). Known under-count: 6 of
-/// 21 000 short random strings, by 1 token (`stress 99`); no whole head has
-/// been observed under. The price is over-counting: about 1.6× on English
-/// (the 288-char D6 instruction: 180 estimated, 109 real on `english`; the
-/// 548-char one that really fits, 300 vs 189, refused) and 2–7× on non-Latin
+/// digit and CJK option keys: the text count alone is never below the real
+/// count, tightest at +0 (digit-only options on multilingual, astral CJK).
+/// Known text under-count: 6 of 21 000 short random strings by 1 token
+/// (`stress 99`), and short random option keys by up to 2 — once per option,
+/// which adds up. [`INSTRUCTION_MARGIN`] and [`OPTION_MARGIN`] cover those:
+/// with them no option of 900 000 random keys (`stress-options`) and no whole
+/// head has been observed under. The price is over-counting: about 1.7× on
+/// English (the 288-char D6 instruction: 185 estimated, 109 real on `english`;
+/// the 548-char one that really fits, 305 vs 189, refused) and 2–7× on non-Latin
 /// scripts, whose every char is counted at its UTF-8 bytes. Refusing a head
 /// that would fit costs a fallback; sending one that does not returns a
 /// confident answer to a question the model never read.
@@ -102,7 +120,7 @@ fn estimated_head_parts(q: &DecisionQuestion) -> (usize, usize) {
     let head = tokens(&format!(
         "{kind} question: {}",
         laya_instruction_text(instructions)
-    ));
+    )) + INSTRUCTION_MARGIN;
     let options: usize = match q {
         DecisionQuestion::Choice { criteria, .. } => criteria
             .iter()
@@ -374,7 +392,7 @@ mod tests {
         };
         assert_eq!(
             estimated_head_tokens(&noul),
-            t("noul question: abcdef") + no + yes
+            t("noul question: abcdef") + 1 + no + yes
         );
         // A described side replaces the default; an empty description is no
         // description (Laya: `not in (None, "")`).
@@ -387,7 +405,7 @@ mod tests {
         };
         assert_eq!(
             estimated_head_tokens(&noul),
-            t("noul question: abcdef") + no + o("true: x")
+            t("noul question: abcdef") + 1 + no + o("true: x")
         );
         // "key: description", or the bare key.
         let choice = DecisionQuestion::Choice {
@@ -401,7 +419,7 @@ mod tests {
         };
         assert_eq!(
             estimated_head_tokens(&choice),
-            t("choice question: Pick") + o("a: bb") + o("c")
+            t("choice question: Pick") + 1 + o("a: bb") + o("c")
         );
         // Non-string instructions are Laya's `json.dumps` text, WITH its default
         // ", " / ": " separators; score levels are "level i: description".
@@ -416,9 +434,9 @@ mod tests {
         );
         assert_eq!(
             estimated_head_tokens(&score),
-            t(&format!("score question: {json_text}")) + o("level 0: lo") + o("level 1: hi")
+            t(&format!("score question: {json_text}")) + 1 + o("level 0: lo") + o("level 1: hi")
         );
-        // An option is capped at 48 tokens (+1 [MASK]) however long it is.
+        // An option is capped at 48 tokens (+1 [MASK], +2 margin) however long.
         let long = DecisionQuestion::Choice {
             instructions: serde_json::json!("Pick"),
             criteria: [("k".to_string(), Some("d".repeat(300)))]
@@ -427,7 +445,7 @@ mod tests {
         };
         assert_eq!(
             estimated_head_tokens(&long),
-            t("choice question: Pick") + 49
+            t("choice question: Pick") + 1 + 51
         );
     }
 
@@ -450,6 +468,9 @@ mod tests {
         assert_eq!(t("a  b"), 3);
         // Rare letters and long runs: "zzkk" = max(2, 0, 2) + 1 (run of 4) + 4.
         assert_eq!(t("zzkk"), 2 + 1 + 4);
+        // An odd-length word whose only floor is ⌈len/2⌉: "lemon" = ⌈5/2⌉ = 3
+        // (2 vowel groups, no run of 3, no rare letter).
+        assert_eq!(t("lemon"), 3);
     }
 
     /// SP-DEC-3 D6: the estimate must never be BELOW what Laya really spends —
@@ -607,10 +628,11 @@ mod tests {
     /// token triggers its per-option cut and is refused.
     #[test]
     fn options_estimated_at_exactly_the_option_room_are_sent() {
-        // 17 eight-digit keys at 10 each, plus one short key: "1234" costs 6
-        // ([MASK], the leading space, 4 digits), "12345" costs 7.
+        // 14 eight-digit keys at 12 each ([MASK], the leading space, 8 digits,
+        // the 2-token margin), plus one last key: "1234" (8) makes 176,
+        // "12345" (9) makes 177.
         let choice = |last: &str| {
-            let mut criteria: Vec<(String, Option<String>)> = (0..17)
+            let mut criteria: Vec<(String, Option<String>)> = (0..14)
                 .map(|i| (format!("{}", 10_000_000 + i), None))
                 .collect();
             criteria.push((last.to_string(), None));
@@ -633,6 +655,37 @@ mod tests {
             check_laya_head_budget("laya", "english", &questions("12345")),
             Err(GatewayError::InputRejected { message, .. }) if message.contains("options would be cut")
         ));
+    }
+
+    /// The ≤ 1-token under-count happens once PER OPTION, so it adds up: each of
+    /// these 32 random keys has `" " + key` estimated 4 by the word rule but
+    /// really 5 on `english` (`tests/fixtures/laya_head_tokens.py`, seed 2026),
+    /// so the options really cost 32 × 6 = 192 > 176 and Laya cuts every
+    /// option — silently: all stay distinct, no `usage.options`, `truncated:
+    /// false`. The per-option margin must refuse it.
+    #[test]
+    fn per_option_under_counts_do_not_add_up_to_a_silent_cut() {
+        let keys = [
+            "yysohatc", "mzuegw", "cudfyihh", "nluhmimb", "fcaygoo", "ysjifu", "ilyttagy",
+            "fynwyrur", "gdaaloiw", "hsehyetu", "aomnaboe", "aeswywec", "tdeirbuu", "iwybmyst",
+            "dymcoosg", "dseemboo", "gwauhle", "yghowpao", "ylhojw", "hnacwuds", "lgupuyp",
+            "gacmywou", "hbyinhio", "ihoegcic", "fwysuah", "rtohbacb", "lnuwfotg", "ifsytufb",
+            "tgacsoh", "ciihunm", "bmylimt", "ymsyydpe",
+        ];
+        for key in keys {
+            assert_eq!(laya_text_tokens(&format!(" {key}")), 4, "{key}");
+        }
+        let q = DecisionQuestion::Choice {
+            instructions: serde_json::json!("Pick"),
+            criteria: keys.iter().map(|k| (k.to_string(), None)).collect(),
+        };
+        let questions = DecisionQuestions::from([("q".to_string(), q)]);
+        match check_laya_head_budget("laya", "english", &questions) {
+            Err(GatewayError::InputRejected { message, .. }) => {
+                assert!(message.contains("options would be cut"), "{message}")
+            }
+            other => panic!("32 options really costing 192 > 176 must be refused, got {other:?}"),
+        }
     }
 
     /// Refusals name the checkpoint as requested and, when Laya resolves it to
@@ -810,6 +863,15 @@ mod tests {
                 27,
             ), // longword
             ("aeiou aeiouaeiou ooooo eeeee iaiaia", 17, 15),  // vowelly
+            // `stress-options` (seeds 1, 7): each 2 tokens under before the margin.
+            ("uyrmuawr", 6, 5),   // random key, 2 under before the margin
+            ("fwytiwee", 6, 4),   // random key, 2 under before the margin
+            ("sdyiwlufyb", 7, 6), // random key, 2 under before the margin
+            ("iafupm", 5, 4),     // random key, 2 under before the margin
+            ("iybsuimilb", 7, 6), // random key, 2 under before the margin
+            ("hnohpudb", 6, 5),   // random key, 2 under before the margin
+            ("iycehriy", 6, 4),   // random key, 2 under before the margin
+            ("yynoowyh", 6, 4),   // random key, 2 under before the margin
         ];
         for (option, english, multilingual) in cases {
             let estimate = laya_option_tokens(option);
@@ -846,17 +908,18 @@ mod tests {
     /// would fit — so options over `budget − 16` are refused on their own.
     #[test]
     fn options_that_would_trigger_the_per_option_cut_are_refused() {
-        // 17 eight-digit keys at 10 and one ten-digit key at 12: 182 = 192 − 10.
-        let mut criteria: Vec<(String, Option<String>)> = (0..17)
+        // 14 eight-digit keys at 12 and one nine-digit key at 13: 181 = 192 − 11;
+        // with the 11-token head of instruction "a" the whole head is 192.
+        let mut criteria: Vec<(String, Option<String>)> = (0..14)
             .map(|i| (format!("{}", 10_000_000 + i), None))
             .collect();
-        criteria.push(("1234567890".into(), None));
+        criteria.push(("123456789".into(), None));
         let q = DecisionQuestion::Choice {
             instructions: serde_json::json!("a"),
             criteria: criteria.into_iter().collect(),
         };
         let (instruction, options) = estimated_head_parts(&q);
-        assert_eq!(options, 192 - 10);
+        assert_eq!(options, 192 - 11);
         assert!(
             instruction + options <= 192,
             "the whole head fits ({instruction} + {options}): only the option rule refuses it"
