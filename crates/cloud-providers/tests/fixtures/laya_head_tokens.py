@@ -17,6 +17,10 @@ Run (with -I so nothing is imported from the working directory):
   python -I laya_head_tokens.py table          # head and option tables, exit 1 on any under-count
   python -I laya_head_tokens.py stress [seed]  # seeded random strings: under-count tally (seed 99: 6 of 21000, by 1)
   python -I laya_head_tokens.py heads          # whole noul heads (instruction + Laya's default options)
+  python -I laya_head_tokens.py stress-options [seed] [n] [margin]
+                                               # n random 1-12 char option keys: per-option under-counts
+                                               # per alphabet (lower, alnum, printable). Seeds 1, 7, 42:
+                                               # margin 2 (shipped): 0 under; 1: 15 of 900000; 0: hundreds
   python -I laya_head_tokens.py rust head|option   # Rust test rows: (text, real english, real multilingual);
                                                    # option rows print the rendered option, counted as " " + it
 
@@ -41,8 +45,17 @@ TOKS = {"english": _tok("LAYA_TOKENIZER_ENGLISH", "laya-coreml"),
 def real(text):
     return {k: len(t.encode(text, add_special_tokens=False).ids) for k, t in TOKS.items()}
 
-# ---- Python mirror of laya_text_tokens / laya_word_tokens (keep in sync) ----
+# ---- Python mirror of laya.rs (keep in sync) ----
 VOWELS, RARE = set("aeiouy"), set("jqxzvk")
+MARGIN = 1         # INSTRUCTION_MARGIN: added once to each instruction head
+OPTION_MARGIN = 2  # OPTION_MARGIN: added to every option
+
+def option_tokens(text, margin=OPTION_MARGIN):
+    """laya_option_tokens: [MASK] + " " + text (capped at 48) + the margin."""
+    return 1 + min(48, text_tokens(" " + text)) + margin
+
+def real_option(text, name):
+    return 1 + min(48, real(" " + text)[name])
 
 def word_tokens(w):
     if any(c.isupper() for c in w[1:]):
@@ -171,9 +184,26 @@ if __name__ == "__main__":
         defaults = ["false: no, the statement does not hold", "true: yes, the statement holds"]
         for name in ("japanese", "json_compact", "ins288", "ins548", "ins808"):
             head = "noul question: " + SAMPLES[name]
-            est = text_tokens(head) + sum(1 + min(48, text_tokens(" " + o)) for o in defaults)
+            est = text_tokens(head) + MARGIN + sum(option_tokens(o) for o in defaults)
             r = {k: v + sum(1 + min(48, real(" " + o)[k]) for o in defaults) for k, v in real(head).items()}
             print(f"{name:13} estimate {est:4}  real english {r['english']:4}  multilingual {r['multilingual']:4}")
+    elif cmd == "stress-options":
+        seed = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+        n = int(sys.argv[3]) if len(sys.argv) > 3 else 100_000
+        margin = int(sys.argv[4]) if len(sys.argv) > 4 else OPTION_MARGIN
+        rng = random.Random(seed)
+        alphabets = {"lower": string.ascii_lowercase, "alnum": string.ascii_letters + string.digits,
+                     "printable": string.printable[:94]}
+        for kind, alphabet in alphabets.items():
+            under = {k: 0 for k in TOKS}; worst = 0
+            for _ in range(n):
+                key = "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 12)))
+                e = option_tokens(key, margin)
+                for name in TOKS:
+                    d = e - real_option(key, name)
+                    under[name] += d < 0; worst = min(worst, d)
+            print(f"seed {seed}, {n} {kind} keys, margin {margin}: under english {under['english']}, "
+                  f"multilingual {under['multilingual']}, worst {worst:+d}")
     elif cmd == "stress":
         stress(int(sys.argv[2]) if len(sys.argv) > 2 else 99)
     elif cmd == "rust":

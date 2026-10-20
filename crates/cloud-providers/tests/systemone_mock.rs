@@ -1361,6 +1361,8 @@ async fn laya_aliases_of_the_served_checkpoint_are_no_re_route() {
         ("typed_decisions", "typed-decisions"),
         ("convaiinnovations/laya-multilingual", "multilingual"),
         ("convaiinnovations/laya", "multilingual"),
+        // The SERVED name is canonicalised too.
+        ("multilingual", "ML"),
     ] {
         let mut body = laya_ok_body();
         body["routing"] = json!({"model": served, "reason": format!("explicit model='{served}'")});
@@ -1531,7 +1533,7 @@ async fn laya_refuses_the_long_instruction_on_multilingual_too() {
     assert_head_refusal(err, "refund", "multilingual", 256);
 }
 
-/// A 288-character instruction (estimate 180; real 109) fits `english` and is sent.
+/// A 288-character instruction (estimate 185; real 109) fits `english` and is sent.
 #[tokio::test]
 async fn laya_sends_a_question_within_the_head_budget() {
     let server = answering_server().await;
