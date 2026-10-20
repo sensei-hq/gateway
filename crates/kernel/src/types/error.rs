@@ -152,12 +152,11 @@ pub enum GatewayError {
         ///
         /// `true` iff at least one candidate failed with a **non-limit fault** — a 5xx,
         /// a network error, or an unclassified fault — which may clear on its own.
-        /// `false` when exhaustion was reached without any such fault: the other route
-        /// here is a terminal limit (401 / credits) that `Stop`ped the walk early and
-        /// left later candidates un-attempted, and no amount of waiting fixes that. An
-        /// attempt that failed with [`GatewayError::InputRejected`] is not such a fault
-        /// either (SP-DEC-3 D5): the same input fails the same way again, so an
-        /// exhaustion made only of input rejections is `false` too.
+        /// `false` when exhaustion was reached without any such fault, by one of two
+        /// routes: a terminal limit (401 / credits) that `Stop`ped the walk early and
+        /// left later candidates un-attempted, or input rejections
+        /// ([`GatewayError::InputRejected`], SP-DEC-3 D5) — the same input fails the
+        /// same way again. No amount of waiting fixes either.
         ///
         /// Exists because the distinction was previously **computed and discarded**.
         /// `exhaustion::contribution_for` already classifies every attempt as

@@ -15,7 +15,11 @@ pub(crate) enum GateContribution {
     /// Attempted, but the candidate cannot serve this request's input
     /// (`GatewayError::InputRejected`, SP-DEC-3 D5). Neither a fault nor a gate:
     /// it does not make exhaustion retryable (the same input fails the same way
-    /// again), and it vetoes `AllGated` (no deadline or human remedy clears it).
+    /// again), and it is NEUTRAL to the all-gated decision, like an over-window
+    /// skip — beside gated candidates the exhaustion is `AllGated` on THEIR gates
+    /// (waiting or a human clears them, and the walk then passes this cheap,
+    /// health-neutral rejection); with no gate at all it is
+    /// `AllAttemptsFailed { retryable: false }`.
     InputRejected,
 }
 
@@ -69,20 +73,20 @@ pub(crate) fn render_skipped(skipped: &[SkippedCandidate]) -> Vec<String> {
 
 /// Build the terminal error at chain exhaustion. `Some(AllGated)` iff every
 /// candidate was gated (health-skip or classified limit) and none hard-failed
-/// or was input-rejected; `None` ⇒ "not all-gated — use the existing terminal
-/// error".
+/// (an input rejection is neutral — it neither vetoes nor counts as a gate);
+/// `None` ⇒ "not all-gated — use the existing terminal error".
 pub(crate) fn all_gated_error(
     skipped: &[SkippedCandidate],
     contributions: &[GateContribution],
 ) -> Option<GatewayError> {
-    // An input rejection vetoes too (SP-DEC-3 D5): `AllGated` tells the caller to
-    // wait or act, and neither changes an input this candidate cannot serve.
-    if contributions.iter().any(|c| {
-        matches!(
-            c,
-            GateContribution::HardFailure | GateContribution::InputRejected
-        )
-    }) {
+    // An input rejection does NOT veto (SP-DEC-3 D5): beside `[laya(rejected),
+    // hosted(breaker-open)]` waiting DOES fix the chain — after `resume_after` the
+    // walk passes laya's rejection and the recovered hosted candidate serves it.
+    // Vetoing would turn that recoverable pause into a permanent `Fail`.
+    if contributions
+        .iter()
+        .any(|c| matches!(c, GateContribution::HardFailure))
+    {
         return None;
     }
     let mut timed: Vec<Instant> = Vec::new();
@@ -113,7 +117,9 @@ pub(crate) fn all_gated_error(
                 any_gate = true;
                 let _ = human.get_or_insert(*h);
             }
-            // Both vetoed above; listed so a new variant must choose here too.
+            // `HardFailure` vetoed above; `InputRejected` is neutral — not a gate,
+            // so it alone never makes `any_gate` true. Listed so a new variant must
+            // choose here too.
             GateContribution::HardFailure | GateContribution::InputRejected => {}
         }
     }

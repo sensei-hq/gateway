@@ -557,6 +557,14 @@ async fn an_input_rejection_does_not_open_the_breaker() {
         first.is_err(),
         "the first call is input-rejected: {first:?}"
     );
+    // Not the breaker alone: NO recorder may hear it. The performance recorder
+    // would otherwise log a failed verdict and drag the endpoint's
+    // `success_rate` — and the default strategy's weighting — down.
+    assert!(
+        gw.performance_stats("rejecting-router:rejecting").is_none(),
+        "an input rejection must record no performance sample: {:?}",
+        gw.performance_stats("rejecting-router:rejecting")
+    );
 
     let second = gw.execute(&req).await;
     assert_eq!(
@@ -627,14 +635,13 @@ async fn an_exhaustion_of_input_rejections_is_not_retryable_and_not_all_gated() 
     }
 }
 
-/// AC8, the `AllGated` veto: beside a GENUINE gate (a breaker-open candidate,
-/// which alone would make the exhaustion a timed `AllGated`), an input
-/// rejection still keeps the result `AllAttemptsFailed { retryable: false }`.
-/// Waiting out the breaker cannot make the rejected candidate serve this input,
-/// so a timed pause would wake into the identical refusal. Without the gate the
-/// veto is unobservable (no gate ⇒ `None` anyway), hence this second chain.
+/// AC8, neutral to all-gated: beside a GENUINE gate (a breaker-open candidate),
+/// an input rejection does not veto `AllGated` — the exhaustion pauses on that
+/// gate. Waiting does fix this chain: after `resume_after` the walk passes the
+/// cheap, health-neutral rejection and the recovered candidate serves the
+/// request. The same neutrality an over-window skip has (`OverContextWindow`).
 #[tokio::test]
-async fn an_input_rejection_beside_a_breaker_open_candidate_is_not_all_gated() {
+async fn an_input_rejection_beside_a_breaker_open_candidate_pauses_on_that_gate() {
     let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
         threshold: 1,
         ..Default::default()
@@ -660,7 +667,82 @@ async fn an_input_rejection_beside_a_breaker_open_candidate_is_not_all_gated() {
 
     assert_eq!((rejecting.calls(), gated.calls()), (1, 0));
     match err {
-        GatewayError::AllAttemptsFailed { retryable, .. } => assert!(!retryable),
-        other => panic!("expected AllAttemptsFailed {{ retryable: false }}, got {other:?}"),
+        GatewayError::AllGated {
+            resume_after: Some(_),
+            ..
+        } => {}
+        other => panic!("expected AllGated {{ resume_after: Some(_) }}, got {other:?}"),
+    }
+}
+
+/// AC8, neutral to all-gated, the HOTL class: beside an auth-locked candidate
+/// the exhaustion is a no-deadline `AllGated` naming the remedy — rotating the
+/// credential fixes the chain, so it must pause for a human, not fail.
+#[tokio::test]
+async fn an_input_rejection_beside_an_auth_locked_candidate_pauses_for_a_human() {
+    use crate::gates::lockout::LockReason;
+    use crate::types::error::HumanAction;
+
+    let gw = gateway_chain(
+        &[
+            ("rejecting", "rejecting-router"),
+            ("locked", "locked-router"),
+        ],
+        vec![],
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+    gw.apply_lockout("locked-router:locked", LockReason::Auth, None);
+    let rejecting = Decider::rejecting_first("rejecting-router", usize::MAX);
+    let locked = Decider::ok("locked-router");
+    gw.adapters.register_decision(rejecting.clone()).await;
+    gw.adapters.register_decision(locked.clone()).await;
+
+    let err = gw
+        .execute(&decision_request(json!("a ticket"), questions()))
+        .await
+        .expect_err("one candidate rejects the input, the other is auth-locked");
+
+    assert_eq!((rejecting.calls(), locked.calls()), (1, 0));
+    match err {
+        GatewayError::AllGated {
+            resume_after: None,
+            human_action: Some(HumanAction::RotateCredential),
+            ..
+        } => {}
+        other => panic!(
+            "expected AllGated {{ resume_after: None, human_action: RotateCredential }}, \
+             got {other:?}"
+        ),
+    }
+}
+
+/// AC8, beside a hard failure: a 500 may clear on its own, so an exhaustion of
+/// `[input rejection, 500]` stays retryable — the rejection must not mask it.
+#[tokio::test]
+async fn an_input_rejection_beside_a_hard_failure_stays_retryable() {
+    let gw = gateway_chain(
+        &[
+            ("rejecting", "rejecting-router"),
+            ("failing", "failing-router"),
+        ],
+        vec![],
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+    let rejecting = Decider::rejecting_first("rejecting-router", usize::MAX);
+    let failing = Decider::failing("failing-router", 500);
+    gw.adapters.register_decision(rejecting.clone()).await;
+    gw.adapters.register_decision(failing.clone()).await;
+
+    let err = gw
+        .execute(&decision_request(json!("a ticket"), questions()))
+        .await
+        .expect_err("one candidate rejects the input, the other 500s");
+
+    assert_eq!((rejecting.calls(), failing.calls()), (1, 1));
+    match err {
+        GatewayError::AllAttemptsFailed { retryable, .. } => {
+            assert!(retryable, "the 500 may clear on its own")
+        }
+        other => panic!("expected AllAttemptsFailed {{ retryable: true }}, got {other:?}"),
     }
 }
