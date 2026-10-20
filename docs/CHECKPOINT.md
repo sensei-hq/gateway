@@ -12,13 +12,14 @@
 
 ## Todo
 
-- [ ] SP-DEC-3: user reviews spec → plan (`docs/superpowers/plans/2026-10-20-sp-dec-3-*.md`) → build
-  red-first (AC1–AC7) → live test vs `laya-coreml-serve` → whole-slice review → docs/site sync.
+- [x] SP-DEC-3 spec approved; plan `docs/superpowers/plans/2026-10-20-sp-dec-3-laya-local-system-one.md` (`055de21`).
+- [ ] SP-DEC-3 build T1–T8 on branch `sp-dec-3-laya`: T1 image guard · T2 truncation · T3 errors ·
+  T4 facade · T5 engine fallback · T6 live · T7 docs · T8 verify/review/land.
 - [ ] torii#45 Phase 2 wave B: #46 config init · #49 budgets from caps · #55 follow-ups; then wave C #47.
 
 ## Next
 
-User review of the SP-DEC-3 spec, then `superpowers:writing-plans`. Live server for AC6:
+User picks execution mode, then `git switch -c sp-dec-3-laya` and plan Task 1. Live server for T6:
 `cd /tmp/laya-bench/scripts && LAYA_HOST=127.0.0.1 LAYA_PORT=8765 LAYA_MODELS=multilingual ../env/.venv/bin/laya-coreml-serve`
 
 ## Open questions
