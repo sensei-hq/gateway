@@ -139,7 +139,7 @@ async fn ollama_posts_the_system_one_body_and_parses_typed_answers() {
 
 /// The truncation check lives in the shared `decide` core, so Ollama gets it too.
 #[tokio::test]
-async fn ollama_also_treats_a_truncated_answer_as_a_provider_error() {
+async fn ollama_also_treats_a_truncated_answer_as_an_input_rejection() {
     let server = MockServer::start().await;
     let mut body = ok_body("nimble:9b");
     body["usage"] = json!({"input_tokens": 512, "output_tokens": 0, "truncated": true});
@@ -158,15 +158,14 @@ async fn ollama_also_treats_a_truncated_answer_as_a_provider_error() {
         .await
         .unwrap_err()
     {
-        GatewayError::ProviderError {
-            status: Some(200),
-            message,
-            ..
-        } => assert!(
-            message.contains("the host truncated the input"),
-            "{message}"
-        ),
-        other => panic!("expected a truncation ProviderError, got {other:?}"),
+        GatewayError::InputRejected { adapter, message } => {
+            assert_eq!(adapter, "ollama");
+            assert!(
+                message.contains("the host truncated the input"),
+                "{message}"
+            )
+        }
+        other => panic!("expected a truncation InputRejected, got {other:?}"),
     }
 }
 
@@ -696,8 +695,8 @@ async fn ollama_keeps_receiving_bare_base64_images() {
 }
 
 /// An image whose bytes are no known format cannot be given a truthful mime
-/// type — fail before any request (a ProviderError, so the chain can fall
-/// back) rather than send a guessed one.
+/// type — fail before any request (an InputRejected, so the chain falls back
+/// whatever its triggers) rather than send a guessed one.
 #[tokio::test]
 async fn an_unrecognisable_image_fails_before_any_request() {
     let server = MockServer::start().await;
@@ -719,17 +718,14 @@ async fn an_unrecognisable_image_fails_before_any_request() {
         .await
         .unwrap_err();
     match err {
-        GatewayError::ProviderError {
-            message,
-            status: None,
-            ..
-        } => {
+        GatewayError::InputRejected { adapter, message } => {
+            assert_eq!(adapter, "llamacpp");
             assert!(
                 message.contains("image 2"),
                 "names the offending image: {message}"
             )
         }
-        other => panic!("expected ProviderError before sending, got {other:?}"),
+        other => panic!("expected InputRejected before sending, got {other:?}"),
     }
 }
 
@@ -872,8 +868,8 @@ async fn live_llama_cpp_answers_and_takes_data_url_images() {
 // ---------------------------------------------------------------------------
 
 /// Laya ignores `images` (verified live: 200, text-only answers), so a `laya`
-/// call with images fails BEFORE sending — a ProviderError the chain falls
-/// back on — the `llamacpp` half of AC2 is pinned by
+/// call with images fails BEFORE sending — an InputRejected the chain falls
+/// back on whatever its triggers — the `llamacpp` half of AC2 is pinned by
 /// `the_generic_adapter_sends_images_as_data_urls_with_the_sniffed_mime` above.
 #[tokio::test]
 async fn laya_refuses_images_before_any_request() {
@@ -892,15 +888,11 @@ async fn laya_refuses_images_before_any_request() {
         .await
         .unwrap_err();
     match err {
-        GatewayError::ProviderError {
-            adapter,
-            message,
-            status: None,
-        } => {
+        GatewayError::InputRejected { adapter, message } => {
             assert_eq!(adapter, "laya");
             assert!(message.contains("does not read images"), "{message}");
         }
-        other => panic!("expected ProviderError before sending, got {other:?}"),
+        other => panic!("expected InputRejected before sending, got {other:?}"),
     }
 }
 
@@ -981,9 +973,10 @@ async fn laya_default_payload_decodes_into_typed_answers() {
 
 /// AC4 (adapter level): Laya answers an over-window state with 200 and
 /// `usage.truncated: true` — answers about a state it never fully read. That is
-/// a failed attempt (ProviderError, so the chain falls back), never a success.
+/// an input rejection (InputRejected, SP-DEC-3 D5: the chain falls back, the
+/// endpoint is healthy), never a success.
 #[tokio::test]
-async fn a_truncated_laya_answer_is_a_provider_error() {
+async fn a_truncated_laya_answer_is_an_input_rejection() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/systemone"))
@@ -999,11 +992,7 @@ async fn a_truncated_laya_answer_is_a_provider_error() {
         .await
         .unwrap_err();
     match err {
-        GatewayError::ProviderError {
-            adapter,
-            message,
-            status: Some(200),
-        } => {
+        GatewayError::InputRejected { adapter, message } => {
             assert_eq!(adapter, "laya");
             assert!(message.contains("truncated"), "{message}");
             assert!(
@@ -1015,7 +1004,7 @@ async fn a_truncated_laya_answer_is_a_provider_error() {
                 "names the cut question: {message}"
             );
         }
-        other => panic!("expected ProviderError, got {other:?}"),
+        other => panic!("expected InputRejected, got {other:?}"),
     }
 }
 
@@ -1065,18 +1054,19 @@ async fn a_truncated_answer_reports_truncation_even_when_answers_are_missing() {
         .await
         .unwrap_err();
     match err {
-        GatewayError::ProviderError { message, .. } => {
+        GatewayError::InputRejected { adapter, message } => {
+            assert_eq!(adapter, "laya");
             assert!(message.contains("truncated"), "{message}");
             assert!(!message.contains("has no answer"), "{message}");
         }
-        other => panic!("expected ProviderError, got {other:?}"),
+        other => panic!("expected InputRejected, got {other:?}"),
     }
 }
 
 /// A host that says `truncated: true` and nothing more is still a failed
 /// attempt; the message admits it has no detail.
 #[tokio::test]
-async fn a_truncated_flag_without_detail_is_still_a_provider_error() {
+async fn a_truncated_flag_without_detail_is_still_an_input_rejection() {
     let server = MockServer::start().await;
     let mut body = ok_body("laya-rl-agent");
     body["usage"] = json!({"input_tokens":512,"output_tokens":0,"truncated":true});
@@ -1094,12 +1084,11 @@ async fn a_truncated_flag_without_detail_is_still_a_provider_error() {
         .await
         .unwrap_err();
     match err {
-        GatewayError::ProviderError {
-            message,
-            status: Some(200),
-            ..
-        } => assert!(message.contains("no detail"), "{message}"),
-        other => panic!("expected ProviderError, got {other:?}"),
+        GatewayError::InputRejected { adapter, message } => {
+            assert_eq!(adapter, "laya");
+            assert!(message.contains("no detail"), "{message}")
+        }
+        other => panic!("expected InputRejected, got {other:?}"),
     }
 }
 
@@ -1222,11 +1211,7 @@ async fn live_laya_answers_every_type_and_reports_truncation() {
     long.state =
         json!(["The customer wrote again about the duplicate invoice charge."; 600].join(" "));
     match adapter.decide(&cfg, &long).await.unwrap_err() {
-        GatewayError::ProviderError {
-            status: Some(200),
-            message,
-            ..
-        } => {
+        GatewayError::InputRejected { message, .. } => {
             assert!(
                 message.contains("the host truncated the input"),
                 "{message}"
@@ -1245,7 +1230,7 @@ async fn live_laya_answers_every_type_and_reports_truncation() {
         .await
         .unwrap_err()
     {
-        GatewayError::ProviderError { message, .. } => {
+        GatewayError::InputRejected { message, .. } => {
             assert!(message.contains("does not read images"), "{message}")
         }
         other => panic!("expected the image refusal, got {other:?}"),

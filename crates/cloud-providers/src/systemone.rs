@@ -256,7 +256,8 @@ struct WireUsage {
     /// Absent on every other host, so it defaults to "not truncated". It is
     /// the authority: `false` with `state_tokens_dropped > 0` is a success. A
     /// `null` or non-bool fails the parse on purpose — we cannot tell the
-    /// answer was not truncated, so it fails closed (ProviderError, fallback).
+    /// answer was not truncated, so it fails closed (ProviderError, fallback);
+    /// `true` is an InputRejected (D5).
     #[serde(default)]
     truncated: bool,
     /// Diagnostics only, shown in the error: a `null` here never vetoes an answer.
@@ -302,11 +303,13 @@ pub(crate) async fn decide(
     req: &DecisionRequest,
 ) -> Result<Result<DecisionResponse, Rejection>, GatewayError> {
     let adapter = host.adapter;
+    // An image this host cannot take (D2) or cannot be labelled (SP-DEC-2) is
+    // the request's fault, not the endpoint's: InputRejected (SP-DEC-3 D5) —
+    // falls back whatever the triggers, not retried, no breaker signal.
     let images =
-        encode_images(&req.images, host.images).map_err(|message| GatewayError::ProviderError {
+        encode_images(&req.images, host.images).map_err(|message| GatewayError::InputRejected {
             adapter: adapter.into(),
             message,
-            status: None,
         })?;
     let base = base_url.trim_end_matches('/');
     let (url, body_model, keep_alive) = match host.dialect {
@@ -382,8 +385,9 @@ pub(crate) async fn decide(
         }
     };
     // SP-DEC-3 D3: a host that truncated the input still answers 200 — about a
-    // state it never fully read. Report a failed attempt so the chain falls
-    // back, as for the missing-answer case below.
+    // state it never fully read. The same input truncates on every retry and
+    // the endpoint is healthy, so it is an InputRejected (D5): the chain falls
+    // back, nothing retries it, and the breaker never counts it.
     if let Some(u) = wire.usage.as_ref().filter(|u| u.truncated) {
         let mut cut = Vec::new();
         let dropped = u.state_tokens_dropped.unwrap_or_default();
@@ -393,7 +397,7 @@ pub(crate) async fn decide(
         if let Some(qs) = u.truncated_questions.as_deref().filter(|q| !q.is_empty()) {
             cut.push(format!("questions cut: {qs:?}"));
         }
-        return Err(GatewayError::ProviderError {
+        return Err(GatewayError::InputRejected {
             adapter: adapter.into(),
             message: format!(
                 "the host truncated the input to fit its window ({}); its answers do not cover \
@@ -405,7 +409,6 @@ pub(crate) async fn decide(
                     cut.join("; ")
                 }
             ),
-            status: Some(status.as_u16()),
         });
     }
 

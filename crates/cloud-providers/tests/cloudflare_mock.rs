@@ -318,7 +318,7 @@ async fn a_path_hostile_model_is_refused_before_any_request() {
 /// The truncation check lives in the shared `decide` core, so Cloudflare gets it
 /// too; `usage` sits inside the Workers AI envelope.
 #[tokio::test]
-async fn cloudflare_also_treats_a_truncated_answer_as_a_provider_error() {
+async fn cloudflare_also_treats_a_truncated_answer_as_an_input_rejection() {
     let server = MockServer::start().await;
     let mut result = clef_result("clef");
     result["usage"] = json!({"input_tokens": 677, "output_tokens": 0, "truncated": true});
@@ -333,14 +333,13 @@ async fn cloudflare_also_treats_a_truncated_answer_as_a_provider_error() {
         .await
         .unwrap_err()
     {
-        GatewayError::ProviderError {
-            status: Some(200),
-            message,
-            ..
-        } => assert!(
-            message.contains("the host truncated the input"),
-            "{message}"
-        ),
-        other => panic!("expected a truncation ProviderError, got {other:?}"),
+        GatewayError::InputRejected { adapter, message } => {
+            assert_eq!(adapter, "cloudflare");
+            assert!(
+                message.contains("the host truncated the input"),
+                "{message}"
+            )
+        }
+        other => panic!("expected a truncation InputRejected, got {other:?}"),
     }
 }
