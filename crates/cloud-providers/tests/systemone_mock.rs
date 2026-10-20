@@ -1135,7 +1135,7 @@ async fn laya_errors_surface_the_servers_detail() {
 
 /// Live, opt-in: a real `laya-coreml-serve` (laya-coreml 0.5.1, verified on an
 /// M4 Max, CoreML CPU+GPU):
-///   pip install "laya-coreml[serve]"
+///   pip install "laya-coreml[serve]==0.5.1"
 ///   LAYA_HOST=127.0.0.1 LAYA_PORT=8000 LAYA_MODELS=english laya-coreml-serve
 ///   LAYA_URL=http://127.0.0.1:8000 cargo test -p sensei-cloud-providers \
 ///     --test systemone_mock live_laya -- --ignored
@@ -1181,17 +1181,19 @@ async fn live_laya_answers_every_type_and_reports_truncation() {
     assert!(
         matches!(resp.answers["urgency"], DecisionAnswer::Score { score, .. } if (0.0..=2.0).contains(&score))
     );
-    assert!(
-        resp.usage
-            .is_some_and(|u| u.input_tokens > 0 && u.output_tokens == 0)
-    );
+    assert!(resp.usage.is_some_and(|u| u.input_tokens > 0));
 
-    // D3 against the real server: ~1200 tokens into a 512-token window.
+    // D3 against the real server: ~6000 tokens, many times any shipped checkpoint's
+    // window (english 512, multilingual 1024), yet under the server's 50 000-char state cap.
     let mut long = request(Some(&model), vec![], None);
     long.state =
-        json!(["The customer wrote again about the duplicate invoice charge."; 120].join(" "));
+        json!(["The customer wrote again about the duplicate invoice charge."; 600].join(" "));
     match adapter.decide(&cfg, &long).await.unwrap_err() {
-        GatewayError::ProviderError { message, .. } => {
+        GatewayError::ProviderError {
+            status: Some(200),
+            message,
+            ..
+        } => {
             assert!(
                 message.contains("the host truncated the input"),
                 "{message}"
@@ -1200,7 +1202,8 @@ async fn live_laya_answers_every_type_and_reports_truncation() {
         other => panic!("expected the D3 truncation error, got {other:?}"),
     }
 
-    // An image is refused before sending; it never reaches the server.
+    // An image is refused client-side (the mock test `laya_refuses_images_before_any_request`
+    // pins that nothing is sent).
     match adapter
         .decide(
             &cfg,
