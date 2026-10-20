@@ -119,6 +119,8 @@ Red-first per task.
 
 ## Not in scope (carry-forwards)
 
+- **Tiny-window decision models can't be benchmarked through the gateway** (user decision 2026-10-20, option 1). The gateway's decision-size estimate puts even the minimal decision at about 182 input tokens, so a 96-token checkpoint such as Laya ANE is refused before sending. The bench reports it as NOT RUN, with that estimate in the reason. Follow-up (gateway): make the decision prompt-overhead estimate model-aware, so small-window decision models are usable.
+
 - Hosted models: config is ready, but they need keys and a spend cap.
 - Routing by benchmark score in the engine.
 - Calibration fitting.
