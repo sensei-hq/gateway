@@ -72,9 +72,11 @@ in-process vs 46.9 ms HTTP (noise); ANE 4.12 ms vs 4.47 ms (+0.35 ms ≈ 8%); ba
     ineligible candidate is a skip, not a provider-fault policy question. `allow_fallback: false` still stops the
     walk after one attempt.
   - **Not retryable:** `is_retryable` is `false`; it contributes a new `GateContribution::InputRejected`, which
-    makes exhaustion `retryable: false` unless another attempt hard-failed, and which is NOT "gated" —
-    `all_gated_error` returns `None` when any attempt was input-rejected (a human cannot fix the input by waiting).
-  - **No health signal:** the engine does not call `record_outcome` for it — the breaker, lockout, cooldown and
+    makes exhaustion `retryable: false` unless another attempt hard-failed, and which is neutral to the
+    all-gated decision, like an over-window skip: if every other candidate was gated, the exhaustion is
+    `AllGated` on those gates (waiting or a human fixes THEM, and the walk then passes the cheap rejection);
+    with no gates it is `AllAttemptsFailed { retryable: false }`.
+  - **No health signal:** the engine's one recorder fan-out (`dispatch_outcome`) drops it — the breaker, lockout, cooldown and
     performance recorders never see it. The `Attempt` is still recorded (`status: Failed`, `error`,
     `fallback_triggered: true`).
   - **Producers:** D2 (image to `laya`), SP-DEC-2's unrecognisable-image refusal, D3 (`usage.truncated`), D6.
@@ -118,7 +120,8 @@ in-process vs 46.9 ms HTTP (noise); ANE 4.12 ms vs 4.47 ms (+0.35 ms ≈ 8%); ba
 
 - **AC8 (D5)** An `InputRejected` attempt falls back even with an empty trigger set, never records a breaker /
   lockout / cooldown / performance outcome (N rejected attempts leave the endpoint `Closed` and dispatchable), and
-  an exhaustion made only of input rejections is `AllAttemptsFailed { retryable: false }`, not `AllGated`.
+  an exhaustion made only of input rejections is `AllAttemptsFailed { retryable: false }`; beside a gated candidate
+  it is `AllGated` on that gate; beside a hard failure it is retryable.
 - **AC9 (D6)** A `laya` question whose estimated head exceeds the checkpoint's budget is refused with
   `InputRejected` before any request (wiremock `expect(0)`); a head under it is sent; other ids are never
   budget-checked. Live: the 808-character instruction on `english` is refused, the 288-character one is answered.
