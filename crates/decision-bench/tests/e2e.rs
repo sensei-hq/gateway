@@ -225,6 +225,7 @@ async fn a_full_run_and_report_over_three_models() {
         roster: cfg.models.iter().map(RosterEntry::from).collect(),
         labels_reviewed: vec![],
         completed: vec![],
+        paths: None,
         rows,
     };
 
@@ -390,6 +391,7 @@ async fn the_report_says_who_won_when_one_model_is_clearly_better() {
         roster: cfg.models.iter().map(RosterEntry::from).collect(),
         labels_reviewed: vec![],
         completed: vec![],
+        paths: None,
         rows,
     };
     let rankings = rank_all(&results.rows, &both, SEED);

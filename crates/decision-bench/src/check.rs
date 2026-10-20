@@ -247,6 +247,7 @@ mod tests {
             roster: vec![(&cfg.models[0]).into()],
             labels_reviewed: vec![],
             completed: vec![],
+            paths: None,
             rows: vec![],
         };
         let md = crate::report::render(&results, 1);
