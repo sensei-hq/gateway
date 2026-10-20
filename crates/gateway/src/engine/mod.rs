@@ -842,10 +842,23 @@ fn build_recorders(
 /// Dispatch an attempt outcome to every recorder. Free fn so the `'static`
 /// stream closure can own a cloned recorder set (where `&self` is unavailable).
 /// Returns the earliest deadline any recorder just wrote (min-fanned), or `None`.
+///
+/// An `InputRejected` outcome reaches NO recorder (SP-DEC-3 D5): the endpoint is
+/// healthy and only this request's input is ineligible, so it must not count toward
+/// the breaker, a lockout, a cooldown or the performance stats — otherwise one
+/// image-bearing request opens the breaker for every valid one behind it. Filtered
+/// here, at the one fan-out every call site (`execute`, stream setup, mid-stream)
+/// goes through, so no path can forget it.
 pub(super) fn dispatch_outcome(
     recorders: &[std::sync::Arc<dyn crate::gates::HealthRecorder>],
     outcome: &crate::gates::AttemptOutcome<'_>,
 ) -> Option<std::time::Instant> {
+    if matches!(
+        outcome.error,
+        Some(kernel::types::error::GatewayError::InputRejected { .. })
+    ) {
+        return None;
+    }
     recorders.iter().filter_map(|r| r.on_outcome(outcome)).min()
 }
 

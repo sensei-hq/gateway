@@ -19,6 +19,9 @@ use std::sync::Mutex;
 struct Decider {
     id: String,
     fail_with_status: Option<u16>,
+    /// The first `reject_first` calls return `GatewayError::InputRejected`
+    /// (SP-DEC-3 D5); later calls behave as `fail_with_status` says.
+    reject_first: usize,
     seen: Mutex<Vec<DecisionRequest>>,
 }
 
@@ -27,6 +30,7 @@ impl Decider {
         Arc::new(Self {
             id: id.into(),
             fail_with_status: None,
+            reject_first: 0,
             seen: Mutex::new(Vec::new()),
         })
     }
@@ -34,6 +38,16 @@ impl Decider {
         Arc::new(Self {
             id: id.into(),
             fail_with_status: Some(status),
+            reject_first: 0,
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+    /// Refuses the input of its first `n` calls (`InputRejected`), then answers.
+    fn rejecting_first(id: &str, n: usize) -> Arc<Self> {
+        Arc::new(Self {
+            id: id.into(),
+            fail_with_status: None,
+            reject_first: n,
             seen: Mutex::new(Vec::new()),
         })
     }
@@ -55,7 +69,17 @@ impl crate::adapters::DecisionModel for Decider {
         _cfg: &RouterConfig,
         req: &DecisionRequest,
     ) -> Result<DecisionResponse, GatewayError> {
-        self.seen.lock().unwrap().push(req.clone());
+        let call = {
+            let mut seen = self.seen.lock().unwrap();
+            seen.push(req.clone());
+            seen.len()
+        };
+        if call <= self.reject_first {
+            return Err(GatewayError::InputRejected {
+                adapter: self.id.clone(),
+                message: "this host ignores images".into(),
+            });
+        }
         if let Some(status) = self.fail_with_status {
             return Err(GatewayError::ProviderError {
                 adapter: self.id.clone(),
@@ -468,5 +492,175 @@ fn the_cost_estimate_covers_what_a_decision_call_bills() {
             est >= billed,
             "N={n}: cost estimate {est} < billed {billed}"
         );
+    }
+}
+
+// ── SP-DEC-3 D5 / AC8: `InputRejected` is a skip, not a fault ──────────────
+
+/// A `Decision` chain over `entries` (`(model, router)`, in priority order),
+/// each model on its own router, with the given triggers and breaker.
+fn gateway_chain(
+    entries: &[(&str, &str)],
+    fallback_triggers: Vec<FallbackTrigger>,
+    breaker: CircuitBreakerManager,
+) -> Gateway {
+    let routers = entries
+        .iter()
+        .map(|(_, r)| (r.to_string(), router()))
+        .collect();
+    let models = entries
+        .iter()
+        .map(|(m, r)| (m.to_string(), model(m, r, &format!("{m}-api"), 65_536)))
+        .collect();
+    let chain = FallbackChainConfig {
+        id: "decide".into(),
+        capability: Capability::Decision,
+        models: entries
+            .iter()
+            .enumerate()
+            .map(|(i, (m, r))| ChainEntry {
+                model: m.to_string(),
+                router: Some(r.to_string()),
+                api_model_id: None,
+                priority: i as u8 + 1,
+            })
+            .collect(),
+        fallback_triggers,
+    };
+    let config = GatewayConfig {
+        routers,
+        models,
+        chains: HashMap::from([("decide".to_string(), chain)]),
+        constraints: Default::default(),
+        panels: Default::default(),
+        consensus: Default::default(),
+    };
+    Gateway::new(config, AdapterRegistry::new(), breaker)
+}
+
+/// AC8 breaker neutrality: with a breaker that opens on ONE failure, an input
+/// rejection must not count as that failure — the next request to the same
+/// single-candidate chain is still dispatched, and served.
+#[tokio::test]
+async fn an_input_rejection_does_not_open_the_breaker() {
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+        threshold: 1,
+        ..Default::default()
+    });
+    let gw = gateway_chain(&[("rejecting", "rejecting-router")], vec![], cb.clone());
+    let rejecting = Decider::rejecting_first("rejecting-router", 1);
+    gw.adapters.register_decision(rejecting.clone()).await;
+    let req = decision_request(json!("a ticket"), questions());
+
+    let first = gw.execute(&req).await;
+    assert!(
+        first.is_err(),
+        "the first call is input-rejected: {first:?}"
+    );
+
+    let second = gw.execute(&req).await;
+    assert_eq!(
+        rejecting.calls(),
+        2,
+        "the second call must be DISPATCHED, not skipped as breaker-open \
+         (breaker state: {}, second: {second:?})",
+        cb.get_state("rejecting-router:rejecting").name()
+    );
+    let resp = second.expect("the second call is served");
+    assert!(resp.decisions.is_some());
+}
+
+/// AC8 fallback: an input rejection falls back even when the chain names no
+/// fallback trigger at all — an ineligible candidate is a skip.
+#[tokio::test]
+async fn an_input_rejection_falls_back_with_an_empty_trigger_set() {
+    let gw = gateway_chain(
+        &[("rejecting", "rejecting-router"), ("ok", "ok-router")],
+        vec![],
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+    let rejecting = Decider::rejecting_first("rejecting-router", usize::MAX);
+    let ok = Decider::ok("ok-router");
+    gw.adapters.register_decision(rejecting.clone()).await;
+    gw.adapters.register_decision(ok.clone()).await;
+
+    let resp = gw
+        .execute(&decision_request(json!("a ticket"), questions()))
+        .await
+        .expect("served by ok-router");
+
+    assert_eq!((rejecting.calls(), ok.calls()), (1, 1));
+    let adapters: Vec<&str> = resp.attempts.iter().map(|a| a.adapter.as_str()).collect();
+    assert_eq!(adapters, ["rejecting-router", "ok-router"]);
+    assert!(resp.attempts[0].fallback_triggered);
+}
+
+/// AC8 exhaustion: a chain exhausted only by input rejections is a terminal,
+/// NON-retryable `AllAttemptsFailed` — waiting will not change the input, so it
+/// is neither retryable nor `AllGated`.
+#[tokio::test]
+async fn an_exhaustion_of_input_rejections_is_not_retryable_and_not_all_gated() {
+    let gw = gateway_chain(
+        &[("rejecting", "rejecting-router")],
+        vec![FallbackTrigger::ProviderError],
+        CircuitBreakerManager::new(CircuitBreakerConfig::default()),
+    );
+    gw.adapters
+        .register_decision(Decider::rejecting_first("rejecting-router", usize::MAX))
+        .await;
+
+    let err = gw
+        .execute(&decision_request(json!("a ticket"), questions()))
+        .await
+        .expect_err("the only candidate rejects the input");
+
+    match err {
+        GatewayError::AllAttemptsFailed {
+            retryable,
+            attempts,
+            ..
+        } => {
+            assert_eq!(attempts, 1);
+            assert!(!retryable, "an input rejection must not be retryable");
+        }
+        other => panic!("expected AllAttemptsFailed {{ retryable: false }}, got {other:?}"),
+    }
+}
+
+/// AC8, the `AllGated` veto: beside a GENUINE gate (a breaker-open candidate,
+/// which alone would make the exhaustion a timed `AllGated`), an input
+/// rejection still keeps the result `AllAttemptsFailed { retryable: false }`.
+/// Waiting out the breaker cannot make the rejected candidate serve this input,
+/// so a timed pause would wake into the identical refusal. Without the gate the
+/// veto is unobservable (no gate ⇒ `None` anyway), hence this second chain.
+#[tokio::test]
+async fn an_input_rejection_beside_a_breaker_open_candidate_is_not_all_gated() {
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+        threshold: 1,
+        ..Default::default()
+    });
+    // Open `gated-router:gated` before the request: selection skips it as
+    // breaker-open — a timed gate in `skipped`.
+    assert!(cb.can_execute("gated-router:gated"));
+    cb.record_failure("gated-router:gated");
+    let gw = gateway_chain(
+        &[("rejecting", "rejecting-router"), ("gated", "gated-router")],
+        vec![],
+        cb,
+    );
+    let rejecting = Decider::rejecting_first("rejecting-router", usize::MAX);
+    let gated = Decider::ok("gated-router");
+    gw.adapters.register_decision(rejecting.clone()).await;
+    gw.adapters.register_decision(gated.clone()).await;
+
+    let err = gw
+        .execute(&decision_request(json!("a ticket"), questions()))
+        .await
+        .expect_err("one candidate rejects the input, the other is breaker-open");
+
+    assert_eq!((rejecting.calls(), gated.calls()), (1, 0));
+    match err {
+        GatewayError::AllAttemptsFailed { retryable, .. } => assert!(!retryable),
+        other => panic!("expected AllAttemptsFailed {{ retryable: false }}, got {other:?}"),
     }
 }
