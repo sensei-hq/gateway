@@ -163,12 +163,15 @@ pub fn compute(rows: &[&ResultRow], seed: u64) -> Metrics {
 }
 
 /// [`compute`] over owned rows, optionally restricted to `case_ids` (the
-/// head-to-head's shared subset). `None` keeps every row.
+/// head-to-head's shared subset). `None` keeps every row. The kept rows are
+/// sorted by `case_id` first, so the bootstrap CI does not depend on the order
+/// the rows arrived in.
 pub fn compute_on(rows: &[ResultRow], case_ids: Option<&HashSet<String>>, seed: u64) -> Metrics {
-    let kept: Vec<&ResultRow> = rows
+    let mut kept: Vec<&ResultRow> = rows
         .iter()
         .filter(|r| case_ids.is_none_or(|ids| ids.contains(&r.case_id)))
         .collect();
+    kept.sort_by(|a, b| a.case_id.cmp(&b.case_id));
     compute(&kept, seed)
 }
 
