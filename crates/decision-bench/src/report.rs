@@ -207,7 +207,8 @@ fn not_run(md: &mut String, results: &Results) {
     let _ = writeln!(md, "## NOT RUN\n");
     let _ = writeln!(
         md,
-        "`check` could not reach these models, so they have no results below:\n"
+        "`check` could not run these models (unreachable, or no input fits their context \
+         window), so they have no results below:\n"
     );
     for n in &results.not_run {
         let _ = writeln!(md, "- **{}**: {}", n.model, n.reason.replace('\n', " "));
@@ -946,6 +947,26 @@ mod tests {
         assert!(md.contains("[0.855, 0.940]"), "{md}");
         assert!(md.contains("| 0.968 |"), "accuracy at 3 dp: {md}");
         assert!(md.contains("| 0.968 (cov 100%) |"), "summary at 3 dp: {md}");
+    }
+
+    /// SP-DEC-4 review A4: `check` also marks a reachable server NOT RUN
+    /// when no input fits its window, so the preamble must not say every
+    /// NOT RUN model was unreachable.
+    #[test]
+    fn the_not_run_preamble_covers_a_model_no_input_fits() {
+        let mut f = fixture();
+        f.not_run = vec![NotRun {
+            model: "laya-ane".into(),
+            reason: "no input fits: the minimal decision needs ≈182 tokens, window 96".into(),
+        }];
+        let md = render(&f, 7);
+        let not_run = section(&md, "## NOT RUN");
+        assert!(!not_run.contains("could not reach"), "{not_run}");
+        assert!(
+            not_run.contains("no input fits their context window"),
+            "{not_run}"
+        );
+        assert!(not_run.contains("**laya-ane**: no input fits"), "{not_run}");
     }
 
     /// The `i`th cell (0 = model) of a table line.

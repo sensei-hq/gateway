@@ -24,7 +24,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Probe every selected model with one tiny decision. A model that does
-    /// not answer is NOT RUN; this still exits 0.
+    /// not answer, or that no input fits its context window, is NOT RUN;
+    /// this still exits 0.
     #[command(after_long_help = RESOLVE_NOTE)]
     Check {
         #[command(flatten)]
@@ -817,6 +818,18 @@ mod tests {
             assert!(help.contains(CRATE), "{sub}: {help}");
             assert!(!help.contains("default --out is"), "{sub}: {help}");
         }
+    }
+
+    /// SP-DEC-4 review A4: NOT RUN is also a reachable model no input fits.
+    #[test]
+    fn check_help_says_a_model_no_input_fits_is_not_run_too() {
+        let mut cmd = Cli::command();
+        let help = cmd
+            .find_subcommand_mut("check")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("no input fits its context window"), "{help}");
     }
 
     #[test]
