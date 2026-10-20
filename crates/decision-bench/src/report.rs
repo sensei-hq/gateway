@@ -475,6 +475,20 @@ fn never_reached(md: &mut String, results: &Results, models: &[String]) {
     md.push('\n');
 }
 
+/// `arg` as one shell word: unchanged when it is plain, else single-quoted with
+/// any embedded `'` written as `'\''`.
+fn sh_quote(arg: &str) -> String {
+    let plain = !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-./,:=@%+".contains(c));
+    if plain {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
+    }
+}
+
 fn reproduce(md: &mut String, results: &Results, rankings: &[ScenarioRanking], seed: u64) {
     let bin = "cargo run --release -p decision-bench --";
     let paths = results.paths.as_ref();
@@ -486,25 +500,25 @@ fn reproduce(md: &mut String, results: &Results, rankings: &[ScenarioRanking], s
     };
     let config = paths
         .and_then(|p| p.config.as_deref())
-        .map(|c| format!(" --config {c}"))
+        .map(|c| format!(" --config {}", sh_quote(c)))
         .unwrap_or_default();
     let scenarios: Vec<&str> = rankings.iter().map(|r| cli_name(r.scenario)).collect();
     let mut run = format!("{bin} run{config}");
     if let Some(p) = paths {
-        let _ = write!(run, " --cases {}", p.cases);
+        let _ = write!(run, " --cases {}", sh_quote(&p.cases));
     }
     if !scenarios.is_empty() {
         let _ = write!(run, " --scenarios {}", scenarios.join(","));
     }
     run += &models;
     if let Some(p) = paths {
-        let _ = write!(run, " --out {}", p.results);
+        let _ = write!(run, " --out {}", sh_quote(&p.results));
     }
     let report = match paths {
         Some(p) => format!(
             "{bin} report --results {} --out {} --seed {seed}",
-            p.results,
-            p.report.as_deref().unwrap_or("report.md")
+            sh_quote(&p.results),
+            sh_quote(p.report.as_deref().unwrap_or("report.md"))
         ),
         None => format!("{bin} report --seed {seed}"),
     };
@@ -517,7 +531,7 @@ fn reproduce(md: &mut String, results: &Results, rankings: &[ScenarioRanking], s
     let _ = writeln!(md, "{bin} check{config}{models}");
     if let Some(m) = &results.manifest {
         let out = paths
-            .map(|p| format!(" --out {}", p.cases))
+            .map(|p| format!(" --out {}", sh_quote(&p.cases)))
             .unwrap_or_default();
         let _ = writeln!(
             md,
