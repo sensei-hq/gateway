@@ -3,10 +3,10 @@
 
 use std::collections::HashMap;
 
-use gateway::Capability;
 use gateway::types::config::{
     ChainEntry, FallbackChainConfig, GatewayConfig, ModelConfig, RouterConfig,
 };
+use gateway::{Capability, GatewayBuilder};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -36,8 +36,10 @@ impl BenchConfig {
     }
 
     /// A gateway config holding only `m`: its router, the model, and a chain of
-    /// that one model with no fallback triggers.
-    pub fn gateway_config_for(&self, m: &ModelSpec) -> GatewayConfig {
+    /// that one model with no fallback triggers. Built through
+    /// [`GatewayBuilder`], so the gateway's own validation rules apply; a failure
+    /// names the model.
+    pub fn gateway_config_for(&self, m: &ModelSpec) -> anyhow::Result<GatewayConfig> {
         let router = RouterConfig {
             url: m.url.clone(),
             api_key_env: m.api_key_env.clone(),
@@ -68,38 +70,63 @@ impl BenchConfig {
             }],
             fallback_triggers: vec![],
         };
-        GatewayConfig {
-            routers: HashMap::from([(m.router.clone(), router)]),
-            models: HashMap::from([(m.id.clone(), model)]),
-            chains: HashMap::from([(chain_id(m), chain)]),
-            ..Default::default()
-        }
+        GatewayBuilder::new()
+            .add_router(&m.router, router)
+            .add_model(model)
+            .add_chain(chain)
+            .build()
+            .map_err(|errors| {
+                anyhow::anyhow!(
+                    "model '{}': invalid gateway config: {}",
+                    m.id,
+                    errors.join("; ")
+                )
+            })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gateway::FacadeBuilder;
+
+    fn example() -> BenchConfig {
+        BenchConfig::from_toml(include_str!("../bench.example.toml")).unwrap()
+    }
 
     #[test]
     fn the_example_config_parses_into_six_models_with_single_entry_chains() {
-        let cfg = BenchConfig::from_toml(include_str!("../bench.example.toml")).unwrap();
+        let cfg = example();
         assert_eq!(cfg.models.len(), 6);
         let m = &cfg.models[0];
-        let g = cfg.gateway_config_for(m);
+        let g = cfg.gateway_config_for(m).unwrap();
         let chain = &g.chains[&chain_id(m)];
         assert_eq!(chain.models.len(), 1, "no fallback: one model per chain");
         assert!(chain.fallback_triggers.is_empty());
         assert_eq!(g.routers.len(), 1, "only this model's router");
     }
 
-    #[tokio::test]
-    async fn every_example_model_yields_a_config_the_facade_builds() {
-        let cfg = BenchConfig::from_toml(include_str!("../bench.example.toml")).unwrap();
+    #[test]
+    fn every_example_model_passes_gateway_validation() {
+        let cfg = example();
         for m in &cfg.models {
-            let g = cfg.gateway_config_for(m);
-            let _facade = FacadeBuilder::new(g).build().await;
+            cfg.gateway_config_for(m)
+                .unwrap_or_else(|e| panic!("{}: {e:#}", m.id));
         }
+    }
+
+    #[test]
+    fn an_invalid_model_is_an_error_naming_the_model() {
+        let cfg = example();
+        let mut m = cfg.models[0].clone();
+        m.url = String::new();
+        let err = cfg.gateway_config_for(&m).unwrap_err().to_string();
+        assert!(
+            err.contains("laya-english"),
+            "error must name the model: {err}"
+        );
+        assert!(
+            err.contains("empty URL"),
+            "error must carry the reason: {err}"
+        );
     }
 }
