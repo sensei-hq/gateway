@@ -1070,9 +1070,10 @@ async fn a_truncated_flag_without_detail_is_still_a_provider_error() {
     }
 }
 
-/// AC5: Laya's FastAPI errors, verbatim from the live server — 401 is an
+/// AC5: Laya's FastAPI `{"detail": "<string>"}` errors — 401 is an
 /// Authentication error; every other status is a ProviderError carrying the
-/// server's `detail` string and the status.
+/// server's `detail` string and the status. Which bodies were captured live
+/// and which are representative is noted inline.
 #[tokio::test]
 async fn laya_errors_surface_the_servers_detail() {
     let server = MockServer::start().await;
@@ -1086,12 +1087,17 @@ async fn laya_errors_surface_the_servers_detail() {
         .await;
     let adapter = SystemOneAdapter::with_id("laya").unwrap();
     let req = request(Some("english"), vec![], None);
-    assert_authentication_error(
-        &adapter
-            .decide(&keyless(&server.uri()), &req)
-            .await
-            .unwrap_err(),
-    );
+    match adapter
+        .decide(&keyless(&server.uri()), &req)
+        .await
+        .unwrap_err()
+    {
+        GatewayError::Authentication { adapter, message } => assert_eq!(
+            (adapter.as_str(), message.as_str()),
+            ("laya", "invalid or missing bearer token")
+        ),
+        other => panic!("401: expected Authentication, got {other:?}"),
+    }
 
     // The 401, 400 and 413 bodies were captured live from laya-coreml-serve
     // 0.5.1; the 422, 500 and 503 `detail` strings are representative of its
