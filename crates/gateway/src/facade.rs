@@ -657,12 +657,15 @@ mod cloud_tests {
             .decide(&laya, &req(vec![]))
             .await
             .expect("laya speaks plain /v1/systemone");
-        assert!(matches!(
-            adapter
-                .decide(&laya, &req(vec!["iVBORw0KGgo=".into()]))
-                .await,
-            Err(GatewayError::ProviderError { status: None, .. })
-        ));
+        let err = adapter
+            .decide(&laya, &req(vec!["iVBORw0KGgo=".into()]))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, GatewayError::ProviderError { status: None, message, .. }
+                if message.contains("does not read images")),
+            "{err:?}"
+        );
         assert!(registry.chat("laya").await.is_none(), "decision-only");
     }
 
