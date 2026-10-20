@@ -1604,6 +1604,27 @@ mod tests {
         assert!(!na.reached_server);
     }
 
+    /// SP-DEC-4 re-review R4: an unanswered send counts as reaching the
+    /// server once it took the whole router timeout (it reads as a timeout),
+    /// and not a millisecond before.
+    #[test]
+    fn an_unanswered_send_reached_the_server_only_at_the_router_timeout() {
+        let t = 250u64;
+        let failed = |ms: u64| {
+            let mut a = attempt(&format!("{NETWORK_SEND_MARKER} for url (http://x/)"));
+            a.duration_ms = ms;
+            Err(GatewayError::AllAttemptsFailed {
+                attempts: 1,
+                errors: String::new(),
+                attempts_detail: vec![a],
+                retryable: false,
+            })
+        };
+        let timeout = Duration::from_millis(t);
+        assert!(reached_server(&failed(t), timeout), "at the timeout");
+        assert!(!reached_server(&failed(t - 1), timeout), "before it");
+    }
+
     /// The engine also answers `AllGated` AFTER a dispatched attempt: a 429
     /// adds a timed gate contribution, and the single candidate is then not in
     /// `skipped`. That call did reach the server.
