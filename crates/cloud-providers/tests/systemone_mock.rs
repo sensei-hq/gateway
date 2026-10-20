@@ -1155,6 +1155,178 @@ async fn laya_errors_surface_the_servers_detail() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SP-DEC-3 D6 — Laya's per-question head budget, checked before sending
+// ---------------------------------------------------------------------------
+
+/// The instruction that, live on `english`, lost its question to Laya's silent
+/// head cut (noul 0.90 → 0.15 with `truncated: false`): 808 characters.
+fn long_instruction() -> String {
+    format!("{}Does the user want a refund?", "Ignore this. ".repeat(60))
+}
+
+/// One noul question `refund` with `instructions`.
+fn noul_request(model: &str, instructions: String) -> DecisionRequest {
+    DecisionRequest {
+        model: Some(model.into()),
+        state: json!("I was charged twice for my last invoice."),
+        questions: DecisionQuestions::from([(
+            "refund".to_string(),
+            DecisionQuestion::Noul {
+                instructions: json!(instructions),
+                criteria: None,
+            },
+        )]),
+        images: vec![],
+        keep_alive: None,
+    }
+}
+
+fn noul_ok_body() -> serde_json::Value {
+    json!({"model":"laya-rl-agent","answers":{"refund":{"type":"noul","noul":0.9}},"usage":{"input_tokens":120,"output_tokens":0,"truncated":false}})
+}
+
+/// A server that must never be called.
+async fn unreachable_server() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(noul_ok_body()))
+        .expect(0)
+        .mount(&server)
+        .await;
+    server
+}
+
+/// A server that answers the `refund` question exactly once.
+async fn answering_server() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(noul_ok_body()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    server
+}
+
+#[track_caller]
+fn assert_head_refusal(
+    err: GatewayError,
+    question: &str,
+    checkpoint: &str,
+    budget: usize,
+) -> String {
+    match err {
+        GatewayError::InputRejected { adapter, message } => {
+            assert_eq!(adapter, "laya");
+            assert!(
+                message.contains(&format!("question '{question}'")),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("checkpoint '{checkpoint}' allows {budget}")),
+                "{message}"
+            );
+            assert!(message.contains("Laya would silently cut it"), "{message}");
+            message
+        }
+        other => panic!("expected the D6 InputRejected before sending, got {other:?}"),
+    }
+}
+
+/// AC9: the 808-character instruction (estimate 300 tokens with its two
+/// options) is over `english`'s 192 — refused, nothing sent.
+#[tokio::test]
+async fn laya_refuses_a_question_over_the_checkpoints_head_budget_before_sending() {
+    let server = unreachable_server().await;
+    let err = SystemOneAdapter::with_id("laya")
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &noul_request("english", long_instruction()),
+        )
+        .await
+        .unwrap_err();
+    let message = assert_head_refusal(err, "refund", "english", 192);
+    // ceil(823 / 3) = 275 for "noul question: <808 chars>", plus Laya's two
+    // default noul options at 14 and 11.
+    assert!(message.contains("needs ≈300 tokens"), "{message}");
+}
+
+/// `multilingual`'s budget is 256 — still under the 808-character estimate.
+#[tokio::test]
+async fn laya_refuses_the_long_instruction_on_multilingual_too() {
+    let server = unreachable_server().await;
+    let err = SystemOneAdapter::with_id("laya")
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &noul_request("multilingual", long_instruction()),
+        )
+        .await
+        .unwrap_err();
+    assert_head_refusal(err, "refund", "multilingual", 256);
+}
+
+/// A 288-character instruction (estimate 126) fits `english` and is sent.
+#[tokio::test]
+async fn laya_sends_a_question_within_the_head_budget() {
+    let server = answering_server().await;
+    let instructions = format!("{}Does the user want a refund?", "Ignore this. ".repeat(20));
+    assert_eq!(instructions.chars().count(), 288);
+    SystemOneAdapter::with_id("laya")
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &noul_request("english", instructions),
+        )
+        .await
+        .expect("a head within budget is sent");
+}
+
+/// The budget is the whole head: a short instruction with many long options
+/// (each capped at 48 tokens + its [MASK]) is over it too. Only the second
+/// question is over, so the refusal names it.
+#[tokio::test]
+async fn laya_counts_a_choices_options_against_the_head_budget() {
+    let server = unreachable_server().await;
+    let mut req = noul_request("english", "Refund?".into());
+    req.questions.insert(
+        "team".into(),
+        DecisionQuestion::Choice {
+            instructions: json!("Which team?"),
+            criteria: (0..6)
+                .map(|i| {
+                    (
+                        format!("team{i}"),
+                        Some("handles this kind of ticket ".repeat(10)),
+                    )
+                })
+                .collect(),
+        },
+    );
+    let err = SystemOneAdapter::with_id("laya")
+        .unwrap()
+        .decide(&keyless(&server.uri()), &req)
+        .await
+        .unwrap_err();
+    assert_head_refusal(err, "team", "english", 192);
+}
+
+/// The budget is Laya's: any other id sends the same long instruction.
+#[tokio::test]
+async fn other_ids_are_never_head_budget_checked() {
+    let server = answering_server().await;
+    SystemOneAdapter::with_id("llamacpp")
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &noul_request("english", long_instruction()),
+        )
+        .await
+        .expect("no head budget outside laya");
+}
+
 /// Live, opt-in: a real `laya-coreml-serve` (laya-coreml 0.5.1, verified on an
 /// M4 Max, CoreML CPU+GPU):
 ///   pip install "laya-coreml[serve]==0.5.1"
@@ -1235,4 +1407,28 @@ async fn live_laya_answers_every_type_and_reports_truncation() {
         }
         other => panic!("expected the image refusal, got {other:?}"),
     }
+
+    // D6 / AC9: the 808-character instruction is refused client-side (the mock
+    // tests pin that nothing is sent); the 288-character one is answered.
+    match adapter
+        .decide(&cfg, &noul_request(&model, long_instruction()))
+        .await
+        .unwrap_err()
+    {
+        GatewayError::InputRejected { message, .. } => {
+            eprintln!("LIVE D6 refusal: {message}");
+            assert!(message.contains("Laya would silently cut it"), "{message}")
+        }
+        other => panic!("expected the D6 head-budget refusal, got {other:?}"),
+    }
+    let fits = format!("{}Does the user want a refund?", "Ignore this. ".repeat(20));
+    let resp = adapter
+        .decide(&cfg, &noul_request(&model, fits))
+        .await
+        .expect("a 288-character instruction is within every checkpoint's budget");
+    eprintln!("LIVE 288-char answer: {:?}", resp.answers["refund"]);
+    assert!(matches!(
+        resp.answers["refund"],
+        DecisionAnswer::Noul { noul } if (0.0..=1.0).contains(&noul)
+    ));
 }

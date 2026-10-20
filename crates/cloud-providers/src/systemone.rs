@@ -16,7 +16,9 @@ use crate::base::{
 };
 use kernel::types::config::RouterConfig;
 use kernel::types::cost::TokenUsage;
-use kernel::types::decision::{DecisionAnswers, DecisionContent, DecisionQuestions};
+use kernel::types::decision::{
+    DecisionAnswers, DecisionContent, DecisionQuestion, DecisionQuestions,
+};
 use kernel::types::error::GatewayError;
 use kernel::types::io::{DecisionRequest, DecisionResponse};
 
@@ -140,6 +142,150 @@ fn image_encoding(id: &str) -> ImageEncoding {
         "laya" => ImageEncoding::Unsupported,
         _ => ImageEncoding::DataUrl,
     }
+}
+
+/// Laya's per-question head budget for a checkpoint (SP-DEC-3 D6): its
+/// `head_max_len` from `rl_agent_config.json` — `english` 192, `multilingual` /
+/// `typed-decisions` 256. Any other name (an operator-registered checkpoint, a
+/// typo) gets the smallest, never room it may not have.
+fn laya_head_budget(model: &str) -> usize {
+    match model {
+        "multilingual" | "typed-decisions" => 256,
+        _ => 192,
+    }
+}
+
+/// A conservative estimate of the tokens Laya's `build_head` spends on one
+/// question (SP-DEC-3 D6). Laya renders `"<type> question: <instructions>"` and
+/// one `[MASK]`-prefixed span per option (capped at 48 tokens each), then cuts
+/// the instruction SILENTLY so the whole head fits `head_max_len` — `truncated`
+/// never reports it.
+///
+/// Every rendered character is counted at `ceil(chars / 3)`, the same text
+/// Laya renders (`render_options` in `laya_coreml/common.py`): a choice option
+/// is `"key: description"` or the bare key; a score level is
+/// `"level i: description"`; a noul side is `"false: …"` / `"true: …"` with
+/// Laya's default text when undescribed. Non-string instructions are Laya's
+/// `json.dumps` text, separators included. Both shipped tokenizers run ≈ 3.2
+/// (english) and ≈ 4.2 (multilingual) chars per token on English text, so the
+/// estimate over-counts it — measured: the 548-char instruction that really
+/// takes 189 of `english`'s 192 is estimated 213 and refused. Refusing a head
+/// that would fit costs a fallback; sending one that does not returns a
+/// confident answer to a question the model never read. Scripts denser than
+/// 3 chars per token (CJK, heavily punctuated JSON) are under-counted.
+fn estimated_head_tokens(q: &DecisionQuestion) -> usize {
+    fn tokens(text: &str) -> usize {
+        text.chars().count().div_ceil(3)
+    }
+    fn option(text: &str) -> usize {
+        1 + tokens(text).min(48)
+    }
+    let (kind, instructions) = match q {
+        DecisionQuestion::Choice { instructions, .. } => ("choice", instructions),
+        DecisionQuestion::Noul { instructions, .. } => ("noul", instructions),
+        DecisionQuestion::Score { instructions, .. } => ("score", instructions),
+    };
+    let head = tokens(&format!(
+        "{kind} question: {}",
+        laya_instruction_text(instructions)
+    ));
+    let options: usize = match q {
+        DecisionQuestion::Choice { criteria, .. } => criteria
+            .iter()
+            .map(|(key, desc)| match desc.as_deref() {
+                None | Some("") => option(key),
+                Some(desc) => option(&format!("{key}: {desc}")),
+            })
+            .sum(),
+        DecisionQuestion::Score { criteria, .. } => criteria
+            .iter()
+            .enumerate()
+            .map(|(i, desc)| option(&format!("level {i}: {desc}")))
+            .sum(),
+        DecisionQuestion::Noul { criteria, .. } => {
+            let side = |label: &str, desc: Option<&str>, default: &str| {
+                option(&format!(
+                    "{label}: {}",
+                    desc.filter(|d| !d.is_empty()).unwrap_or(default)
+                ))
+            };
+            let c = criteria.as_ref();
+            side(
+                "false",
+                c.and_then(|c| c.r#false.as_deref()),
+                "no, the statement does not hold",
+            ) + side(
+                "true",
+                c.and_then(|c| c.r#true.as_deref()),
+                "yes, the statement holds",
+            )
+        }
+    };
+    head + options
+}
+
+/// Instructions as Laya reads them: a string as-is, anything else as Python's
+/// `json.dumps(…, ensure_ascii=False)` — whose `", "` / `": "` separators are
+/// longer than serde_json's compact form, so they are reproduced here.
+fn laya_instruction_text(instructions: &DecisionContent) -> String {
+    struct PythonJson;
+    impl serde_json::ser::Formatter for PythonJson {
+        fn begin_array_value<W: ?Sized + std::io::Write>(
+            &mut self,
+            w: &mut W,
+            first: bool,
+        ) -> std::io::Result<()> {
+            if first { Ok(()) } else { w.write_all(b", ") }
+        }
+        fn begin_object_key<W: ?Sized + std::io::Write>(
+            &mut self,
+            w: &mut W,
+            first: bool,
+        ) -> std::io::Result<()> {
+            if first { Ok(()) } else { w.write_all(b", ") }
+        }
+        fn begin_object_value<W: ?Sized + std::io::Write>(
+            &mut self,
+            w: &mut W,
+        ) -> std::io::Result<()> {
+            w.write_all(b": ")
+        }
+    }
+    match instructions {
+        serde_json::Value::String(s) => s.clone(),
+        other => {
+            let mut out = Vec::new();
+            let mut ser = serde_json::Serializer::with_formatter(&mut out, PythonJson);
+            match serde::Serialize::serialize(other, &mut ser) {
+                Ok(()) => String::from_utf8(out).unwrap_or_else(|_| other.to_string()),
+                Err(_) => other.to_string(),
+            }
+        }
+    }
+}
+
+/// The first question whose estimated head exceeds Laya's budget for
+/// `model`, refused before anything is sent (SP-DEC-3 D6).
+fn check_laya_head_budget(
+    adapter: &str,
+    model: &str,
+    questions: &DecisionQuestions,
+) -> Result<(), GatewayError> {
+    let budget = laya_head_budget(model);
+    for (name, q) in questions {
+        let estimate = estimated_head_tokens(q);
+        if estimate > budget {
+            return Err(GatewayError::InputRejected {
+                adapter: adapter.into(),
+                message: format!(
+                    "question '{name}' needs ≈{estimate} tokens of head but checkpoint \
+                     '{model}' allows {budget} — Laya would silently cut it; shorten the \
+                     instructions/options"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The image type from the first decoded bytes of a base64 string.
@@ -509,6 +655,9 @@ impl kernel::adapters::capability::DecisionModel for SystemOneAdapter {
             });
         };
         let base_url = self.base_url(config)?;
+        if self.id == "laya" {
+            check_laya_head_budget(&self.id, model, &req.questions)?;
+        }
         let host = Host {
             adapter: &self.id,
             dialect: Dialect::SystemOne,
@@ -566,6 +715,72 @@ mod tests {
         for id in ["openrouter", "typesafe", "llamacpp", "sglang", "custom"] {
             assert_eq!(image_encoding(id), ImageEncoding::DataUrl, "{id}");
         }
+    }
+
+    /// SP-DEC-3 D6: each checkpoint's `head_max_len` (its `rl_agent_config.json`);
+    /// an unknown name gets the smallest, so a misspelled or operator-registered
+    /// checkpoint is never assumed to have room it may not have.
+    #[test]
+    fn laya_head_budget_is_the_checkpoints_head_max_len() {
+        assert_eq!(laya_head_budget("english"), 192);
+        assert_eq!(laya_head_budget("multilingual"), 256);
+        assert_eq!(laya_head_budget("typed-decisions"), 256);
+        for unknown in ["ane", "englsh", "", "MULTILINGUAL"] {
+            assert_eq!(laya_head_budget(unknown), 192, "{unknown:?}");
+        }
+    }
+
+    /// The estimate counts the text Laya renders (`build_head` / `render_options`
+    /// in laya_coreml/common.py), `ceil(chars / 3)` each, plus one `[MASK]` per
+    /// option and Laya's 48-token option cap. Expected values are worked by hand.
+    #[test]
+    fn estimated_head_tokens_counts_what_laya_renders() {
+        use kernel::types::decision::{DecisionQuestion, NoulCriteria};
+        // "noul question: abcdef" = 21 chars → 7; Laya's default noul options
+        // "false: no, the statement does not hold" (38 → 13) and
+        // "true: yes, the statement holds" (30 → 10), each +1 [MASK].
+        let noul = DecisionQuestion::Noul {
+            instructions: serde_json::json!("abcdef"),
+            criteria: None,
+        };
+        assert_eq!(estimated_head_tokens(&noul), 7 + 14 + 11);
+        // A described side replaces the default: "true: x" (7 → 3) + 1; an
+        // empty description is no description (Laya: `not in (None, "")`).
+        let noul = DecisionQuestion::Noul {
+            instructions: serde_json::json!("abcdef"),
+            criteria: Some(NoulCriteria {
+                r#false: Some(String::new()),
+                r#true: Some("x".into()),
+            }),
+        };
+        assert_eq!(estimated_head_tokens(&noul), 7 + 14 + 4);
+        // "choice question: Pick" (21 → 7); "a: bb" (5 → 2) + 1; bare "c" (1 → 1) + 1.
+        let choice = DecisionQuestion::Choice {
+            instructions: serde_json::json!("Pick"),
+            criteria: [
+                ("a".to_string(), Some("bb".to_string())),
+                ("c".to_string(), None),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        assert_eq!(estimated_head_tokens(&choice), 7 + 3 + 2);
+        // Non-string instructions are Laya's `json.dumps` text, WITH its default
+        // ", " / ": " separators: `{"k": 1, "j": [1, 2]}` is 21 chars, so
+        // "score question: " + it = 37 → 13; "level 0: lo" / "level 1: hi" (11 → 4) + 1.
+        let score = DecisionQuestion::Score {
+            instructions: serde_json::json!({"k": 1, "j": [1, 2]}),
+            criteria: vec!["lo".into(), "hi".into()],
+        };
+        assert_eq!(estimated_head_tokens(&score), 13 + 5 + 5);
+        // An option is capped at 48 tokens (+1 [MASK]) however long it is.
+        let long = DecisionQuestion::Choice {
+            instructions: serde_json::json!("Pick"),
+            criteria: [("k".to_string(), Some("d".repeat(300)))]
+                .into_iter()
+                .collect(),
+        };
+        assert_eq!(estimated_head_tokens(&long), 7 + 49);
     }
 
     /// Line-wrapped base64 (MIME/PEM style) sniffs fine — and the data URL
