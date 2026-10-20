@@ -43,9 +43,14 @@ fn case_id(s: Scenario, r: &Row) -> String {
     format!("{}-{}", scenario_name(s), r.row_idx)
 }
 
-fn source(src: Source<'_>, r: &Row) -> String {
+/// `<dataset>@<sha10>:<split>#<row_idx> seed=<seed> rand=<RAND_VERSION>`: enough
+/// to redraw the case (`StdRng` is not stable across rand releases).
+fn source(src: Source<'_>, r: &Row, seed: u64) -> String {
     let sha10 = src.sha.get(..10).unwrap_or(src.sha);
-    format!("{}@{sha10}:{}#{}", src.dataset, src.split, r.row_idx)
+    format!(
+        "{}@{sha10}:{}#{} seed={seed} rand={RAND_VERSION}",
+        src.dataset, src.split, r.row_idx
+    )
 }
 
 /// A row's text field: `None` when it is null or blank (the row is skipped;
@@ -115,6 +120,31 @@ fn unique_names(names: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The label indices offered for one case, shuffled: `gold`, distractors
+/// drawn without replacement from the other labels (never `oos`), and `oos`
+/// when given. With `oos`, every case offers 9 options: when gold IS `oos` an
+/// eighth distractor takes its slot, so the chance baseline is the same for
+/// every case.
+fn draw_options(rng: &mut StdRng, gold: usize, n_labels: usize, oos: Option<usize>) -> Vec<usize> {
+    let pool: Vec<usize> = (0..n_labels)
+        .filter(|&l| l != gold && Some(l) != oos)
+        .collect();
+    let distractors = DISTRACTORS + usize::from(oos == Some(gold));
+    let mut options: Vec<usize> = vec![gold];
+    options.extend(
+        rand::seq::index::sample(rng, pool.len(), distractors)
+            .into_iter()
+            .map(|k| pool[k]),
+    );
+    if let Some(o) = oos
+        && o != gold
+    {
+        options.push(o);
+    }
+    options.shuffle(rng);
+    options
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_choice(
     scenario: Scenario,
@@ -157,40 +187,31 @@ fn build_choice(
     let mut out = Vec::with_capacity(picked.len());
     for i in picked {
         let (r, t, gold) = eligible[i];
-        let pool: Vec<usize> = (0..names.len())
-            .filter(|&l| l != gold && Some(l) != oos)
-            .collect();
-        let mut options: Vec<usize> = vec![gold];
-        options.extend(
-            rand::seq::index::sample(&mut rng, pool.len(), DISTRACTORS)
-                .into_iter()
-                .map(|k| pool[k]),
-        );
-        if let Some(o) = oos
-            && o != gold
-        {
-            options.push(o);
+        let options = draw_options(&mut rng, gold, names.len(), oos);
+        let question = DecisionQuestion::Choice {
+            instructions: json!(S1_INSTRUCTIONS),
+            criteria: options.iter().map(|&l| (names[l].clone(), None)).collect(),
+        };
+        if let DecisionQuestion::Choice { criteria, .. } = &question {
+            // Label names are unique (checked above), so no option collapses.
+            debug_assert_eq!(criteria.len(), options.len());
         }
-        options.shuffle(&mut rng);
         out.push(Case {
             id: case_id(scenario, r),
             scenario,
             state: serde_json::Value::String(t.to_string()),
-            question: DecisionQuestion::Choice {
-                instructions: json!(S1_INSTRUCTIONS),
-                criteria: options.iter().map(|&l| (names[l].clone(), None)).collect(),
-            },
+            question,
             expected: Expected::Choice {
                 option: names[gold].clone(),
             },
-            source: source(src, r),
+            source: source(src, r, seed),
         });
     }
     Ok(out)
 }
 
-/// S1a (CLINC `plus`): gold + 7 distractors + `oos`, shuffled; 8 options when
-/// gold is `oos` itself.
+/// S1a (CLINC `plus`): 9 options, shuffled: gold + 7 distractors + `oos`, or
+/// `oos` + 8 distractors when gold is `oos` itself.
 pub fn build_s1a(
     src: Source<'_>,
     rows: &[Row],
@@ -272,7 +293,7 @@ pub fn build_s2(
                     criteria: label_names.to_vec(),
                 },
                 expected: Expected::Score { level },
-                source: source(src, r),
+                source: source(src, r, seed),
             }
         })
         .collect())
@@ -324,7 +345,7 @@ pub fn build_s3(
                     criteria: None,
                 },
                 expected: Expected::Noul { value },
-                source: source(src, r),
+                source: source(src, r, seed),
             }
         })
         .collect())
@@ -338,6 +359,8 @@ pub struct ManifestDataset {
     pub config: String,
     pub split: String,
     pub num_rows: u64,
+    /// sha256 of the cached rows file the cases were built from.
+    pub rows_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -365,6 +388,8 @@ pub struct DatasetSpec {
     pub id: &'static str,
     pub config: &'static str,
     pub split: &'static str,
+    /// The licence the hub card must report; anything else fails the fetch.
+    pub license: &'static str,
 }
 
 pub const DATASETS: [DatasetSpec; 4] = [
@@ -374,6 +399,7 @@ pub const DATASETS: [DatasetSpec; 4] = [
         id: "clinc/clinc_oos",
         config: "plus",
         split: "test",
+        license: "cc-by-3.0",
     },
     DatasetSpec {
         scenario: Scenario::S1bBanking77,
@@ -381,6 +407,7 @@ pub const DATASETS: [DatasetSpec; 4] = [
         id: "legacy-datasets/banking77",
         config: "default",
         split: "test",
+        license: "cc-by-4.0",
     },
     DatasetSpec {
         scenario: Scenario::S2Sentiment,
@@ -388,6 +415,7 @@ pub const DATASETS: [DatasetSpec; 4] = [
         id: "Sp1786/multiclass-sentiment-analysis-dataset",
         config: "default",
         split: "test",
+        license: "apache-2.0",
     },
     DatasetSpec {
         scenario: Scenario::S3Entailment,
@@ -395,6 +423,7 @@ pub const DATASETS: [DatasetSpec; 4] = [
         id: "stanfordnlp/snli",
         config: "plain_text",
         split: "test",
+        license: "cc-by-sa-4.0",
     },
 ];
 
@@ -406,9 +435,10 @@ pub struct FetchOptions<'a> {
     pub per_scenario: usize,
 }
 
-/// Fetch (or load from cache) every dataset in [`DATASETS`], build its
-/// scenario's cases, validate them, and write `<out>/s1a.jsonl` …
-/// `s3.jsonl` plus `manifest.json`.
+/// Fetch (or load from cache) every dataset in [`DATASETS`], check its
+/// licence, build its scenario's cases, validate them, and write
+/// `<out>/s1a.jsonl` … `s3.jsonl` plus `manifest.json` as one set (see
+/// [`write_case_set`]). Nothing is written unless every dataset built.
 pub async fn fetch_cases(
     hf: &crate::fetch::Hf,
     opts: &FetchOptions<'_>,
@@ -419,6 +449,15 @@ pub async fn fetch_cases(
         let ds = hf
             .load_or_fetch(opts.cache_root, spec.id, spec.config, spec.split)
             .await?;
+        if ds.meta.license != spec.license {
+            bail!(
+                "{}: the hub card's licence is {:?}, expected {:?}; check the new terms before \
+                 using it",
+                spec.id,
+                ds.meta.license,
+                spec.license
+            );
+        }
         let src = Source {
             dataset: spec.id,
             sha: &ds.meta.sha,
@@ -447,21 +486,23 @@ pub async fn fetch_cases(
             config: ds.meta.config.clone(),
             split: ds.meta.split.clone(),
             num_rows: ds.meta.num_rows,
+            rows_sha256: ds
+                .meta
+                .rows_sha256
+                .clone()
+                .context("load_or_fetch returned no rows sha256")?,
         });
         built.push((spec, cases));
     }
-    // Write only once every dataset has built, so a failure leaves no
-    // half-updated case set.
-    let mut files = Vec::new();
-    for (spec, cases) in &built {
-        crate::case::write_jsonl(&opts.out.join(spec.file), cases)?;
-        files.push(ManifestFile {
+    let files = built
+        .iter()
+        .map(|(spec, cases)| ManifestFile {
             file: spec.file.to_string(),
             scenario: spec.scenario,
             dataset: spec.id.to_string(),
             cases: cases.len(),
-        });
-    }
+        })
+        .collect();
     let manifest = Manifest {
         seed: opts.seed,
         per_scenario: opts.per_scenario,
@@ -469,10 +510,80 @@ pub async fn fetch_cases(
         datasets,
         files,
     };
-    let mut bytes = serde_json::to_vec_pretty(&manifest)?;
-    bytes.push(b'\n');
-    crate::fetch::write_atomic(&opts.out.join("manifest.json"), &bytes)?;
+    write_case_set(opts.out, &built, &manifest)?;
     Ok(manifest)
+}
+
+fn sibling(dir: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let mut s = dir.as_os_str().to_owned();
+    s.push(suffix);
+    std::path::PathBuf::from(s)
+}
+
+/// Write every case file plus `manifest.json` into `<out>.tmp/`, then swap it
+/// in for `out`, so the files in `out` always come from one run. An existing
+/// `out` is replaced only if it is empty or holds a `manifest.json` (a
+/// previous case set), never an unrelated directory.
+fn write_case_set(
+    out: &std::path::Path,
+    built: &[(DatasetSpec, Vec<Case>)],
+    manifest: &Manifest,
+) -> anyhow::Result<()> {
+    let replaces = out.exists();
+    if replaces {
+        let is_case_set = out.join("manifest.json").exists()
+            || std::fs::read_dir(out)
+                .with_context(|| format!("reading {}", out.display()))?
+                .next()
+                .is_none();
+        if !is_case_set {
+            bail!(
+                "refusing to replace {}: it is not empty and has no manifest.json, so it is not \
+                 a decision-bench case set",
+                out.display()
+            );
+        }
+    }
+    if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let tmp = sibling(out, ".tmp");
+    let old = sibling(out, ".old");
+    for leftover in [&tmp, &old] {
+        if leftover.exists() {
+            std::fs::remove_dir_all(leftover)
+                .with_context(|| format!("removing leftover {}", leftover.display()))?;
+        }
+    }
+    let staged = (|| -> anyhow::Result<()> {
+        std::fs::create_dir(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        for (spec, cases) in built {
+            crate::case::write_jsonl(&tmp.join(spec.file), cases)?;
+        }
+        let mut bytes = serde_json::to_vec_pretty(manifest)?;
+        bytes.push(b'\n');
+        crate::fetch::write_atomic(&tmp.join("manifest.json"), &bytes)
+    })();
+    if let Err(e) = staged {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(e);
+    }
+    // Two renames: no portable call swaps two directories atomically. If the
+    // second fails, the previous set is put back.
+    if replaces {
+        std::fs::rename(out, &old).with_context(|| format!("moving {} aside", out.display()))?;
+    }
+    if let Err(e) = std::fs::rename(&tmp, out) {
+        if replaces {
+            let _ = std::fs::rename(&old, out);
+        }
+        return Err(e).with_context(|| format!("renaming {} to {}", tmp.display(), out.display()));
+    }
+    if replaces {
+        std::fs::remove_dir_all(&old).with_context(|| format!("removing {}", old.display()))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -552,22 +663,15 @@ mod tests {
                 let want = &names[(idx % 20) as usize];
                 assert_eq!(&gold(c), want, "{}", c.id);
                 assert_eq!(c.state, json!(format!("request number {idx}")));
+                // Distinctness is asserted on the drawn indices
+                // (`draw_options_are_distinct_label_indices`): these keys come
+                // out of an IndexMap, which would already have collapsed a
+                // duplicate.
                 let opts = options(c);
-                let unique: std::collections::BTreeSet<_> = opts.iter().collect();
-                assert_eq!(
-                    unique.len(),
-                    opts.len(),
-                    "{}: duplicate option {opts:?}",
-                    c.id
-                );
                 assert!(opts.contains(want));
                 assert!(opts.iter().any(|o| o == "oos"), "{}: no oos {opts:?}", c.id);
-                if want == "oos" {
-                    saw_oos_gold = true;
-                    assert_eq!(opts.len(), 8, "{}: {opts:?}", c.id);
-                } else {
-                    assert_eq!(opts.len(), 9, "{}: {opts:?}", c.id);
-                }
+                saw_oos_gold |= want == "oos";
+                assert_eq!(opts.len(), 9, "{}: {opts:?}", c.id);
                 gold_positions.insert(opts.iter().position(|o| o == want).unwrap());
             }
         }
@@ -593,8 +697,6 @@ mod tests {
                 assert_eq!(c.state, json!(format!("request number {idx}")));
                 let opts = options(c);
                 assert_eq!(opts.len(), 8, "{}: {opts:?}", c.id);
-                let unique: std::collections::BTreeSet<_> = opts.iter().collect();
-                assert_eq!(unique.len(), 8);
                 assert!(opts.contains(want));
                 gold_positions.insert(opts.iter().position(|o| o == want).unwrap());
             }
@@ -721,7 +823,7 @@ mod tests {
         let cases = build_s1a(SRC, &rows, &names, 1, 40).unwrap();
         let c = cases.iter().find(|c| c.id.ends_with("-13")).unwrap();
         assert_eq!(c.id, "s1a_intent_oos-13");
-        assert_eq!(c.source, "org/ds@0123456789:test#13");
+        assert_eq!(c.source, "org/ds@0123456789:test#13 seed=1 rand=0.8.7");
     }
 
     fn jsonl_bytes(cases: &[Case]) -> Vec<u8> {
@@ -820,6 +922,79 @@ mod tests {
     }
 
     #[test]
+    fn every_s1a_case_has_nine_options_even_when_gold_is_oos() {
+        // 60 rows over 20 intents, `oos` at index 7: 3 of them are oos-gold.
+        let names: Vec<String> = (0..20)
+            .map(|i| {
+                if i == 7 {
+                    "oos".into()
+                } else {
+                    format!("intent_{i}")
+                }
+            })
+            .collect();
+        let rows: Vec<Row> = (0..60)
+            .map(|i| row(i, json!({"text": format!("r{i}"), "intent": i % 20})))
+            .collect();
+        let cases = build_s1a(SRC, &rows, &names, 11, 50).unwrap();
+        assert_eq!(cases.len(), 50);
+        assert!(cases.iter().any(|c| gold(c) == "oos"));
+        for c in &cases {
+            assert_eq!(options(c).len(), 9, "{}: {:?}", c.id, options(c));
+        }
+    }
+
+    #[test]
+    fn draw_options_are_distinct_label_indices() {
+        let mut rng = StdRng::seed_from_u64(3);
+        for _ in 0..200 {
+            for gold in 0..20 {
+                for oos in [Some(7), None] {
+                    let opts = draw_options(&mut rng, gold, 20, oos);
+                    let distinct: std::collections::BTreeSet<usize> =
+                        opts.iter().copied().collect();
+                    assert_eq!(distinct.len(), opts.len(), "duplicate in {opts:?}");
+                    assert!(opts.iter().all(|&l| l < 20), "{opts:?}");
+                    assert!(opts.contains(&gold));
+                    match oos {
+                        Some(o) => {
+                            assert_eq!(opts.len(), 9, "{opts:?}");
+                            assert!(opts.contains(&o));
+                        }
+                        None => assert_eq!(opts.len(), 8, "{opts:?}"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn one_seed_samples_different_rows_for_each_scenario() {
+        // S2 and S3 over the same number of eligible rows: without the
+        // scenario tag mixed into the seed they would pick the same indices.
+        let s2_rows: Vec<Row> = (0..30)
+            .map(|i| row(i, json!({"text": format!("t{i}"), "label": i % 3})))
+            .collect();
+        let s3_rows: Vec<Row> = (0..30)
+            .map(|i| {
+                row(
+                    i,
+                    json!({"premise": "p", "hypothesis": format!("h{i}"), "label": ([0, 2])[(i % 2) as usize]}),
+                )
+            })
+            .collect();
+        let ids = |cases: Vec<Case>| -> Vec<u64> {
+            cases
+                .iter()
+                .map(|c| c.id.rsplit('-').next().unwrap().parse().unwrap())
+                .collect()
+        };
+        let a = ids(build_s2(SRC, &s2_rows, &levels(), 2026, 5).unwrap());
+        let b = ids(build_s3(SRC, &s3_rows, &snli_names(), 2026, 5).unwrap());
+        assert_ne!(a, b);
+    }
+
+    #[test]
     fn rand_version_matches_the_lockfile() {
         let lock =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))
@@ -881,9 +1056,13 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn fetch_cases_writes_four_case_files_and_a_reproducible_manifest() {
-        use wiremock::matchers::{path, path_regex};
+    /// A fake datasets-server and hub serving every entry of [`DATASETS`]
+    /// at sha `feedfacecafe0001`, each with its expected licence unless
+    /// `licence_for` overrides one.
+    async fn fake_hf(
+        licence_for: Option<(&str, &str)>,
+    ) -> (crate::fetch::Hf, [wiremock::MockServer; 2]) {
+        use wiremock::matchers::path;
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let ds = MockServer::start().await;
         Mock::given(path("/rows"))
@@ -891,51 +1070,79 @@ mod tests {
             .mount(&ds)
             .await;
         let hub = MockServer::start().await;
-        Mock::given(path_regex("^/api/datasets/.+"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                json!({"sha": "feedfacecafe0001", "cardData": {"license": ["cc-by-4.0"]}}),
-            ))
-            .mount(&hub)
-            .await;
-        let cache = tempfile::tempdir().unwrap();
+        for spec in DATASETS {
+            let license = match licence_for {
+                Some((id, l)) if id == spec.id => l,
+                _ => spec.license,
+            };
+            Mock::given(path(format!("/api/datasets/{}", spec.id)))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    json!({"sha": "feedfacecafe0001", "cardData": {"license": [license]}}),
+                ))
+                .mount(&hub)
+                .await;
+        }
         let hf = crate::fetch::Hf {
             client: reqwest::Client::new(),
             ds_base: ds.uri(),
             hub_base: hub.uri(),
             pacing: crate::fetch::Pacing::ZERO,
         };
-        let run = |out: std::path::PathBuf, seed: u64| {
-            let (hf, cache) = (hf.clone(), cache.path().to_owned());
-            async move {
-                std::fs::create_dir_all(&out).unwrap();
-                let opts = FetchOptions {
-                    cache_root: &cache,
-                    out: &out,
-                    seed,
-                    per_scenario: 5,
-                };
-                fetch_cases(&hf, &opts).await.unwrap()
-            }
+        (hf, [ds, hub])
+    }
+
+    async fn fetch_into(
+        hf: &crate::fetch::Hf,
+        cache: &std::path::Path,
+        out: &std::path::Path,
+        seed: u64,
+    ) -> anyhow::Result<Manifest> {
+        let opts = FetchOptions {
+            cache_root: cache,
+            out,
+            seed,
+            per_scenario: 5,
         };
+        fetch_cases(hf, &opts).await
+    }
+
+    const CASE_FILES: [&str; 5] = [
+        "s1a.jsonl",
+        "s1b.jsonl",
+        "s2.jsonl",
+        "s3.jsonl",
+        "manifest.json",
+    ];
+
+    #[tokio::test]
+    async fn fetch_cases_writes_four_case_files_and_a_reproducible_manifest() {
+        let (hf, _servers) = fake_hf(None).await;
+        let cache = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let (a, b, c) = (
             root.path().join("a"),
             root.path().join("b"),
             root.path().join("c"),
         );
-        let m = run(a.clone(), 2026).await;
-        run(b.clone(), 2026).await;
-        run(c.clone(), 1).await;
+        let m = fetch_into(&hf, cache.path(), &a, 2026).await.unwrap();
+        fetch_into(&hf, cache.path(), &b, 2026).await.unwrap();
+        fetch_into(&hf, cache.path(), &c, 1).await.unwrap();
 
         assert_eq!(m.seed, 2026);
         assert_eq!(m.per_scenario, 5);
         assert_eq!(m.rand_version, RAND_VERSION);
         assert_eq!(m.datasets.len(), 4);
-        assert!(
-            m.datasets
-                .iter()
-                .all(|d| d.sha == "feedfacecafe0001" && d.license == "cc-by-4.0")
-        );
+        for (d, spec) in m.datasets.iter().zip(DATASETS) {
+            assert_eq!(
+                (d.id.as_str(), d.sha.as_str()),
+                (spec.id, "feedfacecafe0001")
+            );
+            assert_eq!(d.license, spec.license);
+            let rows_file = crate::fetch::cache_dir(cache.path(), spec.id, &d.sha)
+                .join(format!("{}-{}.jsonl", spec.config, spec.split));
+            let bytes = std::fs::read(&rows_file).unwrap();
+            assert_eq!(d.rows_sha256, crate::fetch::sha256_hex(&bytes), "{}", d.id);
+        }
         assert_eq!(
             m.files
                 .iter()
@@ -948,27 +1155,112 @@ mod tests {
                 ("s3.jsonl", 5)
             ]
         );
-        for f in [
-            "s1a.jsonl",
-            "s1b.jsonl",
-            "s2.jsonl",
-            "s3.jsonl",
-            "manifest.json",
-        ] {
+        for f in CASE_FILES {
             let bytes = std::fs::read(a.join(f)).unwrap();
             assert_eq!(bytes, std::fs::read(b.join(f)).unwrap(), "{f}");
+            assert_ne!(bytes, std::fs::read(c.join(f)).unwrap(), "{f}");
             if f != "manifest.json" {
-                assert_ne!(bytes, std::fs::read(c.join(f)).unwrap(), "{f}");
                 let (_, cases) = crate::case::read_case_file(&a.join(f)).unwrap();
                 assert_eq!(cases.len(), 5);
-                assert!(cases[0].source.starts_with(&format!(
-                    "{}@feedfaceca:test#",
-                    DATASETS.iter().find(|d| d.file == f).unwrap().id
-                )));
+                let id = DATASETS.iter().find(|d| d.file == f).unwrap().id;
+                for case in &cases {
+                    assert!(case.source.starts_with(&format!("{id}@feedfaceca:test#")));
+                    assert!(
+                        case.source
+                            .ends_with(&format!(" seed=2026 rand={RAND_VERSION}")),
+                        "{}",
+                        case.source
+                    );
+                }
             }
         }
         let on_disk: Manifest =
             serde_json::from_slice(&std::fs::read(a.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(on_disk, m);
+    }
+
+    #[tokio::test]
+    async fn a_licence_other_than_the_expected_one_fails_the_fetch() {
+        let (hf, _servers) = fake_hf(Some(("clinc/clinc_oos", "mit"))).await;
+        let cache = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let err = fetch_into(&hf, cache.path(), &out.path().join("cases"), 1)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("clinc/clinc_oos") && err.contains("mit") && err.contains("cc-by-3.0"),
+            "{err}"
+        );
+    }
+
+    fn listing(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[tokio::test]
+    async fn the_case_set_is_replaced_whole_and_a_failed_fetch_keeps_the_old_one() {
+        let (hf, _servers) = fake_hf(None).await;
+        let cache = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let out = root.path().join("cases");
+
+        fetch_into(&hf, cache.path(), &out, 1).await.unwrap();
+        // A file from some older run must not survive the next one.
+        std::fs::write(out.join("s4-stale.jsonl"), "x").unwrap();
+        let first = std::fs::read(out.join("s1a.jsonl")).unwrap();
+        fetch_into(&hf, cache.path(), &out, 2).await.unwrap();
+        let mut want: Vec<String> = CASE_FILES.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        assert_eq!(listing(&out), want);
+        assert_ne!(std::fs::read(out.join("s1a.jsonl")).unwrap(), first);
+        assert_eq!(listing(root.path()), ["cases"], "scratch dirs left behind");
+
+        // A failing fetch leaves the previous set untouched.
+        let before: Vec<Vec<u8>> = CASE_FILES
+            .iter()
+            .map(|f| std::fs::read(out.join(f)).unwrap())
+            .collect();
+        let (bad, _bad_servers) = fake_hf(Some(("stanfordnlp/snli", "mit"))).await;
+        let empty_cache = tempfile::tempdir().unwrap();
+        assert!(fetch_into(&bad, empty_cache.path(), &out, 3).await.is_err());
+        let after: Vec<Vec<u8>> = CASE_FILES
+            .iter()
+            .map(|f| std::fs::read(out.join(f)).unwrap())
+            .collect();
+        assert_eq!(before, after);
+        assert_eq!(listing(root.path()), ["cases"], "scratch dirs left behind");
+    }
+
+    #[tokio::test]
+    async fn fetch_refuses_to_replace_a_directory_that_is_not_a_case_set() {
+        let (hf, _servers) = fake_hf(None).await;
+        let cache = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let out = root.path().join("mine");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("notes.txt"), "keep me").unwrap();
+        let err = fetch_into(&hf, cache.path(), &out, 1)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("manifest.json") && err.contains("mine"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(out.join("notes.txt")).unwrap(),
+            "keep me"
+        );
+
+        // An empty directory is fine.
+        let empty = root.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        fetch_into(&hf, cache.path(), &empty, 1).await.unwrap();
     }
 }
