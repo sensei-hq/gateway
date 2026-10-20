@@ -217,3 +217,18 @@ Every local engine loads a `ModelEntry`; where that entry comes from is a
   first resolve (see HF download above).
 
 A `ModelEntry` carries `{ id, name, format (Gguf|Onnx|Safetensors), source (Managed|Ollama|External), size_bytes, … }`.
+
+## Benchmarking System One models
+
+To measure which local decision model (Laya, Bespoke-Nimble) is best for which scenario, use the
+`decision-bench` crate. It sends seeded cases through the gateway to each model and ranks them per
+scenario by accuracy with a confidence interval, calibration and confident-wrong rate. It does not
+route by score. The roster, how to start each server, dataset licences and how to read the report
+are in `crates/decision-bench/README.md`.
+
+```sh
+cargo run --release -p decision-bench -- check                      # probe each model; unreachable ones are NOT RUN
+cargo run --release -p decision-bench -- fetch --per-scenario 40    # download public datasets, build seeded cases
+cargo run --release -p decision-bench -- run                        # run every reachable model, write results.json
+cargo run --release -p decision-bench -- report                     # render report.md from results.json
+```
