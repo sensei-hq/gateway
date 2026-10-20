@@ -17,18 +17,33 @@ fn laya_head_budget(model: &str) -> usize {
     }
 }
 
+/// The whole estimated head of [`estimated_head_parts`] (tests).
+#[cfg(test)]
+fn estimated_head_tokens(q: &DecisionQuestion) -> usize {
+    let (instruction, options) = estimated_head_parts(q);
+    instruction + options
+}
+
+/// One rendered option: its `[MASK]` plus `" " + text` — Laya encodes the
+/// leading space, which the multilingual tokenizer makes a token of its own
+/// before a digit, symbol or CJK char — capped at Laya's 48.
+fn laya_option_tokens(text: &str) -> usize {
+    1 + laya_text_tokens(&format!(" {text}")).min(48)
+}
+
 /// A conservative estimate of the tokens Laya's `build_head` spends on one
-/// question (SP-DEC-3 D6). Laya renders `"<type> question: <instructions>"` and
-/// one `[MASK]`-prefixed span per option (capped at 48 tokens each), then cuts
-/// the instruction SILENTLY so the whole head fits `head_max_len` — `truncated`
-/// never reports it.
+/// question (SP-DEC-3 D6), as `(instruction part, all options)`. Laya renders
+/// `"<type> question: <instructions>"` and one `[MASK]`-prefixed span per
+/// option (capped at 48 tokens each), then cuts the instruction SILENTLY so the
+/// whole head fits `head_max_len` — `truncated` never reports it.
 ///
 /// It counts the same text Laya renders (`render_options` in
 /// `laya_coreml/common.py`) with [`laya_text_tokens`]: a choice option is
 /// `"key: description"` or the bare key; a score level is
 /// `"level i: description"`; a noul side is `"false: …"` / `"true: …"` with
-/// Laya's default text when undescribed. Non-string instructions are Laya's
-/// `json.dumps` text, separators included.
+/// Laya's default text when undescribed. Each option is counted as Laya
+/// encodes it, `" " + text` (see [`laya_option_tokens`]). Non-string
+/// instructions are Laya's `json.dumps` text, separators included.
 ///
 /// Measured 2026-10-20 against both real tokenizers (`english`, which
 /// typed-decisions shares, and `multilingual`, which -ane shares) on 27 varied
@@ -44,11 +59,9 @@ fn laya_head_budget(model: &str) -> usize {
 /// scripts, whose every char is counted at its UTF-8 bytes. Refusing a head
 /// that would fit costs a fallback; sending one that does not returns a
 /// confident answer to a question the model never read.
-fn estimated_head_tokens(q: &DecisionQuestion) -> usize {
+fn estimated_head_parts(q: &DecisionQuestion) -> (usize, usize) {
     let tokens = laya_text_tokens;
-    fn option(text: &str) -> usize {
-        1 + laya_text_tokens(text).min(48)
-    }
+    let option = laya_option_tokens;
     let (kind, instructions) = match q {
         DecisionQuestion::Choice { instructions, .. } => ("choice", instructions),
         DecisionQuestion::Noul { instructions, .. } => ("noul", instructions),
@@ -90,7 +103,7 @@ fn estimated_head_tokens(q: &DecisionQuestion) -> usize {
             )
         }
     };
-    head + options
+    (head, options)
 }
 
 /// An upper estimate of the tokens one piece of Laya head text costs, on
@@ -207,8 +220,24 @@ pub(super) fn check_laya_head_budget(
     questions: &DecisionQuestions,
 ) -> Result<(), GatewayError> {
     let budget = laya_head_budget(model);
+    // Laya's `build_head` cuts EVERY option to `max(4, (head_max_len − 16) / n)`
+    // tokens once `head_max_len − Σ options < 16` — options that shared a prefix
+    // then collapse into the same tokens and cannot be told apart.
+    let option_room = budget.saturating_sub(16);
     for (name, q) in questions {
-        let estimate = estimated_head_tokens(q);
+        let (instruction, options) = estimated_head_parts(q);
+        if options > option_room {
+            return Err(GatewayError::InputRejected {
+                adapter: adapter.into(),
+                message: format!(
+                    "question '{name}''s options need ≈{options} tokens but checkpoint \
+                     '{model}' leaves options {option_room} of its {budget} — the options \
+                     would be cut (Laya trims every option to fit, until some cannot be told \
+                     apart); use fewer or shorter options"
+                ),
+            });
+        }
+        let estimate = instruction + options;
         if estimate > budget {
             return Err(GatewayError::InputRejected {
                 adapter: adapter.into(),
@@ -247,9 +276,10 @@ mod tests {
     fn estimated_head_tokens_counts_what_laya_renders() {
         use kernel::types::decision::{DecisionQuestion, NoulCriteria};
         let t = laya_text_tokens;
+        let o = laya_option_tokens;
         let (no, yes) = (
-            1 + t("false: no, the statement does not hold"),
-            1 + t("true: yes, the statement holds"),
+            o("false: no, the statement does not hold"),
+            o("true: yes, the statement holds"),
         );
         // Laya's default noul options when a side is undescribed.
         let noul = DecisionQuestion::Noul {
@@ -271,7 +301,7 @@ mod tests {
         };
         assert_eq!(
             estimated_head_tokens(&noul),
-            t("noul question: abcdef") + no + 1 + t("true: x")
+            t("noul question: abcdef") + no + o("true: x")
         );
         // "key: description", or the bare key.
         let choice = DecisionQuestion::Choice {
@@ -285,7 +315,7 @@ mod tests {
         };
         assert_eq!(
             estimated_head_tokens(&choice),
-            t("choice question: Pick") + 1 + t("a: bb") + 1 + t("c")
+            t("choice question: Pick") + o("a: bb") + o("c")
         );
         // Non-string instructions are Laya's `json.dumps` text, WITH its default
         // ", " / ": " separators; score levels are "level i: description".
@@ -300,11 +330,7 @@ mod tests {
         );
         assert_eq!(
             estimated_head_tokens(&score),
-            t(&format!("score question: {json_text}"))
-                + 1
-                + t("level 0: lo")
-                + 1
-                + t("level 1: hi")
+            t(&format!("score question: {json_text}")) + o("level 0: lo") + o("level 1: hi")
         );
         // An option is capped at 48 tokens (+1 [MASK]) however long it is.
         let long = DecisionQuestion::Choice {
@@ -464,6 +490,181 @@ mod tests {
                 estimate >= english.max(multilingual),
                 "{text:?}: estimate {estimate} < real (english {english}, multilingual {multilingual})"
             );
+        }
+    }
+
+    /// Laya encodes each option as `" " + text` (`build_head`), and on the
+    /// multilingual tokenizer a space before a digit, symbol or CJK char is a
+    /// token of its own (`"▁", "1", "0", …`). Real counts of `" " + option`, by
+    /// `tests/fixtures/laya_head_tokens.py rust option`; each option also costs
+    /// its `[MASK]` and is capped at 48.
+    #[test]
+    fn the_option_estimate_is_at_least_the_real_count_on_both_tokenizers() {
+        // (rendered option, real english tokens, real multilingual tokens)
+        let cases: [(&str, usize, usize); _] = [
+            ("10000000", 2, 9),                               // digit_key
+            ("1234567890", 4, 11),                            // digit_key_10
+            ("7", 1, 2),                                      // one_digit
+            ("level 0: Routine", 5, 5),                       // level
+            ("false: no, the statement does not hold", 9, 9), // noul_false
+            ("true: yes, the statement holds", 7, 7),         // noul_true
+            ("billing: Payments and refunds", 7, 5),          // choice_desc
+            ("bug", 1, 1),                                    // bare_key
+            ("退款", 5, 2),                                   // cjk_key
+            ("退款: 客户要求退款", 16, 6),                    // cjk_desc
+            ("<=5", 2, 2),                                    // symbol_key
+            ("$100.00", 4, 7),                                // money
+            ("50%", 2, 4),                                    // percent
+            ("#1", 2, 2),                                     // hash
+            ("😀", 2, 1),                                     // emoji_key
+            ("-", 1, 1),                                      // dash
+            ("a: {\"min\": 1, \"max\": 5}", 12, 14),          // json_desc
+            ("2026-10-20", 6, 11),                            // date
+            ("Возврат", 4, 2),                                // cyrillic_key
+            ("استرداد", 6, 3),                                // arabic_key
+            ("P1", 2, 2),                                     // upper_key
+            ("needs_human_review", 5, 5),                     // snake_key
+            (
+                "Does the customer want a refund for the duplicate charge on their invoice?",
+                14,
+                14,
+            ), // english
+            (
+                "{\"rubric\":\"refund\",\"weight\":3,\"tags\":[\"billing\",\"urgent\"],\"nested\":{\"a\":1,\"b\":[1,2,3]}}",
+                35,
+                32,
+            ), // json_compact
+            (
+                "{\"rubric\": \"refund\", \"weight\": 3, \"tags\": [\"billing\", \"urgent\"], \"nested\": {\"a\": 1, \"b\": [1, 2, 3]}}",
+                43,
+                44,
+            ), // json_python
+            (
+                "{\n  \"rubric\": \"refund\",\n  \"weight\": 3,\n  \"tags\": [\n    \"billing\",\n    \"urgent\"\n  ],\n  \"nested\": {\n    \"a\": 1,\n    \"b\": [\n      1,\n      2,\n      3\n    ]\n  }\n}",
+                77,
+                101,
+            ), // json_pretty
+            (
+                "顧客は返金を求めていますか？請求書が二重に発行されました。",
+                27,
+                18,
+            ), // japanese
+            ("客户是否要求退款？发票被重复开具了。", 26, 13), // chinese
+            (
+                "고객이 환불을 원합니까? 송장이 두 번 발행되었습니다.",
+                49,
+                20,
+            ), // korean
+            (
+                "Хочет ли клиент вернуть деньги за двойное списание?",
+                28,
+                12,
+            ), // cyrillic
+            ("هل يريد العميل استرداد المبلغ بسبب الخصم المزدوج؟", 36, 17), // arabic
+            ("क्या ग्राहक धनवापसी चाहता है?", 28, 9),            // hindi
+            ("ลูกค้าต้องการขอคืนเงินหรือไม่", 34, 8),                // thai
+            (
+                "Möchte der Kunde eine Rückerstattung für die doppelte Abbuchung? Straße",
+                25,
+                17,
+            ), // german
+            ("Is the user happy 😀😃🎉🔥👍🏽👨‍👩‍👧 or angry 😡🤬?", 42, 21), // emoji
+            ("𠜎𠜱𡃁 𓀀𓀁𓀂", 26, 26),                           // rare_cjk
+            ("fn f(x) -> u8 { x + 1 }", 13, 14),              // code
+            (
+                "See https://example.com/api/v1/refunds?id=12345&sort=desc#top for details",
+                26,
+                30,
+            ), // url
+            (
+                "Order 1234567890 cost 98765.4321 on 2026-10-20 at 23:59:59, ref 000111222333",
+                32,
+                61,
+            ), // numbers
+            ("deadbeef0123456789abcdefABCDEF 3f2a9c7e1b", 20, 25), // hex
+            ("aGVsbG8gd29ybGQgdGhpcyBpcyBiYXNlNjQ=", 27, 22), // base64
+            (
+                "qxzvbnmkjhgfdsawrtyp zzkkqqxxvv bcdfghjklmnpqrstvwxz",
+                29,
+                26,
+            ), // gibberish
+            ("aBcDeFgHiJkLmNoPqRsTuVwXyZ qWeRtYuIoP", 28, 21), // mixed_case
+            ("URGENT REFUND REQUEST XK9QZT7WPL", 17, 12),     // all_caps
+            (
+                "HTTPServerError getUserById snake_case_identifier_name",
+                14,
+                11,
+            ), // camel
+            (
+                "!!??..,,;;::--__==++**&&||^^%%$$##@@~~``''\"\"<<>>//\\\\",
+                26,
+                26,
+            ), // symbols
+            ("a  b   c\n\n\td    e\t\t\tf", 13, 16),          // whitespace
+            (
+                "Pneumonoultramicroscopicsilicovolcanoconiosis antidisestablishmentarianism supercalifragilisticexpialidocious",
+                34,
+                27,
+            ), // longword
+            ("aeiou aeiouaeiou ooooo eeeee iaiaia", 17, 15),  // vowelly
+        ];
+        for (option, english, multilingual) in cases {
+            let estimate = laya_option_tokens(option);
+            let real = 1 + english.max(multilingual).min(48);
+            assert!(
+                estimate >= real,
+                "{option:?}: estimate {estimate} < real {real} (english {english}, multilingual {multilingual})"
+            );
+        }
+    }
+
+    /// The live Critical: 25 eight-digit keys on `multilingual` came back with
+    /// `usage.options: {"q": {"total": 25, "distinct": 3, "tokens_per_option": 9}}`
+    /// and `truncated: false`. Each really costs 10 (`[MASK]`, `▁`, 8 digits).
+    #[test]
+    fn twenty_five_eight_digit_keys_are_over_the_multilingual_budget() {
+        let q = DecisionQuestion::Choice {
+            instructions: serde_json::json!("Pick"),
+            criteria: (0..25)
+                .map(|i| (format!("{}", 10_000_000 + i), None))
+                .collect(),
+        };
+        let estimate = estimated_head_tokens(&q);
+        assert!(estimate > 256, "estimate {estimate}");
+        let questions = DecisionQuestions::from([("q".to_string(), q)]);
+        assert!(matches!(
+            check_laya_head_budget("laya", "multilingual", &questions),
+            Err(GatewayError::InputRejected { .. })
+        ));
+    }
+
+    /// Laya cuts EVERY option to `max(4, (head_max_len − 16) / n)` tokens when
+    /// `head_max_len − Σ options < 16` (`build_head`), even if the whole head
+    /// would fit — so options over `budget − 16` are refused on their own.
+    #[test]
+    fn options_that_would_trigger_the_per_option_cut_are_refused() {
+        // 17 eight-digit keys at 10 and one ten-digit key at 12: 182 = 192 − 10.
+        let mut criteria: Vec<(String, Option<String>)> = (0..17)
+            .map(|i| (format!("{}", 10_000_000 + i), None))
+            .collect();
+        criteria.push(("1234567890".into(), None));
+        let q = DecisionQuestion::Choice {
+            instructions: serde_json::json!("a"),
+            criteria: criteria.into_iter().collect(),
+        };
+        let (instruction, options) = estimated_head_parts(&q);
+        assert_eq!(options, 192 - 10);
+        assert!(
+            instruction + options <= 192,
+            "the whole head fits ({instruction} + {options}): only the option rule refuses it"
+        );
+        let questions = DecisionQuestions::from([("q".to_string(), q)]);
+        match check_laya_head_budget("laya", "english", &questions) {
+            Err(GatewayError::InputRejected { message, .. }) => {
+                assert!(message.contains("question 'q'"), "{message}");
+                assert!(message.contains("options would be cut"), "{message}");
+            }
+            other => panic!("expected the per-option refusal, got {other:?}"),
         }
     }
 

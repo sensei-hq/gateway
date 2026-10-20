@@ -1021,10 +1021,15 @@ async fn untruncated_and_truncation_unaware_answers_stay_successes() {
     // beside `truncated: false` do not make it a truncation.
     let mut details_but_not_truncated = ok_body("laya-rl-agent");
     details_but_not_truncated["usage"] = json!({"input_tokens":98,"output_tokens":0,"truncated":false,"state_tokens_dropped":5,"truncated_questions":["q"]});
+    // Laya reports `usage.options` only for a question whose options collapsed;
+    // an empty object (or none, as above) is no collapse.
+    let mut no_collapse = ok_body("laya-rl-agent");
+    no_collapse["usage"]["options"] = json!({});
     for body in [
         not_truncated,
         null_details,
         details_but_not_truncated,
+        no_collapse,
         ok_body("nimble-v3"),
     ] {
         let server = MockServer::start().await;
@@ -1041,6 +1046,38 @@ async fn untruncated_and_truncation_unaware_answers_stay_successes() {
             )
             .await
             .expect("not truncated → success");
+    }
+}
+
+/// Laya cut every option to fit its head budget and several collapsed into
+/// the same tokens — the answer cannot tell them apart. Captured live
+/// (multilingual, 25 eight-digit keys): `truncated: false`, top probability
+/// 0.107. An input rejection, like truncation.
+#[tokio::test]
+async fn a_collapsed_options_answer_is_an_input_rejection() {
+    let server = MockServer::start().await;
+    let mut body = ok_body("laya-rl-agent");
+    body["usage"] = json!({"input_tokens":234,"output_tokens":0,"state_tokens":1,"state_tokens_dropped":0,"truncated":false,"truncated_questions":[],"options":{"label":{"total":25,"distinct":3,"tokens_per_option":9}}});
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+    match SystemOneAdapter::with_id("laya")
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &request(Some("english"), vec![], None),
+        )
+        .await
+        .unwrap_err()
+    {
+        GatewayError::InputRejected { adapter, message } => {
+            assert_eq!(adapter, "laya");
+            assert!(message.contains("question 'label'"), "{message}");
+            assert!(message.contains("3 distinct of 25"), "{message}");
+        }
+        other => panic!("expected the collapsed-options InputRejected, got {other:?}"),
     }
 }
 
@@ -1406,9 +1443,10 @@ async fn laya_sends_a_question_within_the_head_budget() {
         .expect("a head within budget is sent");
 }
 
-/// The budget is the whole head: a short instruction with many long options
-/// (each capped at 48 tokens + its [MASK]) is over it too. Only the second
-/// question is over, so the refusal names it.
+/// Options count too: a short instruction with many long options (each capped
+/// at 48 tokens + its [MASK]) leaves Laya under 16 tokens of slack, so it would
+/// trim every option — refused on the options. Only the second question is
+/// over, so the refusal names it.
 #[tokio::test]
 async fn laya_counts_a_choices_options_against_the_head_budget() {
     let server = unreachable_server().await;
@@ -1427,12 +1465,23 @@ async fn laya_counts_a_choices_options_against_the_head_budget() {
                 .collect(),
         },
     );
-    let err = SystemOneAdapter::with_id("laya")
+    match SystemOneAdapter::with_id("laya")
         .unwrap()
         .decide(&keyless(&server.uri()), &req)
         .await
-        .unwrap_err();
-    assert_head_refusal(err, "team", "english", 192);
+        .unwrap_err()
+    {
+        GatewayError::InputRejected { adapter, message } => {
+            assert_eq!(adapter, "laya");
+            assert!(message.contains("question 'team''s options"), "{message}");
+            assert!(
+                message.contains("leaves options 176 of its 192"),
+                "{message}"
+            );
+            assert!(message.contains("the options would be cut"), "{message}");
+        }
+        other => panic!("expected the per-option refusal before sending, got {other:?}"),
+    }
 }
 
 /// The budget is Laya's: any other id sends the same long instruction.
@@ -1512,6 +1561,26 @@ async fn live_laya_answers_every_type_and_reports_truncation() {
             )
         }
         other => panic!("expected the D3 truncation error, got {other:?}"),
+    }
+
+    // The per-option cut (found live on multilingual): 25 eight-digit keys are
+    // refused before sending on every checkpoint.
+    let mut many = request(Some(&model), vec![], None);
+    many.questions = DecisionQuestions::from([(
+        "q".to_string(),
+        DecisionQuestion::Choice {
+            instructions: json!("Pick"),
+            criteria: (0..25)
+                .map(|i| (format!("{}", 10_000_000 + i), None))
+                .collect(),
+        },
+    )]);
+    match adapter.decide(&cfg, &many).await.unwrap_err() {
+        GatewayError::InputRejected { message, .. } => {
+            eprintln!("LIVE option-cut refusal: {message}");
+            assert!(message.contains("question 'q'"), "{message}")
+        }
+        other => panic!("expected the option-budget refusal, got {other:?}"),
     }
 
     // D7 / AC10: a misspelled checkpoint is auto-routed by Laya, and refused here.
