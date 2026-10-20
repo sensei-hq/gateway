@@ -397,7 +397,8 @@ pub(crate) async fn decide(
             adapter: adapter.into(),
             message: format!(
                 "the host truncated the input to fit its window ({}); its answers do not cover \
-                 the whole request — set the model's context_window to its real token window (or lower it if it already is)",
+                 the whole request — set the model's context_window to its real token window \
+                 (or lower it if it already is)",
                 if cut.is_empty() {
                     "no detail".to_string()
                 } else {
