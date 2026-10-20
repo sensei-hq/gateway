@@ -1132,3 +1132,86 @@ async fn laya_errors_surface_the_servers_detail() {
         }
     }
 }
+
+/// Live, opt-in: a real `laya-coreml-serve` (laya-coreml 0.5.1, verified on an
+/// M4 Max, CoreML CPU+GPU):
+///   pip install "laya-coreml[serve]"
+///   LAYA_HOST=127.0.0.1 LAYA_PORT=8000 LAYA_MODELS=english laya-coreml-serve
+///   LAYA_URL=http://127.0.0.1:8000 cargo test -p sensei-cloud-providers \
+///     --test systemone_mock live_laya -- --ignored
+/// `LAYA_MODEL` picks the checkpoint (default `english`, a 512-token window).
+#[tokio::test]
+#[ignore = "requires LAYA_URL: a running laya-coreml-serve"]
+async fn live_laya_answers_every_type_and_reports_truncation() {
+    let url = std::env::var("LAYA_URL").expect("LAYA_URL");
+    let model = std::env::var("LAYA_MODEL").unwrap_or_else(|_| "english".into());
+    let mut cfg = keyless(&url);
+    cfg.timeout_ms = Some(120_000);
+    let adapter = SystemOneAdapter::with_id("laya").unwrap();
+
+    let mut req = request(Some(&model), vec![], None);
+    req.questions = laya_questions();
+    let resp = adapter
+        .decide(&cfg, &req)
+        .await
+        .expect("live laya decision");
+    eprintln!(
+        "LIVE laya answers: {:#?}\nusage: {:?}",
+        resp.answers, resp.usage
+    );
+    let DecisionAnswer::Choice {
+        choice,
+        probabilities,
+        ..
+    } = &resp.answers["label"]
+    else {
+        panic!("choice answer expected: {:?}", resp.answers);
+    };
+    // The contract, not the model's opinion.
+    assert_eq!(probabilities.keys().collect::<Vec<_>>(), ["billing", "bug"]);
+    let argmax = probabilities
+        .iter()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(k, _)| k.as_str());
+    assert_eq!(Some(choice.as_str()), argmax, "{probabilities:?}");
+    assert!((probabilities.values().sum::<f64>() - 1.0).abs() < 1e-3);
+    assert!(
+        matches!(resp.answers["refund"], DecisionAnswer::Noul { noul, .. } if (0.0..=1.0).contains(&noul))
+    );
+    assert!(
+        matches!(resp.answers["urgency"], DecisionAnswer::Score { score, .. } if (0.0..=2.0).contains(&score))
+    );
+    assert!(
+        resp.usage
+            .is_some_and(|u| u.input_tokens > 0 && u.output_tokens == 0)
+    );
+
+    // D3 against the real server: ~1200 tokens into a 512-token window.
+    let mut long = request(Some(&model), vec![], None);
+    long.state =
+        json!(["The customer wrote again about the duplicate invoice charge."; 120].join(" "));
+    match adapter.decide(&cfg, &long).await.unwrap_err() {
+        GatewayError::ProviderError { message, .. } => {
+            assert!(
+                message.contains("the host truncated the input"),
+                "{message}"
+            )
+        }
+        other => panic!("expected the D3 truncation error, got {other:?}"),
+    }
+
+    // An image is refused before sending; it never reaches the server.
+    match adapter
+        .decide(
+            &cfg,
+            &request(Some(&model), vec![PNG_B64.to_string()], None),
+        )
+        .await
+        .unwrap_err()
+    {
+        GatewayError::ProviderError { message, .. } => {
+            assert!(message.contains("does not read images"), "{message}")
+        }
+        other => panic!("expected the image refusal, got {other:?}"),
+    }
+}

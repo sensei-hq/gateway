@@ -71,10 +71,10 @@ in-process vs 46.9 ms HTTP (noise); ANE 4.12 ms vs 4.47 ms (+0.35 ms ≈ 8%); ba
   `ProviderError` trigger; `truncated: false` or absent is a success.
 - **AC5** Laya's errors map: 401 → `Authentication`; 400 / 413 / 422 / 500 / 503 → `ProviderError` with the
   `detail` string as the message.
-- **AC6** Ignored live test against a real `laya-coreml-serve` (`LAYA_URL`, optional `LAYA_MODEL`, default
-  `multilingual`): a choice, a noul and a score answer through the engine; an over-window state sent with the
-  model's `context_window` deliberately overstated (so the gate lets it through) comes back as the D3
-  `ProviderError`, never as answers.
+- **AC6** Ignored live tests against a real `laya-coreml-serve` (`LAYA_URL`; `LAYA_MODEL`, default `english`):
+  the adapter answers a choice, a noul and a score with a well-formed distribution, a ~1200-token state
+  into the 512-token window comes back as the D3 `ProviderError`, and an image is refused before sending; a
+  `decide` chain through the facade and engine is served by `laya` in one attempt.
 - **AC7** Docs list `laya` everywhere `llamacpp`/`sglang` are listed (`docs/llms/local.md`, `recipes.md`,
   `docs/features/inference/providers.md`, `capabilities-and-adapters.md`, `docs/features/README.md`, both
   `SKILL.md` copies, the release notes in `docs/llms/upgrading.md` (this repo has no CHANGELOG) and their generated

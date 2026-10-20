@@ -152,3 +152,97 @@ async fn a_decide_chain_routes_to_a_live_llama_cpp_server() {
     );
     assert_eq!(legend["2"], "Immediate");
 }
+
+/// SP-DEC-3 — the facade's `laya` router, a `decide` chain, and a real
+/// `laya-coreml-serve` (see `live_laya_answers_every_type_and_reports_truncation`
+/// in cloud-providers for the server command):
+///   LAYA_URL=http://127.0.0.1:8000 cargo test -p sensei-gateway \
+///     --test live_decision_self_hosted laya -- --ignored
+#[tokio::test]
+#[ignore = "requires LAYA_URL: a running laya-coreml-serve"]
+async fn a_decide_chain_routes_to_a_live_laya_server() {
+    let url = std::env::var("LAYA_URL").expect("LAYA_URL");
+    let config = GatewayConfig {
+        routers: HashMap::from([
+            ("laya".into(), router(&url)),
+            ("openrouter".into(), router("http://127.0.0.1:9")),
+        ]),
+        models: HashMap::from([
+            ("english".into(), model("english", "laya", "english", 512)),
+            (
+                "jev".into(),
+                model("jev", "openrouter", "typesafe/jev-1.13", 32_000),
+            ),
+        ]),
+        chains: HashMap::from([(
+            "decide".into(),
+            FallbackChainConfig {
+                id: "decide".into(),
+                capability: Capability::Decision,
+                models: vec![
+                    ChainEntry {
+                        model: "english".into(),
+                        router: Some("laya".into()),
+                        api_model_id: None,
+                        priority: 1,
+                    },
+                    ChainEntry {
+                        model: "jev".into(),
+                        router: Some("openrouter".into()),
+                        api_model_id: None,
+                        priority: 2,
+                    },
+                ],
+                fallback_triggers: vec![FallbackTrigger::ProviderError],
+            },
+        )]),
+        ..Default::default()
+    };
+    let gw = FacadeBuilder::new(config).build().await.gateway;
+    let req = InferenceRequest {
+        capability: Capability::Decision,
+        model: None,
+        router: None,
+        chain: Some("decide".into()),
+        payload: Payload::Decision {
+            state: json!({"ticket": "I was charged twice. Please refund the extra payment."}),
+            questions: DecisionQuestions::from([
+                (
+                    "refund".to_string(),
+                    DecisionQuestion::Noul {
+                        instructions: json!("Is the customer requesting a refund?"),
+                        criteria: None,
+                    },
+                ),
+                (
+                    "urgency".to_string(),
+                    DecisionQuestion::Score {
+                        instructions: json!("How urgently does this ticket need a response?"),
+                        criteria: vec!["Routine".into(), "Soon".into(), "Immediate".into()],
+                    },
+                ),
+            ]),
+            images: vec![],
+            keep_alive: None,
+        },
+        budget: None,
+        auth: None,
+        panel: None,
+        consensus: None,
+        allow_fallback: true,
+        credentials: Default::default(),
+        routing: None,
+    };
+    let resp = gw.execute(&req).await.expect("the decide chain answers");
+    assert!(resp.success, "{resp:?}");
+    assert_eq!(
+        resp.attempts.len(),
+        1,
+        "served by laya: {:?}",
+        resp.attempts
+    );
+    assert_eq!(resp.attempts[0].adapter, "laya");
+    let answers = resp.decisions.expect("decisions");
+    assert!(matches!(answers["refund"], DecisionAnswer::Noul { .. }));
+    assert!(matches!(answers["urgency"], DecisionAnswer::Score { .. }));
+}
