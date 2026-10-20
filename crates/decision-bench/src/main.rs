@@ -820,6 +820,47 @@ mod tests {
         }
     }
 
+    /// SP-DEC-4 review A7: with no `--seed`, `report` seeds the CIs with the
+    /// manifest's sampling seed, else 2026.
+    #[test]
+    fn report_defaults_seed_to_manifest_seed_else_2026() {
+        let dir = tempfile::tempdir().unwrap();
+        let results = |manifest: serde_json::Value| {
+            serde_json::json!({
+                "generated_at": 0, "manifest": manifest, "not_run": [], "rows": []
+            })
+            .to_string()
+        };
+        let seeded = results(serde_json::json!({
+            "seed": 4242, "per_scenario": 3, "rand_version": "0.8.5",
+            "datasets": [], "files": []
+        }));
+        std::fs::write(dir.path().join("seeded.json"), seeded).unwrap();
+        std::fs::write(
+            dir.path().join("bare.json"),
+            results(serde_json::Value::Null),
+        )
+        .unwrap();
+        let render_of = |file: &str, seed: Option<u64>| {
+            let out = report_command(Path::new(file), Path::new("r.md"), seed, dir.path()).unwrap();
+            std::fs::read_to_string(out).unwrap()
+        };
+        let md = render_of("seeded.json", None);
+        assert!(
+            md.contains("Bootstrap CIs: 1000 resamples, seed 4242."),
+            "{md}"
+        );
+        assert!(md.contains("report --seed 4242"), "{md}");
+        let md = render_of("bare.json", None);
+        assert!(
+            md.contains("Bootstrap CIs: 1000 resamples, seed 2026."),
+            "{md}"
+        );
+        assert!(md.contains("report --seed 2026"), "{md}");
+        let md = render_of("seeded.json", Some(9));
+        assert!(md.contains("report --seed 9"), "--seed wins: {md}");
+    }
+
     /// SP-DEC-4 review A4: NOT RUN is also a reachable model no input fits.
     #[test]
     fn check_help_says_a_model_no_input_fits_is_not_run_too() {

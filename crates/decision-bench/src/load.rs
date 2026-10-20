@@ -327,4 +327,51 @@ mod tests {
         );
         assert!(parse_scenarios(" , ").is_err());
     }
+
+    /// SP-DEC-4 review A8: every documented name parses to its scenario —
+    /// the short CLI names, the serde names, and every name the report's
+    /// reproduce footer writes.
+    #[test]
+    fn every_documented_scenario_name_parses_to_its_scenario() {
+        use Scenario::*;
+        let all = [
+            S1aIntentOos,
+            S1bBanking77,
+            S2Sentiment,
+            S3Entailment,
+            S4TestOutput,
+            S4ReviewFinding,
+            S4FixCheck,
+        ];
+        let table = [
+            ("s1a", S1aIntentOos),
+            ("s1a_intent_oos", S1aIntentOos),
+            ("s1b", S1bBanking77),
+            ("s1b_banking77", S1bBanking77),
+            ("s2", S2Sentiment),
+            ("s2_sentiment", S2Sentiment),
+            ("s3", S3Entailment),
+            ("s3_entailment", S3Entailment),
+            ("s4-test-output", S4TestOutput),
+            ("s4_test_output", S4TestOutput),
+            ("s4-review-finding", S4ReviewFinding),
+            ("s4_review_finding", S4ReviewFinding),
+            ("s4-fix-check", S4FixCheck),
+            ("s4_fix_check", S4FixCheck),
+        ];
+        for (name, want) in table {
+            assert_eq!(parse_scenarios(name).unwrap(), [want], "{name}");
+        }
+        for s in all {
+            let serde_name = serde_json::to_value(s).unwrap();
+            let serde_name = serde_name.as_str().unwrap();
+            assert_eq!(parse_scenarios(serde_name).unwrap(), [s], "{serde_name}");
+            let cli = crate::report::cli_name(s);
+            assert_eq!(parse_scenarios(cli).unwrap(), [s], "{cli}");
+        }
+        assert_eq!(
+            parse_scenarios("s4").unwrap(),
+            [S4TestOutput, S4ReviewFinding, S4FixCheck]
+        );
+    }
 }
