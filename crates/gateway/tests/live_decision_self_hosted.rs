@@ -166,8 +166,8 @@ async fn a_decide_chain_routes_to_a_live_llama_cpp_server() {
 async fn a_decide_chain_routes_to_a_live_laya_server() {
     let url = std::env::var("LAYA_URL").expect("LAYA_URL");
     // The request estimates to ~285 tokens against the 512 window, so the context-window gate
-    // admits laya. The openrouter leg is unroutable and must never be reached; if it is, the
-    // gate skipped laya.
+    // admits laya. The openrouter leg is unroutable and must never be reached; if it is, laya
+    // was skipped by the gate or its attempt failed — see `resp.attempts`.
     let config = GatewayConfig {
         routers: HashMap::from([
             ("laya".into(), router(&url)),
