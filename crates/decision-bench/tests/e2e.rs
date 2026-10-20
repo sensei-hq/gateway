@@ -421,3 +421,85 @@ async fn the_report_says_who_won_when_one_model_is_clearly_better() {
     assert!(!md.contains("## NOT RUN"), "{md}");
     assert!(!md.contains("INCOMPLETE"), "{md}");
 }
+
+/// A server that answers its first connection with a valid System One
+/// answer (so `check` finds it reachable) and drops every later one unanswered
+/// (so the warm-up and every case fail with a transport error that quotes the
+/// request URL).
+fn answer_once_then_drop() -> String {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let mut first = true;
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            if !std::mem::take(&mut first) {
+                drop(stream);
+                continue;
+            }
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = v.trim().parse().unwrap();
+                }
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let answer = json!({
+                "model": "m",
+                "answers": {"q": {"type": "noul", "noul": 0.9}},
+                "usage": {"input_tokens": 3, "output_tokens": 0},
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{answer}",
+                answer.len()
+            )
+            .unwrap();
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// SP-DEC-4 review A9: a URL can carry a token, and the warm-up failure
+/// line on stderr quoted it unredacted.
+#[test]
+fn a_failed_warm_up_never_prints_the_model_url() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = format!("{}/?token=SECRETTOK/", answer_once_then_drop());
+    std::fs::write(
+        dir.path().join("bench.toml"),
+        format!(
+            "[[models]]\nid = \"tok\"\nrouter = \"llamacpp\"\nurl = \"{url}\"\n\
+             api_model_id = \"tok-api\"\ncontext_window = 8192\n"
+        ),
+    )
+    .unwrap();
+    let cases_dir = dir.path().join("cases");
+    std::fs::create_dir_all(&cases_dir).unwrap();
+    decision_bench::case::write_jsonl(&cases_dir.join("s3.jsonl"), &cases(2, 0)).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_decision-bench"))
+        .arg("run")
+        .arg("--config")
+        .arg(dir.path().join("bench.toml"))
+        .arg("--cases")
+        .arg(&cases_dir)
+        .args(["--scenarios", "s3", "--out"])
+        .arg(dir.path().join("results.json"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("warm-up failed"), "{stderr}");
+    assert!(!stderr.contains("SECRETTOK"), "{stderr}");
+    let results = std::fs::read_to_string(dir.path().join("results.json")).unwrap();
+    assert!(!results.contains("SECRETTOK"), "{results}");
+}
