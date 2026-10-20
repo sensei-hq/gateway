@@ -70,6 +70,7 @@ each adapter's `RegisterInto` impl (cloud and embedded alike).
 | `cloudflare` | | | | | | | ✓ |
 | `llamacpp` | | | | | | | ✓ |
 | `sglang` | | | | | | | ✓ |
+| `laya` | | | | | | | ✓ |
 | `gemini` | ✓ | ✓ | | | | | |
 | `huggingface` | ✓ | ✓ | | | | | |
 | `bedrock` | ✓ | ✓ | | | | | |
@@ -96,6 +97,6 @@ Notes:
 - `noop` is the catch-all test/dev adapter — accepts every capability, returns a canned "no provider" response.
 - `openai` also registers under other ids (`openrouter`, `vercel`, `nvidia`, …) via `with_id`, sharing one implementation across OpenAI-compatible endpoints. Its capability set is fixed regardless of id, so the `openrouter` row's chat…image ticks are OpenAI's set, not a claim about what OpenRouter serves.
 - `openrouter` and `typesafe` are auto-registered by the facade when their router id is in config: `openrouter` = `OpenAIAdapter` (id `openrouter`) + a decision-only `SystemOneAdapter`; `typesafe` = `SystemOneAdapter` only. See [capabilities & adapters § Decision](inference/capabilities-and-adapters.md#decision-system-one).
-- `cloudflare`, `llamacpp` and `sglang` are likewise auto-registered by the facade, decision-only: `cloudflare` = `CloudflareAdapter` (Workers AI `clef` / `clef-flash`; `url` = `https://api.cloudflare.com/client/v4/accounts/<account_id>/ai`), `llamacpp` / `sglang` = `SystemOneAdapter` pointed at a self-hosted `llama-server` / SGLang server. A chat adapter the caller registers under one of these ids lives in the chat map and is left untouched. `llamacpp` (a server over HTTP) is not the embedded `llama_cpp` engine. There is no `vllm` id — vLLM has no upstream `/v1/systemone`.
+- `cloudflare`, `llamacpp`, `sglang` and `laya` are likewise auto-registered by the facade, decision-only: `cloudflare` = `CloudflareAdapter` (Workers AI `clef` / `clef-flash`; `url` = `https://api.cloudflare.com/client/v4/accounts/<account_id>/ai`), `llamacpp` / `sglang` / `laya` = `SystemOneAdapter` pointed at a self-hosted `llama-server` / SGLang server / `laya-coreml-serve` (open-weight, CoreML on Apple Silicon). A chat adapter the caller registers under one of these ids lives in the chat map and is left untouched; a *decision* adapter registered under one of them is replaced by `build()`. `laya` refuses (as `GatewayError::InputRejected`, which always falls back, is never retried and never counts toward the breaker) a decision that carries images (it ignores them) or a question over its per-question head budget, and an answer whose `usage.truncated` is `true` or whose options collapsed (the gateway checks both on every decision host; only Laya sends them today); a misspelled `laya` model is refused too, since Laya would silently re-route it. Keep `LAYA_HOST=127.0.0.1` (Laya's default `0.0.0.0` has no auth unless `LAYA_API_KEY` is set). `llamacpp` (a server over HTTP) is not the embedded `llama_cpp` engine. There is no `vllm` id — vLLM has no upstream `/v1/systemone`.
 - `base` and `async_job` are shared helpers, not adapters — `async_job` drives the submit-then-poll pattern for async media adapters.
 - Update this matrix when an adapter gains or loses a capability.

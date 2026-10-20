@@ -9,9 +9,9 @@ live in `local-providers`.
 
 ```toml
 local-providers = { package = "sensei-local-providers", git = "https://github.com/sensei-hq/gateway",
-                    tag = "v0.4.8", features = ["llama-cpp"] }   # or: ort  (fastembed deferred, see note)
+                    tag = "v0.12.0", features = ["llama-cpp"] }   # or: ort  (fastembed deferred, see note)
 local-engine    = { package = "sensei-local-engine", git = "https://github.com/sensei-hq/gateway",
-                    tag = "v0.4.8", features = ["hf-download"] } # resolvers + HF pull
+                    tag = "v0.12.0", features = ["hf-download"] } # resolvers + HF pull
 ```
 
 | Feature | Engine | Capabilities | Format |
@@ -38,11 +38,11 @@ models you've `ollama pull`ed are available for chat + embed, and decision model
 [recipes § decision](recipes.md#ask-a-decision-system-one). Use this when Ollama is
 already running on the box and you don't want to link native engines.
 
-## Self-hosted decision servers (llama.cpp, SGLang)
+## Self-hosted decision servers (llama.cpp, SGLang, Laya)
 
 For System One **decisions** you can also point a router at your own `llama-server`
-or SGLang server — again no `local-providers` / `local-engine` needed. The facade
-auto-registers the router ids `llamacpp` and `sglang` as decision-only
+SGLang server or Laya server — again no `local-providers` / `local-engine` needed. The facade
+auto-registers the router ids `llamacpp`, `sglang` and `laya` as decision-only
 `SystemOneAdapter`s (POST `{url}/v1/systemone`; bearer only if a key is configured).
 This `llamacpp` router is an HTTP server, unrelated to the embedded `llama-cpp`
 feature below, and a chat adapter you register under the same id is left untouched.
@@ -59,6 +59,44 @@ feature below, and a chat adapter you register under the same id is left untouch
   are only on main (#42183): **v0.5.21 silently drops images** (200, text-only
   answers). A model name containing `:` is parsed as a LoRA adapter → 400; serve it
   under a colon-free name. Optional `--api-key` bearer. `usage.output_tokens` is 0.
+- **Laya** — open-weight, CoreML on Apple Silicon — no cloud key; weights are public
+  Hub downloads (offline after the first). `pip install "laya-coreml[serve]"` (verified
+  with 0.5.1), then `LAYA_HOST=127.0.0.1 LAYA_PORT=8000 LAYA_MODELS=english
+  laya-coreml-serve`; router `url = "http://127.0.0.1:8000"`, pin `api_model_id` to a
+  checkpoint (`english` 512-token window, `multilingual` / `typed-decisions` 1024, or
+  your own via `LAYA_EXTRA_MODELS`). Bearer only if the server sets `LAYA_API_KEY`.
+  **Keep `LAYA_HOST=127.0.0.1`**: Laya's default is `0.0.0.0` with no auth unless
+  `LAYA_API_KEY` is set, so otherwise anyone on the network can call it — set a key and
+  the router's `api_key_env` if it must listen wider.
+  Laya ignores images and cuts over-long questions **silently**, so the gateway refuses
+  both itself, before sending, as `GatewayError::InputRejected` ("this candidate cannot
+  serve this input; the endpoint is healthy"): the chain falls back **whatever
+  `fallback_triggers` holds** (even empty), it is never retried and never counts toward
+  the breaker. Concretely, a `laya` decision is refused if it carries images, or if a
+  question's head (`<type> question: <instructions>` plus its options) is estimated over the checkpoint's
+  `head_max_len` (`english` 192 tokens; `multilingual` / `typed-decisions` 256; any other
+  name, 192), or its options over that budget minus 16 (Laya also trims every option
+  below 16 tokens of room). The estimate is a conservative character-class count measured
+  against both checkpoints' real tokenizers (never under in the committed fixture), so it
+  errs high (it adds a margin of 2 tokens per option and 1 on the head) — about 1.7x on English (roughly 300 instruction chars fit on `english`, a 288-character
+  instruction estimating 185 of 192, against a real limit near 560), 2-7x on non-Latin scripts (Chinese on `multilingual`
+  allows about 70 chars). The model name is canonicalised with Laya's aliases first
+  (`en` / `laya` / `default`, `multi` / `ml`, `typed` / `decisions`, the
+  `convaiinnovations/laya-*` ids). A `LAYA_EXTRA_MODELS` checkpoint with `head_max_len`
+  below 192 is unknown to the gateway and can still be cut silently. Over-window input
+  is also caught by the model's `context_window` (set it to the real window) and by
+  `usage.truncated: true` on a 200 (an `InputRejected` too); keep Laya's default payload
+  (`LAYA_JEV_STRICT` strips the flag). A 200 whose `usage.options` has an entry with
+  `distinct < total` (options that collapsed to the same tokens) is an `InputRejected`
+  as well. Laya **auto-routes an unknown model name and still answers 200**, so if the
+  response's `routing.model` differs from the one you asked for (both canonicalised), the
+  gateway fails the call with a `ProviderError` naming both: a misspelled `api_model_id`
+  is refused (the message lists the valid names: `english`, `multilingual`, `typed-decisions`, their aliases, the two `convaiinnovations/laya-*` ids, or a key of the server's `LAYA_EXTRA_MODELS`; `/health` `loaded` shows only the checkpoints resident right now — `LAYA_MAX_LOADED`, default 2 — not the servable names, and Laya has no endpoint that lists them). The check runs first: a re-routed response is this `ProviderError` even if it is also truncated. Chain a second
+  decision router for refused requests: with only rejections in the chain the engine
+  returns `AllAttemptsFailed { retryable: false }`. Laya's own 413 (too many
+  questions/options) and 422 (e.g. over the exported `max_options`; CoreML caps at 32)
+  are still `ProviderError`s and do count toward the breaker. The response `model` is
+  always `laya-rl-agent`; `usage.output_tokens` is 0. No `/v1/systemone/batch`.
 - **vLLM** — no upstream `/v1/systemone` (PR #59299 open; only an example proxy); not
   supported, no `vllm` id.
 

@@ -252,6 +252,8 @@ impl super::Gateway {
         // `attempted_all` is false and `gated` is None even though nothing hard-failed),
         // and waiting cannot fix that. Computed from `contributions` rather than sniffed
         // from `errors`, so a provider rewording a message cannot change the verdict.
+        // `InputRejected` contributions are not `HardFailure` (SP-DEC-3 D5): an
+        // exhaustion made only of them is `retryable: false`.
         let retryable = contributions
             .iter()
             .any(|c| matches!(c, super::exhaustion::GateContribution::HardFailure));
@@ -442,6 +444,9 @@ impl super::Gateway {
                 // Capture the instant the recorder pipeline just wrote (for a
                 // recoverable limit that locked this endpoint) so the exhaustion
                 // aggregation can attribute a timed resume to this attempt.
+                // An `InputRejected` reaches no recorder and writes nothing
+                // (`dispatch_outcome`, SP-DEC-3 D5); `classify` is `None` for it, so
+                // `should_trigger_fallback` (always `true` for it) decides the walk.
                 let written_until = self.record_outcome(&crate::gates::AttemptOutcome {
                     endpoint: &endpoint,
                     router: &candidate.router,

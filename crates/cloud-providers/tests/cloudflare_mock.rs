@@ -314,3 +314,52 @@ async fn a_path_hostile_model_is_refused_before_any_request() {
         }
     }
 }
+
+/// D7 compares `routing.model` with the BODY model — for Workers AI the short
+/// name — so a catalog id (`@cf/cloudflare/clef`) answered as `clef` is no
+/// re-route. (Workers AI sends no `routing` today; this pins the comparison.)
+#[tokio::test]
+async fn a_routing_model_equal_to_the_short_name_is_not_a_re_route() {
+    let server = MockServer::start().await;
+    let mut result = clef_result("clef");
+    result["routing"] = json!({"model": "clef"});
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(result)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    CloudflareAdapter::new()
+        .unwrap()
+        .decide(&cfg(&server), &request(Some("@cf/cloudflare/clef"), vec![]))
+        .await
+        .expect("the body model is the short name");
+}
+
+/// The truncation check lives in the shared `decide` core, so Cloudflare gets it
+/// too; `usage` sits inside the Workers AI envelope.
+#[tokio::test]
+async fn cloudflare_also_treats_a_truncated_answer_as_an_input_rejection() {
+    let server = MockServer::start().await;
+    let mut result = clef_result("clef");
+    result["usage"] = json!({"input_tokens": 677, "output_tokens": 0, "truncated": true});
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(envelope(result)))
+        .mount(&server)
+        .await;
+
+    match CloudflareAdapter::new()
+        .unwrap()
+        .decide(&cfg(&server), &request(Some("clef"), vec![]))
+        .await
+        .unwrap_err()
+    {
+        GatewayError::InputRejected { adapter, message } => {
+            assert_eq!(adapter, "cloudflare");
+            assert!(
+                message.contains("the host truncated the input"),
+                "{message}"
+            )
+        }
+        other => panic!("expected a truncation InputRejected, got {other:?}"),
+    }
+}

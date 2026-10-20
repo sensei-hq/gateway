@@ -3356,6 +3356,103 @@ async fn execute_stream_setup_failure_cools_router_closing_the_gap() {
     );
 }
 
+/// SP-DEC-3 D5 on the STREAM path: an `InputRejected` from `chat_stream` setup falls
+/// back under an EMPTY trigger set (the stream-local `should_trigger_fallback` use),
+/// and leaves the rejecting endpoint breaker-`Closed` (threshold 1, so one recorded
+/// failure would open it) with no performance sample — no recorder heard it.
+#[tokio::test]
+async fn execute_stream_input_rejected_at_setup_falls_back_and_stays_health_neutral() {
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig {
+        threshold: 1,
+        ..Default::default()
+    });
+    let gw = Gateway::new(ab_chain_config(vec![]), AdapterRegistry::new(), cb.clone());
+    register_stream_err(&gw, "A", || GatewayError::InputRejected {
+        adapter: "A".into(),
+        message: "this host ignores images".into(),
+    })
+    .await;
+    gw.adapters
+        .register_chat(Arc::new(FakeStreamer {
+            id: "B".to_string(),
+        }))
+        .await;
+
+    let events = collect_stream(&gw, &chat_request()).await;
+
+    assert!(
+        matches!(events.last(), Some(StreamEvent::Done { model, .. }) if model == "b-model"),
+        "an input rejection must fall back to B even with no triggers, got {events:?}"
+    );
+    assert_eq!(cb.get_state("A:a-model").name(), "closed");
+    assert!(
+        gw.performance_stats("A:a-model").is_none(),
+        "an input rejection must record no performance sample: {:?}",
+        gw.performance_stats("A:a-model")
+    );
+}
+
+/// SP-DEC-3 D5 on the STREAM path: a chain exhausted only by setup input rejections
+/// ends in a terminal `input_rejected` error with no `resume_after` — not
+/// `all_gated`. (The stream terminal event carries no `retryable` flag; "no deadline,
+/// not gated" is its form of `AllAttemptsFailed { retryable: false }`.)
+#[tokio::test]
+async fn execute_stream_exhaustion_of_input_rejections_is_terminal_not_gated() {
+    let gw = ab_gateway(ab_chain_config(vec![]));
+    for id in ["A", "B"] {
+        let adapter = id.to_string();
+        register_stream_err(&gw, id, move || GatewayError::InputRejected {
+            adapter: adapter.clone(),
+            message: "this host ignores images".into(),
+        })
+        .await;
+    }
+
+    let events = collect_stream(&gw, &chat_request()).await;
+
+    match events.last() {
+        Some(StreamEvent::Error {
+            code, resume_after, ..
+        }) => {
+            assert_eq!(code, "input_rejected");
+            assert!(resume_after.is_none(), "waiting cannot fix the input");
+        }
+        other => panic!("expected a terminal input_rejected Error, got {other:?}"),
+    }
+}
+
+/// SP-DEC-3 D5 on the STREAM path: the setup contribution for an input rejection is
+/// NEUTRAL, exactly as in `execute`. Beside a setup rate limit (a timed gate) the
+/// stream ends `all_gated` with a deadline — waiting clears B, and the walk then
+/// passes A's cheap rejection. A rejection mis-counted as a hard failure would veto
+/// that and end on B's plain error instead.
+#[tokio::test]
+async fn execute_stream_input_rejection_beside_a_setup_rate_limit_is_all_gated() {
+    let gw = ab_gateway(ab_chain_config(vec![]));
+    register_stream_err(&gw, "A", || GatewayError::InputRejected {
+        adapter: "A".into(),
+        message: "this host ignores images".into(),
+    })
+    .await;
+    register_stream_err(&gw, "B", || GatewayError::RateLimit {
+        adapter: "B".into(),
+        retry_after_ms: None,
+    })
+    .await;
+
+    let events = collect_stream(&gw, &chat_request()).await;
+
+    match events.last() {
+        Some(StreamEvent::Error {
+            code, resume_after, ..
+        }) => {
+            assert_eq!(code, "all_gated", "the rejection must not veto B's gate");
+            assert_resume_near(*resume_after, 60, 40); // rate-limit base ~60s
+        }
+        other => panic!("expected a terminal all_gated Error, got {other:?}"),
+    }
+}
+
 /// (5) Guard: an early terminal stop leaves a PLAIN error, not all_gated.
 /// `[A (401 auth), B (ok)]` → A's terminal auth stops the walk with B still
 /// untried, so the terminal `StreamEvent::Error` carries `resume_after: None`

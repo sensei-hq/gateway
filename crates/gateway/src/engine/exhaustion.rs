@@ -12,6 +12,15 @@ pub(crate) enum GateContribution {
     Terminal(HumanAction),
     /// Attempted, failed with a non-limit fault (500 / network / unclassified).
     HardFailure,
+    /// Attempted, but the candidate cannot serve this request's input
+    /// (`GatewayError::InputRejected`, SP-DEC-3 D5). Neither a fault nor a gate:
+    /// it does not make exhaustion retryable (the same input fails the same way
+    /// again), and it is NEUTRAL to the all-gated decision, like an over-window
+    /// skip — beside gated candidates the exhaustion is `AllGated` on THEIR gates
+    /// (waiting or a human clears them, and the walk then passes this cheap,
+    /// health-neutral rejection); with no gate at all it is
+    /// `AllAttemptsFailed { retryable: false }`.
+    InputRejected,
 }
 
 /// Anchor a monotonic `Instant` deadline to wall-clock. Past/elapsed ⇒ now.
@@ -27,6 +36,11 @@ pub(super) fn contribution_for(
     written_until: Option<Instant>,
 ) -> GateContribution {
     use crate::gates::lockout::{LockReason, classify};
+    // SP-DEC-3 D5: decided before `classify`, which returns `None` for it and would
+    // otherwise land it on `HardFailure` — a retryable fault it is not.
+    if matches!(err, GatewayError::InputRejected { .. }) {
+        return GateContribution::InputRejected;
+    }
     match classify(err) {
         Some(r) if r.is_recoverable() => match written_until {
             Some(u) => GateContribution::Timed(u),
@@ -58,12 +72,17 @@ pub(crate) fn render_skipped(skipped: &[SkippedCandidate]) -> Vec<String> {
 }
 
 /// Build the terminal error at chain exhaustion. `Some(AllGated)` iff every
-/// candidate was gated (health-skip or classified limit) and none hard-failed;
+/// candidate was gated (health-skip or classified limit) and none hard-failed
+/// (an input rejection is neutral — it neither vetoes nor counts as a gate);
 /// `None` ⇒ "not all-gated — use the existing terminal error".
 pub(crate) fn all_gated_error(
     skipped: &[SkippedCandidate],
     contributions: &[GateContribution],
 ) -> Option<GatewayError> {
+    // An input rejection does NOT veto (SP-DEC-3 D5): beside `[laya(rejected),
+    // hosted(breaker-open)]` waiting DOES fix the chain — after `resume_after` the
+    // walk passes laya's rejection and the recovered hosted candidate serves it.
+    // Vetoing would turn that recoverable pause into a permanent `Fail`.
     if contributions
         .iter()
         .any(|c| matches!(c, GateContribution::HardFailure))
@@ -98,7 +117,10 @@ pub(crate) fn all_gated_error(
                 any_gate = true;
                 let _ = human.get_or_insert(*h);
             }
-            GateContribution::HardFailure => {}
+            // `HardFailure` vetoed above; `InputRejected` is neutral — not a gate,
+            // so it alone never makes `any_gate` true. Listed so a new variant must
+            // choose here too.
+            GateContribution::HardFailure | GateContribution::InputRejected => {}
         }
     }
     if !any_gate {
