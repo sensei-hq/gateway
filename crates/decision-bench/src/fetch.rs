@@ -255,6 +255,15 @@ async fn hub_info(hf: &Hf, id: &str) -> anyhow::Result<HubInfo> {
     let req = hf.client.get(format!("{}/api/datasets/{id}", hf.hub_base));
     let body = get_text(req, &what, hf.pacing.retry_after).await?;
     let raw: RawHub = serde_json::from_str(&body).with_context(|| format!("{what}: parsing"))?;
+    // The sha names a cache directory (`cache_dir`), so it must be a plain
+    // revision hash, never a path.
+    let hex = |c: char| c.is_ascii_digit() || ('a'..='f').contains(&c);
+    if !matches!(raw.sha.len(), 40 | 64) || !raw.sha.chars().all(hex) {
+        bail!(
+            "{what}: sha {:?} is not a hex revision (40 or 64 lowercase hex chars)",
+            raw.sha
+        );
+    }
     let license = match raw.card_data.as_ref().and_then(|c| c.get("license")) {
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Array(a)) if !a.is_empty() => a
@@ -597,6 +606,13 @@ mod tests {
     use sha2::Digest;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    /// Hex revisions for the mocked hub (a sha must look like one).
+    const S1: &str = "5151515151515151515151515151515151515151";
+    const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const SHA_OLD: &str = "0000000000000000000000000000000000000001";
+    const SHA_NEW: &str = "0000000000000000000000000000000000000002";
 
     const CLINC: &str = include_str!("../tests/fixtures/rows_clinc.json");
     const BANKING: &str = include_str!("../tests/fixtures/rows_banking77.json");
@@ -1071,9 +1087,9 @@ mod tests {
     #[tokio::test]
     async fn hub_info_without_a_usable_licence_is_an_error() {
         for body in [
-            json!({"sha": "s"}),
-            json!({"sha": "s", "cardData": {}}),
-            json!({"sha": "s", "cardData": {"license": []}}),
+            json!({"sha": S1}),
+            json!({"sha": S1, "cardData": {}}),
+            json!({"sha": S1, "cardData": {"license": []}}),
         ] {
             let hub = hub_serving("o/d", &body.to_string()).await;
             let err = hf("", &hub.uri())
@@ -1085,7 +1101,7 @@ mod tests {
         }
         let hub = hub_serving(
             "o/d",
-            &json!({"sha": "s", "cardData": {"license": ["mit", 3]}}).to_string(),
+            &json!({"sha": S1, "cardData": {"license": ["mit", 3]}}).to_string(),
         )
         .await;
         let err = hf("", &hub.uri())
@@ -1094,6 +1110,44 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("licence 3 is not a string"), "{err}");
+    }
+
+    /// SP-DEC-4 review B4: the hub sha names a cache directory, so anything
+    /// but a 40- or 64-char lowercase hex revision is refused before use.
+    #[tokio::test]
+    async fn a_hub_sha_that_is_not_a_hex_revision_is_refused() {
+        for bad in [
+            "../../x",
+            "s1",
+            "ABCDEF0123456789ABCDEF0123456789ABCDEF01",
+            &"a".repeat(41),
+            &format!("{}/", "a".repeat(39)),
+        ] {
+            let hub = hub_serving(
+                "org/ds",
+                &json!({"sha": bad, "cardData": {"license": "mit"}}).to_string(),
+            )
+            .await;
+            let root = tempfile::tempdir().unwrap();
+            let inner = root.path().join("a").join("b");
+            let err = format!(
+                "{:#}",
+                hf("http://127.0.0.1:9", &hub.uri())
+                    .load_or_fetch(&inner, "org/ds", "plain", "test")
+                    .await
+                    .unwrap_err()
+            );
+            assert!(err.contains("not a hex revision"), "{bad}: {err}");
+            assert!(!root.path().join("x").exists(), "{bad}");
+        }
+        for good in ["0123456789abcdef0123456789abcdef01234567", &"f".repeat(64)] {
+            let hub = hub_serving(
+                "o/d",
+                &json!({"sha": good, "cardData": {"license": "mit"}}).to_string(),
+            )
+            .await;
+            assert_eq!(hf("", &hub.uri()).hub_info("o/d").await.unwrap().sha, good);
+        }
     }
 
     #[test]
@@ -1123,17 +1177,17 @@ mod tests {
     #[test]
     fn the_sha_guard_refuses_a_stale_cache() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(check_cached_sha(dir.path(), "bbb").unwrap(), None);
+        assert_eq!(check_cached_sha(dir.path(), SHA_B).unwrap(), None);
         std::fs::write(
             dir.path().join("meta.json"),
-            serde_json::to_string(&meta("aaa")).unwrap(),
+            serde_json::to_string(&meta(SHA_A)).unwrap(),
         )
         .unwrap();
-        let err = check_cached_sha(dir.path(), "bbb").unwrap_err().to_string();
-        assert!(err.contains("aaa") && err.contains("bbb"), "{err}");
+        let err = check_cached_sha(dir.path(), SHA_B).unwrap_err().to_string();
+        assert!(err.contains(SHA_A) && err.contains(SHA_B), "{err}");
         assert_eq!(
-            check_cached_sha(dir.path(), "aaa").unwrap(),
-            Some(meta("aaa"))
+            check_cached_sha(dir.path(), SHA_A).unwrap(),
+            Some(meta(SHA_A))
         );
     }
 
@@ -1151,7 +1205,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_or_fetch_writes_the_cache_once_and_then_reads_it() {
-        let hub = hub_with_sha("s1").await;
+        let hub = hub_with_sha(S1).await;
         let ds = MockServer::start().await;
         Mock::given(path("/rows"))
             .respond_with(Pager(150))
@@ -1165,10 +1219,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(a.rows.len(), 150);
-        assert_eq!(a.meta.sha, "s1");
+        assert_eq!(a.meta.sha, S1);
         assert_eq!(a.meta.num_rows, 150);
         assert_eq!(a.meta.license, "mit");
-        let dir = root.path().join("org__ds@s1");
+        let dir = root.path().join(format!("org__ds@{S1}"));
         assert!(dir.join("meta.json").exists());
         let rows_file = std::fs::read(dir.join("plain-test.jsonl")).unwrap();
         assert_eq!(a.meta.rows_sha256, Some(sha256_ref(&rows_file)));
@@ -1189,11 +1243,11 @@ mod tests {
     /// A complete cache for org/ds@s1 holding `rows` 3-row-file rows, with
     /// `meta` edited by `edit`.
     fn seed_cache(root: &Path, edit: impl FnOnce(&mut Meta)) -> PathBuf {
-        let dir = root.join("org__ds@s1");
+        let dir = root.join(format!("org__ds@{S1}"));
         std::fs::create_dir_all(&dir).unwrap();
         let rows: Vec<Row> = parse_rows_page(&page(3, 0, 3).to_string()).unwrap().rows;
         crate::case::write_jsonl(&dir.join("plain-test.jsonl"), &rows).unwrap();
-        let mut m = meta("s1");
+        let mut m = meta(S1);
         m.num_rows = 3;
         m.rows_sha256 = Some(sha256_ref(
             &std::fs::read(dir.join("plain-test.jsonl")).unwrap(),
@@ -1204,7 +1258,7 @@ mod tests {
     }
 
     async fn load_cached(root: &Path) -> anyhow::Result<Dataset> {
-        let hub = hub_with_sha("s1").await;
+        let hub = hub_with_sha(S1).await;
         // Any datasets-server call would fail: the cache must answer.
         hf("http://127.0.0.1:9", &hub.uri())
             .load_or_fetch(root, "org/ds", "plain", "test")
@@ -1257,7 +1311,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_interrupted_fetch_resumes_from_the_saved_pages() {
-        let hub = hub_with_sha("s1").await;
+        let hub = hub_with_sha(S1).await;
         let ds = MockServer::start().await;
         Mock::given(path("/rows"))
             .and(query_param("offset", "100"))
@@ -1292,7 +1346,7 @@ mod tests {
                 .collect();
         // Run 1: 0 ok, 100 fails. Run 2 resumes at 100; offset 0 is never re-fetched.
         assert_eq!(offsets, [0, 100, 100, 200]);
-        let dir = root.path().join("org__ds@s1");
+        let dir = root.path().join(format!("org__ds@{S1}"));
         assert!(
             !dir.join("plain-test.pages").exists(),
             "page files not cleaned up"
@@ -1302,7 +1356,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_invalid_page_is_never_saved() {
-        let hub = hub_with_sha("s1").await;
+        let hub = hub_with_sha(S1).await;
         let ds = MockServer::start().await;
         Mock::given(path("/rows"))
             .and(query_param("offset", "100"))
@@ -1320,16 +1374,22 @@ mod tests {
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("offset 100"), "{err:#}");
-        let pages = root.path().join("org__ds@s1").join("plain-test.pages");
+        let pages = root
+            .path()
+            .join(format!("org__ds@{S1}"))
+            .join("plain-test.pages");
         assert!(pages.join("0.json").exists());
         assert!(!pages.join("100.json").exists());
     }
 
     #[tokio::test]
     async fn a_corrupt_saved_page_names_its_file_and_how_to_recover() {
-        let hub = hub_with_sha("s1").await;
+        let hub = hub_with_sha(S1).await;
         let root = tempfile::tempdir().unwrap();
-        let pages = root.path().join("org__ds@s1").join("plain-test.pages");
+        let pages = root
+            .path()
+            .join(format!("org__ds@{S1}"))
+            .join("plain-test.pages");
         std::fs::create_dir_all(&pages).unwrap();
         std::fs::write(pages.join("0.json"), "{not json").unwrap();
         let err = format!(
@@ -1348,14 +1408,17 @@ mod tests {
 
     #[tokio::test]
     async fn a_stale_resumed_page_is_discarded_so_a_retry_succeeds() {
-        let hub = hub_with_sha("s1").await;
+        let hub = hub_with_sha(S1).await;
         let ds = MockServer::start().await;
         Mock::given(path("/rows"))
             .respond_with(Pager(300))
             .mount(&ds)
             .await;
         let root = tempfile::tempdir().unwrap();
-        let pages = root.path().join("org__ds@s1").join("plain-test.pages");
+        let pages = root
+            .path()
+            .join(format!("org__ds@{S1}"))
+            .join("plain-test.pages");
         std::fs::create_dir_all(&pages).unwrap();
         // Saved by an earlier run when the split had 250 rows.
         std::fs::write(pages.join("0.json"), page(250, 0, 100).to_string()).unwrap();
@@ -1382,13 +1445,13 @@ mod tests {
 
     #[tokio::test]
     async fn load_or_fetch_refuses_a_cache_whose_meta_disagrees_with_the_hub() {
-        let hub = hub_with_sha("bbb").await;
+        let hub = hub_with_sha(SHA_B).await;
         let root = tempfile::tempdir().unwrap();
-        let dir = root.path().join("org__ds@bbb");
+        let dir = root.path().join(format!("org__ds@{SHA_B}"));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("meta.json"),
-            serde_json::to_string(&meta("aaa")).unwrap(),
+            serde_json::to_string(&meta(SHA_A)).unwrap(),
         )
         .unwrap();
         let err = hf("http://127.0.0.1:9", &hub.uri())
@@ -1396,7 +1459,7 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("aaa") && err.contains("bbb"), "{err}");
+        assert!(err.contains(SHA_A) && err.contains(SHA_B), "{err}");
     }
 
     #[tokio::test]
@@ -1407,13 +1470,13 @@ mod tests {
                 .set_body_json(json!({"sha": sha, "cardData": {"license": "mit"}}))
         };
         Mock::given(path("/api/datasets/org/ds"))
-            .respond_with(body("old"))
+            .respond_with(body(SHA_OLD))
             .up_to_n_times(1)
             .with_priority(1)
             .mount(&hub)
             .await;
         Mock::given(path("/api/datasets/org/ds"))
-            .respond_with(body("new"))
+            .respond_with(body(SHA_NEW))
             .mount(&hub)
             .await;
         let ds = MockServer::start().await;
@@ -1427,8 +1490,8 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("old") && err.contains("new"), "{err}");
-        let dir = root.path().join("org__ds@old");
+        assert!(err.contains(SHA_OLD) && err.contains(SHA_NEW), "{err}");
+        let dir = root.path().join(format!("org__ds@{SHA_OLD}"));
         assert!(!dir.join("meta.json").exists());
         assert!(
             !dir.join("plain-test.pages").exists(),

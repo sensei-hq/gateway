@@ -1139,7 +1139,7 @@ mod tests {
     }
 
     /// A fake datasets-server and hub serving every entry of [`DATASETS`]
-    /// at sha `feedfacecafe0001`, each with its expected licence unless
+    /// at sha `feedfacecafe0001` + 24 zeros, each with its expected licence unless
     /// `licence_for` overrides one.
     async fn fake_hf(
         licence_for: Option<(&str, &str)>,
@@ -1159,7 +1159,7 @@ mod tests {
             };
             Mock::given(path(format!("/api/datasets/{}", spec.id)))
                 .respond_with(ResponseTemplate::new(200).set_body_json(
-                    json!({"sha": "feedfacecafe0001", "cardData": {"license": [license]}}),
+                    json!({"sha": "feedfacecafe0001000000000000000000000000", "cardData": {"license": [license]}}),
                 ))
                 .mount(&hub)
                 .await;
@@ -1217,7 +1217,7 @@ mod tests {
         for (d, spec) in m.datasets.iter().zip(DATASETS) {
             assert_eq!(
                 (d.id.as_str(), d.sha.as_str()),
-                (spec.id, "feedfacecafe0001")
+                (spec.id, "feedfacecafe0001000000000000000000000000")
             );
             assert_eq!(d.license, spec.license);
             let rows_file = crate::fetch::cache_dir(cache.path(), spec.id, &d.sha)
