@@ -162,7 +162,8 @@ Reproduce.
 - **Coverage**: the share of a scenario's cases that are applicable, i.e. not `not_applicable`.
 - **`not_applicable`**: not wrong, just not gradable for that model. It covers the gateway's
   context-window refusal and any `InputRejected` (Laya head budget, images, server-side
-  truncation, collapsed options).
+  truncation, collapsed options). Under each table, every model with `not_applicable` rows is
+  listed with its most common reason and how many rows have it.
 - **Accuracy**: over the applicable cases, with `error` counted as wrong (the error rate is
   shown too). The 95% CI is a bootstrap over 1000 seeded resamples; noul answers are decided at 0.5.
 - **The shared subset**: the head-to-head ranking uses only the cases applicable to every ranked

@@ -364,6 +364,8 @@ fn scenario_section(md: &mut String, results: &Results, r: &ScenarioRanking) {
             metrics_row(md, &m.id, &m.own, &m.shared);
         }
         md.push('\n');
+        let ids: Vec<&str> = r.ranked.iter().map(|m| m.id.as_str()).collect();
+        not_applicable_reasons(md, results, r.scenario, &ids);
     }
     let verdict = match &r.verdict {
         Verdict::Winner(m) => format!(
@@ -389,10 +391,58 @@ fn scenario_section(md: &mut String, results: &Results, r: &ScenarioRanking) {
             metrics_row(md, id, m, m);
         }
         md.push('\n');
+        let ids: Vec<&str> = r.low_coverage.iter().map(|(id, _)| id.as_str()).collect();
+        not_applicable_reasons(md, results, r.scenario, &ids);
     }
     if !r.no_rows.is_empty() {
         let _ = writeln!(md, "No rows: {}\n", r.no_rows.join(", "));
     }
+}
+
+/// Longest not-applicable reason quoted in the report, in chars.
+const REASON_MAX_CHARS: usize = 160;
+
+/// For each of `models` with not-applicable rows on `scenario`: its most
+/// common not-applicable detail (first seen on a tie) and how many rows have
+/// it, e.g. `- m: 29 of 30 not applicable: <detail>`. Details were redacted
+/// and clipped when the rows were recorded.
+fn not_applicable_reasons(md: &mut String, results: &Results, scenario: Scenario, models: &[&str]) {
+    let mut lines = Vec::new();
+    for &m in models {
+        let mut counts: Vec<(&str, usize)> = Vec::new();
+        for r in results.rows.iter().filter(|r| {
+            r.model == m && r.scenario == scenario && r.outcome == Outcome::NotApplicable
+        }) {
+            let d = r.detail.as_deref().unwrap_or("no reason recorded");
+            match counts.iter_mut().find(|(x, _)| *x == d) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((d, 1)),
+            }
+        }
+        let total: usize = counts.iter().map(|(_, n)| n).sum();
+        // `max_by_key` keeps the last maximum; reversed, that is the first seen.
+        let Some(&(detail, n)) = counts.iter().rev().max_by_key(|(_, n)| *n) else {
+            continue;
+        };
+        let mut reason: String = detail.replace('\n', " ");
+        if reason.chars().count() > REASON_MAX_CHARS {
+            reason = reason.chars().take(REASON_MAX_CHARS).collect::<String>() + "…";
+        }
+        let share = if n == total {
+            n.to_string()
+        } else {
+            format!("{n} of {total}")
+        };
+        lines.push(format!("- {m}: {share} not applicable: {reason}"));
+    }
+    if lines.is_empty() {
+        return;
+    }
+    let _ = writeln!(md, "Most common not-applicable reason:\n");
+    for l in lines {
+        let _ = writeln!(md, "{l}");
+    }
+    md.push('\n');
 }
 
 fn label_review(md: &mut String, results: &Results, rankings: &[ScenarioRanking]) {
@@ -967,6 +1017,41 @@ mod tests {
             "{not_run}"
         );
         assert!(not_run.contains("**laya-ane**: no input fits"), "{not_run}");
+    }
+
+    /// SP-DEC-4 review A5: a model under the coverage floor is shown with
+    /// why its cases were not applicable (the most common detail, counted),
+    /// so 0% coverage is not left unexplained.
+    #[test]
+    fn a_low_coverage_model_names_its_most_common_not_applicable_reason() {
+        let mut f = fixture();
+        let budget = "adapter 'laya' cannot serve this input: the options of question 'q' \
+                      need ≈182 tokens";
+        for r in f.rows.iter_mut().filter(|r| r.model == "ane") {
+            if r.outcome == Outcome::NotApplicable {
+                r.detail = Some(budget.into());
+            }
+        }
+        // One odd one out: the most common reason wins, and says it is not all.
+        let odd = f
+            .rows
+            .iter_mut()
+            .find(|r| r.model == "ane" && r.outcome == Outcome::NotApplicable)
+            .unwrap();
+        odd.detail = Some("all candidates gated: over window".into());
+        let md = render(&f, 7);
+        let s3 = section(&md, "## S3");
+        let low = &s3[at(s3, "### Below the 50% coverage floor")..];
+        assert!(
+            low.contains(&format!("- ane: 29 of 30 not applicable: {budget}")),
+            "{low}"
+        );
+        // A ranked model's not-applicable rows get their reason too.
+        let ranked = &s3[..at(s3, "### Below the 50% coverage floor")];
+        assert!(
+            ranked.contains("- mid: 8 not applicable: no reason recorded"),
+            "{ranked}"
+        );
     }
 
     /// The `i`th cell (0 = model) of a table line.
