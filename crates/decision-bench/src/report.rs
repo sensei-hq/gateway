@@ -571,6 +571,8 @@ mod tests {
             top_probability: None,
             score_value: None,
             expected_level: None,
+            answer: None,
+            probabilities: None,
             latency_ms: 10 + case as u64,
             reached_server: true,
             detail: None,

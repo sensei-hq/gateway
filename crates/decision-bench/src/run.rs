@@ -2,6 +2,7 @@
 //! exactly one [`ResultRow`] per (case, model) — `ok`, `not_applicable` or
 //! `error` (spec D2/D2a, AC3). Nothing is retried and nothing is dropped.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -44,6 +45,15 @@ pub struct ResultRow {
     pub score_value: Option<f64>,
     /// Score cases: the gold level, for MAE.
     pub expected_level: Option<usize>,
+    /// The answer the decision gave (`Some` only when `outcome` is `Ok`):
+    /// the chosen option key; `"yes"` / `"no"` for noul (decided at 0.5); the
+    /// argmax level's key for score (as in `probabilities`).
+    #[serde(default)]
+    pub answer: Option<String>,
+    /// The probabilities the decision returned (`Some` only when `outcome`
+    /// is `Ok`): per option / per level key; noul: `{"yes": p}`.
+    #[serde(default)]
+    pub probabilities: Option<BTreeMap<String, f64>>,
     pub latency_ms: u64,
     /// Whether the call reached the model's server (the chain has exactly
     /// one candidate):
@@ -196,6 +206,10 @@ pub fn redact(text: &str, m: &ModelSpec) -> String {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Scored {
     pub correct: bool,
+    /// What [`ResultRow::answer`] records.
+    pub answer: String,
+    /// What [`ResultRow::probabilities`] records.
+    pub probabilities: BTreeMap<String, f64>,
     pub top_probability: f64,
     pub score_value: Option<f64>,
     pub expected_level: Option<usize>,
@@ -275,6 +289,8 @@ pub fn score(case: &Case, answer: &DecisionAnswer) -> anyhow::Result<Scored> {
             })?;
             Ok(Scored {
                 correct: choice == option,
+                answer: choice.clone(),
+                probabilities: owned(probabilities),
                 top_probability: p,
                 score_value: None,
                 expected_level: None,
@@ -285,6 +301,8 @@ pub fn score(case: &Case, answer: &DecisionAnswer) -> anyhow::Result<Scored> {
             check_probability(id, "noul", p)?;
             Ok(Scored {
                 correct: (p >= 0.5) == *value,
+                answer: if p >= 0.5 { "yes" } else { "no" }.into(),
+                probabilities: BTreeMap::from([("yes".to_string(), p)]),
                 top_probability: p.max(1.0 - p),
                 score_value: None,
                 expected_level: None,
@@ -310,16 +328,16 @@ pub fn score(case: &Case, answer: &DecisionAnswer) -> anyhow::Result<Scored> {
                 let l: usize = k.parse().with_context(|| {
                     format!("case {id}: score probability key {k:?} is not a level index")
                 })?;
-                levels.push((l, *p));
+                levels.push((l, *p, k));
             }
-            levels.sort_by_key(|(l, _)| *l);
-            let mut best: Option<(usize, f64)> = None;
-            for (l, p) in levels {
-                if best.is_none_or(|(_, bp)| p > bp) {
-                    best = Some((l, p));
+            levels.sort_by_key(|(l, _, _)| *l);
+            let mut best: Option<(usize, f64, &String)> = None;
+            for (l, p, k) in levels {
+                if best.is_none_or(|(_, bp, _)| p > bp) {
+                    best = Some((l, p, k));
                 }
             }
-            let (argmax, p) =
+            let (argmax, p, key) =
                 best.with_context(|| format!("case {id}: score answer has no probabilities"))?;
             if argmax >= criteria.len() {
                 bail!(
@@ -329,6 +347,8 @@ pub fn score(case: &Case, answer: &DecisionAnswer) -> anyhow::Result<Scored> {
             }
             Ok(Scored {
                 correct: argmax == *level,
+                answer: key.clone(),
+                probabilities: owned(probabilities),
                 top_probability: p,
                 score_value: Some(*score),
                 expected_level: Some(*level),
@@ -343,6 +363,15 @@ pub fn score(case: &Case, answer: &DecisionAnswer) -> anyhow::Result<Scored> {
             }
         ),
     }
+}
+
+fn owned<'a>(
+    probabilities: impl IntoIterator<Item = (&'a String, &'a f64)>,
+) -> BTreeMap<String, f64> {
+    probabilities
+        .into_iter()
+        .map(|(k, p)| (k.clone(), *p))
+        .collect()
 }
 
 /// `p` must be a number within 0..=1 (NaN is not).
@@ -504,6 +533,8 @@ fn row_unclipped(
         top_probability: None,
         score_value: None,
         expected_level: None,
+        answer: None,
+        probabilities: None,
         latency_ms,
         reached_server: reached_server(result, router_timeout),
         detail: None,
@@ -528,6 +559,8 @@ fn row_unclipped(
             row.top_probability = Some(s.top_probability);
             row.score_value = s.score_value;
             row.expected_level = s.expected_level;
+            row.answer = Some(s.answer);
+            row.probabilities = Some(s.probabilities);
         }
         Err(e) => row.detail = Some(format!("{e:#}")),
     }
@@ -933,6 +966,8 @@ mod tests {
             s,
             Scored {
                 correct: true,
+                answer: "a".into(),
+                probabilities: BTreeMap::from([("a".into(), 0.7), ("b".into(), 0.3)]),
                 top_probability: 0.7,
                 score_value: None,
                 expected_level: None
@@ -979,6 +1014,12 @@ mod tests {
             s,
             Scored {
                 correct: true,
+                answer: "2".into(),
+                probabilities: BTreeMap::from([
+                    ("0".into(), 0.1),
+                    ("1".into(), 0.2),
+                    ("2".into(), 0.7)
+                ]),
                 top_probability: 0.7,
                 score_value: Some(1.6),
                 expected_level: Some(2)
@@ -1049,11 +1090,51 @@ mod tests {
                 top_probability: Some(0.8),
                 score_value: None,
                 expected_level: None,
+                answer: Some("no".into()),
+                probabilities: Some(BTreeMap::from([("yes".into(), 0.2)])),
                 latency_ms: 42,
                 reached_server: true,
                 detail: None,
             }
         );
+    }
+
+    /// SP-DEC-4 review A2 (spec D4/D7): a scored row records the answer and
+    /// the probabilities it was chosen from; a row with no answer has neither.
+    #[test]
+    fn a_scored_row_carries_its_answer_and_probabilities() {
+        let as_json = |row: &ResultRow| serde_json::to_value(row).unwrap();
+        let choice = response(json!({"q": {
+            "type": "choice", "choice": "b",
+            "probabilities": {"a": 0.25, "b": 0.75}, "confidence": 0.5
+        }}));
+        let v = as_json(&row_for(&choice_case("a"), "m", &Ok(choice), 1));
+        assert_eq!(v["answer"], "b", "{v}");
+        assert_eq!(v["probabilities"], json!({"a": 0.25, "b": 0.75}), "{v}");
+
+        let noul = response(json!({"q": {"type": "noul", "noul": 0.25}}));
+        let v = as_json(&row_for(&noul_case(true), "m", &Ok(noul), 1));
+        assert_eq!(v["answer"], "no", "{v}");
+        assert_eq!(v["probabilities"], json!({"yes": 0.25}), "{v}");
+
+        let score = response(json!({"q": {
+            "type": "score", "score": 1.5,
+            "legend": {"0": "low", "1": "mid", "2": "high"},
+            "probabilities": {"0": 0.1, "1": 0.3, "2": 0.6}, "confidence": 0.5
+        }}));
+        let v = as_json(&row_for(&score_case(2), "m", &Ok(score), 1));
+        assert_eq!(v["answer"], "2", "{v}");
+        assert_eq!(
+            v["probabilities"],
+            json!({"0": 0.1, "1": 0.3, "2": 0.6}),
+            "{v}"
+        );
+
+        let mistyped = response(json!({"q": {"type": "noul", "noul": 0.2}}));
+        let v = as_json(&row_for(&choice_case("a"), "m", &Ok(mistyped), 1));
+        assert_eq!(v["outcome"], "error", "{v}");
+        assert_eq!(v["answer"], serde_json::Value::Null, "{v}");
+        assert_eq!(v["probabilities"], serde_json::Value::Null, "{v}");
     }
 
     #[test]
@@ -1245,6 +1326,7 @@ mod tests {
         assert_eq!(
             row_keys,
             [
+                "answer",
                 "case_id",
                 "correct",
                 "detail",
@@ -1252,6 +1334,7 @@ mod tests {
                 "latency_ms",
                 "model",
                 "outcome",
+                "probabilities",
                 "reached_server",
                 "scenario",
                 "score_value",
@@ -1282,6 +1365,19 @@ mod tests {
         assert!(back.roster.is_empty());
         assert!(back.labels_reviewed.is_empty());
         assert!(back.completed.is_empty());
+    }
+
+    /// A2: rows written before `answer` / `probabilities` existed still parse.
+    #[test]
+    fn a_row_without_answer_or_probabilities_still_parses() {
+        let row: ResultRow = serde_json::from_value(json!({
+            "case_id": "c1", "scenario": "s3_entailment", "model": "m",
+            "outcome": "ok", "correct": true, "top_probability": 0.9,
+            "score_value": null, "expected_level": null, "latency_ms": 3,
+            "reached_server": true, "detail": null
+        }))
+        .unwrap();
+        assert_eq!((row.answer, row.probabilities), (None, None));
     }
 
     // --- T4 review ---------------------------------------------------------

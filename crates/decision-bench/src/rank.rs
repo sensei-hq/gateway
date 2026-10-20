@@ -230,6 +230,8 @@ mod tests {
             top_probability: correct.map(|_| p),
             score_value: None,
             expected_level: None,
+            answer: None,
+            probabilities: None,
             latency_ms: lat,
             reached_server: true,
             detail: None,
