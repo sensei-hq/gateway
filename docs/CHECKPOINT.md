@@ -1,35 +1,39 @@
 # Checkpoint
 
 **Current slice: SP-DEC-3 — local open-weight System One via Laya-CoreML** (`laya` router id,
-`laya-coreml-serve` over HTTP). Spec: `docs/superpowers/specs/2026-10-20-sp-dec-3-laya-local-system-one-design.md`
-(`e849c7e`). Paused behind it: epic [torii#45](https://github.com/sensei-hq/torii/issues/45) Phase 2 wave B.
+`laya-coreml-serve` over HTTP). Branch `sp-dec-3-laya` (worktree `../gateway-sp-dec-3`), **commit gate
+PASSED, not yet merged to develop** (merge was permission-blocked — needs the user). **Breaking → 0.12.0.**
+Spec `docs/superpowers/specs/2026-10-20-sp-dec-3-laya-local-system-one-design.md` (D1–D7, AC1–AC10).
 
 ## Done
 
-- SP-DEC-3 design approved (D1 `laya` facade id · D2 refuse images pre-send · D3 `usage.truncated` →
-  ProviderError · D4 additive only); spec committed. HTTP cost measured: +0.35 ms/decision on ANE.
-- torii#45: Phase 1 → v0.11.0; torii #54 #56; Phase 2 wave A → torii #57 (`2724a1d`).
+- T1–T8 + whole-slice review fixes R1–R4 + final-review groups A–C, every task spec- and quality-reviewed.
+- D5 `GatewayError::InputRejected` (falls back always, never retried, breaker/health-neutral, neutral to
+  AllGated); D6 Laya per-question head budget (conservative estimate, +2/option +1/head, fixture-measured);
+  D7 re-routed checkpoint (alias-canonicalised, runs first). Docs + 0.12.0 upgrading notes on every surface.
+- Gate: `cargo test --workspace` 1869 passed · stable clippy · fmt · live english/multilingual/engine ·
+  docs-sync · site copies identical.
 
 ## Todo
 
-- [x] SP-DEC-3 spec approved; plan `docs/superpowers/plans/2026-10-20-sp-dec-3-laya-local-system-one.md` (`055de21`).
-- [ ] SP-DEC-3 build T1–T8 on branch `sp-dec-3-laya`: T1 image guard · T2 truncation · T3 errors ·
-  T4 facade · T5 engine fallback · T6 live · T7 docs · T8 verify/review/land.
-- [ ] torii#45 Phase 2 wave B: #46 config init · #49 budgets from caps · #55 follow-ups; then wave C #47.
+- [ ] Merge `sp-dec-3-laya` → develop (`git merge --no-ff`), re-run `cargo test --workspace`, push.
+- [ ] Release 0.12.0 later (release checklist) + torii re-pin (exhaustive `GatewayError` matches).
+- [ ] SP-DEC-4: System One benchmark harness + per-scenario ranking report (user chose option 1).
+- [ ] torii#45 Phase 2 wave B (#46 #49 #55), then wave C #47.
 
 ## Next
 
-User picks execution mode, then `git switch -c sp-dec-3-laya` and plan Task 1. Live server for T6:
-`cd /tmp/laya-bench/scripts && LAYA_HOST=127.0.0.1 LAYA_PORT=8765 LAYA_MODELS=multilingual ../env/.venv/bin/laya-coreml-serve`
+User merges (or grants permission), then: `cd ../gateway && git merge --no-ff sp-dec-3-laya`.
 
 ## Open questions
 
-- None for SP-DEC-3. torii#55: may an operator correct a tool-confirmation decision before resume?
+- Bundle id `convaiinnovations/laya` skips D7 with budget 192 (kept; one-line change to refuse instead).
+- Upstream: ask Laya to report head truncation (external contact — user's call).
 
 ## Known-broken / carry-forwards
 
-- SP-DEC-3 out of scope: in-process CoreML Laya; CLM-8B (needs vLLM/CUDA — revisit if ported to Metal);
-  `/v1/systemone/batch`. Scratch `/tmp/laya-bench` (134 MB) to delete at slice end.
-- sensei daemon `update_phase` / `get_workflow_state` return HTTP 404 (2026-10-20); checkpoint lives here.
-- Process crash between a paid response and its `EffectRecorded` re-buys one call (documented).
-- torii DB-gated tests don't run in CI (#55). Gateway engine follow-ons: gateway#88.
+- Laya 413/422 still `ProviderError` (breaker-counted); no per-model `head_max_len` override for
+  `LAYA_EXTRA_MODELS`; exact tokenizer counts; unmetered truncated hosted calls; image guard keyed on id `laya`.
+- Estimate errs high (~1.7× English, 2–7× non-Latin). Docs-sync id list is hand-kept (LOW).
+- sensei daemon `update_phase` 404 (2026-10-20). Scratch: `/tmp/laya-bench` (venv), `/tmp/laya-src`,
+  `/tmp/clm-src`, `/tmp/r3-scripts`, `/tmp/rev-r3` — delete after merge.
