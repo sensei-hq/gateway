@@ -870,3 +870,142 @@ async fn laya_refuses_images_before_any_request() {
         other => panic!("expected ProviderError before sending, got {other:?}"),
     }
 }
+
+/// Laya's real default (non-strict) payload, captured live.
+fn laya_ok_body() -> serde_json::Value {
+    json!({"model":"laya-rl-agent","answers":{"label":{"type":"choice","choice":"billing","probabilities":{"billing":0.868,"bug":0.132},"confidence":0.437,"answer_confidence":0.868,"action":{"act_probability":1.0},"x_jev_confidence":0.736},"refund":{"type":"noul","noul":0.9038,"confidence":0.9038,"answer_confidence":0.9038,"action":{"act_probability":1.0}},"urgency":{"type":"score","score":1.9366,"legend":{"0":"Routine","1":"Soon","2":"Immediate"},"probabilities":{"0":0.0092,"1":0.045,"2":0.9458},"confidence":0.7857,"answer_confidence":0.9458,"action":{"act_probability":1.0},"x_jev_confidence":0.9049}},"usage":{"input_tokens":98,"output_tokens":0,"state_tokens":8,"state_tokens_dropped":0,"truncated":false,"truncated_questions":[]},"routing":{"model":"english","repo":"convaiinnovations/laya","reason":"explicit model='english'","detection":null,"workflow":null}})
+}
+
+fn laya_questions() -> DecisionQuestions {
+    let mut q = questions();
+    q.insert(
+        "refund".into(),
+        DecisionQuestion::Noul {
+            instructions: json!("Refund requested?"),
+            criteria: None,
+        },
+    );
+    q.insert(
+        "urgency".into(),
+        DecisionQuestion::Score {
+            instructions: json!("How urgent?"),
+            criteria: vec!["Routine".into(), "Soon".into(), "Immediate".into()],
+        },
+    );
+    q
+}
+
+/// AC3: every Laya extension (`routing`, `x_jev_confidence`, `answer_confidence`,
+/// `action`, noul `confidence`, extended `usage`) decodes into the plain answers.
+#[tokio::test]
+async fn laya_default_payload_decodes_into_typed_answers() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .and(body_partial_json(json!({"model": "english"})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(laya_ok_body()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut req = request(Some("english"), vec![], None);
+    req.questions = laya_questions();
+    let resp = SystemOneAdapter::with_id("laya")
+        .unwrap()
+        .decide(&keyless(&server.uri()), &req)
+        .await
+        .expect("laya's default payload is a success");
+
+    match &resp.answers["label"] {
+        DecisionAnswer::Choice {
+            choice,
+            probabilities,
+            confidence,
+        } => {
+            assert_eq!(choice, "billing");
+            assert_eq!(probabilities["bug"], 0.132);
+            assert_eq!(
+                *confidence, 0.437,
+                "laya's own confidence, not x_jev_confidence"
+            );
+        }
+        other => panic!("choice expected, got {other:?}"),
+    }
+    assert_eq!(
+        resp.answers["refund"],
+        DecisionAnswer::Noul { noul: 0.9038 }
+    );
+    match &resp.answers["urgency"] {
+        DecisionAnswer::Score { score, legend, .. } => {
+            assert_eq!(*score, 1.9366);
+            assert_eq!(legend["2"], "Immediate");
+        }
+        other => panic!("score expected, got {other:?}"),
+    }
+    assert_eq!(resp.model.as_deref(), Some("laya-rl-agent"));
+    let usage = resp.usage.expect("usage");
+    assert_eq!((usage.input_tokens, usage.output_tokens), (98, 0));
+}
+
+/// AC4 (adapter level): Laya answers an over-window state with 200 and
+/// `usage.truncated: true` — answers about a state it never fully read. That is
+/// a failed attempt (ProviderError, so the chain falls back), never a success.
+#[tokio::test]
+async fn a_truncated_laya_answer_is_a_provider_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"model":"laya-rl-agent","answers":{"label":{"type":"choice","choice":"bug","probabilities":{"billing":0.4,"bug":0.6},"confidence":0.03}},"usage":{"input_tokens":512,"output_tokens":0,"state_tokens":1200,"state_tokens_dropped":718,"truncated":true,"truncated_questions":["label"]},"routing":{"model":"english"}})))
+        .mount(&server)
+        .await;
+    let err = SystemOneAdapter::with_id("laya")
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &request(Some("english"), vec![], None),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        GatewayError::ProviderError {
+            adapter,
+            message,
+            status: Some(200),
+        } => {
+            assert_eq!(adapter, "laya");
+            assert!(message.contains("truncated"), "{message}");
+            assert!(
+                message.contains("718"),
+                "names the dropped tokens: {message}"
+            );
+            assert!(
+                message.contains("label"),
+                "names the cut question: {message}"
+            );
+        }
+        other => panic!("expected ProviderError, got {other:?}"),
+    }
+}
+
+/// D3 is additive: `truncated: false`, and a usage block with no such key
+/// (every other host), stay successes.
+#[tokio::test]
+async fn untruncated_and_truncation_unaware_answers_stay_successes() {
+    let mut not_truncated = ok_body("laya-rl-agent");
+    not_truncated["usage"]["truncated"] = json!(false);
+    for body in [not_truncated, ok_body("nimble-v3")] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/systemone"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        SystemOneAdapter::with_id("laya")
+            .unwrap()
+            .decide(
+                &keyless(&server.uri()),
+                &request(Some("english"), vec![], None),
+            )
+            .await
+            .expect("not truncated → success");
+    }
+}

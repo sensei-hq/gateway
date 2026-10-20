@@ -252,6 +252,14 @@ struct WireUsage {
     input_tokens: u32,
     #[serde(default)]
     output_tokens: u32,
+    /// Laya's report that it cut the input to fit its window (SP-DEC-3 D3).
+    /// Absent on every other host, so it defaults to "not truncated".
+    #[serde(default)]
+    truncated: bool,
+    #[serde(default)]
+    state_tokens_dropped: u32,
+    #[serde(default)]
+    truncated_questions: Vec<String>,
 }
 
 /// A non-success response, before it becomes a [`GatewayError`] — kept apart
@@ -382,6 +390,32 @@ pub(crate) async fn decide(
         return Err(GatewayError::ProviderError {
             adapter: adapter.into(),
             message: format!("System One response has no answer for {missing:?}"),
+            status: Some(status.as_u16()),
+        });
+    }
+
+    // SP-DEC-3 D3: a host that truncated the input still answers 200 — about a
+    // state it never fully read. Report a failed attempt so the chain falls
+    // back, as for the missing-answer case above.
+    if let Some(u) = wire.usage.as_ref().filter(|u| u.truncated) {
+        let mut cut = Vec::new();
+        if u.state_tokens_dropped > 0 {
+            cut.push(format!("{} state tokens dropped", u.state_tokens_dropped));
+        }
+        if !u.truncated_questions.is_empty() {
+            cut.push(format!("questions cut: {:?}", u.truncated_questions));
+        }
+        return Err(GatewayError::ProviderError {
+            adapter: adapter.into(),
+            message: format!(
+                "the host truncated the input to fit its window ({}); its answers do not cover \
+                 the whole request — set the model's context_window to the checkpoint's window",
+                if cut.is_empty() {
+                    "no detail".to_string()
+                } else {
+                    cut.join("; ")
+                }
+            ),
             status: Some(status.as_u16()),
         });
     }
