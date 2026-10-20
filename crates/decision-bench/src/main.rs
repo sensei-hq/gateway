@@ -26,7 +26,7 @@ enum Command {
     /// Probe every selected model with one tiny decision. A model that does
     /// not answer, or that no input fits its context window, is NOT RUN;
     /// this still exits 0.
-    #[command(after_long_help = RESOLVE_NOTE)]
+    #[command(after_long_help = CHECK_NOTE)]
     Check {
         #[command(flatten)]
         select: Select,
@@ -51,7 +51,7 @@ enum Command {
     },
     /// Run the benchmark: `check`, then every reachable model over the cases,
     /// rewriting the results file after each model.
-    #[command(after_long_help = RESOLVE_NOTE)]
+    #[command(after_long_help = RUN_NOTE)]
     Run {
         #[command(flatten)]
         select: Select,
@@ -67,7 +67,7 @@ enum Command {
         out: PathBuf,
     },
     /// Render the per-scenario ranking report from a results file.
-    #[command(after_long_help = RESOLVE_NOTE)]
+    #[command(after_long_help = REPORT_NOTE)]
     Report {
         #[arg(long, default_value = "results.json")]
         results: PathBuf,
@@ -102,13 +102,29 @@ const PATH_NOTE: &str = concat!(
      gitignored, so fetched data cannot be committed by accident."
 );
 
-/// Path anchoring for `check`, `run` and `report`.
-const RESOLVE_NOTE: &str = concat!(
-    "Paths: relative --config, --cases, --out and --results paths resolve under the \
-     decision-bench crate directory, ",
+/// Path anchoring for `check`: only `--config` is a path.
+const CHECK_NOTE: &str = concat!(
+    "Paths: a relative --config path resolves under the decision-bench crate directory, ",
+    env!("CARGO_MANIFEST_DIR"),
+    ", not the current directory."
+);
+
+/// Path anchoring for `run`.
+const RUN_NOTE: &str = concat!(
+    "Paths: relative --config, --cases and --out paths resolve under the decision-bench \
+     crate directory, ",
     env!("CARGO_MANIFEST_DIR"),
     ", not the current directory. Hand-curated S4 cases are read from its scenarios/ \
      subdirectory (s4-*.jsonl; none is fine)."
+);
+
+/// Path anchoring for `report`.
+const REPORT_NOTE: &str = concat!(
+    "Paths: relative --results and --out paths resolve under the decision-bench crate \
+     directory, ",
+    env!("CARGO_MANIFEST_DIR"),
+    ", not the current directory; so a report to commit takes \
+     --out ../../docs/benchmarks/<date>-system-one-local.md (or an absolute path)."
 );
 
 /// `p` if absolute, else `p` under the crate directory (see [`PATH_NOTE`]).
@@ -814,9 +830,39 @@ mod tests {
                 .unwrap()
                 .render_long_help()
                 .to_string();
-            assert!(help.contains("relative --config"), "{sub}: {help}");
+            assert!(help.contains("Paths: "), "{sub}: {help}");
+            assert!(help.contains("not the current directory"), "{sub}: {help}");
             assert!(help.contains(CRATE), "{sub}: {help}");
             assert!(!help.contains("default --out is"), "{sub}: {help}");
+        }
+    }
+
+    /// SP-DEC-4 review C7: each subcommand's path note names only flags that
+    /// subcommand has.
+    #[test]
+    fn each_path_note_names_only_its_own_flags() {
+        let cmd = Cli::command();
+        for sub in cmd.get_subcommands() {
+            let note = sub
+                .get_after_long_help()
+                .map(|h| h.to_string())
+                .unwrap_or_default();
+            let own: Vec<String> = sub
+                .get_arguments()
+                .filter_map(|a| a.get_long())
+                .map(|l| format!("--{l}"))
+                .collect();
+            let named: Vec<&str> = note
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+                .filter(|w| w.starts_with("--") && w.len() > 2)
+                .collect();
+            for flag in named {
+                assert!(
+                    own.iter().any(|o| o == flag),
+                    "{}: help names {flag}, which it does not take ({own:?})",
+                    sub.get_name()
+                );
+            }
         }
     }
 
