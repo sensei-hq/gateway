@@ -137,6 +137,39 @@ async fn ollama_posts_the_system_one_body_and_parses_typed_answers() {
     assert!(!resp.degraded);
 }
 
+/// The truncation check lives in the shared `decide` core, so Ollama gets it too.
+#[tokio::test]
+async fn ollama_also_treats_a_truncated_answer_as_a_provider_error() {
+    let server = MockServer::start().await;
+    let mut body = ok_body("nimble:9b");
+    body["usage"] = json!({"input_tokens": 512, "output_tokens": 0, "truncated": true});
+    Mock::given(method("POST"))
+        .and(path("/v1/systemone"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+
+    match OllamaAdapter::new()
+        .unwrap()
+        .decide(
+            &keyless(&server.uri()),
+            &request(Some("nimble:9b"), vec![], None),
+        )
+        .await
+        .unwrap_err()
+    {
+        GatewayError::ProviderError {
+            status: Some(200),
+            message,
+            ..
+        } => assert!(
+            message.contains("the host truncated the input"),
+            "{message}"
+        ),
+        other => panic!("expected a truncation ProviderError, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn ollama_omits_absent_optionals_and_sends_no_auth_and_defaults_to_nimble() {
     let server = MockServer::start().await;
