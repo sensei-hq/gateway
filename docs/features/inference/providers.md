@@ -77,6 +77,7 @@ else const …*: the router's `url` is used whenever it is set.
 | `replicate` | const `https://api.replicate.com/v1`, `config.url` fallback | `bearer_auth` | `VideoGenerate`, `ImageGenerate` | `tencent/hunyuan-video` | Async `predictions` submit + poll. |
 | `runway` | const `https://api.runwayml.com/v1`, `config.url` fallback | `bearer_auth` | `VideoGenerate` | `gen-4` | Async submit + poll. |
 | `sglang` | `RouterConfig.url` (no default — empty is `InvalidConfig`) + `/v1/systemone` | `bearer_auth` **only if a key is present** (the server's optional `--api-key`) | `Decision` | none (a call without a model is `InvalidRequest`) | `SystemOneAdapter::from_config_with_id("sglang", …)`, decision-only, auto-registered by the facade — a self-hosted SGLang server. Server caveats below. |
+| `laya` | `RouterConfig.url` (no default — empty is `InvalidConfig`; e.g. `http://127.0.0.1:8000`) + `/v1/systemone` | `bearer_auth` **only if a key is present** (the server's `LAYA_API_KEY`) | `Decision` | none (a call without a model is `InvalidRequest`; pin a checkpoint such as `english`) | `SystemOneAdapter::from_config_with_id("laya", …)`, decision-only, auto-registered by the facade — a local `laya-coreml-serve` (CoreML). Refuses images; a `usage.truncated: true` answer is a `ProviderError`. Errors are FastAPI `{detail}`. Server caveats below. |
 | `stability` | const `https://api.stability.ai/v2beta`, `config.url` fallback | `bearer_auth` + multipart form | `ImageGenerate` | `sd3.5-large` | Synchronous multipart upload (no polling). |
 | `typesafe` | `RouterConfig.url`, else const `https://api.typesafe.ai`, + `/v1/systemone` | `bearer_auth` | `Decision` | none (a call without a model is `InvalidRequest`) | `SystemOneAdapter`, decision-only, auto-registered by the facade. TypeSafe's System One API is the origin of the decision wire format. |
 | `together` | const `https://api.together.xyz/v1`, `config.url` fallback | `bearer_auth` | `TextChat`, `ImageGenerate` | chat `meta-llama/Llama-3.3-70B-Instruct-Turbo`; image `black-forest-labs/FLUX.1-schnell-Free` | OpenAI-compatible chat + synchronous `/images/generations`. |
@@ -89,8 +90,8 @@ else const …*: the router's `url` is used whenever it is set.
 id-configurable, decision-only adapter for any bearer-auth host of
 `POST {base}/v1/systemone`. Built with `SystemOneAdapter::with_id(id)` or
 `from_config_with_id(id, config)`. The ids `openrouter` and `typesafe` default their
-base URL when `RouterConfig.url` is empty; any other id (including `llamacpp` and
-`sglang`) needs a `url` (else `InvalidConfig`). It never picks a model for you. The
+base URL when `RouterConfig.url` is empty; any other id (including `llamacpp`,
+`sglang` and `laya`) needs a `url` (else `InvalidConfig`). It never picks a model for you. The
 Ollama adapter and `CloudflareAdapter` (`cloudflare.rs`) delegate to the same POST
 core: Ollama adds its own reading of Ollama's two 404s; Cloudflare speaks the
 Workers AI *dialect* of it (different path, short body `model`, no `keep_alive`, an
@@ -101,7 +102,7 @@ for the request/answer types and how to read `confidence`, `noul` and `score`.
 
 **Images are encoded per host.** The caller passes bare base64 in
 `DecisionRequest.images`. Ollama receives it verbatim (it rejects data URLs).
-`SystemOneAdapter` (every id: `openrouter`, `typesafe`, `llamacpp`, `sglang`, custom)
+`SystemOneAdapter` (every id: `openrouter`, `typesafe`, `llamacpp`, `sglang`, `laya`, custom)
 and `CloudflareAdapter` send `data:<mime>;base64,…`, with the mime sniffed from the
 decoded magic bytes (PNG / JPEG / WebP / GIF); a value already starting `data:` passes
 through. An image that is none of those four is a `ProviderError` **before any
@@ -138,6 +139,38 @@ checkpoints are only on main (#42183) — **v0.5.21 silently drops images** (200
 text-only answers). A model name containing `:` is parsed as a LoRA adapter → 400, so
 serve it under a colon-free name. Optional `--api-key` bearer. `usage.output_tokens` is
 0.
+
+**Laya (`laya`).** An open-weight System One model on Apple CoreML; weights are public
+Hub downloads (offline after the first), so no cloud key. `pip install
+"laya-coreml[serve]"` (verified with 0.5.1), then `LAYA_HOST=127.0.0.1 LAYA_PORT=8000
+LAYA_MODELS=english laya-coreml-serve`; router `url = "http://127.0.0.1:8000"` and pin
+`api_model_id`. Checkpoints: `english` (512-token window), `multilingual` (1024),
+`typed-decisions` (1024), or your own via `LAYA_EXTRA_MODELS` (e.g. the ANE checkpoint
+`{"ane":"aac6fef/laya-multilingual-coreml-ane"}`, a 96-token window). Bearer
+(`Authorization: Bearer <key>`) only if the server sets `LAYA_API_KEY`. The response
+`model` is always `laya-rl-agent`, not the checkpoint, and `usage.output_tokens` is 0.
+Errors are FastAPI `{"detail": "…"}`: 401 → `Authentication`; 400 / 413 / 422 / 500 /
+503 → `ProviderError` carrying the detail. Out of scope: `/v1/systemone/batch` and
+CLM-8B (needs vLLM / CUDA).
+- **Images:** Laya ignores them, so a `laya` decision with `images` is refused before
+  sending, as a `ProviderError` (status `None`) that falls back. The guard keys on the
+  exact router id `laya`; a Laya server registered under another id would get images
+  it silently ignores.
+- **Truncation:** Laya truncates over-window input **silently** — still a 200, with
+  only `usage.truncated: true` to show it. The adapter reads `usage.truncated` on
+  every System One response (every id; only Laya sends it today); `true` is a
+  `ProviderError` (status `Some(200)`), so the chain falls back. Set the model's
+  `context_window` to its real token window (english 512, multilingual /
+  typed-decisions 1024) so the `ContextWindowGate` refuses oversize requests before
+  sending; the runtime message says "set the model's context_window to its real
+  token window (or lower it if it already is)". Keep Laya's default payload:
+  `LAYA_JEV_STRICT` strips `truncated`, which disables the check.
+- **Known limit:** truncation is input-determined. With no other candidate in the
+  chain the same request is retried up to `max_attempts`, and every truncation counts
+  toward the router's circuit breaker. Set `context_window` and chain a second
+  decision router.
+- **Overhead:** measured on an M4 Max, HTTP adds about 0.35 ms per decision — about
+  8% on the ANE checkpoint (4.1 ms), negligible on CPU+GPU (~50 ms).
 
 **vLLM** has no upstream `/v1/systemone` (PR #59299 is open; only an example proxy
 exists), so it is not supported and there is no `vllm` facade id.

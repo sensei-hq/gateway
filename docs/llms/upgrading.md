@@ -6,6 +6,16 @@ routing call path (build a request, `gateway.execute(&req).await`, read
 `InferenceResponse`) stays source-compatible across every step below; each section
 lists only what you must touch.
 
+## Unreleased (after 0.11.0) — SP-DEC-3, Laya System One
+
+Additive; no type changes.
+
+| Area | Change | Action |
+|---|---|---|
+| Facade (`FacadeBuilder::build`) | auto-registers `laya` (`SystemOneAdapter`, decision-only) for a local `laya-coreml-serve` | if you registered your own decision adapter under `laya`, it is now replaced; rename yours |
+| `SystemOneAdapter` | id `laya`: a decision with `images` fails before sending (`ProviderError`, `status: None`) | route image decisions to a vision-capable host |
+| `SystemOneAdapter` (every id) | a 200 whose `usage.truncated` is `true` is a `ProviderError` (status 200), not a success. Only Laya sends the field today | none; add `FallbackTrigger::ProviderError` to chains that should fall back |
+
 ## 0.10.x → 0.11.0 (agentic phase 1 — HITL hooks, wake retry, money budget, tool policy)
 
 The routing call path is unchanged. Everything here is in the orchestrator crates; the one
