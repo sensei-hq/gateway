@@ -630,8 +630,9 @@ pub async fn run_with_progress(
             // Loads the model; the result is never recorded.
             if let Err(e) = execute_watched(&gw, &request_for(warm, m), &m.id, "warm-up").await {
                 eprintln!(
-                    "decision-bench: {}: warm-up failed (not recorded): {e}",
-                    m.id
+                    "decision-bench: {}: warm-up failed (not recorded): {}",
+                    m.id,
+                    redact(&e.to_string(), m)
                 );
             }
         }
@@ -876,6 +877,17 @@ mod tests {
     }
 
     // --- marker pin -------------------------------------------------------
+
+    /// A9: a URL ending in `/` is redacted both as given and with the slash
+    /// trimmed (how an adapter joins it to a path).
+    #[test]
+    fn a_url_is_redacted_as_given_and_with_its_trailing_slash_trimmed() {
+        let m = spec("http://127.0.0.1:9/?token=SECRETTOK/");
+        let text = "a http://127.0.0.1:9/?token=SECRETTOK/ b http://127.0.0.1:9/?token=SECRETTOK c";
+        let out = redact(text, &m);
+        assert!(!out.contains("SECRETTOK"), "{out}");
+        assert_eq!(out, "a <url> b <url> c");
+    }
 
     #[test]
     fn the_input_rejected_marker_matches_the_kernel() {
