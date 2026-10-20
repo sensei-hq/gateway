@@ -2,7 +2,7 @@
 //! `manifest.json`) and the hand-curated `scenarios/s4-*.jsonl`, filtered by
 //! scenario.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -94,10 +94,15 @@ pub fn load(cases_dir: &Path, s4_dir: &Path, only: Option<&[Scenario]>) -> anyho
     files.extend(jsonl_files(s4_dir, "s4-")?);
 
     let mut loaded: Vec<(Scenario, Option<String>, Vec<Case>, bool)> = Vec::new();
+    // Case count of each fetched file, by file name, for the manifest check.
+    let mut fetched_counts: HashMap<String, usize> = HashMap::new();
     for path in &files {
         let (header, cases) = read_case_file(path)?;
         let scenario = cases[0].scenario;
         let hand_curated = path.starts_with(s4_dir);
+        if !hand_curated && let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            fetched_counts.insert(name.to_owned(), cases.len());
+        }
         if keep(scenario) {
             loaded.push((scenario, header.labels_reviewed_by, cases, hand_curated));
         }
@@ -147,12 +152,42 @@ pub fn load(cases_dir: &Path, s4_dir: &Path, only: Option<&[Scenario]>) -> anyho
     if manifest_path.exists() {
         let text = std::fs::read_to_string(&manifest_path)
             .with_context(|| format!("reading {}", manifest_path.display()))?;
-        out.manifest = Some(
-            serde_json::from_str(&text)
-                .with_context(|| format!("parsing {}", manifest_path.display()))?,
-        );
+        let manifest: Manifest = serde_json::from_str(&text)
+            .with_context(|| format!("parsing {}", manifest_path.display()))?;
+        check_manifest_counts(cases_dir, &manifest, &fetched_counts)?;
+        out.manifest = Some(manifest);
     }
     Ok(out)
+}
+
+/// Every file `manifest` lists holds the number of cases it records: a file
+/// cut at a line boundary still parses, and would otherwise load short.
+/// Files the manifest does not list (the hand-curated S4 ones) are not checked.
+fn check_manifest_counts(
+    cases_dir: &Path,
+    manifest: &Manifest,
+    counts: &HashMap<String, usize>,
+) -> anyhow::Result<()> {
+    for f in &manifest.files {
+        let path = cases_dir.join(&f.file);
+        match counts.get(&f.file) {
+            Some(&n) if n == f.cases => {}
+            Some(&n) => bail!(
+                "{}: {n} case{} but manifest.json records {}; the case set is damaged, \
+                 re-run `decision-bench fetch` to rebuild it",
+                path.display(),
+                if n == 1 { "" } else { "s" },
+                f.cases
+            ),
+            None => bail!(
+                "{}: missing, but manifest.json records {} cases in it; the case set is \
+                 damaged, re-run `decision-bench fetch` to rebuild it",
+                path.display(),
+                f.cases
+            ),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -264,6 +299,43 @@ mod tests {
         let l = load(&cases, &root.path().join("nope"), None).unwrap();
         assert_eq!(ids(&l), ["a", "b"]);
         assert!(l.labels_reviewed.is_empty());
+    }
+
+    /// SP-DEC-4 review B3: a case file cut at a line boundary still parses;
+    /// only the manifest's count can tell it is short.
+    #[test]
+    fn a_case_file_shorter_than_its_manifest_count_is_an_error() {
+        let (_root, cases, s4) = layout();
+        let mut m = manifest_json();
+        m["files"] = json!([
+            {"file": "s3.jsonl", "scenario": "s3_entailment", "dataset": "d", "cases": 2}
+        ]);
+        std::fs::write(cases.join("manifest.json"), m.to_string()).unwrap();
+        // Intact, the listed count matches and the S4 files (not listed) load.
+        assert_eq!(
+            ids(&load(&cases, &s4, None).unwrap()),
+            ["a", "b", "t1", "f1"]
+        );
+
+        let file = cases.join("s3.jsonl");
+        let text = std::fs::read_to_string(&file).unwrap();
+        std::fs::write(&file, text.lines().next().unwrap().to_string() + "\n").unwrap();
+        let err = format!("{:#}", load(&cases, &s4, None).unwrap_err());
+        assert!(
+            err.contains(&file.display().to_string())
+                && err.contains("1 case")
+                && err.contains("records 2")
+                && err.contains("fetch"),
+            "{err}"
+        );
+
+        // A listed file that is gone is the same damage.
+        std::fs::remove_file(&file).unwrap();
+        let err = format!("{:#}", load(&cases, &s4, None).unwrap_err());
+        assert!(
+            err.contains(&file.display().to_string()) && err.contains("missing"),
+            "{err}"
+        );
     }
 
     #[test]
