@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
 
 use serde::{Deserialize, Serialize};
 
@@ -308,7 +308,9 @@ async fn fetch_rows_saving(
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let mut requested = false;
-    let mut any_resumed = false;
+    // Whether the first page, which every later page is compared against for
+    // `num_rows_total` and features, was read from a saved file.
+    let mut baseline_resumed = false;
     let mut features: Option<Vec<Feature>> = None;
     let mut total: Option<u64> = None;
     let mut rows: Vec<Row> = Vec::new();
@@ -351,11 +353,17 @@ async fn fetch_rows_saving(
             ),
             None => what.clone(),
         })?;
-        any_resumed |= resumed.is_some();
-        if let Err(e) = check_page(&what, offset, total, features.as_deref(), &page) {
-            // A saved page from an earlier run disagrees with the live one; kept,
-            // it would fail every later fetch identically.
-            if let (true, Some(dir)) = (any_resumed, pages) {
+        if total.is_none() {
+            baseline_resumed = resumed.is_some();
+        }
+        if let Err(fault) = check_page(&what, offset, total, features.as_deref(), &page) {
+            // Blame the saved pages only when the failing comparison involves
+            // one: the failing page was resumed, or it disagrees with a resumed
+            // baseline. Kept, such a page would fail every later fetch
+            // identically. A failure within a live page keeps the saved pages.
+            let saved_involved = resumed.is_some() || (fault.vs_baseline && baseline_resumed);
+            let e = fault.error;
+            if let (true, Some(dir)) = (saved_involved, pages) {
                 let cleanup = discard_pages(dir);
                 return Err(e.context(format!(
                     "saved pages {} from an earlier run disagree with the live dataset; \
@@ -377,6 +385,15 @@ async fn fetch_rows_saving(
     })
 }
 
+/// Why a page failed `check_page`.
+struct PageFault {
+    error: anyhow::Error,
+    /// The page disagrees with the first page's `num_rows_total` or
+    /// features, so either side may be the stale one; otherwise the fault is
+    /// within the page itself.
+    vs_baseline: bool,
+}
+
 /// `page` (at `offset`) agrees with the pages before it: the same
 /// `num_rows_total` and features, rows before the total, and contiguous
 /// `row_idx`.
@@ -386,30 +403,40 @@ fn check_page(
     total: Option<u64>,
     features: Option<&[Feature]>,
     page: &RowsPage,
-) -> anyhow::Result<()> {
+) -> Result<(), PageFault> {
+    let fault = |vs_baseline, error| Err(PageFault { error, vs_baseline });
     if let Some(t) = total
         && t != page.num_rows_total
     {
-        bail!(
-            "{what}: num_rows_total changed from {t} to {} mid-fetch",
-            page.num_rows_total
+        return fault(
+            true,
+            anyhow!(
+                "{what}: num_rows_total changed from {t} to {} mid-fetch",
+                page.num_rows_total
+            ),
         );
     }
     if let Some(f) = features
         && *f != page.features[..]
     {
-        bail!("{what}: features changed mid-fetch");
+        return fault(true, anyhow!("{what}: features changed mid-fetch"));
     }
     if page.rows.is_empty() && offset < page.num_rows_total {
-        bail!(
-            "{what}: no rows returned before num_rows_total {}",
-            page.num_rows_total
+        return fault(
+            false,
+            anyhow!(
+                "{what}: no rows returned before num_rows_total {}",
+                page.num_rows_total
+            ),
         );
     }
     for (i, r) in page.rows.iter().enumerate() {
         let want = offset + i as u64;
         if r.row_idx != want {
-            bail!("{what}: expected row_idx {want}, got {}", r.row_idx);
+            return fault(
+                false,
+                anyhow!("{what}: expected row_idx {want}, got {}", r.row_idx),
+            );
         }
     }
     Ok(())
@@ -1441,6 +1468,49 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got.rows.len(), 300);
+    }
+
+    #[tokio::test]
+    async fn a_live_page_failure_keeps_the_saved_pages_and_blames_the_live_page() {
+        let hub = hub_with_sha(S1).await;
+        let ds = MockServer::start().await;
+        Mock::given(path("/rows"))
+            .and(query_param("offset", "200"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page(300, 200, 0)))
+            .with_priority(1)
+            .mount(&ds)
+            .await;
+        Mock::given(path("/rows"))
+            .respond_with(Pager(300))
+            .mount(&ds)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let pages = root
+            .path()
+            .join(format!("org__ds@{S1}"))
+            .join("plain-test.pages");
+        std::fs::create_dir_all(&pages).unwrap();
+        // Saved by an earlier run, and consistent with the live dataset.
+        std::fs::write(pages.join("0.json"), page(300, 0, 100).to_string()).unwrap();
+        let err = format!(
+            "{:#}",
+            hf(&ds.uri(), &hub.uri())
+                .load_or_fetch(root.path(), "org/ds", "plain", "test")
+                .await
+                .unwrap_err()
+        );
+        assert!(
+            err.contains("offset 200") && err.contains("no rows returned"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("earlier run"),
+            "blamed the saved pages: {err}"
+        );
+        assert!(
+            pages.join("0.json").exists() && pages.join("100.json").exists(),
+            "good saved pages were discarded"
+        );
     }
 
     #[tokio::test]
