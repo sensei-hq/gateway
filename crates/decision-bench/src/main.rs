@@ -46,11 +46,12 @@ enum Command {
 /// Where a relative path is anchored, so `fetch` writes to the same place
 /// whatever directory it is run from.
 const PATH_NOTE: &str = concat!(
-    "Paths: relative paths resolve against the decision-bench crate directory, ",
+    "Paths: relative paths resolve under the decision-bench crate directory, ",
     env!("CARGO_MANIFEST_DIR"),
     ", not the current directory; so the default --out is ",
     env!("CARGO_MANIFEST_DIR"),
-    "/cases."
+    "/cases. Every subdirectory there except src/, tests/ and scenarios/ is \
+     gitignored, so fetched data cannot be committed by accident."
 );
 
 /// `p` if absolute, else `p` under the crate directory (see [`PATH_NOTE`]).
@@ -153,7 +154,8 @@ mod tests {
             .unwrap()
             .render_long_help()
             .to_string();
-        assert!(help.contains("relative paths resolve against"), "{help}");
+        assert!(help.contains("relative paths resolve under"), "{help}");
+        assert!(help.contains("gitignored"), "{help}");
         assert!(help.contains(CRATE), "{help}");
     }
 }
