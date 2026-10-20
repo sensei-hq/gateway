@@ -69,7 +69,8 @@ in-process vs 46.9 ms HTTP (noise); ANE 4.12 ms vs 4.47 ms (+0.35 ms ≈ 8%); ba
   `ProviderError`, never as answers.
 - **AC7** Docs list `laya` everywhere `llamacpp`/`sglang` are listed (`docs/llms/local.md`, `recipes.md`,
   `docs/features/inference/providers.md`, `capabilities-and-adapters.md`, `docs/features/README.md`, both
-  `SKILL.md` copies, upgrading notes and their site copy), `docs_sync_capabilities` passes, CHANGELOG updated.
+  `SKILL.md` copies, the release notes in `docs/llms/upgrading.md` (this repo has no CHANGELOG) and their generated
+  site copies), and `docs_sync_capabilities` passes.
 
 ## Testing
 
