@@ -83,7 +83,7 @@ S4 lives in `crates/decision-bench/scenarios/s4-*.jsonl`, 50–100 cases per gat
   - **Head-to-head on a shared subset.** The ranking within a scenario uses only the cases that are applicable to every model being ranked, so no model is graded on an easier subset.
   - **Coverage floor.** A model with coverage below 50% is left out of the head-to-head and gets its own table over its own applicable cases. Example: "ANE: 30% coverage, 0.91 accuracy on short checks".
   - **Ordering.** Inside the head-to-head, models are ordered by accuracy, then lower confident-wrong rate, then lower p50 latency.
-  - A model is called the **winner** only if its CI lower bound exceeds the runner-up's CI upper bound. Otherwise the top models are reported as **tied**: the tie lists the top model and every ranked model whose CI overlaps the top model's, i.e. `hi_other ≥ lo_top` (the exact negation of the winner test; T6 as built).
+  - A model is called the **winner** only if its CI lower bound exceeds the CI upper bound of **every** other ranked model, not just the runner-up. This means the verdict cannot depend on an accuracy or latency tiebreak (T6 review). Otherwise the top models are reported as **tied**: the tie lists the top model and every ranked model whose CI overlaps the top model's, i.e. `hi_other ≥ lo_top` (with the every-model winner rule, Winner and Tie are exact complements).
   - The report also has a scenario × model summary table and a "use X for scenario Y" line per scenario (or "tie: X, Y").
 - **D7 Outputs.**
   - `results.json` is gitignored and machine-readable, with stable field names so a later routing slice can read it.
