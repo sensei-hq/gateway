@@ -285,18 +285,20 @@ fn summary(md: &mut String, models: &[String], rankings: &[ScenarioRanking]) {
 const TABLE_HEAD: &str = "| Model | Coverage | Accuracy | 95% CI | ECE | Confident-wrong | \
                           Error rate | Not reached | MAE | p50 ms | p95 ms |";
 
-fn metrics_row(md: &mut String, id: &str, coverage: f64, m: &Metrics) {
+/// One table line: `own` gives coverage and not-reached (over the model's
+/// own rows), `m` everything else.
+fn metrics_row(md: &mut String, id: &str, own: &Metrics, m: &Metrics) {
     let _ = writeln!(
         md,
         "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
         cell(id),
-        pct(coverage),
+        pct(own.coverage),
         f2(m.accuracy),
         ci(m.ci),
         f2(m.ece),
         f2(m.confident_wrong),
         f2(m.error_rate),
-        m.not_reached,
+        own.not_reached,
         f2(m.mae),
         ms(m.p50_ms),
         ms(m.p95_ms)
@@ -343,19 +345,21 @@ fn scenario_section(md: &mut String, results: &Results, r: &ScenarioRanking) {
         let _ = writeln!(
             md,
             "Shared cases: {} (applicable to every ranked model). Metrics are over the shared \
-             cases; coverage is over the model's own cases.\n",
+             cases; coverage and not-reached are over the model's own cases.\n",
             r.shared_cases
         );
         table_head(md);
         for m in &r.ranked {
-            metrics_row(md, &m.id, m.own.coverage, &m.shared);
+            metrics_row(md, &m.id, &m.own, &m.shared);
         }
         md.push('\n');
     }
     let verdict = match &r.verdict {
-        Verdict::Winner(m) => {
-            format!("**Use {m} for {name}**: its 95% CI lies above every other ranked model's.")
-        }
+        Verdict::Winner(m) => format!(
+            "**Use {m} for {name}** among the head-to-head models: its 95% CI lies above \
+             every other head-to-head model's; models below the coverage floor are not \
+             compared."
+        ),
         Verdict::Tie(ms) => format!(
             "**Tie: {}**: not statistically separable (their 95% CIs reach the top model's).",
             ms.join(", ")
@@ -371,7 +375,7 @@ fn scenario_section(md: &mut String, results: &Results, r: &ScenarioRanking) {
         );
         table_head(md);
         for (id, m) in &r.low_coverage {
-            metrics_row(md, id, m.coverage, m);
+            metrics_row(md, id, m, m);
         }
         md.push('\n');
     }
@@ -473,42 +477,62 @@ fn never_reached(md: &mut String, results: &Results, models: &[String]) {
 
 fn reproduce(md: &mut String, results: &Results, rankings: &[ScenarioRanking], seed: u64) {
     let bin = "cargo run --release -p decision-bench --";
-    let models: Vec<&str> = if results.roster.is_empty() {
-        Vec::new()
+    let paths = results.paths.as_ref();
+    let models: Vec<&str> = results.roster.iter().map(|m| m.id.as_str()).collect();
+    let models = if models.is_empty() {
+        String::new()
     } else {
-        results.roster.iter().map(|m| m.id.as_str()).collect()
+        format!(" --models {}", models.join(","))
     };
+    let config = paths
+        .and_then(|p| p.config.as_deref())
+        .map(|c| format!(" --config {c}"))
+        .unwrap_or_default();
     let scenarios: Vec<&str> = rankings.iter().map(|r| cli_name(r.scenario)).collect();
-    let mut run = format!("{bin} run");
+    let mut run = format!("{bin} run{config}");
+    if let Some(p) = paths {
+        let _ = write!(run, " --cases {}", p.cases);
+    }
     if !scenarios.is_empty() {
         let _ = write!(run, " --scenarios {}", scenarios.join(","));
     }
-    if !models.is_empty() {
-        let _ = write!(run, " --models {}", models.join(","));
+    run += &models;
+    if let Some(p) = paths {
+        let _ = write!(run, " --out {}", p.results);
     }
+    let report = match paths {
+        Some(p) => format!(
+            "{bin} report --results {} --out {} --seed {seed}",
+            p.results,
+            p.report.as_deref().unwrap_or("report.md")
+        ),
+        None => format!("{bin} report --seed {seed}"),
+    };
     let _ = writeln!(md, "## Reproduce\n");
     let _ = writeln!(
         md,
-        "From the repo root, with a `bench.toml` holding the roster above (relative paths \
-         resolve under `crates/decision-bench/`):\n"
+        "From the repo root (relative paths resolve under `crates/decision-bench/`):\n"
     );
     let _ = writeln!(md, "```sh");
-    let _ = writeln!(md, "{bin} check");
+    let _ = writeln!(md, "{bin} check{config}{models}");
     if let Some(m) = &results.manifest {
+        let out = paths
+            .map(|p| format!(" --out {}", p.cases))
+            .unwrap_or_default();
         let _ = writeln!(
             md,
-            "{bin} fetch --per-scenario {} --seed {}",
+            "{bin} fetch --per-scenario {} --seed {}{out}",
             m.per_scenario, m.seed
         );
     }
     let _ = writeln!(md, "{run}");
-    let _ = writeln!(md, "{bin} report --seed {seed}");
+    let _ = writeln!(md, "{report}");
     let _ = writeln!(md, "```\n");
     if results.manifest.is_some() {
         let _ = writeln!(
             md,
             "`fetch` rebuilds byte-identical cases only while each dataset is still at the \
-             revision sha above; compare the rows sha256 in `cases/manifest.json`."
+             revision sha above; compare the rows sha256 in the cases' `manifest.json`."
         );
     }
 }
@@ -518,7 +542,7 @@ mod tests {
     use super::*;
     use crate::case::Scenario;
     use crate::metrics::compute_on;
-    use crate::run::{LabelReview, NotRun, Outcome, ResultRow, RosterEntry};
+    use crate::run::{LabelReview, NotRun, Outcome, ResultRow, RosterEntry, RunPaths};
     use crate::scenarios::{Manifest, ManifestDataset};
 
     fn row(model: &str, scenario: Scenario, case: usize, outcome: Outcome) -> ResultRow {
@@ -585,6 +609,11 @@ mod tests {
         }
         mid[38].case_id = "c39".into();
         mid[39].case_id = "c40".into();
+        // c17..c24 (4 right, 4 wrong) do not fit mid: own coverage 80%, and
+        // the shared S3 set is the other 32.
+        for (i, r) in mid.iter_mut().enumerate().take(24).skip(16) {
+            *r = row("mid", S3Entailment, i + 1, Outcome::NotApplicable);
+        }
         rows.extend(mid);
         rows.extend((1..=40).map(|i| {
             if i <= 30 {
@@ -638,6 +667,7 @@ mod tests {
                 },
             ],
             completed: vec!["good".into(), "mid".into(), "ane".into()],
+            paths: None,
             rows,
         }
     }
@@ -762,10 +792,11 @@ mod tests {
             .lines()
             .find(|l| l.starts_with("| S3"))
             .unwrap_or_else(|| panic!("{summary}"));
-        // good: 40/40 on the 40 shared cases; mid: 20/40 with full coverage;
+        // good: 32/32 on the 32 shared cases; mid: 16/32 at 80% coverage;
         // ane: 10 own applicable cases, all right.
         assert!(s3.contains("| 1.00 (cov 100%) |"), "{s3}");
-        assert!(s3.contains("| 0.50 (cov 100%) |"), "{s3}");
+        // T7 review I4: the coverage is mid's own, not the shared set's 100%.
+        assert!(s3.contains("| 0.50 (cov 80%) |"), "{s3}");
         assert!(s3.contains("| 1.00 (cov 25%, own cases) |"), "{s3}");
         let s2 = summary.lines().find(|l| l.starts_with("| S2")).unwrap();
         assert!(s2.trim_end().ends_with("| — |"), "ane has no S2 rows: {s2}");
@@ -789,7 +820,7 @@ mod tests {
     fn a_scenario_section_has_the_shared_count_ranked_table_low_coverage_and_no_rows() {
         let md = md();
         let s3 = section(&md, "## S3");
-        assert!(s3.contains("Shared cases: 40"), "{s3}");
+        assert!(s3.contains("Shared cases: 32"), "{s3}");
         assert!(
             s3.contains(
                 "| Model | Coverage | Accuracy | 95% CI | ECE | Confident-wrong | Error rate | \
@@ -817,7 +848,13 @@ mod tests {
             .filter(|r| r.model == "mid" && r.scenario == Scenario::S3Entailment)
             .cloned()
             .collect();
-        let m = compute_on(&mid, None, 7);
+        let shared: std::collections::HashSet<String> = mid
+            .iter()
+            .filter(|r| r.outcome != Outcome::NotApplicable)
+            .map(|r| r.case_id.clone())
+            .collect();
+        assert_eq!(shared.len(), 32);
+        let m = compute_on(&mid, Some(&shared), 7);
         let (lo, hi) = m.ci.unwrap();
         let s3 = section(&md, "## S3");
         let line = s3
@@ -826,8 +863,87 @@ mod tests {
             .unwrap_or_else(|| panic!("{s3}"));
         assert!(line.contains("| 0.50 |"), "{line}");
         assert!(line.contains(&format!("| [{lo:.2}, {hi:.2}] |")), "{line}");
-        assert!(line.contains("| 0.05 |"), "error rate 2/40: {line}");
-        assert!(line.contains("| 2 |"), "2 not reached: {line}");
+        let error_rate = format!("| {:.2} |", 2.0 / 32.0);
+        assert!(line.contains(&error_rate), "error rate 2/32: {line}");
+        // T7 review I4: coverage is over mid's own 40 cases.
+        assert!(line.starts_with("| mid | 80% |"), "{line}");
+    }
+
+    /// The `i`th cell (0 = model) of a table line.
+    fn cell_at(line: &str, i: usize) -> &str {
+        line.split('|').map(str::trim).nth(i + 1).unwrap()
+    }
+
+    /// T7 review M1: the "Not reached" column counts every row that never
+    /// reached the server, over the model's own rows, so it agrees with the
+    /// "never reached the server" lines.
+    #[test]
+    fn the_not_reached_column_agrees_with_the_never_reached_lines() {
+        let md = md();
+        let s3 = section(&md, "## S3");
+        let never = section(&md, "## Rows that never reached the server");
+        for (model, n) in [("mid", 2), ("ane", 30)] {
+            let line = s3
+                .lines()
+                .find(|l| l.starts_with(&format!("| {model} |")))
+                .unwrap();
+            assert_eq!(cell_at(line, 7), n.to_string(), "{line}");
+            assert!(
+                never.contains(&format!("{model} on S3: {n} rows never reached")),
+                "{never}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_share_just_under_one_never_rounds_up_to_100_percent() {
+        assert_eq!(pct(0.995), "99%");
+        assert_eq!(pct(1.0), "100%");
+        assert_eq!(pct(0.25), "25%");
+    }
+
+    /// T7 review M6: the winner is the best of the head-to-head models only.
+    #[test]
+    fn the_winner_line_says_it_is_among_the_head_to_head_models() {
+        let md = md();
+        assert!(
+            section(&md, "## S3").contains(
+                "**Use good for S3** among the head-to-head models: its 95% CI lies above \
+                 every other head-to-head model's; models below the coverage floor are not \
+                 compared."
+            ),
+            "{md}"
+        );
+    }
+
+    /// T7 review M2: the footer replays the run's actual paths.
+    #[test]
+    fn the_footer_uses_the_recorded_paths() {
+        let mut f = fixture();
+        f.paths = Some(RunPaths {
+            config: Some("my.toml".into()),
+            cases: "/data/cases".into(),
+            results: "out/r.json".into(),
+            report: Some("docs/x.md".into()),
+        });
+        let md = render(&f, 7);
+        let repro = section(&md, "## Reproduce");
+        let models = "--models good,mid,ane,down";
+        assert!(
+            repro.contains(&format!("-- check --config my.toml {models}")),
+            "{repro}"
+        );
+        assert!(
+            repro.contains(&format!(
+                "-- run --config my.toml --cases /data/cases --scenarios \
+                 s1a,s2,s3,s4-test-output,s4-fix-check {models} --out out/r.json"
+            )),
+            "{repro}"
+        );
+        assert!(
+            repro.contains("-- report --results out/r.json --out docs/x.md --seed 7"),
+            "{repro}"
+        );
     }
 
     #[test]

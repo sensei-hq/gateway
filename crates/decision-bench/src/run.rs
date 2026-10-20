@@ -123,7 +123,24 @@ pub struct Results {
     /// stopped early).
     #[serde(default)]
     pub completed: Vec<String>,
+    /// The paths the run used, for the report's reproduce commands.
+    #[serde(default)]
+    pub paths: Option<RunPaths>,
     pub rows: Vec<ResultRow>,
+}
+
+/// Paths as given to the CLI: relative to the crate directory where they lie
+/// under it, else absolute.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct RunPaths {
+    /// `None`: the default (`bench.toml`, else the example).
+    pub config: Option<String>,
+    pub cases: String,
+    /// The results file `run` wrote (`report --results`).
+    pub results: String,
+    /// Set by `report` to its `--out` before rendering.
+    #[serde(default)]
+    pub report: Option<String>,
 }
 
 /// The sign-off state of one hand-curated scenario's labels.
@@ -1161,6 +1178,7 @@ mod tests {
                 reviewed_by: None,
             }],
             completed: vec!["m".into()],
+            paths: None,
             rows: vec![row_for(
                 &noul_case(true),
                 "m",
@@ -1181,6 +1199,7 @@ mod tests {
                 "labels_reviewed",
                 "manifest",
                 "not_run",
+                "paths",
                 "roster",
                 "rows"
             ]
@@ -1448,6 +1467,7 @@ mod tests {
             roster: vec![],
             labels_reviewed: vec![],
             completed: vec![],
+            paths: None,
             rows: vec![],
         }
     }

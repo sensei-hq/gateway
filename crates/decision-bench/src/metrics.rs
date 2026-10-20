@@ -14,6 +14,7 @@ pub struct Metrics {
     pub n_applicable: usize,
     pub n_ok: usize,
     pub n_error: usize,
+    /// Rows (of any outcome) that never reached the server.
     pub not_reached: usize,
     pub coverage: f64,
     pub accuracy: Option<f64>,
@@ -121,7 +122,9 @@ pub fn compute(rows: &[&ResultRow], seed: u64) -> Metrics {
         .filter(|r| r.outcome == Outcome::Error)
         .collect();
     let n_error = errors.len();
-    let not_reached = errors.iter().filter(|r| !r.reached_server).count();
+    // Every row that never reached the server: gated errors and gated
+    // not_applicable rows alike.
+    let not_reached = rows.iter().filter(|r| !r.reached_server).count();
 
     let is_correct = |r: &ResultRow| r.outcome == Outcome::Ok && r.correct == Some(true);
     let outcomes: Vec<u8> = applicable.iter().map(|r| u8::from(is_correct(r))).collect();
@@ -242,15 +245,22 @@ mod tests {
         assert!(close(x.error_rate, 1.0 / 7.0));
     }
 
+    /// T7 review M1: every row that never reached the server, gated
+    /// not_applicable ones included (so the report's column and its "never
+    /// reached the server" lines agree).
     #[test]
-    fn not_reached_counts_gated_errors() {
+    fn not_reached_counts_every_row_that_never_reached_the_server() {
         let gated = ResultRow {
             reached_server: false,
             ..err()
         };
-        let rows = vec![gated.clone(), gated, err(), ok(true, 0.9)];
+        let gated_na = ResultRow {
+            reached_server: false,
+            ..na()
+        };
+        let rows = vec![gated.clone(), gated, err(), ok(true, 0.9), gated_na, na()];
         let x = m(&rows);
-        assert_eq!((x.n_error, x.not_reached), (3, 2));
+        assert_eq!((x.n_error, x.not_reached), (3, 3));
     }
 
     #[test]

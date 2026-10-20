@@ -8,7 +8,7 @@ use decision_bench::config::{BenchConfig, resolve_under};
 use decision_bench::fetch::{Hf, default_cache_root};
 use decision_bench::load::{load, parse_scenarios};
 use decision_bench::report::{cli_name, render};
-use decision_bench::run::{NotRun, Results, RosterEntry, run_saving};
+use decision_bench::run::{NotRun, Results, RosterEntry, RunPaths, run_saving};
 use decision_bench::scenarios::{FetchOptions, fetch_cases};
 
 #[derive(Parser)]
@@ -197,9 +197,17 @@ fn select_models(cfg: &BenchConfig, models: Option<&str>) -> anyhow::Result<Vec<
         .collect())
 }
 
+/// `p` relative to `crate_dir` when under it, else as given.
+fn rel(p: &Path, crate_dir: &Path) -> String {
+    p.strip_prefix(crate_dir).unwrap_or(p).display().to_string()
+}
+
 /// Load the config named by `select` (printing a note when the example is
 /// used) and the selected model ids.
-fn load_config(select: &Select, crate_dir: &Path) -> anyhow::Result<(BenchConfig, Vec<String>)> {
+fn load_config(
+    select: &Select,
+    crate_dir: &Path,
+) -> anyhow::Result<(BenchConfig, Vec<String>, PathBuf)> {
     let loaded = BenchConfig::load(select.config.as_deref(), crate_dir)?;
     if loaded.is_example {
         eprintln!(
@@ -208,7 +216,7 @@ fn load_config(select: &Select, crate_dir: &Path) -> anyhow::Result<(BenchConfig
         );
     }
     let ids = select_models(&loaded.config, select.models.as_deref())?;
-    Ok((loaded.config, ids))
+    Ok((loaded.config, ids, loaded.path))
 }
 
 /// The `check` table: one line per model.
@@ -238,7 +246,7 @@ fn check_table(cfg: &BenchConfig, results: &[CheckResult]) -> String {
 
 /// `check`: probe and print. A NOT RUN model is reported, never an error.
 async fn check_command(select: &Select, crate_dir: &Path) -> anyhow::Result<Vec<CheckResult>> {
-    let (cfg, ids) = load_config(select, crate_dir)?;
+    let (cfg, ids, _) = load_config(select, crate_dir)?;
     let results = check(&cfg, &ids).await;
     print!("{}", check_table(&cfg, &results));
     Ok(results)
@@ -253,7 +261,7 @@ async fn run_command(
     out: &Path,
     crate_dir: &Path,
 ) -> anyhow::Result<Results> {
-    let (cfg, ids) = load_config(select, crate_dir)?;
+    let (cfg, ids, config_path) = load_config(select, crate_dir)?;
     let only = scenarios.map(parse_scenarios).transpose()?;
     let cases_dir = resolve_under(cases, crate_dir);
     let loaded = load(&cases_dir, &crate_dir.join("scenarios"), only.as_deref())?;
@@ -297,6 +305,12 @@ async fn run_command(
             .collect(),
         labels_reviewed: loaded.labels_reviewed,
         completed: vec![],
+        paths: Some(RunPaths {
+            config: Some(rel(&config_path, crate_dir)),
+            cases: rel(&cases_dir, crate_dir),
+            results: rel(&resolve_under(out, crate_dir), crate_dir),
+            report: None,
+        }),
         rows: vec![],
     };
     let out = resolve_under(out, crate_dir);
@@ -319,12 +333,15 @@ fn report_command(
     let path = resolve_under(results, crate_dir);
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading results {}", path.display()))?;
-    let results: Results =
+    let mut results: Results =
         serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     let seed = seed
         .or(results.manifest.as_ref().map(|m| m.seed))
         .unwrap_or(DEFAULT_SEED);
     let out = resolve_under(out, crate_dir);
+    if let Some(p) = results.paths.as_mut() {
+        p.report = Some(rel(&out, crate_dir));
+    }
     decision_bench::fetch::write_atomic(&out, render(&results, seed).as_bytes())
         .with_context(|| format!("writing {}", out.display()))?;
     eprintln!("decision-bench: wrote {}", out.display());
@@ -604,19 +621,40 @@ mod tests {
 
         let report = report_command(
             Path::new("results.json"),
-            Path::new("report.md"),
+            Path::new("r.md"),
             None,
             dir.path(),
         )
         .unwrap();
-        assert_eq!(report, dir.path().join("report.md"));
+        assert_eq!(report, dir.path().join("r.md"));
         let md = std::fs::read_to_string(report).unwrap();
         assert!(md.contains("## NOT RUN") && md.contains("**down**"), "{md}");
         assert!(md.contains("**labels unreviewed**"), "{md}");
         assert!(
-            md.contains("report --seed 2026"),
+            md.contains("report --results results.json --out r.md --seed 2026"),
             "default seed is the manifest's: {md}"
         );
+        // T7 review M2: the run recorded its paths, relative to the crate dir.
+        let paths = results.paths.as_ref().unwrap();
+        assert_eq!(paths.cases, "cases");
+        assert_eq!(paths.results, "results.json");
+        assert_eq!(paths.config.as_deref(), Some("bench.toml"));
+        // Every command the footer gives parses as this CLI.
+        let block = md
+            .split("```sh\n")
+            .nth(1)
+            .unwrap()
+            .split("```")
+            .next()
+            .unwrap();
+        let mut n = 0;
+        for line in block.lines() {
+            let args = line.split(" -- ").nth(1).unwrap();
+            let argv = std::iter::once("decision-bench").chain(args.split_whitespace());
+            Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{line}: {e}"));
+            n += 1;
+        }
+        assert_eq!(n, 4, "{block}");
     }
 
     /// T7 review M3: an invalid model entry is a NOT RUN row, not an abort.
