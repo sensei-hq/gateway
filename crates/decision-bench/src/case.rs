@@ -147,7 +147,7 @@ pub fn read_jsonl<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result
 }
 
 /// Write one compact JSON object per line, each `\n`-terminated. Writes to
-/// `<path>.tmp` then renames, so a failed write never leaves a truncated file
+/// `<path>.tmp`, `sync_all`s it, then renames, so a failed write never leaves a truncated file
 /// (or clobbers an existing one).
 pub fn write_jsonl<T: Serialize>(path: &Path, items: &[T]) -> anyhow::Result<()> {
     let mut tmp = path.as_os_str().to_owned();
@@ -163,8 +163,14 @@ pub fn write_jsonl<T: Serialize>(path: &Path, items: &[T]) -> anyhow::Result<()>
             w.write_all(b"\n")
                 .with_context(|| format!("{}: writing item {i}", path.display()))?;
         }
-        w.flush()
+        let f = w
+            .into_inner()
+            .map_err(std::io::IntoInnerError::into_error)
             .with_context(|| format!("flushing {}", tmp.display()))?;
+        // Durable before the rename: callers then write a marker (meta.json,
+        // manifest.json) and delete the only other copy.
+        f.sync_all()
+            .with_context(|| format!("syncing {}", tmp.display()))?;
         std::fs::rename(&tmp, path)
             .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
         Ok(())
