@@ -662,8 +662,8 @@ mod cloud_tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&err, GatewayError::ProviderError { status: None, message, .. }
-                if message.contains("does not read images")),
+            matches!(&err, GatewayError::InputRejected { adapter, message }
+                if adapter == "laya" && message.contains("does not read images")),
             "{err:?}"
         );
         assert!(registry.chat("laya").await.is_none(), "decision-only");

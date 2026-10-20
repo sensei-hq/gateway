@@ -1,6 +1,7 @@
-//! SP-DEC-3 AC4 — a `laya` answer the server truncated is a failed attempt the
-//! engine falls back on: the facade's `laya` router (mocked with Laya's real
-//! truncated payload) fails, the next router in the `decide` chain answers.
+//! SP-DEC-3 AC4 — a `laya` answer the server truncated is an input rejection
+//! (D5) the engine falls back on: the facade's `laya` router (mocked with Laya's
+//! real truncated payload) fails, the next router in the `decide` chain answers —
+//! whatever the chain's trigger set, including none.
 
 #![cfg(feature = "cloud")]
 
@@ -52,6 +53,17 @@ fn entry(model: &str, router: &str, priority: u8) -> ChainEntry {
 
 #[tokio::test]
 async fn a_truncated_laya_answer_falls_back_to_the_next_router() {
+    truncated_laya_falls_back(vec![FallbackTrigger::ProviderError]).await;
+}
+
+/// D5: `InputRejected` falls back whatever the trigger set — an ineligible
+/// candidate is a skip, not a provider-fault policy question.
+#[tokio::test]
+async fn a_truncated_laya_answer_falls_back_even_with_no_triggers() {
+    truncated_laya_falls_back(vec![]).await;
+}
+
+async fn truncated_laya_falls_back(fallback_triggers: Vec<FallbackTrigger>) {
     let laya = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/systemone"))
@@ -90,7 +102,7 @@ async fn a_truncated_laya_answer_falls_back_to_the_next_router() {
                     entry("english", "laya", 1),
                     entry("nimble-v3", "llamacpp", 2),
                 ],
-                fallback_triggers: vec![FallbackTrigger::ProviderError],
+                fallback_triggers,
             },
         )]),
         ..Default::default()
@@ -132,6 +144,10 @@ async fn a_truncated_laya_answer_falls_back_to_the_next_router() {
         .error
         .as_deref()
         .expect("laya attempt error");
+    assert!(
+        laya_error.contains("adapter 'laya' cannot serve this input"),
+        "an InputRejected, not a ProviderError: {laya_error}"
+    );
     assert!(
         laya_error.contains("the host truncated the input"),
         "{laya_error}"
