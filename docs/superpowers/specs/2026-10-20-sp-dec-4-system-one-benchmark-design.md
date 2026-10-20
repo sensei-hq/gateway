@@ -31,14 +31,14 @@ One question per case.
 
 | Id | Scenario | Type | Source | Licence |
 |---|---|---|---|---|
-| S1a | Intent routing (10 domains + out-of-scope) | choice | `clinc/clinc_oos` config `plus` (HF datasets-server) | CC-BY-3.0 |
+| S1a | Intent routing with an out-of-scope option: 8 candidates per case (gold + 7 seeded distractors from 151 intents, `oos` always offered) | choice | `clinc/clinc_oos` config `plus` (HF datasets-server) | CC-BY-3.0 |
 | S1b | Tool/intent routing, 8 candidates per case (gold + 7 seeded distractors from 77 intents) | choice | `legacy-datasets/banking77` | CC-BY-4.0 |
 | S2 | Ordered triage score (negative / neutral / positive as a 3-level score) | score | `Sp1786/multiclass-sentiment-analysis-dataset` | Apache-2.0 |
 | S3 | Does B follow from A? (entailment → yes, contradiction → no; neutral excluded) | noul | `stanfordnlp/snli` | CC-BY-SA-4.0 |
 | S4 | Coding-pipeline gates: test output → continue / fix_code / retry / fix_environment; review finding → block / follow_up / dismiss; "does the change fix the finding?" | choice + noul | hand-curated, committed | repo |
 
 Dataset notes:
-- Verified 2026-10-20: each id exists, is ungated, and has its splits served by `datasets-server.huggingface.co`.
+- Verified 2026-10-20: each id exists, is ungated, and has its splits served by `datasets-server.huggingface.co`. `/rows` pages are at most 100 rows long. CLINC `plus` has 151 labels, `oos` among them (looked up by name, never by index). The sentiment set is 0 negative, 1 neutral, 2 positive. datasets-server serves only the current revision, so `fetch` records the hub sha and refuses to reuse a cache built from a different one.
 - `PolyAI/banking77` is not served, so its `legacy-datasets/` copy is used.
 - `SetFit/sst5` was rejected (no licence), and so were Yelp (licence "other") and MultiNLI (mixed licence).
 - Public data is **fetched, never committed**.
