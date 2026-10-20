@@ -7,12 +7,24 @@
 //! JSON object that has neither an `id` nor a `scenario` key. Such a line must
 //! then deserialize as a [`Header`] (unknown keys are rejected, so a typo does
 //! not silently turn a header into nothing). Any other first line is a case.
+//! A header line that fails to parse is reported as "has no id/scenario, so it
+//! was read as a header". A leading UTF-8 BOM is ignored.
+//!
+//! [`read_case_file`] also rejects: an empty or header-only file, duplicate
+//! case ids, and a file mixing more than one `scenario`. Every case is checked
+//! with the gateway's own `validate_decision`, so a case that could never run
+//! fails at load time rather than looking like a model being wrong.
+//!
+//! Known limitation: duplicate keys inside a choice's `criteria` object
+//! collapse silently (serde's map types keep the last value, and the raw
+//! `Value` is a map too), so they cannot be detected here. T9's file check is
+//! the guard for that.
 
 use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, bail};
-use gateway::types::decision::DecisionQuestion;
+use gateway::types::decision::{DecisionQuestion, DecisionQuestions, validate_decision};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
@@ -51,6 +63,7 @@ pub enum Expected {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Case {
     pub id: String,
     pub scenario: Scenario,
@@ -74,6 +87,10 @@ impl Case {
     /// Reject an expectation that cannot be an answer to the case's question.
     pub fn validate(&self) -> anyhow::Result<()> {
         let id = &self.id;
+        let mut questions = DecisionQuestions::default();
+        questions.insert("q".to_string(), self.question.clone());
+        validate_decision(&self.state, &questions)
+            .map_err(|msg| anyhow::anyhow!("case {id}: {msg}"))?;
         match (&self.question, &self.expected) {
             (DecisionQuestion::Choice { criteria, .. }, Expected::Choice { option }) => {
                 if !criteria.contains_key(option) {
@@ -104,11 +121,19 @@ impl Case {
     }
 }
 
+fn read_text(path: &Path) -> anyhow::Result<String> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(text
+        .strip_prefix('\u{feff}')
+        .map(str::to_owned)
+        .unwrap_or(text))
+}
+
 /// Read every non-blank line of a JSONL file as a `T`. Errors name `line N`
 /// (1-based, counting blank lines).
 pub fn read_jsonl<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<Vec<T>> {
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let text = read_text(path)?;
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
@@ -121,31 +146,50 @@ pub fn read_jsonl<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result
     Ok(out)
 }
 
-/// Write one compact JSON object per line, each `\n`-terminated.
+/// Write one compact JSON object per line, each `\n`-terminated. Writes to
+/// `<path>.tmp` then renames, so a failed write never leaves a truncated file
+/// (or clobbers an existing one).
 pub fn write_jsonl<T: Serialize>(path: &Path, items: &[T]) -> anyhow::Result<()> {
-    let mut f =
-        std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
-    for item in items {
-        serde_json::to_writer(&mut f, item)?;
-        f.write_all(b"\n")?;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    let result = (|| -> anyhow::Result<()> {
+        let f =
+            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        let mut w = std::io::BufWriter::new(f);
+        for (i, item) in items.iter().enumerate() {
+            serde_json::to_writer(&mut w, item)
+                .with_context(|| format!("{}: writing item {i}", path.display()))?;
+            w.write_all(b"\n")
+                .with_context(|| format!("{}: writing item {i}", path.display()))?;
+        }
+        w.flush()
+            .with_context(|| format!("flushing {}", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    f.flush()?;
-    Ok(())
+    result
 }
 
 /// Read a case file: optional header line (see module docs), then cases, each
 /// validated.
 pub fn read_case_file(path: &Path) -> anyhow::Result<(Header, Vec<Case>)> {
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let text = read_text(path)?;
     let mut header = Header::default();
-    let mut cases = Vec::new();
+    let mut cases: Vec<Case> = Vec::new();
+    let mut ids: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut scenario: Option<(Scenario, usize)> = None;
     let mut seen_first = false;
     for (i, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let at = || format!("{}: line {}", path.display(), i + 1);
+        let n = i + 1;
+        let at = || format!("{}: line {n}", path.display());
         let value: serde_json::Value = serde_json::from_str(line).with_context(at)?;
         let is_header = !seen_first
             && value
@@ -153,12 +197,35 @@ pub fn read_case_file(path: &Path) -> anyhow::Result<(Header, Vec<Case>)> {
                 .is_some_and(|o| !o.contains_key("id") && !o.contains_key("scenario"));
         seen_first = true;
         if is_header {
-            header = serde_json::from_value(value).with_context(at)?;
-        } else {
-            let case: Case = serde_json::from_value(value).with_context(at)?;
-            case.validate().with_context(at)?;
-            cases.push(case);
+            header = serde_json::from_value(value)
+                .with_context(|| format!("line {n} has no id/scenario, so it was read as a header"))
+                .with_context(at)?;
+            continue;
         }
+        let case: Case = serde_json::from_value(value).with_context(at)?;
+        case.validate().with_context(at)?;
+        if let Some(first) = ids.get(&case.id) {
+            bail!(
+                "{}: duplicate case id {:?} (first seen on line {first})",
+                at(),
+                case.id
+            );
+        }
+        ids.insert(case.id.clone(), n);
+        match scenario {
+            None => scenario = Some((case.scenario, n)),
+            Some((s, first)) if s != case.scenario => bail!(
+                "{}: mixed scenarios: case {:?} is {:?} but line {first} is {s:?}",
+                at(),
+                case.id,
+                case.scenario
+            ),
+            Some(_) => {}
+        }
+        cases.push(case);
+    }
+    if cases.is_empty() {
+        bail!("{}: file contains no cases", path.display());
     }
     Ok((header, cases))
 }
@@ -198,17 +265,68 @@ mod tests {
 
     #[test]
     fn case_round_trips_through_jsonl() {
-        let cases = vec![
-            case("c1", choice_q(), Expected::Choice { option: "b".into() }),
-            case("c2", score_q(), Expected::Score { level: 2 }),
-        ];
+        let mut c1 = case("c1", choice_q(), Expected::Choice { option: "b".into() });
+        c1.state = json!({"text": "hi", "n": 0.5});
+        let cases = vec![c1, case("c2", score_q(), Expected::Score { level: 2 })];
         let f = tempfile::NamedTempFile::new().unwrap();
         write_jsonl(f.path(), &cases).unwrap();
         let text = std::fs::read_to_string(f.path()).unwrap();
-        assert_eq!(text.lines().count(), 2);
-        assert!(text.ends_with('\n'));
+        let expected = concat!(
+            r#"{"id":"c1","scenario":"s2_sentiment","state":{"n":0.5,"text":"hi"},"question":{"type":"choice","instructions":"pick","criteria":{"a":null,"b":"the b"}},"expected":{"kind":"choice","option":"b"},"source":"hand-curated"}"#,
+            "\n",
+            r#"{"id":"c2","scenario":"s2_sentiment","state":{"text":"hi"},"question":{"type":"score","instructions":"rate","criteria":["bad","ok","good"]},"expected":{"kind":"score","level":2},"source":"hand-curated"}"#,
+            "\n",
+        );
+        assert_eq!(text, expected);
         let back: Vec<Case> = read_jsonl(f.path()).unwrap();
         assert_eq!(back, cases);
+    }
+
+    #[test]
+    fn option_order_survives_a_round_trip() {
+        // IndexMap's PartialEq ignores order, so compare the key order itself.
+        // Parse from text: `json!` would sort the keys before we ever wrote them.
+        let rev: DecisionQuestion = serde_json::from_str(
+            r#"{"type":"choice","instructions":"pick","criteria":{"b":null,"a":null}}"#,
+        )
+        .unwrap();
+        let c = case("c1", rev, Expected::Choice { option: "a".into() });
+        let f = tempfile::NamedTempFile::new().unwrap();
+        write_jsonl(f.path(), &[c]).unwrap();
+        let back: Vec<Case> = read_jsonl(f.path()).unwrap();
+        let DecisionQuestion::Choice { criteria, .. } = &back[0].question else {
+            panic!("not a choice")
+        };
+        assert_eq!(criteria.keys().collect::<Vec<_>>(), ["b", "a"]);
+    }
+
+    #[test]
+    fn write_jsonl_is_atomic_and_names_the_failing_item() {
+        struct Boom(bool);
+        impl Serialize for Boom {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                if self.0 {
+                    Err(serde::ser::Error::custom("boom"))
+                } else {
+                    s.serialize_u8(1)
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.jsonl");
+        std::fs::write(&path, "previous\n").unwrap();
+        let err = format!(
+            "{:#}",
+            write_jsonl(&path, &[Boom(false), Boom(true)]).unwrap_err()
+        );
+        assert!(err.contains("item 1"), "{err}");
+        assert!(err.contains("out.jsonl"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "previous\n");
+        assert!(!dir.path().join("out.jsonl.tmp").exists());
+
+        let missing = dir.path().join("no-such-dir").join("x.jsonl");
+        let err = format!("{:#}", write_jsonl(&missing, &[Boom(false)]).unwrap_err());
+        assert!(err.contains("x.jsonl"), "{err}");
     }
 
     #[test]
@@ -297,17 +415,104 @@ mod tests {
     }
 
     #[test]
-    fn scenario_tags_are_distinct() {
-        let all = [
-            Scenario::S1aIntentOos,
-            Scenario::S1bBanking77,
-            Scenario::S2Sentiment,
-            Scenario::S3Entailment,
-            Scenario::S4TestOutput,
-            Scenario::S4ReviewFinding,
-            Scenario::S4FixCheck,
+    fn scenario_tags_and_serde_names_are_pinned() {
+        let table = [
+            (Scenario::S1aIntentOos, 1, "s1a_intent_oos"),
+            (Scenario::S1bBanking77, 2, "s1b_banking77"),
+            (Scenario::S2Sentiment, 3, "s2_sentiment"),
+            (Scenario::S3Entailment, 4, "s3_entailment"),
+            (Scenario::S4TestOutput, 5, "s4_test_output"),
+            (Scenario::S4ReviewFinding, 6, "s4_review_finding"),
+            (Scenario::S4FixCheck, 7, "s4_fix_check"),
         ];
-        let set: std::collections::HashSet<_> = all.iter().map(Scenario::tag).collect();
-        assert_eq!(set.len(), all.len());
+        for (sc, tag, name) in table {
+            assert_eq!(sc.tag(), tag, "{name}");
+            assert_eq!(serde_json::to_string(&sc).unwrap(), format!("\"{name}\""));
+        }
+    }
+
+    #[test]
+    fn validate_applies_the_gateways_structural_rules() {
+        let one_opt = q(json!({"type":"choice","instructions":"pick","criteria":{"a":null}}));
+        let c = case("one-opt", one_opt, Expected::Choice { option: "a".into() });
+        assert!(c.validate().unwrap_err().to_string().contains("one-opt"));
+
+        let blank = q(json!({"type":"noul","instructions":"   "}));
+        let c = case("blank-instr", blank, Expected::Noul { value: true });
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("blank-instr") && err.contains("instructions"),
+            "{err}"
+        );
+
+        let mut c = case("null-state", noul_q(), Expected::Noul { value: true });
+        c.state = serde_json::Value::Null;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("null-state") && err.contains("state"), "{err}");
+    }
+
+    fn line(c: &Case) -> String {
+        serde_json::to_string(c).unwrap()
+    }
+
+    #[test]
+    fn duplicate_ids_are_rejected_with_both_line_numbers() {
+        let a = case("dup", noul_q(), Expected::Noul { value: true });
+        let b = case("other", noul_q(), Expected::Noul { value: true });
+        let f = tmp(&format!("{}\n{}\n{}\n", line(&a), line(&b), line(&a)));
+        let err = format!("{:#}", read_case_file(f.path()).unwrap_err());
+        assert!(err.contains("line 3"), "{err}");
+        assert!(err.contains("duplicate case id \"dup\""), "{err}");
+        assert!(err.contains("first seen on line 1"), "{err}");
+    }
+
+    #[test]
+    fn a_file_mixing_scenarios_is_rejected() {
+        let a = case("a", noul_q(), Expected::Noul { value: true });
+        let mut b = case("b", noul_q(), Expected::Noul { value: true });
+        b.scenario = Scenario::S3Entailment;
+        let f = tmp(&format!("{}\n{}\n", line(&a), line(&b)));
+        let err = format!("{:#}", read_case_file(f.path()).unwrap_err());
+        assert!(err.contains("scenario") && err.contains("line 2"), "{err}");
+    }
+
+    #[test]
+    fn a_header_parse_failure_explains_why_it_was_a_header() {
+        let f = tmp("{\"labels_reviewd_by\": \"x\"}\n");
+        let err = format!("{:#}", read_case_file(f.path()).unwrap_err());
+        assert!(
+            err.contains("line 1 has no id/scenario, so it was read as a header"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_case_with_an_unknown_field_is_rejected() {
+        let c = case("c1", noul_q(), Expected::Noul { value: true });
+        let mut v = serde_json::to_value(&c).unwrap();
+        v["extra"] = json!(1);
+        let f = tmp(&format!("{v}\n"));
+        assert!(read_case_file(f.path()).is_err());
+    }
+
+    #[test]
+    fn empty_and_header_only_files_are_errors_naming_the_path() {
+        for content in ["", "\n  \n", "{\"notes\": \"x\"}\n"] {
+            let f = tmp(content);
+            let err = format!("{:#}", read_case_file(f.path()).unwrap_err());
+            assert!(err.contains(&f.path().display().to_string()), "{err}");
+            assert!(err.contains("no cases"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_leading_bom_is_ignored() {
+        let c = case("c1", noul_q(), Expected::Noul { value: true });
+        let f = tmp(&format!("\u{feff}{}\n", line(&c)));
+        let (_, cs) = read_case_file(f.path()).unwrap();
+        assert_eq!(cs, vec![c.clone()]);
+        let f = tmp(&format!("\u{feff}{}\n", line(&c)));
+        let back: Vec<Case> = read_jsonl(f.path()).unwrap();
+        assert_eq!(back, vec![c]);
     }
 }
