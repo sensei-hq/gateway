@@ -97,6 +97,12 @@ pub enum GatewayError {
         status: Option<u16>,
     },
 
+    /// The candidate cannot serve this request's INPUT — the endpoint is healthy (SP-DEC-3 D5):
+    /// an image to a host that ignores images, an over-window state or question, … Falls back
+    /// whatever the trigger set, is never retryable, and is never recorded as an endpoint failure.
+    #[error("adapter '{adapter}' cannot serve this input: {message}")]
+    InputRejected { adapter: String, message: String },
+
     #[error("model '{model}' unavailable on adapter '{adapter}'")]
     ModelUnavailable { adapter: String, model: String },
 
@@ -259,6 +265,11 @@ impl GatewayError {
     }
 
     pub fn should_trigger_fallback(&self, triggers: &[FallbackTrigger]) -> bool {
+        // SP-DEC-3 D5: an input the candidate cannot serve falls back whatever the trigger set.
+        if matches!(self, GatewayError::InputRejected { .. }) {
+            return true;
+        }
+
         if triggers.is_empty() {
             return false;
         }
@@ -290,6 +301,8 @@ impl GatewayError {
             | GatewayError::InvalidRequest { .. }
             | GatewayError::Network(_)
             | GatewayError::Serialization(_) => false,
+            // Handled by the early return above (D5); unreachable here, and `true` to stay correct.
+            GatewayError::InputRejected { .. } => true,
         }
     }
 }
@@ -576,6 +589,38 @@ mod tests {
             }
             .should_trigger_fallback(&triggers)
         );
+    }
+
+    #[test]
+    fn input_rejected_falls_back_whatever_the_trigger_set() {
+        let err = GatewayError::InputRejected {
+            adapter: "laya".into(),
+            message: "image input".into(),
+        };
+        assert!(err.should_trigger_fallback(&[]));
+        assert!(err.should_trigger_fallback(&[FallbackTrigger::RateLimit]));
+    }
+
+    #[test]
+    fn input_rejected_is_never_retryable() {
+        assert!(
+            !GatewayError::InputRejected {
+                adapter: "laya".into(),
+                message: "image input".into(),
+            }
+            .is_retryable()
+        );
+    }
+
+    #[test]
+    fn input_rejected_display_names_adapter_and_message() {
+        let text = GatewayError::InputRejected {
+            adapter: "laya".into(),
+            message: "image input".into(),
+        }
+        .to_string();
+        assert!(text.contains("laya"), "{text}");
+        assert!(text.contains("image input"), "{text}");
     }
 
     #[test]

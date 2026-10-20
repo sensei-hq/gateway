@@ -66,7 +66,7 @@ pub struct FallbackChainConfig {
 | `id`                | `String`                | Chain identifier. Also the tie-breaker for capability-based selection (lowest id wins — see §4). |
 | `capability`        | `Capability`            | The capability this chain serves. Capability-based resolution matches on this. |
 | `models`            | `Vec<ChainEntry>`       | The candidate entries. Walked in ascending `priority` order, **not** slice order. |
-| `fallback_triggers` | `Vec<FallbackTrigger>`  | Which failure conditions are allowed to advance to the next candidate. An **empty** vec means *no* error triggers fallback (the walk stops on the first failing candidate). |
+| `fallback_triggers` | `Vec<FallbackTrigger>`  | Which failure conditions are allowed to advance to the next candidate. An **empty** vec means *no* error triggers fallback (the walk stops on the first failing candidate), with one exception: `InputRejected` always advances (see §3). |
 
 ### `ChainEntry`
 
@@ -156,6 +156,7 @@ Which errors can vs. cannot advance the walk:
 | `RateLimit`             | if listed | Transient provider condition; another provider may succeed. |
 | `Timeout`               | if listed | Transient; another candidate may be faster/healthier. |
 | `ProviderError`         | if listed | Provider-side failure; another candidate may work. |
+| `InputRejected`         | **always** | This candidate cannot serve this request's *input* (an image sent to a host that ignores images, a state or question over the window) while the endpoint itself is healthy. Advances the walk whatever `fallback_triggers` holds (even empty), is never retryable, and is never recorded as an endpoint failure, so it does not count toward the circuit breaker. |
 | `ModelUnavailable`      | if listed | This model/adapter can't serve it; try the next. |
 | `BudgetExceeded`        | if listed | A cheaper candidate later in the chain may fit the budget. |
 | `Authentication`        | **never** | A bad/missing credential will not be fixed by another candidate; failing over would mask the misconfiguration. |

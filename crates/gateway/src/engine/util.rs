@@ -19,6 +19,7 @@ pub(super) fn stream_error_code(err: &GatewayError) -> String {
         GatewayError::ProviderError { status, .. } => status
             .map(|s| s.to_string())
             .unwrap_or_else(|| "provider_error".to_string()),
+        GatewayError::InputRejected { .. } => "input_rejected".to_string(),
         GatewayError::ModelUnavailable { .. } => "model_unavailable".to_string(),
         GatewayError::Unsupported { .. } => "unsupported".to_string(),
         GatewayError::NoCandidates { .. } => "no_candidates".to_string(),
