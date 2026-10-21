@@ -7,12 +7,10 @@
 
 - 2026-10-21: gateway PR #93 merged to main (`60de4b5`, SP-DEC-4 + RUSTSEC-2026-0382/0383); develop fast-forwarded.
   torii PR #58 merged (`913500f`): gateway re-pinned to v0.12.0 + the same advisory fix.
-- S4 labels signed off by the user 2026-10-20 (`3f919f1`); report re-rendered, no "unreviewed" banner.
 - SP-DEC-4 (System One benchmark): `crates/decision-bench` (check / fetch / run / report), S1–S4, first
   local report `docs/benchmarks/2026-10-20-system-one-local.md` (5 models, laya-ane NOT RUN: no input fits
   96-token window). Whole-slice review (5 reviewers) + re-review: 1 HIGH + 13 MEDIUM + cheap LOWs fixed red-first.
   Gates: 2101 tests, stable clippy, fmt, local qlty clean.
-- v0.12.0 released; torii#45 Phase 1 → v0.11.0; Phase 2 wave A → torii #57.
 
 ## Todo
 
