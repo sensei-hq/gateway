@@ -1,0 +1,4 @@
+# The default `decision-bench report` output (a committed report goes to
+# docs/benchmarks/ via --out ../../docs/benchmarks/…). Results, bench.toml and fetched data are
+# ignored in the repo-root .gitignore.
+/report*.md
