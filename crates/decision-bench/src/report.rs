@@ -111,12 +111,26 @@ fn f2(v: Option<f64>) -> String {
     }
 }
 
-/// Accuracy and CI bounds: three decimals, because CI bounds are multiples of
-/// 0.005 and at two a separated winner's lower bound can print equal to the
-/// runner-up's upper bound.
-fn f3(v: Option<f64>) -> String {
+/// Decimals for an accuracy or CI bound over `n` applicable cases: the
+/// number of digits in `n`, at least three.
+///
+/// Accuracy and both bootstrap bounds are multiples of 1/n, so two distinct
+/// values differ by at least 1/n. With d = digits(n), n < 10^d, so the
+/// printing step g = 10^-d is strictly below 1/n. If b - a > g, then since
+/// a rounds to some r with a >= r - g/2, b > r + g/2 and b rounds above r:
+/// distinct values print distinctly. (The margin 1/n - g is at least
+/// 1/(n(n+1)), far above f64 error at any case count.) At two decimals a
+/// separated winner's lower bound could print equal to the runner-up's upper
+/// bound; n = 200 keeps three.
+fn decimals(n: usize) -> usize {
+    let digits = n.checked_ilog10().map_or(1, |l| l as usize + 1);
+    digits.max(3)
+}
+
+/// Accuracy over `n` applicable cases, at [`decimals`]`(n)`.
+fn f3(v: Option<f64>, n: usize) -> String {
     match v {
-        Some(x) if x.is_finite() => format!("{x:.3}"),
+        Some(x) if x.is_finite() => format!("{x:.d$}", d = decimals(n)),
         _ => DASH.into(),
     }
 }
@@ -130,9 +144,11 @@ fn pct(v: f64) -> String {
     format!("{}%", (v * 100.0 + 1e-9).floor() as i64)
 }
 
-fn ci(v: Option<(f64, f64)>) -> String {
+/// A CI over `n` applicable cases, at [`decimals`]`(n)`.
+fn ci(v: Option<(f64, f64)>, n: usize) -> String {
+    let d = decimals(n);
     match v {
-        Some((lo, hi)) if lo.is_finite() && hi.is_finite() => format!("[{lo:.3}, {hi:.3}]"),
+        Some((lo, hi)) if lo.is_finite() && hi.is_finite() => format!("[{lo:.d$}, {hi:.d$}]"),
         _ => DASH.into(),
     }
 }
@@ -289,9 +305,17 @@ fn summary(md: &mut String, models: &[String], rankings: &[ScenarioRanking]) {
             .iter()
             .map(|m| {
                 if let Some(x) = r.ranked.iter().find(|x| &x.id == m) {
-                    format!("{} (cov {})", f3(x.shared.accuracy), pct(x.own.coverage))
+                    format!(
+                        "{} (cov {})",
+                        f3(x.shared.accuracy, x.shared.n_applicable),
+                        pct(x.own.coverage)
+                    )
                 } else if let Some((_, x)) = r.low_coverage.iter().find(|(id, _)| id == m) {
-                    format!("{} (cov {}, own cases)", f3(x.accuracy), pct(x.coverage))
+                    format!(
+                        "{} (cov {}, own cases)",
+                        f3(x.accuracy, x.n_applicable),
+                        pct(x.coverage)
+                    )
                 } else {
                     DASH.into()
                 }
@@ -313,8 +337,8 @@ fn metrics_row(md: &mut String, id: &str, own: &Metrics, m: &Metrics) {
         "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
         cell(id),
         pct(own.coverage),
-        f3(m.accuracy),
-        ci(m.ci),
+        f3(m.accuracy, m.n_applicable),
+        ci(m.ci, m.n_applicable),
         f2(m.ece),
         f2(m.confident_wrong),
         f2(m.error_rate),
@@ -962,10 +986,11 @@ mod tests {
         assert!(line.starts_with("| mid | 80% |"), "{line}");
     }
 
-    /// SP-DEC-4 review A3: CI bounds are multiples of 0.005, so at two
-    /// decimals a separated winner (lower bound 0.945) and the runner-up
-    /// (upper bound 0.94) both print "0.94" and the table contradicts the
-    /// verdict. Accuracy and CIs print to three decimals.
+    /// SP-DEC-4 review A3: at n = 200 CI bounds are multiples of 0.005, so
+    /// at two decimals a separated winner (lower bound 0.945) and the
+    /// runner-up (upper bound 0.94) both print "0.94" and the table
+    /// contradicts the verdict. At n = 200 accuracy and CIs print to three
+    /// decimals.
     #[test]
     fn ci_bounds_and_accuracy_print_three_decimals_so_a_winner_reads_separated() {
         let metrics = |accuracy: f64, ci: (f64, f64)| Metrics {
@@ -1011,6 +1036,65 @@ mod tests {
         assert!(md.contains("[0.855, 0.940]"), "{md}");
         assert!(md.contains("| 0.968 |"), "accuracy at 3 dp: {md}");
         assert!(md.contains("| 0.968 (cov 100%) |"), "summary at 3 dp: {md}");
+    }
+
+    /// SP-DEC-4 re-review R5: at n = 2000 (allowed by `--per-scenario`) CI
+    /// bounds are multiples of 0.0005, so two distinct bounds can round to
+    /// the same three decimals. Decimals follow the case count.
+    #[test]
+    fn distinct_ci_bounds_print_distinctly_at_two_thousand_cases() {
+        let n = 2000;
+        let k = |k: u32| f64::from(k) / f64::from(n);
+        let metrics = |ci: (f64, f64)| Metrics {
+            n_total: n as usize,
+            n_applicable: n as usize,
+            n_ok: n as usize,
+            n_error: 0,
+            not_reached: 0,
+            coverage: 1.0,
+            accuracy: Some((ci.0 + ci.1) / 2.0),
+            ci: Some(ci),
+            ece: None,
+            confident_wrong: None,
+            error_rate: None,
+            mae: None,
+            p50_ms: None,
+            p95_ms: None,
+        };
+        let model = |id: &str, m: Metrics| crate::rank::RankedModel {
+            id: id.into(),
+            shared: m.clone(),
+            own: m,
+        };
+        // 0.9445 vs 0.944 would not show it: that f64 is just above the tie
+        // and prints "0.945". 0.9435 is just above too, and rounds onto 0.944.
+        let (winner_lo, runner_up_hi) = (k(1888), k(1887));
+        let ranking = ScenarioRanking {
+            scenario: Scenario::S1aIntentOos,
+            shared_cases: n as usize,
+            ranked: vec![
+                model("a", metrics((winner_lo, k(1990)))),
+                model("b", metrics((k(1700), runner_up_hi))),
+            ],
+            verdict: Verdict::Winner("a".into()),
+            low_coverage: vec![],
+            no_rows: vec![],
+        };
+        let mut md = String::new();
+        scenario_section(&mut md, &fixture(), &ranking);
+        let bound = |id: &str, side: usize| -> String {
+            let line = md
+                .lines()
+                .find(|l| l.starts_with(&format!("| {id} |")))
+                .unwrap_or_else(|| panic!("{md}"));
+            let ci = cell_at(line, 3);
+            let inner = ci.trim_start_matches('[').trim_end_matches(']');
+            inner.split(", ").nth(side).unwrap().to_string()
+        };
+        let (lo, hi) = (bound("a", 0), bound("b", 1));
+        assert_ne!(lo, hi, "distinct bounds print equal:\n{md}");
+        // n = 2000 needs four decimals, so nothing is lost either.
+        assert_eq!((lo.as_str(), hi.as_str()), ("0.9440", "0.9435"), "{md}");
     }
 
     /// SP-DEC-4 review A4: `check` also marks a reachable server NOT RUN
