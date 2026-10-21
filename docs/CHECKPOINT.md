@@ -1,10 +1,12 @@
 # Checkpoint
 
-**Last release: v0.12.0 (2026-10-20)** — PR #92 → tag on main `6aa26e0`. **SP-DEC-4 merged to develop
-2026-10-20 (`5edad11`)** — not yet on main (batched develop→main PR, human review).
+**Last release: v0.12.0 (2026-10-20)** — PR #92 → tag on main `6aa26e0`. **SP-DEC-4 on main
+2026-10-21 (PR #93, `60de4b5`)**; unreleased (no tag).
 
 ## Done
 
+- 2026-10-21: gateway PR #93 merged to main (`60de4b5`, SP-DEC-4 + RUSTSEC-2026-0382/0383); develop fast-forwarded.
+  torii PR #58 merged (`913500f`): gateway re-pinned to v0.12.0 + the same advisory fix.
 - S4 labels signed off by the user 2026-10-20 (`3f919f1`); report re-rendered, no "unreviewed" banner.
 - SP-DEC-4 (System One benchmark): `crates/decision-bench` (check / fetch / run / report), S1–S4, first
   local report `docs/benchmarks/2026-10-20-system-one-local.md` (5 models, laya-ane NOT RUN: no input fits
@@ -14,14 +16,12 @@
 
 ## Todo
 
-- [ ] Review + merge torii PR #58 (re-pin to v0.12.0; no code arm needed — torii never matches `GatewayError`; + RUSTSEC-2026-0382/0383).
 - [ ] torii#45 Phase 2 wave B (#46 #49 #55), then wave C #47.
-- [ ] Review + merge gateway PR #93 (develop→main: SP-DEC-4 + RUSTSEC-2026-0382/0383); all required checks green.
 - [ ] torii: 4 Dependabot alerts on its default branch (1 high, 3 moderate), not yet looked at.
 
 ## Next
 
-Both PRs await human review: gateway #93, torii #58. Then torii#45 Phase 2 wave B.
+torii#45 Phase 2 wave B (#46 #49 #55; worktrees torii-p2-46/-49/-55, integrate/phase2-wave-b) — rebase onto torii develop `913500f` first.
 
 ## Open questions
 
