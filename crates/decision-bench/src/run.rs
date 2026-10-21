@@ -963,7 +963,7 @@ mod tests {
         };
         assert_eq!(classify(&t).0, Outcome::Error);
         let network = reqwest::Client::new()
-            .get("http://[::1")
+            .get("https://[::1")
             .build()
             .expect_err("an unparseable URL is a reqwest::Error");
         assert_eq!(classify(&GatewayError::Network(network)).0, Outcome::Error);
