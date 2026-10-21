@@ -110,8 +110,6 @@ Shared cases: 200 (applicable to every ranked model). Metrics are over the share
 
 ## S4 test-output — test output → continue / fix_code / retry / fix_environment
 
-> **labels unreviewed**: nobody has signed off these hand-curated labels yet, so the results below are provisional.
-
 Shared cases: 60 (applicable to every ranked model). Metrics are over the shared cases; coverage and not-reached are over the model's own cases.
 
 | Model | Coverage | Accuracy | 95% CI | ECE | Confident-wrong | Error rate | Not reached | MAE | p50 ms | p95 ms |
@@ -134,8 +132,6 @@ Most common not-applicable reason:
 - laya-english: 60 not applicable: adapter 'laya' cannot serve this input: the options of question 'q' need ≈182 tokens but checkpoint 'english' leaves options 176 of its 192 — the options would …
 
 ## S4 review-finding — review finding → block / follow_up / dismiss
-
-> **labels unreviewed**: nobody has signed off these hand-curated labels yet, so the results below are provisional.
 
 Shared cases: 60 (applicable to every ranked model). Metrics are over the shared cases; coverage and not-reached are over the model's own cases.
 
@@ -160,8 +156,6 @@ Most common not-applicable reason:
 
 ## S4 fix-check — does the change fix the finding? (yes / no)
 
-> **labels unreviewed**: nobody has signed off these hand-curated labels yet, so the results below are provisional.
-
 Shared cases: 60 (applicable to every ranked model). Metrics are over the shared cases; coverage and not-reached are over the model's own cases.
 
 | Model | Coverage | Accuracy | 95% CI | ECE | Confident-wrong | Error rate | Not reached | MAE | p50 ms | p95 ms |
@@ -176,9 +170,9 @@ Shared cases: 60 (applicable to every ranked model). Metrics are over the shared
 
 ## Label review
 
-- S4 test-output: **labels unreviewed**; results are provisional until `labels_reviewed_by` is set in the file's header line.
-- S4 review-finding: **labels unreviewed**; results are provisional until `labels_reviewed_by` is set in the file's header line.
-- S4 fix-check: **labels unreviewed**; results are provisional until `labels_reviewed_by` is set in the file's header line.
+- S4 test-output: reviewed by jerrythomas, 2026-10-20
+- S4 review-finding: reviewed by jerrythomas, 2026-10-20
+- S4 fix-check: reviewed by jerrythomas, 2026-10-20
 
 ## Reproduce
 

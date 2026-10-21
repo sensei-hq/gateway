@@ -53,6 +53,9 @@ fn label(e: &Expected) -> String {
     }
 }
 
+/// The user signed off every S4 label on 2026-10-20.
+const REVIEWED_BY: &str = "jerrythomas, 2026-10-20";
+
 #[test]
 fn the_s4_gate_files_load_validate_and_are_balanced() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scenarios");
@@ -63,8 +66,9 @@ fn the_s4_gate_files_load_validate_and_are_balanced() {
         let f = gate.file;
 
         assert_eq!(
-            header.labels_reviewed_by, None,
-            "{f}: labels are unreviewed"
+            header.labels_reviewed_by.as_deref(),
+            Some(REVIEWED_BY),
+            "{f}: labels are signed off"
         );
         assert_eq!(cases.len(), 60, "{f}: case count");
 
