@@ -16,12 +16,12 @@
 
 ## Todo
 
-- [ ] torii#45 Phase 2 wave B (#46 #49 #55), then wave C #47.
-- [ ] torii: 4 Dependabot alerts on its default branch (1 high, 3 moderate), not yet looked at.
+- [ ] Review + merge torii PR #60 (Phase 2 wave B: #46 #49 #55; CI green). Then wave C #47.
+- [ ] Review + merge torii PR #59 (jsonwebtoken >= 10.3, Dependabot #3).
 
 ## Next
 
-torii#45 Phase 2 wave B (#46 #49 #55; worktrees torii-p2-46/-49/-55, integrate/phase2-wave-b) — rebase onto torii develop `913500f` first.
+torii PR #60 (wave B) awaits review; after merge remove worktrees torii-p2-46/-49/-55/-p2b and start wave C #47 (gate authorization; also binds TORII_USER to an authenticated principal).
 
 ## Open questions
 
@@ -30,6 +30,8 @@ torii#45 Phase 2 wave B (#46 #49 #55; worktrees torii-p2-46/-49/-55, integrate/p
   "reached the server" from timing, and a connect that hangs to the timeout reads as reached.
 
 ## Known-broken / carry-forwards
+
+- torii wave B: a DB that already applied an older `runs.run_charges` needs it rebuilt (two columns added); orphan charges are not swept; dbd 0.27 rejects `model_capabilities.jsonl` record 26 (CI pins 0.24.1); glib alert waits on Tauri.
 
 - SP-DEC-4: hosted models, routing by score, calibration fitting, multi-question cases, bench CI job;
   laya-english S4 0% coverage is the D6 estimate over-counting (~1.7× high), not a model failure.
