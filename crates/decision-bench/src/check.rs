@@ -41,7 +41,7 @@ pub async fn check(cfg: &BenchConfig, model_ids: &[String]) -> Vec<CheckResult> 
 }
 
 /// [`check_with_timeouts`] with the router timeout `timeout` and a hard
-/// cut-off [`CUTOFF_GRACE`] after it, in case a server holds the connection.
+/// cut-off `CUTOFF_GRACE` after it, in case a server holds the connection.
 pub async fn check_with_timeout(
     cfg: &BenchConfig,
     model_ids: &[String],

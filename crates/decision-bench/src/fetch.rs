@@ -12,7 +12,7 @@ pub const DATASETS_SERVER: &str = "https://datasets-server.huggingface.co";
 pub const HUB: &str = "https://huggingface.co";
 
 /// The waits a fetch makes: between page requests, and before the single
-/// retry of a transient status. Defaults to [`PAGE_GAP`] / [`RETRY_AFTER`].
+/// retry of a transient status. Defaults to [`PAGE_GAP`] / `RETRY_AFTER`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Pacing {
     pub page_gap: Duration,
