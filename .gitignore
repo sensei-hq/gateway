@@ -15,3 +15,13 @@
 /.worktrees/
 # Site design mockups — generated/exported artifacts, kept local, not tracked.
 /docs/mockups/
+
+# decision-bench local config, results and downloaded data. `fetch` resolves a
+# relative --out / --cache-dir under the crate dir, so EVERY subdirectory there
+# is ignored (public dataset rows are never committed) except the tracked ones.
+crates/decision-bench/bench.toml
+crates/decision-bench/results*.json
+crates/decision-bench/*/
+!crates/decision-bench/src/
+!crates/decision-bench/tests/
+!crates/decision-bench/scenarios/

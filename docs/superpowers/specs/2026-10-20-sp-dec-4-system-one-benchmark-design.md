@@ -31,14 +31,14 @@ One question per case.
 
 | Id | Scenario | Type | Source | Licence |
 |---|---|---|---|---|
-| S1a | Intent routing with an out-of-scope option: 8 candidates per case (gold + 7 seeded distractors from 151 intents, `oos` always offered) | choice | `clinc/clinc_oos` config `plus` (HF datasets-server) | CC-BY-3.0 |
+| S1a | Intent routing with an out-of-scope option: 9 options per case: `oos` plus 8 intents (gold + 7 seeded distractors, or 8 distractors when gold is `oos`), so every case has the same 1-in-9 chance baseline | choice | `clinc/clinc_oos` config `plus` (HF datasets-server) | CC-BY-3.0 |
 | S1b | Tool/intent routing, 8 candidates per case (gold + 7 seeded distractors from 77 intents) | choice | `legacy-datasets/banking77` | CC-BY-4.0 |
 | S2 | Ordered triage score (negative / neutral / positive as a 3-level score) | score | `Sp1786/multiclass-sentiment-analysis-dataset` | Apache-2.0 |
 | S3 | Does B follow from A? (entailment → yes, contradiction → no; neutral excluded) | noul | `stanfordnlp/snli` | CC-BY-SA-4.0 |
 | S4 | Coding-pipeline gates: test output → continue / fix_code / retry / fix_environment; review finding → block / follow_up / dismiss; "does the change fix the finding?" | choice + noul | hand-curated, committed | repo |
 
 Dataset notes:
-- Verified 2026-10-20: each id exists, is ungated, and has its splits served by `datasets-server.huggingface.co`. `/rows` pages are at most 100 rows long. CLINC `plus` has 151 labels, `oos` among them (looked up by name, never by index). The sentiment set is 0 negative, 1 neutral, 2 positive. datasets-server serves only the current revision, so `fetch` records the hub sha and refuses to reuse a cache built from a different one.
+- Verified 2026-10-20: each id exists, is ungated, and has its splits served by `datasets-server.huggingface.co`. `/rows` pages are at most 100 rows long. CLINC `plus` has 151 labels, `oos` among them (looked up by name, never by index). The sentiment set is 0 negative, 1 neutral, 2 positive. datasets-server serves only the current revision, so `fetch` records the hub sha and refuses to reuse a cache built from a different one. Limitation: datasets-server can lag a hub push, so for a short window it may serve rows of the previous revision under the new sha. The rows sha256 in the manifest makes any such drift visible on re-fetch.
 - `PolyAI/banking77` is not served, so its `legacy-datasets/` copy is used.
 - `SetFit/sst5` was rejected (no licence), and so were Yelp (licence "other") and MultiNLI (mixed licence).
 - Public data is **fetched, never committed**.
@@ -63,12 +63,16 @@ S4 lives in `crates/decision-bench/scenarios/s4-*.jsonl`, 50–100 cases per gat
   - Nothing is retried or dropped.
 - **Detecting `InputRejected`.** It is found by the kernel's own `InputRejected` Display prefix (`adapter '…' cannot serve this input:`) on the single attempt's error string.
   - A bench unit test builds a real `InputRejected` and asserts that prefix. If the kernel format changes, the bench's tests fail instead of silently mis-classifying.
-- **Pre-send refusals never reach the server.** A server-side truncation does, because it is only known after the call.
+- **Which rows reached the server** (`reached_server` on each row; the report lists the rest under "Rows that never reached the server"). The chain has one candidate, and the kernel keeps only each attempt's error text.
+  - Not reached: a gateway gate refused the candidate before dispatch (it is listed in `AllGated.skipped`: context window, cooldown, lockout, breaker), any other pre-dispatch error, and an attempt that failed with the kernel's network-send error text (`network error: error sending request`) before the router timeout ran out: a refused or dropped connection, or a DNS failure (review A1).
+  - Reached: an answer; an attempt that got any reply; an attempt that lasted the whole router timeout (the same network-send text, read as a timeout); and an `AllGated` with an empty `skipped` (the engine gated the chain after an attempt, e.g. a 429 lockout). A server-side truncation is reached, because it is only known after the call.
+  - Caveat: an adapter's own pre-send `InputRejected` (Laya head budget, images) is a recorded attempt, so it reads as reached although nothing was sent; its error text cannot be told apart from a server-side truncation.
+  - Caveat: a connect that hangs for the whole router timeout (a blackholed host) reads as reached, because its text is the same as a timeout's.
 - **D3 Config.** `bench.toml` (example committed, local copy gitignored) lists models: id, router, url, `api_model_id`, `context_window`.
 - **D4 Commands.**
-  - `check`: probes every configured router. An unreachable one is **NOT RUN** and is named at the top of the report, never silently skipped.
-  - `fetch [--per-scenario N=200] [--seed 2026]`: pulls rows from datasets-server `/rows` (JSON, paginated) into `~/.cache/decision-bench/<dataset>@<sha>/<split>.jsonl`. It then builds the seeded case files. The cache is outside the repo.
-  - `run [--scenarios …] [--models …]`: runs cases sequentially, after one warm-up call per model. It writes `results.json`, one row per (case, model): answer, probabilities, correct, latency_ms, outcome.
+  - `check`: probes every configured router with one tiny decision. A model whose probe gets no answer (unreachable, an error, or no reply in time), or that no input fits its context window (e.g. `laya-ane`), is **NOT RUN** and is named at the top of the report, never silently skipped.
+  - `fetch [--per-scenario N=200] [--seed 2026] [--out cases] [--cache-dir …]`: pulls rows from datasets-server `/rows` (JSON, paginated) into `<user cache dir>/decision-bench/<id with / → __>@<sha>/<config>-<split>.jsonl`, beside a `meta.json` written last. It then builds the seeded case files. The cache is outside the repo.
+  - `run [--config …] [--cases cases] [--scenarios …] [--models …] [--out results.json]`: runs cases sequentially, after one warm-up call per model. It writes `results.json`, one row per (case, model) with the fields `case_id`, `scenario`, `model`, `outcome`, `correct`, `top_probability`, `score_value`, `expected_level`, `answer`, `probabilities`, `latency_ms`, `reached_server` and `detail`.
   - `report`: renders Markdown from `results.json`.
 - **D5 Metrics, per (scenario, model):**
   - Coverage: the share of the scenario's cases that are applicable, i.e. not `not_applicable`.
@@ -83,7 +87,8 @@ S4 lives in `crates/decision-bench/scenarios/s4-*.jsonl`, 50–100 cases per gat
   - **Head-to-head on a shared subset.** The ranking within a scenario uses only the cases that are applicable to every model being ranked, so no model is graded on an easier subset.
   - **Coverage floor.** A model with coverage below 50% is left out of the head-to-head and gets its own table over its own applicable cases. Example: "ANE: 30% coverage, 0.91 accuracy on short checks".
   - **Ordering.** Inside the head-to-head, models are ordered by accuracy, then lower confident-wrong rate, then lower p50 latency.
-  - A model is called the **winner** only if its CI lower bound exceeds the runner-up's CI upper bound. Otherwise the top models are reported as **tied**.
+  - **Insufficient.** Fewer than 2 head-to-head models, or fewer than 20 shared cases (`MIN_SHARED_CASES`), is **Insufficient**: no verdict, with the reason.
+  - Otherwise a model is called the **winner** only if its CI lower bound exceeds the CI upper bound of **every** other ranked model, not just the runner-up. This means the verdict cannot depend on an accuracy or latency tiebreak (T6 review). Otherwise the top models are reported as **tied**: the tie lists the top model and every ranked model whose CI overlaps the top model's, i.e. `hi_other ≥ lo_top` (with the every-model winner rule, Winner and Tie are exact complements).
   - The report also has a scenario × model summary table and a "use X for scenario Y" line per scenario (or "tie: X, Y").
 - **D7 Outputs.**
   - `results.json` is gitignored and machine-readable, with stable field names so a later routing slice can read it.
@@ -91,8 +96,8 @@ S4 lives in `crates/decision-bench/scenarios/s4-*.jsonl`, 50–100 cases per gat
 
 ## Acceptance criteria
 
-- **AC1** `cargo run -p decision-bench -- check` reports every configured router as reachable or NOT RUN; an unreachable one never aborts the run silently.
-- **AC2** `fetch` is reproducible: the same seed and revision give byte-identical case files. It parses datasets-server JSON. This is tested against a recorded fixture: a JSON file captured from the API, not real dataset rows. The fetched data is never written inside the repo.
+- **AC1** `cargo run -p decision-bench -- check` reports every configured router as reachable or NOT RUN. NOT RUN covers an unreachable model and one that no input fits its context window; neither aborts the run silently.
+- **AC2** `fetch` is reproducible: the same seed, revision and row content give byte-identical case files. Each dataset's rows sha256 is recorded in the manifest so this is checkable. `fetch` parses datasets-server JSON, tested against recorded fixtures (API responses, not datasets). Fetched data is never committed: the case dir and cache are gitignored or outside the repo. Every case's `source` carries the seed and rand version.
 - **AC3** `run` records `ok` / `not_applicable` / `error` per case.
   - A context-window refusal is `not_applicable`, and so is any `InputRejected`. The prefix used to detect `InputRejected` is pinned by a unit test against the real kernel type.
   - A D7 re-route and every other error are `error`, and count as wrong.
@@ -118,6 +123,10 @@ Red-first per task.
 - Every guard is mutation-checked, e.g. the tie rule, `not_applicable` classification, the shared subset and seeded sampling.
 
 ## Not in scope (carry-forwards)
+
+- **Tiny-window decision models can't be benchmarked through the gateway** (user decision 2026-10-20, option 1). The gateway's decision-size estimate puts even the minimal decision at about 182 input tokens, so a 96-token checkpoint such as Laya ANE is refused before sending. The bench reports it as NOT RUN, with that estimate in the reason. Follow-up (gateway): make the decision prompt-overhead estimate model-aware, so small-window decision models are usable.
+
+- **A transport failure is told from a timeout by duration only** (review A1). The kernel keeps only each attempt's error text, and a refused connection, a DNS failure, a dropped connection and a timeout all read `network error: error sending request`. The bench calls an attempt that failed so before the router timeout "not reached", and one that lasted the whole timeout "reached", so a connect that hangs to the timeout reads as reached. An adapter's pre-send `InputRejected` also reads as reached. Follow-up (gateway kernel): preserve the error's source or kind per attempt (connect vs. timeout vs. pre-send), so `reached_server` need not infer it.
 
 - Hosted models: config is ready, but they need keys and a spend cap.
 - Routing by benchmark score in the engine.
