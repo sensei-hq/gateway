@@ -5,6 +5,7 @@
 
 ## Done
 
+- S4 labels signed off by the user 2026-10-20 (`3f919f1`); report re-rendered, no "unreviewed" banner.
 - SP-DEC-4 (System One benchmark): `crates/decision-bench` (check / fetch / run / report), S1–S4, first
   local report `docs/benchmarks/2026-10-20-system-one-local.md` (5 models, laya-ane NOT RUN: no input fits
   96-token window). Whole-slice review (5 reviewers) + re-review: 1 HIGH + 13 MEDIUM + cheap LOWs fixed red-first.
@@ -13,15 +14,13 @@
 
 ## Todo
 
-- [ ] User sign-off of S4 labels (`crates/decision-bench/scenarios/s4-*.jsonl`, `labels_reviewed_by` null;
-      14 labels flagged for a look). Report says "labels unreviewed" until then.
 - [ ] torii re-pin to v0.12.0 (add the `InputRejected` arm to exhaustive `GatewayError` matches).
 - [ ] torii#45 Phase 2 wave B (#46 #49 #55), then wave C #47.
 - [ ] develop→main batched PR (SP-DEC-4).
 
 ## Next
 
-`git log --oneline -1 origin/develop` → `5edad11`; then pick: S4 label review, or torii re-pin.
+`git log --oneline -1 origin/develop` → `5edad11`; next: torii re-pin to v0.12.0, or the develop→main PR.
 
 ## Open questions
 
