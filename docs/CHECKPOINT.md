@@ -14,13 +14,14 @@
 
 ## Todo
 
-- [ ] torii re-pin to v0.12.0 (add the `InputRejected` arm to exhaustive `GatewayError` matches).
+- [ ] Review + merge torii PR #58 (re-pin to v0.12.0; no code arm needed — torii never matches `GatewayError`; + RUSTSEC-2026-0382/0383).
 - [ ] torii#45 Phase 2 wave B (#46 #49 #55), then wave C #47.
-- [ ] develop→main batched PR (SP-DEC-4).
+- [ ] Review + merge gateway PR #93 (develop→main: SP-DEC-4 + RUSTSEC-2026-0382/0383); all required checks green.
+- [ ] torii: 4 Dependabot alerts on its default branch (1 high, 3 moderate), not yet looked at.
 
 ## Next
 
-`git log --oneline -1 origin/develop` → `5edad11`; next: torii re-pin to v0.12.0, or the develop→main PR.
+Both PRs await human review: gateway #93, torii #58. Then torii#45 Phase 2 wave B.
 
 ## Open questions
 
@@ -34,5 +35,6 @@
   laya-english S4 0% coverage is the D6 estimate over-counting (~1.7× high), not a model failure.
 - SP-DEC-3: Laya 413/422 still `ProviderError`; no per-model `head_max_len` override; exact tokenizer counts.
 - Qlty Cloud statuses fail on billing — local `qlty check` is the accepted substitute.
+- CI rustdoc (`RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --locked`) is not in the pre-commit hook — run it before a PR.
 - Flaky: `orchestrator agent::sandbox::tests::a_backgrounded_straggler_is_reaped_on_clean_exit` (timing).
 - sensei daemon `update_phase` 404 (2026-10-20). torii DB-gated tests don't run in CI (#55).
