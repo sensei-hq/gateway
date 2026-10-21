@@ -438,7 +438,7 @@ pub struct FetchOptions<'a> {
 /// Fetch (or load from cache) every dataset in [`DATASETS`], check its
 /// licence, build its scenario's cases, validate them, and write
 /// `<out>/s1a.jsonl` … `s3.jsonl` plus `manifest.json` as one set (see
-/// [`write_case_set`]). Nothing is written unless every dataset built.
+/// `write_case_set`). Nothing is written unless every dataset built.
 pub async fn fetch_cases(
     hf: &crate::fetch::Hf,
     opts: &FetchOptions<'_>,
