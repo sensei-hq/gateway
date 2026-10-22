@@ -5,8 +5,9 @@
 
 ## Done
 
-- 2026-10-21: gateway PR #93 merged to main (`60de4b5`, SP-DEC-4 + RUSTSEC-2026-0382/0383); develop fast-forwarded.
-  torii PR #58 merged (`913500f`): gateway re-pinned to v0.12.0 + the same advisory fix.
+- 2026-10-22: torii PR #60 merged (`f11728f`, Phase 2 wave B #46 #49 #55 closed; dbd 0.27.5; CI
+  Postgres image from Docker Hub by digest) + PR #59 (`dddc38e`, jsonwebtoken >= 10.3).
+- 2026-10-21: gateway PR #93 → main (`60de4b5`, SP-DEC-4); torii #58 re-pinned v0.12.0 (`913500f`).
 - SP-DEC-4 (System One benchmark): `crates/decision-bench` (check / fetch / run / report), S1–S4, first
   local report `docs/benchmarks/2026-10-20-system-one-local.md` (5 models, laya-ane NOT RUN: no input fits
   96-token window). Whole-slice review (5 reviewers) + re-review: 1 HIGH + 13 MEDIUM + cheap LOWs fixed red-first.
@@ -14,12 +15,11 @@
 
 ## Todo
 
-- [ ] Review + merge torii PR #60 (Phase 2 wave B: #46 #49 #55; CI green). Then wave C #47.
-- [ ] Review + merge torii PR #59 (jsonwebtoken >= 10.3, Dependabot #3).
+- [ ] Review + merge torii PR #61 (pin bun 1.4.3: bun 1.4.4 broke the js gate on develop). Then wave C #47.
 
 ## Next
 
-torii PR #60 (wave B) awaits review; after merge remove worktrees torii-p2-46/-49/-55/-p2b and start wave C #47 (gate authorization; also binds TORII_USER to an authenticated principal).
+torii wave C #47 (gate authorization; also binds TORII_USER to an authenticated principal), after PR #61 lands.
 
 ## Open questions
 
@@ -29,7 +29,7 @@ torii PR #60 (wave B) awaits review; after merge remove worktrees torii-p2-46/-4
 
 ## Known-broken / carry-forwards
 
-- torii wave B: a DB that already applied an older `runs.run_charges` needs it rebuilt (two columns added); orphan charges are not swept; dbd 0.27 rejects `model_capabilities.jsonl` record 26 (CI pins 0.24.1); glib alert waits on Tauri.
+- torii: update an existing DB with `dbd -e dev reconcile` then `dbd -e dev deploy` (database/README.md); orphan charges are not swept; `packageManager: bun@1.3.14` ≠ CI's 1.4.3; glib alert waits on Tauri.
 
 - SP-DEC-4: hosted models, routing by score, calibration fitting, multi-question cases, bench CI job;
   laya-english S4 0% coverage is the D6 estimate over-counting (~1.7× high), not a model failure.
