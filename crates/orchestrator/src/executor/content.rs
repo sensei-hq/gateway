@@ -119,7 +119,10 @@ impl Executor {
     /// `Consolidate` synthesis, the planner selector's lent dispatch
     /// (`SelectorDispatch::complete`), and the ReAct turn (`dispatch_model_turn`,
     /// which APPENDS `tool_calls` to this shape after — it is the only path that
-    /// carries tool calls; the other four are single-shot and text-only).
+    /// carries tool calls; the other four are single-shot and text-only). A decision
+    /// call is the selector's second shape and crosses
+    /// [`decision_output`](Self::decision_output) instead; it is not a sixth producer,
+    /// but it is a second journaled shape and has its own redaction test.
     ///
     /// This count is the same census the INPUT side keeps at `dispatch_metered`, and
     /// it moves with it: the budget-completeness pass made the selector the fifth of
@@ -136,6 +139,48 @@ impl Executor {
                 resp.content.clone().unwrap_or_default(),
             )),
         })
+    }
+
+    /// Build a System One choice decision's journaled+returned output
+    /// `{model, decisions:{<question>:{choice, confidence}}}` with the answer redacted —
+    /// the decision twin of [`model_output`](Self::model_output), beside it for the same
+    /// reason: one redaction point per capability, so a new producer of that kind is
+    /// scrubbed by construction rather than by remembering.
+    ///
+    /// **Only the fields the port replays are journaled.** The provider's
+    /// `probabilities` map is dropped rather than recorded, and that is a security
+    /// decision, not a size one: its keys are the option keys the caller supplied, and
+    /// [`Redactor::redact`](orchestrator_core::Redactor::redact) scrubs VALUES and
+    /// key-evidence, not arbitrary object keys — a secret-shaped option key survived
+    /// there while the same string was redacted in `choice` one field over. A map this
+    /// executor never reads is not worth a second copy of model-authored text in the
+    /// durable journal.
+    ///
+    /// The journaled shape is what a replay parses, so the live and replayed paths read
+    /// the same value rather than two independently-built ones.
+    pub(super) fn decision_output(
+        &self,
+        resp: &kernel::types::request::InferenceResponse,
+        question: &str,
+    ) -> serde_json::Value {
+        let answer = resp
+            .decisions
+            .as_ref()
+            .and_then(|answers| answers.get(question))
+            .and_then(|answer| match answer {
+                kernel::types::decision::DecisionAnswer::Choice {
+                    choice, confidence, ..
+                } => Some(serde_json::json!({ "choice": choice, "confidence": confidence })),
+                _ => None,
+            });
+        let mut decisions = serde_json::Map::new();
+        if let Some(answer) = answer {
+            decisions.insert(question.to_string(), answer);
+        }
+        self.redact(&serde_json::json!({
+            "model": resp.model,
+            "decisions": decisions,
+        }))
     }
 
     /// Materialize a recorded [`EffectOutput`] into its value: an inline value is

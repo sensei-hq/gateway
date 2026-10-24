@@ -44,6 +44,13 @@ pub const RESERVED_SELECT_ID: &str = "__select__";
 /// crate (see [`TokenUsage`](crate::budget::TokenUsage), mirrored locally for the same
 /// reason), so the port speaks text in and text out. The implementor owns building the
 /// request, gating, charging and journaling.
+///
+/// **Two shapes, one accounting rule.** [`complete`](Self::complete) is a text
+/// completion; [`choose`](Self::choose) is a System One **decision** — typed questions
+/// answered with probabilities instead of prose (gh#72). Both route through the same
+/// implementor chokepoint, so a decision call is gated, charged, journaled and replayed
+/// exactly like a completion. A selector picks whichever shape its chain serves; neither
+/// is privileged here.
 #[async_trait]
 pub trait ModelDispatch: Send + Sync {
     /// Run one metered text completion and return the model's text.
@@ -57,6 +64,66 @@ pub trait ModelDispatch: Send + Sync {
         user: &str,
         chain: Option<&str>,
     ) -> Result<String, OrchestratorError>;
+
+    /// Run one metered System One **choice** decision: pick one of
+    /// [`ChoiceQuestion::options`] for a shared `state`.
+    ///
+    /// The same contract as [`complete`](Self::complete) — `Err` is terminal, a budget
+    /// refusal arrives already journaled, and the implementor owns building, gating,
+    /// charging and journaling. Unlike `complete` the answer is not text: it is the
+    /// chosen option's key plus a confidence, so a caller gets a value it can match on
+    /// instead of prose to parse. It must still check that the key is one it offered —
+    /// a provider can invent one, and redaction can change one.
+    ///
+    /// **Only the `choice` question shape is exposed, and only because a consumer
+    /// exists.** System One also serves `noul` (a probability) and `score` (an ordered
+    /// level); neither has a consumer in this crate yet, and a port that speaks shapes
+    /// nobody asks for is a surface with no test behind it. The implementor maps this
+    /// onto the full typed question set; extending the port is additive when a consumer
+    /// needs another shape.
+    async fn choose(
+        &self,
+        question: &ChoiceQuestion,
+        chain: Option<&str>,
+    ) -> Result<ChoiceAnswer, OrchestratorError>;
+}
+
+/// One option a [`ChoiceQuestion`] offers: a stable key the caller can match on, and an
+/// optional human-readable description the model sees beside it.
+///
+/// The key IS the answer contract — it is what comes back in [`ChoiceAnswer::choice`] —
+/// so callers should not have to reinterpret a description, and the implementor must
+/// pass both through unaltered (the description only helps the model choose).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChoiceOption {
+    pub key: String,
+    pub description: Option<String>,
+}
+
+/// A System One `choice` decision: one shared `state`, one instruction, and the menu of
+/// options to choose from.
+///
+/// `state` is deliberately a `serde_json::Value` rather than a string so a caller can
+/// pass structured evidence (a goal, a finding, a diff) without flattening it first;
+/// the implementor is responsible for handing it to the provider in a form the provider
+/// accepts.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ChoiceQuestion {
+    pub state: serde_json::Value,
+    pub instructions: String,
+    pub options: Vec<ChoiceOption>,
+}
+
+/// The answer to a [`ChoiceQuestion`]: the winning option's key and the probability mass
+/// concentrated on it.
+///
+/// `confidence` is **concentration, not correctness** — it is uncalibrated, a confident
+/// answer can be wrong, and nothing should treat it as accuracy or gate on it as if it
+/// were (the gateway's `DecisionAnswer::Choice` carries the same warning).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ChoiceAnswer {
+    pub choice: String,
+    pub confidence: f64,
 }
 
 /// Picks WHICH planner agent runs for a goal, from the candidate library (agents
@@ -133,6 +200,13 @@ mod selector_tests {
             _chain: Option<&str>,
         ) -> Result<String, OrchestratorError> {
             panic!("RulePlannerSelector is pure — it must never dispatch a model call")
+        }
+        async fn choose(
+            &self,
+            _question: &ChoiceQuestion,
+            _chain: Option<&str>,
+        ) -> Result<ChoiceAnswer, OrchestratorError> {
+            panic!("RulePlannerSelector is pure — it must never dispatch a decision call")
         }
     }
 

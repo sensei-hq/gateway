@@ -14,6 +14,13 @@
 //! about: it shipped holding its own `Arc<Gateway>` and spent past the cap with no
 //! ledger entry, so it is now handed a borrowed capability instead of owning one.
 //!
+//! The selector's lent dispatch has two SHAPES, not two producers: `complete` (a chat
+//! completion) and `choose` (a System One `Decision` payload — typed questions answered
+//! with probabilities). Both go through `dispatch_metered`, so the budget gate, the live
+//! meter, the durable `EffectRecorded` and the memo replay are shared rather than
+//! reimplemented; the decision shape owes the same three per-producer guards and has
+//! them.
+//!
 //! **A new producer owes THREE tests, not one.** The five are a census on both sides,
 //! and each side has its own per-producer guard in `tests.rs`: the budget gate
 //! (`budget_gate_stops_the_*_producer`), the redaction leaf (`*_text_is_redacted` —
@@ -32,8 +39,11 @@
 //! Map child's `MapChildPaused`).
 
 use gateway::GatewayError;
+use kernel::types::decision::{DecisionQuestion, DecisionQuestions};
 use kernel::types::request::{InferenceRequest, InferenceResponse, Payload};
-use orchestrator_core::{JournalEvent, NodeId, OrchestratorError, RunId};
+use orchestrator_core::{
+    ChoiceAnswer, ChoiceQuestion, JournalEvent, NodeId, OrchestratorError, RunId,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::Executor;
@@ -1654,6 +1664,11 @@ fn window_reason(
     )
 }
 
+/// The question name a selector's System One choice is asked under. One question per
+/// call, so the name is a constant rather than caller-supplied — the answer is looked up
+/// by it.
+const SELECT_CHOICE_QUESTION: &str = "choice";
+
 /// The executor's [`ModelDispatch`]: the only provider access a
 /// [`PlannerSelector`](orchestrator_core::PlannerSelector) gets.
 ///
@@ -1892,6 +1907,156 @@ impl orchestrator_core::ModelDispatch for SelectorDispatch<'_> {
             .await
             .map_err(|e| self.fatal(e))?;
         Ok(text)
+    }
+
+    /// A System One **choice** decision through the same chokepoint, with the same
+    /// three obligations as [`complete`](Self::complete): gate on the run's budget,
+    /// charge the live meter, journal the spend. The only differences are the payload
+    /// (`Decision` rather than `Chat`, so the pre-call clamp does not apply — it is a
+    /// `Chat`-only transport parameter, exactly as for `Embed`) and what gets journaled:
+    /// the winning option and its confidence, so a replay hands back the same answer
+    /// rather than re-asking the model.
+    ///
+    /// The effect id comes from the SAME `calls` counter `complete` uses, so a selector
+    /// that makes both kinds of call cannot collide two of them on one journal key. A
+    /// selector that dispatches its calls in an unstable ORDER is still a
+    /// `DeterminismViolation` on replay — loudly, and deliberately (see `calls`).
+    async fn choose(
+        &self,
+        question: &ChoiceQuestion,
+        chain: Option<&str>,
+    ) -> Result<ChoiceAnswer, OrchestratorError> {
+        let chain = chain.unwrap_or_default();
+        let path = self.select_path();
+        let eid = orchestrator_core::effect_id(
+            &path,
+            0,
+            self.calls.fetch_add(1, Ordering::Relaxed) as usize,
+        );
+        let ih = super::support::input_hash(chain, &serde_json::to_value(question)?)?;
+        if let Some((recorded_ih, output)) = self.fold.memo.get(&eid) {
+            if recorded_ih != &ih {
+                return Err(self.fatal(OrchestratorError::DeterminismViolation {
+                    node: NodeId(path),
+                    effect_id: eid,
+                }));
+            }
+            let replayed = match self.exec.materialize(output).await {
+                Ok(v) => v,
+                Err(e) => return Err(self.fatal(e)),
+            };
+            return choice_answer_from(&replayed, SELECT_CHOICE_QUESTION);
+        }
+
+        let criteria = question
+            .options
+            .iter()
+            .map(|o| (o.key.clone(), o.description.clone()))
+            .collect();
+        let request = InferenceRequest {
+            capability: kernel::types::capability::Capability::Decision,
+            model: None,
+            router: None,
+            chain: Some(chain.to_string()),
+            payload: Payload::Decision {
+                state: question.state.clone(),
+                questions: DecisionQuestions::from([(
+                    SELECT_CHOICE_QUESTION.to_string(),
+                    DecisionQuestion::Choice {
+                        instructions: serde_json::json!(question.instructions),
+                        criteria,
+                    },
+                )]),
+                images: Vec::new(),
+                keep_alive: None,
+            },
+            budget: None,
+            auth: None,
+            panel: None,
+            consensus: None,
+            allow_fallback: true,
+            credentials: Default::default(),
+            routing: None,
+        };
+
+        let response = match self
+            .exec
+            .dispatch_metered(&request, &self.fold.meter())
+            .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(refusal)) => {
+                let kind = self
+                    .exec
+                    .record_refusal(self.run, &self.node, refusal)
+                    .await?;
+                let message = match &kind {
+                    RefusalKind::Paused(reason) => reason.clone(),
+                    RefusalKind::Failed(error) => error.clone(),
+                };
+                *self.refusal.lock().expect("selector refusal lock") = Some(kind);
+                return Err(OrchestratorError::Gateway(message));
+            }
+            Err(error) => return Err(OrchestratorError::Gateway(error.to_string())),
+        };
+
+        // Built through the SAME output builder the replay path parses, so "what the
+        // answer is" has one definition. The spend is journaled even when the answer is
+        // unusable: the provider was paid either way, and a missing record is how a
+        // re-drive re-buys the call.
+        let output = self.exec.decision_output(&response, SELECT_CHOICE_QUESTION);
+        let answer = choice_answer_from(&output, SELECT_CHOICE_QUESTION);
+        let node = NodeId(path);
+        self.exec
+            .record_paid_effect(self.run, &node, &output, |recorded| {
+                JournalEvent::EffectRecorded {
+                    node: node.clone(),
+                    effect_id: eid,
+                    class: orchestrator_core::EffectClass::Pure,
+                    input_hash: ih,
+                    seq: 0,
+                    output: recorded,
+                    observation: None,
+                    usage: self.fold.recorded_usage(&response),
+                }
+            })
+            .await
+            .map_err(|e| self.fatal(e))?;
+
+        answer
+    }
+}
+
+/// Read a decision output — just built or journaled by an earlier drive — back into a
+/// [`ChoiceAnswer`].
+///
+/// Shared by the live and replayed paths so the two cannot disagree about what a
+/// recorded answer means — the defect class this module's `complete` avoids by
+/// journaling the exact text it later replays. A `noul` or `score` answer where a choice
+/// was asked for is a provider fault, not a value to reinterpret, and a missing answer
+/// map is reported as the same fault so a replay reproduces it exactly.
+fn choice_answer_from(
+    output: &serde_json::Value,
+    question: &str,
+) -> Result<ChoiceAnswer, OrchestratorError> {
+    let answer = output
+        .get("decisions")
+        .and_then(|decisions| decisions.get(question));
+    match (
+        answer
+            .and_then(|a| a.get("choice"))
+            .and_then(|v| v.as_str()),
+        answer
+            .and_then(|a| a.get("confidence"))
+            .and_then(|v| v.as_f64()),
+    ) {
+        (Some(choice), Some(confidence)) => Ok(ChoiceAnswer {
+            choice: choice.to_string(),
+            confidence,
+        }),
+        _ => Err(OrchestratorError::Gateway(format!(
+            "decision question {question:?} returned no choice answer"
+        ))),
     }
 }
 

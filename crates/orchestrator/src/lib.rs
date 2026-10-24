@@ -17,6 +17,6 @@ pub mod scheduler;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-pub use executor::selector::LlmPlannerSelector;
+pub use executor::selector::{DecisionPlannerSelector, LlmPlannerSelector};
 pub use executor::{Executor, RunOutcome, money_spend_of, spend_of};
 pub use scheduler::{Scheduler, WakeRetryPolicy};

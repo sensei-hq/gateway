@@ -6,6 +6,18 @@ routing call path (build a request, `gateway.execute(&req).await`, read
 `InferenceResponse`) stays source-compatible across every step below; each section
 lists only what you must touch.
 
+## develop (unreleased) — System One decisions in the executor
+
+The routing call path is unchanged. This is an orchestrator-crate addition plus one
+**breaking** trait method; no gateway surface moved.
+
+| Area | Change | Action |
+|---|---|---|
+| `ModelDispatch` | new **required** `choose(&ChoiceQuestion, Option<&str>) -> Result<ChoiceAnswer, OrchestratorError>` — one metered System One **choice** decision (state + instruction + option menu → the winning key). The executor's `SelectorDispatch` implements it through the same `dispatch_metered` chokepoint as `complete`: budget gate, live meter, durable `EffectRecorded` under `"{expand}/__select__"`, and memo replay | custom `ModelDispatch` impls must add the method; a text-only dispatcher should return an `Err` that names the limitation rather than pretend to decide |
+| Port types | `orchestrator_core::{ChoiceQuestion, ChoiceOption, ChoiceAnswer}` (re-exported at the crate root). Only the `choice` question shape is exposed — `noul` / `score` have no consumer yet | use them to build a question; `ChoiceAnswer.confidence` is concentration, not correctness |
+| `orchestrator` exports | new `DecisionPlannerSelector` — the planner choice asked as a typed choice over the candidate menu. `LlmPlannerSelector` is unchanged, so a chat chain keeps working | where a decision model is available, wire `DecisionPlannerSelector::new(registry, "<Decision chain>")` in place of the text selector |
+| Expand failures | `NodeFailed` messages raised by an `Expand` now pass the configured `Redactor` before the durable write — the same rule gates and model output already followed. This includes the selector's `non-candidate` refusal, which quotes the model's answer | none; a secret-shaped answer now journals as `[REDACTED]` |
+
 ## 0.11.x → 0.12.0 (SP-DEC-3 — Laya System One, `InputRejected`)
 
 **Breaking:** `GatewayError` is not `#[non_exhaustive]` and gains a variant, so exhaustive
