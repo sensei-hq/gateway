@@ -34,8 +34,9 @@ The long-term payoff is the engine follow-on (decision-backed gates), not the se
 | Decision hosts: `ollama`, `openrouter`, `typesafe`, `llamacpp`, `sglang`, `laya`, `cloudflare` | shipped (SP-DEC-2/3, v0.11/0.12) |
 | Benchmark harness (`crates/decision-bench`) + first local report | on `main`, unreleased (SP-DEC-4) |
 | Ranking data in the gateway | **none, and that is the design** — no table, file or default ranking |
-| Per-request ordering | `RoutingPreferences { sort, only, ignore, order }` on `InferenceRequest.routing` — **chat only** |
-| `DecisionRequest` | `model`, `state`, `questions`, `images`, `keep_alive` — **no `routing`, so a decision cannot be ordered by its caller today** |
+| Per-request ordering | `RoutingPreferences { sort, only, ignore, order }` on `InferenceRequest.routing` — **any capability, decisions included**: `to_decision_request` runs after selection, so `sort`/`only`/`ignore`/`order` already reach a decision call |
+| A *measured* order | **does not exist** — `order` is hand-authored and carries no category, revision or provenance |
+| `DecisionRequest` | `model`, `state`, `questions`, `images`, `keep_alive` — the **adapter boundary**, built by `to_decision_request` *after* selection; it needs no routing field |
 | Corpus | cases **fetched at run time and gitignored**; only the S4 gates are committed |
 | `DecisionModelStatus` | `Ready` / `ServerTooOld` / `NotPulled` / `NotADecisionModel` — **no effective window**, though the probe already reads `/api/show` |
 | `ModelDispatch::choose` + `DecisionPlannerSelector` | **uncommitted working tree**, unreleased |
@@ -53,8 +54,15 @@ The long-term payoff is the engine follow-on (decision-backed gates), not the se
 | Ledger | `metering.inference_calls.capability` stores any capability in snake_case — no DDL needed |
 | Engine-call ledger | the executor's gateway has no `GatewayStore`; run spend is journaled by the executor and charged at run level (AG-13) |
 
-**The three blockers, in order:** `DecisionRequest` cannot carry an ordering; torii has no ranking
-store and no `decision` capability mapping; and the gateway seam is untagged.
+**The three blockers, in order:** there is no *measured* ordering to send (the field, the store and the
+artifact are all missing); torii has no ranking store and no `decision` capability mapping; and the
+gateway seam is untagged.
+
+The correction that matters: ordering a decision call is **not** the blocker. `RoutingPreferences`
+travels on `InferenceRequest`, and a decision request is an `InferenceRequest` with a `Decision`
+payload that reaches selection like any other — `DecisionRequest` is the adapter's wire shape,
+filled in afterwards. So the gateway change is one field on `RoutingPreferences`, not a field on two
+types.
 
 ### 2.1 The Ollama roster, measured (2026-10-24)
 
@@ -114,9 +122,10 @@ Two consequences:
 
 ### 3.1 Why a new input, and why not just `order`
 
-`RoutingPreferences.order` already carries a per-request try-order, so torii *could* send a ranking
-today — for chat. Three things make a distinct `ranking` field worth its weight rather than a second
-ordering mechanism:
+`RoutingPreferences.order` already carries a per-request try-order that reaches a decision call, so
+torii *could* send an order today — but only a hand-authored one, with nothing saying where it came
+from or what it was measured for. Three things make a distinct `ranking` field worth its weight
+rather than a second ordering mechanism:
 
 - **Provenance is part of the data.** An authored `order` is an operator preference with no date; a
   ranking is a measurement with a category, an artifact revision and a generation time. The trace has
@@ -134,14 +143,15 @@ same first-match-wins grammar as `order`; there is no second ordering implementa
 **Why first:** torii's CI resolves the pinned tag, not `../gateway`.
 
 - Commit the decision seam + `DecisionPlannerSelector` (the working tree) **and** the Phase 2 ranking
-  input below, in one release: `ModelDispatch::choose` is already a required-trait-method break, and
-  `DecisionRequest` gaining `routing` is a struct-literal break, so one `0.13.0` bump covers both.
+  input below, in one release: `ModelDispatch::choose` is a required-trait-method break, and
+  `RoutingPreferences` / `RoutingDecision` gaining a field breaks exhaustive struct literals, so one
+  `0.13.0` bump covers both.
 - Tag `v0.13.0`; update the README's consumer examples.
 - Gates: `cargo test --workspace`, stable clippy `-D warnings`, fmt,
   `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked`.
 
 **AC:** the tag exposes `DecisionPlannerSelector`, `ModelDispatch::choose`, `RoutingPreferences::ranking`
-and `DecisionRequest::routing`.
+(passed on an `InferenceRequest`, no new field on `DecisionRequest`), and `RoutingDecision::ranking`.
 
 ## 5. Phase 1 — the corpus and the ranking artifact (this repo)
 
@@ -229,6 +239,10 @@ falling back to `model_info`), reused by the bench's `check` and torii's seeding
 
 ## 6. Phase 2 — the ranking input on a decision call (this repo)
 
+**Landed** with the decision seam: `RoutingPreferences::ranking`, applied by the same re-rank as
+`order`, recorded as `RoutingDecision::ranking` (`RankingApplied`). Five tests in
+`engine/decision_tests.rs` pin the semantics below.
+
 The gateway gains the ability to be *told* an order, and the memory of where it came from. It gains no
 ranking data and makes no ranking decisions of its own.
 
@@ -253,8 +267,7 @@ pub struct RankingSource {
 // `RoutingPreferences` gains:
 pub ranking: Option<Ranking>,
 
-// `DecisionRequest` (kernel/types/io.rs) gains:
-pub routing: Option<RoutingPreferences>,
+// (No `DecisionRequest` change — it is the adapter boundary, built after selection.)
 ```
 
 Semantics, each pinned by a test:
@@ -531,7 +544,8 @@ and why.
   - `TORII_PLANNER_SELECTOR=decision` → `DecisionPlannerSelector::new(registry, chain)`, with
     `TORII_DECISION_CHAIN` (default `decide`) and `TORII_DECISION_CATEGORY` (default
     `planner.select`, falling back to a labelled proxy).
-- The selector carries the composed per-run ranking and sets `DecisionRequest::routing` on each call.
+- The selector carries the composed per-run ranking and sets `InferenceRequest.routing` (which holds
+  `RoutingPreferences::ranking`) on each decision call.
 - Resolve the snapshot **once per run per category** (§8.1b), not per decision, and reuse it across the
   run's steps. A resolver failure is not a run failure: log it, send no ranking, and let the chain's
   authored order stand — the gateway must remain fully usable with torii's resolver unavailable.
@@ -584,8 +598,8 @@ decision chains; budget reserve/commit on an input-only estimate; redaction, tra
   and can run in parallel; Phase 4 touches `boot.rs` and should follow #47.
 - **Pin discipline:** one gateway ref across every crate (TM-8a); every `sensei-*` pin and both
   `[patch]` blocks move in one commit.
-- **Kernel break:** `DecisionRequest` gaining a field is source-breaking for struct literals; it rides
-  the same `0.13.0` as `choose`.
+- **Kernel break:** `RoutingPreferences` and `RoutingDecision` each gain a field, which is
+  source-breaking for exhaustive struct literals; both ride the same `0.13.0` as `choose`.
 
 ## 12. Risks and traps
 

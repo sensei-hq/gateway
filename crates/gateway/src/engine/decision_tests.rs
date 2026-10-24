@@ -9,7 +9,8 @@ use crate::types::config::{
 };
 use crate::types::decision::{DecisionAnswer, DecisionQuestion, DecisionQuestions};
 use crate::types::io::{DecisionRequest, DecisionResponse};
-use crate::types::request::Payload;
+use crate::types::request::{CandidateRef, Payload, Ranking, RankingSource, RoutingPreferences};
+use crate::types::trace::RoutingDecision;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Mutex;
@@ -745,4 +746,197 @@ async fn an_input_rejection_beside_a_hard_failure_stays_retryable() {
         }
         other => panic!("expected AllAttemptsFailed {{ retryable: true }}, got {other:?}"),
     }
+}
+
+// ── the measured ranking (Phase 2 of the System One plan) ─────────────────────
+//
+// A ranking is a caller-supplied ORDER with provenance, applied after the
+// strategy and after any authored `order`. These pin the four things that make
+// it a preference rather than a second admission path: it reorders survivors,
+// it cannot promote a gated candidate, a ref nobody answers is recorded rather
+// than rejected, and carrying both orderings is a caller error.
+
+fn ranked_to(model: &str) -> Option<RoutingPreferences> {
+    Some(RoutingPreferences {
+        ranking: Some(Ranking {
+            category: "planner.select".into(),
+            preferred: vec![CandidateRef {
+                router: None,
+                model: Some(model.into()),
+            }],
+            source: Some(RankingSource {
+                artifact: "torii:catalog.model_rankings".into(),
+                revision: Some(7),
+                generated_at: None,
+            }),
+        }),
+        ..Default::default()
+    })
+}
+
+fn routing(resp: &InferenceResponse) -> &RoutingDecision {
+    resp.routing
+        .as_ref()
+        .expect("selection ran on a chain, so a decision is recorded")
+}
+
+#[tokio::test]
+async fn a_ranking_tries_the_named_model_first_and_records_its_provenance() {
+    let gw = gateway_with(8192);
+    let ollama = Decider::ok("ollama");
+    let openrouter = Decider::ok("openrouter");
+    gw.adapters.register_decision(ollama.clone()).await;
+    gw.adapters.register_decision(openrouter.clone()).await;
+
+    let mut req = decision_request(json!({"ticket": "charged twice"}), questions());
+    req.routing = ranked_to("jev");
+
+    let resp = gw.execute(&req).await.expect("the ranked call succeeds");
+
+    // The chain's authored order is nimble then jev; the ranking reverses it.
+    assert_eq!(
+        (ollama.calls(), openrouter.calls()),
+        (0, 1),
+        "jev is tried first and succeeds, so nimble is never called"
+    );
+    assert_eq!(
+        openrouter.seen.lock().unwrap()[0].model.as_deref(),
+        Some("typesafe/jev-1.13")
+    );
+
+    let decision = routing(&resp);
+    assert_eq!(
+        decision
+            .order
+            .iter()
+            .map(|c| c.endpoint.as_str())
+            .collect::<Vec<_>>(),
+        vec!["openrouter:jev", "ollama:nimble"],
+        "the trace's order is the order the engine actually tried"
+    );
+    let applied = decision.ranking.as_ref().expect("the ranking is recorded");
+    assert_eq!(applied.category, "planner.select");
+    assert_eq!(applied.matched, 1);
+    assert!(applied.unmatched.is_empty());
+    assert_eq!(
+        applied.source.as_ref().and_then(|s| s.revision),
+        Some(7),
+        "a revision that is recorded is a run whose order can be re-derived"
+    );
+}
+
+#[tokio::test]
+async fn a_ranking_cannot_promote_a_candidate_a_gate_skipped() {
+    // A 96-token window is below the minimum decision (the laya-ane case), so
+    // nimble is skipped by the context-window gate before ordering runs at all.
+    let gw = gateway_with(96);
+    let ollama = Decider::ok("ollama");
+    let openrouter = Decider::ok("openrouter");
+    gw.adapters.register_decision(ollama.clone()).await;
+    gw.adapters.register_decision(openrouter.clone()).await;
+
+    let mut req = decision_request(json!({"ticket": "charged twice"}), questions());
+    req.routing = ranked_to("nimble");
+
+    let resp = gw.execute(&req).await.expect("falls through to jev");
+
+    assert_eq!(
+        ollama.calls(),
+        0,
+        "a ranking is a preference over survivors, not a way past a gate"
+    );
+    assert_eq!(openrouter.calls(), 1);
+
+    let applied = routing(&resp).ranking.as_ref().expect("recorded");
+    assert_eq!(applied.matched, 0, "the ref matched no admitted candidate");
+    assert_eq!(applied.unmatched, vec!["*:nimble".to_string()]);
+}
+
+#[tokio::test]
+async fn a_ranking_ref_nobody_answers_is_recorded_and_inert() {
+    let gw = gateway_with(8192);
+    let ollama = Decider::ok("ollama");
+    gw.adapters.register_decision(ollama.clone()).await;
+
+    let mut req = decision_request(json!({"ticket": "charged twice"}), questions());
+    req.routing = ranked_to("ghost");
+
+    let resp = gw
+        .execute(&req)
+        .await
+        .expect("an unmatched ref is not an error");
+
+    assert_eq!(
+        ollama.calls(),
+        1,
+        "an artifact's roster drifts from availability by design; the chain still runs"
+    );
+    let applied = routing(&resp).ranking.as_ref().expect("recorded");
+    assert_eq!(applied.matched, 0);
+    assert_eq!(applied.unmatched, vec!["*:ghost".to_string()]);
+    assert_eq!(
+        routing(&resp)
+            .order
+            .iter()
+            .map(|c| c.endpoint.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ollama:nimble", "openrouter:jev"],
+        "with no ref matched, the strategy's order survives intact"
+    );
+}
+
+#[tokio::test]
+async fn two_orderings_in_one_call_are_rejected_before_any_candidate_runs() {
+    let gw = gateway_with(8192);
+    let ollama = Decider::ok("ollama");
+    gw.adapters.register_decision(ollama.clone()).await;
+
+    let mut req = decision_request(json!({"ticket": "charged twice"}), questions());
+    req.routing = Some(RoutingPreferences {
+        order: Some(vec![CandidateRef {
+            router: None,
+            model: Some("jev".into()),
+        }]),
+        ..ranked_to("nimble").expect("a ranking")
+    });
+
+    let err = gw
+        .execute(&req)
+        .await
+        .expect_err("authored and measured order in one call is a caller bug");
+
+    match err {
+        GatewayError::InvalidRequest { message } => {
+            assert!(
+                message.contains("order"),
+                "names the authored field: {message}"
+            );
+            assert!(
+                message.contains("ranking"),
+                "names the measured field: {message}"
+            );
+        }
+        other => panic!("expected InvalidRequest, got {other:?}"),
+    }
+    assert_eq!(ollama.calls(), 0, "rejected before any dispatch");
+}
+
+#[tokio::test]
+async fn a_request_without_a_ranking_records_none() {
+    let gw = gateway_with(8192);
+    let ollama = Decider::ok("ollama");
+    gw.adapters.register_decision(ollama.clone()).await;
+
+    let resp = gw
+        .execute(&decision_request(
+            json!({"ticket": "charged twice"}),
+            questions(),
+        ))
+        .await
+        .expect("unranked call succeeds");
+
+    assert!(
+        routing(&resp).ranking.is_none(),
+        "no ranking in, no ranking recorded: the pre-feature behaviour"
+    );
 }

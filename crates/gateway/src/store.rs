@@ -292,6 +292,7 @@ mod tests {
                 routing: Some(RoutingDecision {
                     strategy: "grouped_weighted".to_string(),
                     degraded: false,
+                    ranking: None,
                     order: vec![RoutedCandidate {
                         endpoint: "priority:claude-sonnet".to_string(),
                         priority: 1,

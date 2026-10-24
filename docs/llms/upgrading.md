@@ -9,7 +9,8 @@ lists only what you must touch.
 ## develop (unreleased) — System One decisions in the executor
 
 The routing call path is unchanged. This is an orchestrator-crate addition plus one
-**breaking** trait method; no gateway surface moved.
+**breaking** trait method, and one additive routing field that is source-breaking only for
+exhaustive struct literals.
 
 | Area | Change | Action |
 |---|---|---|
@@ -17,6 +18,8 @@ The routing call path is unchanged. This is an orchestrator-crate addition plus 
 | Port types | `orchestrator_core::{ChoiceQuestion, ChoiceOption, ChoiceAnswer}` (re-exported at the crate root). Only the `choice` question shape is exposed — `noul` / `score` have no consumer yet | use them to build a question; `ChoiceAnswer.confidence` is concentration, not correctness |
 | `orchestrator` exports | new `DecisionPlannerSelector` — the planner choice asked as a typed choice over the candidate menu. `LlmPlannerSelector` is unchanged, so a chat chain keeps working | where a decision model is available, wire `DecisionPlannerSelector::new(registry, "<Decision chain>")` in place of the text selector |
 | Expand failures | `NodeFailed` messages raised by an `Expand` now pass the configured `Redactor` before the durable write — the same rule gates and model output already followed. This includes the selector's `non-candidate` refusal, which quotes the model's answer | none; a secret-shaped answer now journals as `[REDACTED]` |
+| `RoutingPreferences` | new optional `ranking: Option<Ranking>` — a **measured** try-order with provenance (`category`, `preferred` refs, `source`). Applied by the same stable re-rank as `order`, after the strategy; it never filters and never resurrects a gated candidate. `None` is the previous behaviour, byte for byte. Sending `ranking` **and** `order` is `InvalidRequest` | add `..Default::default()` to exhaustive `RoutingPreferences` literals; send one ordering, not two |
+| `RoutingDecision` | new optional `ranking: Option<RankingApplied>` — `category`, `source`, `matched` (refs an admitted candidate answered) and `unmatched` (refs nobody answered) | add `ranking: None` to exhaustive literals; read it to explain why a call ordered as it did |
 
 ## 0.11.x → 0.12.0 (SP-DEC-3 — Laya System One, `InputRejected`)
 

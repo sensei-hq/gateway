@@ -49,6 +49,11 @@ impl super::Gateway {
                 .map_err(|message| GatewayError::InvalidRequest { message })?;
         }
 
+        // One ordering per call. Refused here, before any candidate is gated or
+        // tried, so the caller hears about its own contradiction instead of
+        // getting an order it cannot account for (see `engine::util::validate_routing`).
+        super::util::validate_routing(request.routing.as_ref())?;
+
         // 2. Build SelectionCriteria from request. TWO size estimates over one payload,
         // for two gates that want opposite biases: `input_tokens` is the cost figure the
         // `BudgetGate` prices from, and `input_tokens_pessimistic` is the window figure

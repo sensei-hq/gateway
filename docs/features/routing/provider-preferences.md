@@ -303,6 +303,52 @@ later ref**, because first-match-wins gives every candidate rank 0 before any
 subsequent ref is consulted. `order: [{}, {"model": "charlie"}]` does not
 promote charlie.
 
+### The measured variant — `ranking`
+
+`order` is an operator's authored sequence. `ranking` is a caller's **measured**
+one: which model scores best on this kind of task, according to evidence the
+gateway does not hold. The gateway measures nothing, stores nothing and invents
+no default — it accepts an order, applies it, and records where it came from.
+
+```jsonc
+"routing": {
+  "ranking": {
+    "category": "planner.select",
+    "preferred": [ { "model": "strands-decider" }, { "model": "nimble" } ],
+    "source": {
+      "artifact": "torii:catalog.model_rankings",
+      "revision": 42,
+      "generated_at": 1761264000
+    }
+  }
+}
+```
+
+It uses the **same** `CandidateRef` grammar, the same first-match-wins rule and
+the same stable re-rank as `order` — one implementation, so the two cannot drift
+into two subtly different orderings. The differences are what make it safe to
+accept from a caller:
+
+- **It never filters and never resurrects.** `only`/`ignore` and the gates decide
+  admission; a ranking only permutes survivors. Ranking a model with an open
+  breaker, a cooldown, a lockout, an exhausted budget or an unusable window first
+  does not promote it — it is not in the admitted set to be promoted.
+- **Unmatched refs are inert.** An artifact's roster drifts from a deployment's
+  availability by design, so a ref naming a model this deployment does not have
+  is recorded in `routing.ranking.unmatched` and otherwise ignored. It is never
+  an error, and it never falls back to a different model of the caller's
+  choosing.
+- **`ranking` and `order` together are `InvalidRequest`.** Two orderings in one
+  call is a caller bug, and any silent rule (authored wins, measured wins,
+  interleave) would leave the caller unable to tell which of its own
+  instructions ran. Both entry points reject it before a candidate is gated.
+- **Absent is byte-identical.** No `ranking` ⇒ the strategy's order plus any
+  `order`, exactly as before, and `routing.ranking` is `null`.
+- **The category is recorded, not interpreted.** The gateway has no opinion on
+  what `planner.select` means, and no accuracy data to judge whether the ranking
+  is any good. Deciding *whether* to send one — a tie or an insufficient corpus
+  means no order at all — belongs to the caller that holds the measurements.
+
 ---
 
 ## 6. The default — `GroupedWeightedStrategy`
@@ -473,7 +519,15 @@ on the response:
 pub struct RoutingDecision {
     pub strategy: String,               // "grouped_weighted" | "price" | "latency" | "throughput" | "priority"
     pub degraded: bool,                 // a metric sort found too few samples to reorder anything
-    pub order: Vec<RoutedCandidate>,    // AFTER the `order` re-rank
+    pub order: Vec<RoutedCandidate>,    // AFTER the `order`/`ranking` re-rank
+    pub ranking: Option<RankingApplied>,// Some only when the CALLER supplied a ranking
+}
+
+pub struct RankingApplied {
+    pub category: String,               // echoed from the ranking
+    pub source: Option<RankingSource>,  // artifact, revision, generated_at — recorded, never read
+    pub matched: usize,                 // how many REFS an admitted candidate answered
+    pub unmatched: Vec<String>,         // refs nobody answered: "router:model" | "router:*" | "*:model" | "*"
 }
 
 pub struct RoutedCandidate {
@@ -504,6 +558,11 @@ pub struct RoutedCandidate {
 - `routing` is `None` when no strategy ran — a direct router+model request
   orders nothing. That is not "preferences were ignored": `only`/`ignore` still
   filtered it (§2), it just had one candidate and nothing to order.
+- `ranking` is `None` when the caller supplied no ranking, which is the
+  pre-feature behaviour and the common case. `Some(RankingApplied { matched: 0, .. })`
+  with a non-empty `unmatched` is the healthy outcome of a stale artifact, not a
+  fault: read `unmatched` to see which refs the deployment could not answer,
+  and `order` to see what actually ran.
 
 ### The streaming path reports the same decision
 

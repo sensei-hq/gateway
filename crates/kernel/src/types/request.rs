@@ -458,6 +458,65 @@ pub struct RoutingPreferences {
     /// does not promote charlie.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order: Option<Vec<CandidateRef>>,
+    /// A **measured** try-order, supplied by the caller from evidence the gateway
+    /// does not hold: which model scores best on this kind of task.
+    ///
+    /// The gateway never invents one, never stores one and never fills a default
+    /// in: `None` is the whole of the previous behaviour, byte for byte. When it
+    /// is present it is applied by the SAME stable re-rank `order` uses, after
+    /// the strategy has ordered the admitted candidates — so it is a preference
+    /// over survivors, not an admission rule.
+    ///
+    /// # Why it is not just `order`
+    ///
+    /// `order` is an operator's authored sequence. A ranking is a *claim* with
+    /// provenance: the category it was measured for, the artifact revision, when
+    /// it was generated. Keeping them apart means the trace can say whether a
+    /// call's sequence was authored or measured, and means a caller cannot pass
+    /// two orderings and have one silently win — the pair is rejected (see
+    /// `Gateway`'s entry points).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ranking: Option<Ranking>,
+}
+
+/// A caller-supplied, measured preference over the candidates that survive
+/// admission (see [`RoutingPreferences::ranking`]).
+///
+/// **It never filters and never resurrects.** `only`, `ignore` and the gates
+/// decide who is admitted; a ranking only permutes them. A candidate skipped for
+/// a closed breaker, a cooldown, a lockout, an exhausted budget or a context
+/// window stays skipped however highly it is ranked — otherwise a ranking would
+/// be a way to bypass every gate in the pipeline by simply naming a dead model.
+///
+/// **Unmatched refs are inert.** An artifact's roster drifts from a tenant's
+/// availability by design, so a ref naming a model this deployment does not have
+/// is recorded in the trace and otherwise ignored, never an error.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct Ranking {
+    /// What this order was measured for, e.g. `"planner.select"`. Free-form:
+    /// the gateway only records it.
+    pub category: String,
+    /// Best first. The same [`CandidateRef`] grammar and first-match-wins rule
+    /// as [`RoutingPreferences::order`].
+    pub preferred: Vec<CandidateRef>,
+    /// Where it came from. Recorded, never consulted for ordering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<RankingSource>,
+}
+
+/// Provenance for a [`Ranking`]: enough to re-derive where an order came from
+/// after the fact, and nothing the ordering itself reads.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct RankingSource {
+    /// The artifact or table the rows live in, e.g.
+    /// `"torii:catalog.model_rankings"`.
+    pub artifact: String,
+    /// The artifact's monotonic revision, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    /// Unix seconds the artifact was generated, when it says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_at: Option<i64>,
 }
 
 /// Which deterministic ordering replaces the weighted default
@@ -1009,6 +1068,7 @@ mod tests {
         let decision = RoutingDecision {
             strategy: "grouped_weighted".to_string(),
             degraded: false,
+            ranking: None,
             order: vec![
                 RoutedCandidate {
                     endpoint: "anthropic:claude-haiku".to_string(),
@@ -1932,6 +1992,7 @@ mod tests {
                 router: Some("ollama".into()),
                 model: None,
             }]),
+            ranking: None,
         };
         let json = serde_json::to_string(&prefs).unwrap();
         assert_eq!(
