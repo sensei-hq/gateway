@@ -13,9 +13,72 @@ use crate::types::config::{
     ChainEntry, FallbackChainConfig, GatewayConfig, ModelConfig, RouterConfig,
 };
 use crate::types::cost::CostEstimate;
-use crate::types::request::RoutingPreferences;
-use crate::types::trace::{RoutedCandidate, RoutingDecision};
+use crate::types::request::{CandidateRef, RoutingPreferences};
+use crate::types::trace::{RankingApplied, RoutedCandidate, RoutingDecision};
 use std::time::Instant;
+
+/// Stable re-rank of the ADMITTED candidates by matched-ref index, shared by
+/// `RoutingPreferences::order` (authored) and `Ranking::preferred` (measured) so
+/// the two cannot drift into two subtly different orderings.
+///
+/// **First matching ref wins**: `[{model: charlie}, {router: north}]` reads
+/// "charlie, then the rest of north", so a candidate matching both takes the
+/// earlier rank. `rposition` would give charlie the LATER one, tying it with the
+/// rest of north and losing its lead. Candidates matching no ref keep their
+/// relative order after the ranked ones, as fallbacks.
+///
+/// The key is `(rank, position-in-the-strategy's-output)`, and the index is what
+/// makes it correct rather than correct-today: keyed on `rank` alone the answer
+/// holds only while the sort is stable, which is how `sort_by_key` →
+/// `sort_unstable_by_key` once silently scrambled an operator's sequence. With
+/// the index every key is distinct, so any correct sort produces the specified
+/// order.
+///
+/// Returns the INDICES of the refs some candidate answered, so a caller can
+/// report what it could not apply. Several candidates can answer one ref (a
+/// router-wide ref names them all), so this is a count of refs, not of
+/// candidates.
+fn reorder_by_refs(candidates: &mut Vec<SelectedModel>, refs: &[CandidateRef]) -> Vec<usize> {
+    let mut answered = vec![false; refs.len()];
+    let mut ranked: Vec<(usize, usize, SelectedModel)> = std::mem::take(candidates)
+        .into_iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let rank = refs
+                .iter()
+                .position(|r| {
+                    r.router.as_deref().is_none_or(|x| x == m.router)
+                        && r.model.as_deref().is_none_or(|x| x == m.model)
+                })
+                .unwrap_or(usize::MAX);
+            if rank != usize::MAX {
+                answered[rank] = true;
+            }
+            (rank, i, m)
+        })
+        .collect();
+    ranked.sort_by_key(|(rank, i, _)| (*rank, *i));
+    *candidates = ranked.into_iter().map(|(_, _, m)| m).collect();
+    answered
+        .iter()
+        .enumerate()
+        .filter_map(|(i, hit)| hit.then_some(i))
+        .collect()
+}
+
+/// A [`CandidateRef`] as a trace names it: `router:model`, `router:*`, `*:model`
+/// or `*` for the all-wildcard ref.
+///
+/// A trace field, not a grammar: it exists so an unmatched ref in a trace is
+/// readable, and it deliberately does not round-trip back into a `CandidateRef`.
+fn describe_ref(r: &CandidateRef) -> String {
+    match (r.router.as_deref(), r.model.as_deref()) {
+        (Some(router), Some(model)) => format!("{router}:{model}"),
+        (Some(router), None) => format!("{router}:*"),
+        (None, Some(model)) => format!("*:{model}"),
+        (None, None) => "*".to_string(),
+    }
+}
 
 /// Criteria used to resolve which model(s) to try.
 #[derive(Debug, Clone)]
@@ -519,27 +582,41 @@ impl<'a> ModelSelectionService<'a> {
         // could change between two comparisons, and `sort_by` detects the
         // resulting intransitivity and panics inside model selection.
         if let Some(refs) = criteria.preferences.as_ref().and_then(|p| p.order.as_ref()) {
-            // FIRST match wins: `[{model: charlie}, {router: north}]` reads
-            // "charlie, then the rest of north", so a candidate matching both
-            // takes the earlier rank. `rposition` would give charlie the LATER
-            // one, tying it with the rest of north and losing its lead.
-            let rank_of = |m: &SelectedModel| {
-                refs.iter()
-                    .position(|r| {
-                        r.router.as_deref().is_none_or(|x| x == m.router)
-                            && r.model.as_deref().is_none_or(|x| x == m.model)
-                    })
-                    .unwrap_or(usize::MAX)
-            };
-            let mut ranked: Vec<(usize, usize, SelectedModel)> =
-                std::mem::take(&mut all_candidates)
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, m)| (rank_of(&m), i, m))
-                    .collect();
-            ranked.sort_by_key(|(rank, i, _)| (*rank, *i));
-            all_candidates = ranked.into_iter().map(|(_, _, m)| m).collect();
+            reorder_by_refs(&mut all_candidates, refs);
         }
+
+        // A MEASURED order, layered the same way and for the same reason: the
+        // caller (torii) holds evidence the gateway does not — which model scores
+        // best on this kind of task — and sends it as refs. It runs AFTER `order`
+        // and after the strategy, so it permutes survivors and nothing else; a
+        // candidate an admission gate skipped is not in `all_candidates` to be
+        // promoted, which is what makes "a ranking cannot bypass a gate" true by
+        // construction rather than by a check that could be forgotten.
+        //
+        // The empty case is inert on purpose: no refs means every candidate ranks
+        // last in its current order, i.e. unchanged. A caller that has no ranking
+        // should send `None`; an empty one is tolerated because a resolved,
+        // filtered-to-nothing ranking is a real intermediate state.
+        let ranking = criteria
+            .preferences
+            .as_ref()
+            .and_then(|p| p.ranking.as_ref())
+            .filter(|r| !r.preferred.is_empty())
+            .map(|r| {
+                let answered = reorder_by_refs(&mut all_candidates, &r.preferred);
+                RankingApplied {
+                    category: r.category.clone(),
+                    source: r.source.clone(),
+                    matched: answered.len(),
+                    unmatched: r
+                        .preferred
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| !answered.contains(i))
+                        .map(|(_, c)| describe_ref(c))
+                        .collect(),
+                }
+            });
 
         // AC10 — record WHY the candidates came out in this order.
         //
@@ -559,6 +636,7 @@ impl<'a> ModelSelectionService<'a> {
         let decision = RoutingDecision {
             strategy: strategy.name().to_string(),
             degraded: report.degraded,
+            ranking,
             order: all_candidates
                 .iter()
                 .map(|m| {

@@ -62,6 +62,11 @@ impl super::Gateway {
             });
         }
 
+        // The same one-ordering-per-call rule `execute` enforces — a caller's
+        // preferences must not be judged differently depending on the entry point
+        // (`engine::util::validate_routing`).
+        super::util::validate_routing(request.routing.as_ref())?;
+
         // 3. Build SelectionCriteria from request (same as `execute`, including BOTH
         // size estimates — the cost one for the `BudgetGate` and the pessimistic one for
         // the `ContextWindowGate`). Streaming is where an unfit candidate is worst: the

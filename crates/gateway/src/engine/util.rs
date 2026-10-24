@@ -4,7 +4,31 @@ use crate::store::UsageTotals;
 use crate::types::config::{MeterUnit, Window};
 use crate::types::decision::{DecisionContent, DecisionQuestion, DecisionQuestions};
 use crate::types::error::GatewayError;
-use crate::types::request::{MediaAttachment, Payload};
+use crate::types::request::{MediaAttachment, Payload, RoutingPreferences};
+
+/// Refuse a request that carries TWO orderings.
+///
+/// `order` is the operator's authored sequence and `ranking` is a caller's
+/// measured one; a call carrying both is a caller bug, not a tie to break. Any
+/// silent rule (order wins, ranking wins, interleave) invents an ordering the
+/// caller did not ask for, and the one thing a caller can then no longer do is
+/// tell which of its own instructions ran.
+///
+/// Checked at BOTH entry points (`execute`, `execute_stream`) rather than in
+/// selection, which cannot return an error: rejecting the pair on one path only
+/// would be the same defect as a preference reaching one entry point and not the
+/// other.
+pub(super) fn validate_routing(routing: Option<&RoutingPreferences>) -> Result<(), GatewayError> {
+    let both = routing.is_some_and(|p| p.order.is_some() && p.ranking.is_some());
+    if both {
+        return Err(GatewayError::InvalidRequest {
+            message: "routing carries both `order` (authored) and `ranking` \
+                      (measured); send exactly one ordering"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
 
 /// Map a [`GatewayError`] to a short, stable `code` string for a
 /// [`StreamEvent::Error`]. `ProviderError` reports its HTTP status when

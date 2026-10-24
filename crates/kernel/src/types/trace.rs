@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use super::capability::Capability;
 use super::cost::{Cost, CostEstimate, TokenUsage};
+use super::request::RankingSource;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -90,6 +91,37 @@ pub struct RoutingDecision {
     /// credits) stops the walk where it stands. Read it as the ranking, not as
     /// a record of what was attempted — `attempts` is that record.
     pub order: Vec<RoutedCandidate>,
+    /// The measured order this call was given, when it was given one.
+    ///
+    /// `None` means the caller supplied no [`Ranking`](super::request::Ranking)
+    /// — the sequence is the one the strategy and any authored `order`
+    /// produced, exactly as before this field existed. `Some` says the final
+    /// sequence was permuted by measurement, and why, so "why did this run use
+    /// the 9B model" stays answerable from the trace alone.
+    ///
+    /// `unmatched` is the interesting half in production: an artifact's roster
+    /// drifts from a deployment's availability, so a ref the deployment cannot
+    /// answer is normal and recorded rather than rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ranking: Option<RankingApplied>,
+}
+
+/// What a [`Ranking`](super::request::Ranking) did to one selection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RankingApplied {
+    /// Echoed from the ranking — the task category it was measured for.
+    pub category: String,
+    /// Echoed from the ranking: artifact, revision, generation time. Recorded,
+    /// never consulted for ordering.
+    pub source: Option<RankingSource>,
+    /// How many of the ranking's refs an admitted candidate answered.
+    ///
+    /// A COUNT OF REFS, not of candidates: several candidates can match one
+    /// ref (a router-wide ref names them all), and `preferred.len() -
+    /// matched` is the number of refs in `unmatched`.
+    pub matched: usize,
+    /// Refs no admitted candidate answered, in the ranking's own order.
+    pub unmatched: Vec<String>,
 }
 
 /// One candidate's place in a [`RoutingDecision`], and the inputs that put it
