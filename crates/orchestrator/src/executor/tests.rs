@@ -2,7 +2,7 @@ use super::*;
 use crate::test_support::{
     CallLog, FIXTURE_CONTEXT_WINDOW, FIXTURE_MAX_OUTPUT_TOKENS, SUB_FLOOR_MAX_OUTPUT_TOKENS,
     TWO_WINDOW_BIG, TWO_WINDOW_SMALL, clamp_observing_gateway, content_gated_gateway,
-    demo_reference_gateway, demo_reference_tool_gateway, echo_system_gateway,
+    decision_gateway, demo_reference_gateway, demo_reference_tool_gateway, echo_system_gateway,
     failing_after_gateway, final_response, metered_embed_gateway, metered_gateway,
     metered_latency_gateway, prompt_recording_gateway, recording_gateway, scripted_gateway,
     scripted_tool_watching_gateway, sub_floor_output_clamp_observing_gateway, tool_call_response,
@@ -9974,6 +9974,20 @@ impl orchestrator_core::ModelDispatch for FixedDispatch {
     ) -> Result<String, OrchestratorError> {
         Ok(self.0.clone())
     }
+    /// A decision answers with the same fixed string, as if it were an option key. No
+    /// test drives a `DecisionPlannerSelector` through `FixedDispatch` today, but the
+    /// port's answer shape is small enough to honour rather than panic on — a panic here
+    /// would fail a future test for the wrong reason.
+    async fn choose(
+        &self,
+        _question: &orchestrator_core::ChoiceQuestion,
+        _chain: Option<&str>,
+    ) -> Result<orchestrator_core::ChoiceAnswer, OrchestratorError> {
+        Ok(orchestrator_core::ChoiceAnswer {
+            choice: self.0.clone(),
+            confidence: 1.0,
+        })
+    }
 }
 
 /// A registry with two `planning`-area planner agents (both emit a plan via the gateway).
@@ -13543,6 +13557,359 @@ async fn the_selector_transmits_the_goal_the_menu_and_its_instruction() {
         user.contains("- alpha (planning/reasoning)")
             && user.contains("- beta (planning/reasoning)"),
         "both candidates reach it, each with the capability the registry knows: {user}"
+    );
+}
+
+// ---- SP-DEC: the decision-backed planner selector ----
+
+/// The selector asks a TYPED question, not prose: the goal as `state`, the agent menu
+/// as choice criteria, and the pick comes back as an option key.
+///
+/// This is the whole point of the decision seam. `LlmPlannerSelector` asks a chat model
+/// for a bare agent name and then has to trust that the answer is one; here the caller
+/// supplied the menu, so the only thing the model can answer with is one of its keys
+/// (and the Expand arm's membership check rejects even that if a provider invents one).
+///
+/// The assertions are on the REQUEST the adapter actually received, not on anything the
+/// executor recorded about it: a selector that built the menu wrong would still return
+/// a plausible-looking pick.
+#[tokio::test]
+async fn the_decision_selector_asks_a_typed_choice_and_picks_the_named_agent() {
+    let (gateway, decisions) = decision_gateway("beta").await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let registry = two_planner_registry();
+    let graph = Graph {
+        nodes: vec![expand_select_node("e", vec![])],
+    };
+
+    // The node FAILS after the pick: the decision fixture has no chat adapter, so the
+    // selected planner agent's own plan call cannot run. The selection is journaled
+    // first, which is what this test reads.
+    Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(registry.clone())
+        .with_planner_selector(Arc::new(crate::DecisionPlannerSelector::new(
+            registry, "decide",
+        )))
+        .run(run, &graph)
+        .await
+        .expect("drives");
+
+    let recorded = decisions.lock().unwrap().clone();
+    assert_eq!(recorded.len(), 1, "one decision call: {recorded:?}");
+    let req = &recorded[0];
+    assert_eq!(
+        req.state,
+        serde_json::json!({ "goal": "g" }),
+        "the Expand input is the decision state, unwrapped"
+    );
+    assert_eq!(req.questions.len(), 1, "one typed question per call");
+    let question = req
+        .questions
+        .get("choice")
+        .expect("asked under the port's reserved question name");
+    let kernel::types::decision::DecisionQuestion::Choice {
+        instructions,
+        criteria,
+    } = question
+    else {
+        panic!("a choice question, got {question:?}");
+    };
+    assert!(
+        instructions
+            .as_str()
+            .unwrap_or_default()
+            .contains("best suited to the goal"),
+        "the selector's instruction is transmitted: {instructions}"
+    );
+    assert_eq!(
+        criteria.keys().cloned().collect::<Vec<_>>(),
+        vec!["alpha".to_string(), "beta".to_string()],
+        "the menu is every candidate, in the order the executor offered them"
+    );
+    assert_eq!(
+        criteria.get("alpha"),
+        Some(&Some("planning/reasoning".to_string())),
+        "each option carries the capability the registry knows"
+    );
+
+    let events = journal.load(run).await.unwrap();
+    let selected = events
+        .iter()
+        .find_map(|(_, e)| match e {
+            JournalEvent::PlannerSelected { agent, .. } => Some(agent.clone()),
+            _ => None,
+        })
+        .expect("the decision's pick is journaled");
+    assert_eq!(selected.0, "beta", "the chosen option key names the agent");
+}
+
+/// A decision call's spend reaches the DURABLE ledger, under the same reserved path the
+/// text selector uses.
+///
+/// The answer here is `"ghost"` — not a candidate — so the selection is rejected AFTER
+/// the call was paid for. That is deliberate: it isolates the ledger write from the
+/// node's outcome, and pins the rule that a provider answer the caller refuses is still
+/// a call somebody has to account for.
+///
+/// *Mutation:* drop the `record_paid_effect` call from `SelectorDispatch::choose` and the
+/// usage assertion has nothing to find.
+#[tokio::test]
+async fn the_decision_selector_journals_its_spend_to_the_ledger() {
+    let (gateway, decisions) = decision_gateway("ghost").await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let registry = two_planner_registry();
+    let graph = Graph {
+        nodes: vec![expand_select_node("e", vec![])],
+    };
+
+    let out = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(registry.clone())
+        .with_planner_selector(Arc::new(crate::DecisionPlannerSelector::new(
+            registry, "decide",
+        )))
+        .run(run, &graph)
+        .await
+        .expect("drives");
+
+    assert_eq!(decisions.lock().unwrap().len(), 1, "one decision call");
+    assert!(
+        out.failed.is_some(),
+        "'ghost' is not a candidate, so the pick is rejected: {out:?}"
+    );
+
+    let events = journal.load(run).await.unwrap();
+    let usage = events
+        .iter()
+        .find_map(|(_, e)| match e {
+            JournalEvent::EffectRecorded { node, usage, .. }
+                if node.0 == format!("e/{}", orchestrator_core::RESERVED_SELECT_ID) =>
+            {
+                Some(*usage)
+            }
+            _ => None,
+        })
+        .expect("the decision call is journaled under 'e/__select__'")
+        .expect("and carries the usage the provider reported");
+    assert_eq!(
+        usage.total_tokens, 70,
+        "the ledger records what the decision call really spent"
+    );
+}
+
+/// Producer 6: the decision selector goes through the SAME metered chokepoint, so an
+/// exhausted budget stops it before any dispatch.
+///
+/// The fixture proves it structurally rather than by inspection: the run is already over
+/// its cap from a completed `ModelCall`, only the `Select` node is left to drive, and the
+/// decision log must stay empty.
+#[tokio::test]
+async fn budget_gate_stops_the_decision_selector_producer() {
+    let (gateway, decisions) = decision_gateway("beta").await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let registry = two_planner_registry();
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: NodeId("n1".into()),
+                kind: model_call("c", "p1"),
+                deps: vec![],
+            },
+            expand_select_node("e", vec![Dep::hard("n1")]),
+        ],
+    };
+
+    let ih = input_hash("c", &serde_json::json!({ "prompt": "p1" })).unwrap();
+    journal
+        .append(run, run_started_with_budget(100))
+        .await
+        .unwrap();
+    journal
+        .append(run, spent_effect("n1", effect_id("n1", 0, 0), ih, 120))
+        .await
+        .unwrap();
+    journal
+        .append(
+            run,
+            JournalEvent::NodeCompleted {
+                node: NodeId("n1".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(registry.clone())
+        .with_planner_selector(Arc::new(crate::DecisionPlannerSelector::new(
+            registry, "decide",
+        )));
+    let out = exec.start(run, &graph).await.expect("drives");
+
+    assert_eq!(
+        decisions.lock().unwrap().len(),
+        0,
+        "an exhausted budget must dispatch NOTHING — the decision seam is not a bypass"
+    );
+    let pause = out
+        .paused
+        .as_ref()
+        .expect("an exhausted budget pauses the run");
+    assert_eq!(pause.node.0, "e", "paused at the selector's Expand node");
+    assert!(
+        pause.reason.starts_with("budget: "),
+        "budget pause reason: {}",
+        pause.reason
+    );
+}
+
+/// A re-driven `Select` node replays the DECISION from the journal instead of asking (and
+/// paying for) the model again.
+///
+/// The same window the text selector's replay test covers: a node that failed after a
+/// paid call has no `PlannerSelected`, so every wake re-enters the `Select` arm. Without
+/// the memo check, each wake was a fresh billed decision call whose `EffectRecorded`
+/// landed on the same effect id, freezing the durable ledger at one call while the run
+/// spent without bound.
+///
+/// *Mutation:* drop the `fold.memo` lookup from `SelectorDispatch::choose` — the dispatch
+/// count goes to five and the ledger stays at one call's tokens.
+#[tokio::test]
+async fn a_re_driven_decision_selector_replays_its_call_instead_of_respending() {
+    let (gateway, decisions) = decision_gateway("ghost").await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let registry = two_planner_registry();
+    let graph = Graph {
+        nodes: vec![expand_select_node("e", vec![])],
+    };
+    journal
+        .append(run, run_started_with_budget(5_000))
+        .await
+        .unwrap();
+    let exec = Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(registry.clone())
+        .with_planner_selector(Arc::new(crate::DecisionPlannerSelector::new(
+            registry, "decide",
+        )));
+
+    // "ghost" is not a candidate ⇒ the node fails ⇒ no `PlannerSelected` ⇒ the next
+    // drive re-enters the Select arm.
+    for i in 0..5 {
+        let out = exec.start(run, &graph).await.expect("drives");
+        assert!(out.failed.is_some(), "drive {i}: {out:?}");
+    }
+
+    let dispatched = decisions.lock().unwrap().len() as u64;
+    assert_eq!(
+        dispatched, 1,
+        "five wakes, one billed decision call — the rest replay from the journal"
+    );
+    let events = journal.load(run).await.unwrap();
+    assert_eq!(
+        crate::spend_of(&events).0,
+        70 * dispatched,
+        "the durable ledger accounts for every decision dispatch"
+    );
+}
+
+/// The decision answer crosses the SAME redaction chokepoint as chat text before it is
+/// journaled.
+///
+/// An option key is caller text and a provider may echo arbitrary content back in the
+/// answer, so a recorded `choice` is a secret-bearing field like any other model output.
+/// The redactor is wired, the answer is a secret-shaped string, and what lands on the
+/// journal is the placeholder — never the secret.
+#[tokio::test]
+async fn a_decision_answer_is_redacted_before_it_is_journaled() {
+    let secret = "sk-abcdefghijklmnopqrstuvwx";
+    let (gateway, _decisions) = decision_gateway(secret).await;
+    let journal = InMemoryJournal::new();
+    let run = RunId(uuid::Uuid::new_v4());
+    let registry = two_planner_registry();
+    let graph = Graph {
+        nodes: vec![expand_select_node("e", vec![])],
+    };
+
+    Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(registry.clone())
+        .with_planner_selector(Arc::new(crate::DecisionPlannerSelector::new(
+            registry, "decide",
+        )))
+        .with_redactor(Arc::new(orchestrator_core::PatternRedactor::default()))
+        .run(run, &graph)
+        .await
+        .expect("drives");
+
+    let events = journal.load(run).await.unwrap();
+    let recorded = events
+        .iter()
+        .find_map(|(_, e)| match e {
+            JournalEvent::EffectRecorded { node, output, .. }
+                if node.0 == format!("e/{}", orchestrator_core::RESERVED_SELECT_ID) =>
+            {
+                Some(output.clone())
+            }
+            _ => None,
+        })
+        .expect("the decision call is journaled under 'e/__select__'");
+    let orchestrator_core::EffectOutput::Inline(value) = recorded else {
+        panic!("a choice answer is small enough to journal inline");
+    };
+    assert_eq!(
+        value
+            .get("decisions")
+            .and_then(|d| d.get("choice"))
+            .and_then(|a| a.get("choice"))
+            .and_then(|v| v.as_str()),
+        Some("[REDACTED]"),
+        "the recorded choice is the redacted answer: {value}"
+    );
+    assert!(
+        value
+            .get("decisions")
+            .and_then(|d| d.get("choice"))
+            .and_then(|a| a.get("probabilities"))
+            .is_none(),
+        "the probabilities map is not journaled — its option keys are not redactable: {value}"
+    );
+    assert!(
+        !serde_json::to_string(&events).unwrap().contains(secret),
+        "the secret appears nowhere in the journal"
+    );
+}
+
+/// One candidate costs no call at all: a System One choice needs at least two options, so
+/// a one-option menu would be an `InvalidRequest` rather than an answer.
+#[tokio::test]
+async fn a_single_planner_candidate_costs_no_decision_call() {
+    let (gateway, decisions) = decision_gateway("alpha").await;
+    let journal = InMemoryJournal::new();
+    let mut agents = two_planner_agents_marking(None);
+    agents.truncate(1);
+    let registry = Arc::new(
+        agents
+            .into_iter()
+            .fold(Registry::default(), Registry::with_agent),
+    );
+    let graph = Graph {
+        nodes: vec![expand_select_node("e", vec![])],
+    };
+
+    Executor::new(Arc::new(gateway), Arc::new(journal.clone()), "v1")
+        .with_registry(registry.clone())
+        .with_planner_selector(Arc::new(crate::DecisionPlannerSelector::new(
+            registry, "decide",
+        )))
+        .run(RunId(uuid::Uuid::new_v4()), &graph)
+        .await
+        .expect("drives");
+
+    assert_eq!(
+        decisions.lock().unwrap().len(),
+        0,
+        "the only candidate is the pick by construction — no decision call to make"
     );
 }
 

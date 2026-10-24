@@ -305,6 +305,11 @@ impl Executor {
         node_id: &NodeId,
         message: String,
     ) -> Result<NodeExec, OrchestratorError> {
+        // Redact at the WRITE chokepoint, the same rule `fail_gate` follows: an Expand
+        // failure message can quote model-authored text (a selector's answer in the
+        // non-candidate refusal, a planner error carrying provider content), and this
+        // row is re-read by every later drive and rendered by `torii run status`.
+        let message = self.redact_text(message);
         self.append(
             run,
             JournalEvent::NodeFailed {

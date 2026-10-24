@@ -12,15 +12,16 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use gateway::Gateway;
 use gateway::adapters::AdapterRegistry;
-use gateway::adapters::capability::{ChatModel, Model};
+use gateway::adapters::capability::{ChatModel, DecisionModel, Model};
 use gateway::circuit_breaker::{CircuitBreakerConfig, CircuitBreakerManager};
 use kernel::types::capability::Capability;
 use kernel::types::config::{
     ChainEntry, FallbackChainConfig, GatewayConfig, ModelConfig, RouterConfig,
 };
 use kernel::types::cost::TokenUsage;
+use kernel::types::decision::{DecisionAnswer, DecisionAnswers};
 use kernel::types::error::GatewayError;
-use kernel::types::io::{ChatRequest, ChatResponse};
+use kernel::types::io::{ChatRequest, ChatResponse, DecisionRequest, DecisionResponse};
 use kernel::types::request::{InferenceRequest, Message, MessageRole, Payload, ToolCall};
 use orchestrator_core::Clock;
 
@@ -582,6 +583,147 @@ pub async fn recording_gateway() -> (Gateway, CallLog) {
 /// errors thereafter — the crash injector for the resume-without-re-spend test.
 pub async fn failing_after_gateway(succeed: usize) -> (Gateway, CallLog) {
     build_gateway(Some(succeed)).await
+}
+
+/// One recorded System One decision call: the exact request the selector sent, so a
+/// test can assert the menu the model was offered rather than a prompt string.
+pub type DecisionLog = Arc<Mutex<Vec<DecisionRequest>>>;
+
+/// System One **decision** adapter: records each request and answers the single `choice`
+/// question with `choice` at `confidence`.
+///
+/// Deliberately a separate adapter from [`RecordingAdapter`] rather than one dual-purpose
+/// double: the gateway's capability maps are per-capability, and a fixture that serves
+/// both would let a test pass while the selector silently reached the chat path.
+pub struct RecordingDecisionAdapter {
+    calls: DecisionLog,
+    choice: String,
+    confidence: f64,
+    usage: Option<TokenUsage>,
+}
+
+impl Model for RecordingDecisionAdapter {
+    fn id(&self) -> &str {
+        "d"
+    }
+}
+
+#[async_trait]
+impl DecisionModel for RecordingDecisionAdapter {
+    async fn decide(
+        &self,
+        _cfg: &RouterConfig,
+        req: &DecisionRequest,
+    ) -> Result<DecisionResponse, GatewayError> {
+        self.calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(req.clone());
+        // Built through the WIRE shape rather than by naming `indexmap`, which this crate
+        // does not depend on: the answer the executor sees is the one a provider would
+        // actually return, deserialized by the same types.
+        let mut probabilities = serde_json::Map::new();
+        probabilities.insert(self.choice.clone(), serde_json::json!(self.confidence));
+        let answer: DecisionAnswer = serde_json::from_value(serde_json::json!({
+            "type": "choice",
+            "choice": self.choice,
+            "probabilities": probabilities,
+            "confidence": self.confidence,
+        }))
+        .expect("a well-formed choice answer");
+        Ok(DecisionResponse {
+            answers: DecisionAnswers::from([("choice".to_string(), answer)]),
+            usage: self.usage.clone(),
+            model: req.model.clone(),
+            degraded: false,
+        })
+    }
+}
+
+/// A gateway whose only capability is System One decisions: chain `"decide"` resolves
+/// `Decision` to router `"d"` / model `"md"`, which always answers `choice` with usage.
+///
+/// The usage is real (70 input tokens) because a budgeted run refuses a call that reports
+/// none, and every money/token assertion here needs a figure to count.
+pub async fn decision_gateway(choice: &str) -> (Gateway, DecisionLog) {
+    let calls: DecisionLog = Arc::new(Mutex::new(Vec::new()));
+    let adapters = AdapterRegistry::new();
+    adapters
+        .register_decision(Arc::new(RecordingDecisionAdapter {
+            calls: calls.clone(),
+            choice: choice.to_string(),
+            confidence: 0.9,
+            usage: Some(TokenUsage {
+                input_tokens: 70,
+                output_tokens: 0,
+                total_tokens: 70,
+            }),
+        }))
+        .await;
+    let cb = CircuitBreakerManager::new(CircuitBreakerConfig::default());
+    (
+        Gateway::new(single_decision_chain_config(), adapters, cb),
+        calls,
+    )
+}
+
+/// The decision twin of [`single_chain_config`]: one router, one decision model, one
+/// `Decision` chain. Inert for every chat fixture — nothing resolves chain `"decide"`
+/// except a [`DecisionPlannerSelector`](crate::DecisionPlannerSelector).
+fn single_decision_chain_config() -> GatewayConfig {
+    let mut routers = HashMap::new();
+    routers.insert(
+        "d".to_string(),
+        RouterConfig {
+            url: "http://localhost".to_string(),
+            api_key_env: None,
+            api_key: None,
+            enabled: true,
+            timeout_ms: None,
+            headers: HashMap::new(),
+        },
+    );
+
+    let mut models = HashMap::new();
+    models.insert(
+        "md".to_string(),
+        ModelConfig {
+            id: "md".to_string(),
+            api_model_id: None,
+            provider: "d".to_string(),
+            family: None,
+            capabilities: vec![Capability::Decision],
+            context_window: FIXTURE_CONTEXT_WINDOW,
+            max_output_tokens: FIXTURE_MAX_OUTPUT_TOKENS,
+            pricing: None,
+            catalog: None,
+        },
+    );
+
+    let mut chains = HashMap::new();
+    chains.insert(
+        "decide".to_string(),
+        FallbackChainConfig {
+            id: "decide".to_string(),
+            capability: Capability::Decision,
+            models: vec![ChainEntry {
+                model: "md".to_string(),
+                router: Some("d".to_string()),
+                api_model_id: None,
+                priority: 1,
+            }],
+            fallback_triggers: Vec::new(),
+        },
+    );
+
+    GatewayConfig {
+        routers,
+        models,
+        chains,
+        constraints: Default::default(),
+        panels: Default::default(),
+        consensus: Default::default(),
+    }
 }
 
 /// Chat adapter that behaves like [`RecordingAdapter`] (records + always succeeds)
