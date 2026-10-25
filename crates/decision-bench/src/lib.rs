@@ -1,10 +1,13 @@
 pub mod case;
+pub mod category;
 pub mod check;
 pub mod config;
+pub mod corpus;
 pub mod fetch;
 pub mod load;
 pub mod metrics;
 pub mod rank;
+pub mod ranking;
 pub mod report;
 pub mod run;
 pub mod scenarios;

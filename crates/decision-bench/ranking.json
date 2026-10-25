@@ -1,0 +1,188 @@
+{
+  "schema": 1,
+  "generated_at": 1792879208,
+  "corpus": {
+    "lock": "corpus.lock.json",
+    "sha256": "d7dbb5ba6621f2a9a4133ee7b5649e0d74fba282de3fb0ae00da6615ecd4fcf7",
+    "seed": 2026
+  },
+  "roster": [
+    {
+      "id": "nimble",
+      "router": "ollama",
+      "api_model_id": "nimble",
+      "context_window": 8194
+    },
+    {
+      "id": "strands-decider",
+      "router": "ollama",
+      "api_model_id": "strands-decider",
+      "context_window": 4096
+    },
+    {
+      "id": "tev1",
+      "router": "ollama",
+      "api_model_id": "tev1:0.8b",
+      "context_window": 2048
+    },
+    {
+      "id": "laya-ollama",
+      "router": "ollama",
+      "api_model_id": "laya",
+      "context_window": 512
+    }
+  ],
+  "categories": {
+    "entailment.check": {
+      "verdict": "unranked",
+      "ranked": [],
+      "evidence": [],
+      "shared_cases": 0
+    },
+    "gate.fix_check": {
+      "verdict": "unranked",
+      "ranked": [],
+      "evidence": [],
+      "shared_cases": 0
+    },
+    "gate.review_finding": {
+      "verdict": "unranked",
+      "ranked": [],
+      "evidence": [],
+      "shared_cases": 0
+    },
+    "gate.test_output": {
+      "verdict": "unranked",
+      "ranked": [],
+      "evidence": [],
+      "shared_cases": 0
+    },
+    "intent.route": {
+      "verdict": "unranked",
+      "ranked": [],
+      "evidence": [],
+      "shared_cases": 0
+    },
+    "planner.select": {
+      "verdict": "tie",
+      "proxy": "tool.route",
+      "ranked": [
+        {
+          "model": "nimble",
+          "accuracy": 0.95,
+          "ci": [
+            0.92,
+            0.98
+          ],
+          "ece": 0.03176946693351152,
+          "confident_wrong": 0.03,
+          "coverage": 1.0,
+          "p50_ms": 558
+        },
+        {
+          "model": "strands-decider",
+          "accuracy": 0.945,
+          "ci": [
+            0.91,
+            0.975
+          ],
+          "ece": 0.028448576505276886,
+          "confident_wrong": 0.015,
+          "coverage": 1.0,
+          "p50_ms": 48
+        },
+        {
+          "model": "tev1",
+          "accuracy": 0.93,
+          "ci": [
+            0.89,
+            0.965
+          ],
+          "ece": 0.045344424856990515,
+          "confident_wrong": 0.015,
+          "coverage": 1.0,
+          "p50_ms": 41
+        },
+        {
+          "model": "laya-ollama",
+          "accuracy": 0.865,
+          "ci": [
+            0.815,
+            0.915
+          ],
+          "ece": 0.06406193528503532,
+          "confident_wrong": 0.055,
+          "coverage": 1.0,
+          "p50_ms": 15
+        }
+      ],
+      "evidence": [
+        "s1b"
+      ],
+      "shared_cases": 200
+    },
+    "tool.route": {
+      "verdict": "tie",
+      "ranked": [
+        {
+          "model": "nimble",
+          "accuracy": 0.95,
+          "ci": [
+            0.92,
+            0.98
+          ],
+          "ece": 0.03176946693351152,
+          "confident_wrong": 0.03,
+          "coverage": 1.0,
+          "p50_ms": 558
+        },
+        {
+          "model": "strands-decider",
+          "accuracy": 0.945,
+          "ci": [
+            0.91,
+            0.975
+          ],
+          "ece": 0.028448576505276886,
+          "confident_wrong": 0.015,
+          "coverage": 1.0,
+          "p50_ms": 48
+        },
+        {
+          "model": "tev1",
+          "accuracy": 0.93,
+          "ci": [
+            0.89,
+            0.965
+          ],
+          "ece": 0.045344424856990515,
+          "confident_wrong": 0.015,
+          "coverage": 1.0,
+          "p50_ms": 41
+        },
+        {
+          "model": "laya-ollama",
+          "accuracy": 0.865,
+          "ci": [
+            0.815,
+            0.915
+          ],
+          "ece": 0.06406193528503532,
+          "confident_wrong": 0.055,
+          "coverage": 1.0,
+          "p50_ms": 15
+        }
+      ],
+      "evidence": [
+        "s1b"
+      ],
+      "shared_cases": 200
+    },
+    "triage.score": {
+      "verdict": "unranked",
+      "ranked": [],
+      "evidence": [],
+      "shared_cases": 0
+    }
+  }
+}

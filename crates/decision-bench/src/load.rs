@@ -25,8 +25,9 @@ pub struct Loaded {
 }
 
 /// `--scenarios` names: `s1a`, `s1b`, `s2`, `s3`, `s4` (all three gates),
-/// `s4-test-output`, `s4-review-finding`, `s4-fix-check`, or the serde names
-/// (`s3_entailment`, …). Comma separated; an unknown name is an error.
+/// `s4-test-output`, `s4-review-finding`, `s4-fix-check`, `planner` (or its
+/// category id `planner.select`), or the serde names (`s3_entailment`, …).
+/// Comma separated; an unknown name is an error.
 pub fn parse_scenarios(list: &str) -> anyhow::Result<Vec<Scenario>> {
     use Scenario::*;
     let mut out = Vec::new();
@@ -40,9 +41,10 @@ pub fn parse_scenarios(list: &str) -> anyhow::Result<Vec<Scenario>> {
             "s4-test-output" | "s4_test_output" => &[S4TestOutput],
             "s4-review-finding" | "s4_review_finding" => &[S4ReviewFinding],
             "s4-fix-check" | "s4_fix_check" => &[S4FixCheck],
+            "planner" | "planner.select" | "planner_select" => &[PlannerSelect],
             other => bail!(
                 "unknown scenario '{other}' (expected s1a, s1b, s2, s3, s4, s4-test-output, \
-                 s4-review-finding or s4-fix-check)"
+                 s4-review-finding, s4-fix-check or planner)"
             ),
         };
         for s in picked {
@@ -92,6 +94,7 @@ pub fn load(cases_dir: &Path, s4_dir: &Path, only: Option<&[Scenario]>) -> anyho
     let keep = |s: Scenario| only.is_none_or(|o| o.contains(&s));
     let mut files = jsonl_files(cases_dir, "")?;
     files.extend(jsonl_files(s4_dir, "s4-")?);
+    files.extend(jsonl_files(s4_dir, "planner-")?);
 
     let mut loaded: Vec<(Scenario, Option<String>, Vec<Case>, bool)> = Vec::new();
     // Case count of each fetched file, by file name, for the manifest check.
@@ -136,7 +139,8 @@ pub fn load(cases_dir: &Path, s4_dir: &Path, only: Option<&[Scenario]>) -> anyho
     if out.cases.is_empty() {
         bail!(
             "no cases to run: {} has no case files for the selected scenarios (run \
-             `decision-bench fetch` first), and {} has no matching s4-*.jsonl",
+             `decision-bench fetch` first), and {} has no matching s4-*.jsonl or \
+             planner-*.jsonl",
             cases_dir.display(),
             s4_dir.display()
         );

@@ -164,6 +164,75 @@ async fn probe(
 /// Slack past the router timeout before the probe is abandoned outright.
 const CUTOFF_GRACE: Duration = Duration::from_secs(2);
 
+/// How long `/api/show` may take. It is a metadata read, not a generation.
+pub const WINDOW_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The context window the **server** will honour for `model`, not the model
+/// card's (Ollama's `num_ctx` default is far below the card, and it refuses
+/// input above it rather than truncating).
+///
+/// Only Ollama is asked; every other router returns `Ok(None)` — a missing
+/// answer, never a guess. An unknown model id, an unreachable server or a
+/// non-2xx answer is an error, so a caller can tell "not probed" from
+/// "probed and absent".
+pub async fn probe_decision_window(cfg: &BenchConfig, model: &str) -> anyhow::Result<Option<u32>> {
+    use anyhow::Context;
+    let m = cfg
+        .models
+        .iter()
+        .find(|m| m.id == model)
+        .ok_or_else(|| anyhow::anyhow!("unknown model '{model}': not in the bench config"))?;
+    if m.router != "ollama" {
+        return Ok(None);
+    }
+    let url = format!("{}/api/show", m.url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(WINDOW_PROBE_TIMEOUT)
+        .build()
+        .context("building the window-probe client")?;
+    let response = client
+        .post(&url)
+        .json(&json!({ "model": m.api_model_id }))
+        .send()
+        .await
+        .with_context(|| format!("probing {url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!("{url} answered {status} for model '{}'", m.api_model_id);
+    }
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .with_context(|| format!("parsing the {url} response"))?;
+    Ok(window_from_show(&body))
+}
+
+/// `parameters`' `num_ctx` (the runtime value Ollama actually enforces), else
+/// the architecture's `*.context_length` from `model_info`.
+fn window_from_show(body: &serde_json::Value) -> Option<u32> {
+    if let Some(text) = body.get("parameters").and_then(serde_json::Value::as_str) {
+        for line in text.lines() {
+            let mut words = line.split_whitespace();
+            if words.next() == Some("num_ctx")
+                && let Some(n) = words.next().and_then(|v| v.parse().ok())
+            {
+                return Some(n);
+            }
+        }
+    }
+    let info = body.get("model_info")?.as_object()?;
+    if let Some(n) = info.get("general.context_length").and_then(|v| v.as_u64()) {
+        return u32::try_from(n).ok();
+    }
+    // `qwen2.context_length`, `llama.context_length`, …: take the largest, so a
+    // hypothetical per-layer value cannot shadow the model's own.
+    info.iter()
+        .filter(|(k, _)| k.ends_with(".context_length"))
+        .filter_map(|(_, v)| v.as_u64())
+        .max()
+        .and_then(|n| u32::try_from(n).ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,5 +496,84 @@ mod tests {
         assert!(not_run_reason(&got[0]).contains("empty URL"), "{got:?}");
         assert_eq!(got[1].status, CheckStatus::Reachable);
         assert!(not_run_reason(&got[2]).contains("not in the bench config"));
+    }
+
+    fn ollama(id: &str, url: &str) -> ModelSpec {
+        ModelSpec {
+            router: "ollama".into(),
+            ..spec(id, url)
+        }
+    }
+
+    async fn serving_show(body: serde_json::Value) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path("/api/show"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// The runtime `num_ctx` wins over the architecture's card-derived
+    /// `model_info` value — the whole reason to probe.
+    #[tokio::test]
+    async fn the_probed_window_is_num_ctx_not_the_model_cards() {
+        let server = serving_show(json!({
+            "parameters": "num_ctx 8194\ntemperature 0.7",
+            "model_info": { "general.architecture": "qwen2", "qwen2.context_length": 262144 }
+        }))
+        .await;
+        let cfg = BenchConfig {
+            models: vec![ollama("nimble", &server.uri())],
+        };
+        let window = probe_decision_window(&cfg, "nimble").await.unwrap();
+        assert_eq!(window, Some(8194));
+    }
+
+    #[tokio::test]
+    async fn model_info_is_the_fallback_when_parameters_has_no_num_ctx() {
+        let server = serving_show(json!({
+            "parameters": "temperature 0.7",
+            "model_info": { "llama.context_length": 131072 }
+        }))
+        .await;
+        let cfg = BenchConfig {
+            models: vec![ollama("laya", &server.uri())],
+        };
+        assert_eq!(
+            probe_decision_window(&cfg, "laya").await.unwrap(),
+            Some(131072)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_ollama_router_is_not_probed_and_an_unknown_model_is_an_error() {
+        let cfg = BenchConfig {
+            models: vec![spec("llamacpp-model", "http://127.0.0.1:9")],
+        };
+        assert_eq!(
+            probe_decision_window(&cfg, "llamacpp-model").await.unwrap(),
+            None,
+            "only Ollama publishes a server-side window"
+        );
+        assert!(probe_decision_window(&cfg, "ghost").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_error_response_is_an_error_not_a_silent_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("model not found"))
+            .mount(&server)
+            .await;
+        let cfg = BenchConfig {
+            models: vec![ollama("missing", &server.uri())],
+        };
+        let err = format!(
+            "{:#}",
+            probe_decision_window(&cfg, "missing").await.unwrap_err()
+        );
+        assert!(err.contains("404"), "{err}");
     }
 }
