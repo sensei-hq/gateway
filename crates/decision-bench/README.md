@@ -82,12 +82,14 @@ command works from anywhere.
 | Command | What it does | Flags (defaults) |
 |---|---|---|
 | `check` | Probes every selected model with one tiny decision. A model that does not answer, or that no input fits its context window, is **NOT RUN**; `check` still exits 0. | `--config <path>`, `--models <a,b>` |
-| `fetch` | Downloads the public datasets and builds the seeded S1a/S1b/S2/S3 case files plus `manifest.json`. | `--per-scenario <n>` (200), `--seed <n>` (2026), `--out <dir>` (`cases`), `--cache-dir <dir>` (user cache dir, `decision-bench/`) |
-| `run` | Runs `check`, then every reachable model over the cases, sequentially after one warm-up call per model. Rewrites the results file atomically after each model. | `--config`, `--models`, `--cases <dir>` (`cases`), `--scenarios <list>` (all found), `--out <file>` (`results.json`) |
+| `fetch` | Downloads the public datasets and builds the seeded S1a/S1b/S2/S3 case files plus `manifest.json`. Writes the corpus lock when it is absent and refuses to replace a lock it disagrees with. | `--per-scenario <n>` (200), `--seed <n>` (2026), `--out <dir>` (`cases`), `--cache-dir <dir>` (user cache dir, `decision-bench/`), `--corpus-lock <file>` (`corpus.lock.json`), `--rewrite-lock` |
+| `run` | Runs `check`, then every reachable model over the cases, sequentially after one warm-up call per model. Rewrites the results file atomically after each model. Refuses cases that disagree with the corpus lock. | `--config`, `--models`, `--cases <dir>` (`cases`), `--scenarios <list>` (all found), `--out <file>` (`results.json`), `--corpus-lock <file>` (`corpus.lock.json`) |
 | `report` | Renders the Markdown ranking report from a results file. | `--results <file>` (`results.json`), `--out <file>` (`report.md`), `--seed <n>` (the manifest's sampling seed, else 2026) |
+| `rank` | Writes `ranking.json`, the machine-readable ranking (see below). Byte-identical on a re-run for the same results and seed. | `--results <file>` (`results.json`), `--out <file>` (`ranking.json`), `--seed <n>`, `--corpus-lock <file>` (`corpus.lock.json`) |
 
 `--scenarios` takes a comma-separated list of `s1a`, `s1b`, `s2`, `s3`, `s4` (every S4 gate),
-`s4-test-output`, `s4-review-finding`, `s4-fix-check`. `--models` takes model ids from the
+`s4-test-output`, `s4-review-finding`, `s4-fix-check`, `planner` (the hand-curated
+`planner.select` cases). `--models` takes model ids from the
 config. The report ends with a **Reproduce** section whose commands replay the run, quoted
 so they can be pasted into a shell.
 
@@ -98,6 +100,7 @@ cargo run --release -p decision-bench -- check
 cargo run --release -p decision-bench -- fetch --per-scenario 40 --seed 2026
 cargo run --release -p decision-bench -- run
 cargo run --release -p decision-bench -- report
+cargo run --release -p decision-bench -- rank
 ```
 
 ## Where things live
@@ -108,8 +111,13 @@ cargo run --release -p decision-bench -- report
   plus that directory's `meta.json`, outside the repo (`--cache-dir` replaces
   `<user cache dir>/decision-bench`). `fetch` records the hub revision sha and refuses to reuse
   a cache built from a different one.
-- **Results**: `crates/decision-bench/results.json`; **report**: `report.md` by default.
+- **Results**: `crates/decision-bench/results.json`; **report**: `report.md` by default;
+  **artifact**: `ranking.json`.
 - **S4 cases**: `crates/decision-bench/scenarios/s4-*.jsonl`, hand-curated and committed.
+- **Planner cases**: `crates/decision-bench/scenarios/planner-select.jsonl`, committed. Their
+  labels are synthetic and unreviewed (the header says so), so read a `planner.select`
+  ranking as a smoke test, not a measurement of planner quality.
+- **Corpus lock**: `crates/decision-bench/corpus.lock.json`, committed.
 
 Every subdirectory of `crates/decision-bench/` except `src/`, `tests/` and `scenarios/` is
 gitignored (`crates/decision-bench/*/` with `!` exceptions in the root `.gitignore`), so fetched
@@ -141,6 +149,40 @@ present), `paths` (`config`, `cases`, `results`, `report`) and `rows`. One row p
 - `latency_ms`.
 - `reached_server`: see "Rows that never reached the server" below.
 - `detail`: the reason for `not_applicable` / `error`, URL-redacted and clipped to 300 chars.
+
+### `ranking.json`
+
+`rank` turns a results file into the artifact a gateway or torii seeds from. It is a pure
+function of `results.json` + `--seed`, so a re-run over the same inputs is byte-identical
+(`generated_at` is the run's, not the render's).
+
+Top level: `schema` (1), `generated_at`, `corpus` (`lock`, `sha256`, `seed`), `roster` (the
+probed windows, so a consumer can check fit) and `categories`, keyed by category id:
+`intent.route`, `tool.route`, `triage.score`, `entailment.check`, `gate.test_output`,
+`gate.review_finding`, `gate.fix_check`, `planner.select`.
+
+Each category has `verdict` (`winner` | `tie` | `insufficient` | `unranked`), `proxy`, `order`,
+`ranked` (`model`, `accuracy`, `ci`, `ece`, `confident_wrong`, `coverage`, `p50_ms`), `evidence`
+(scenario ids) and `shared_cases`.
+
+The rules a consumer must keep:
+
+- **`order` is present only for a `winner`.** A `tie` is a set; `insufficient` and `unranked`
+  have no ranking at all. Never read `ranked`'s order as a recommendation.
+- `proxy` names the stand-in when a category has no rows of its own. While `planner.select`
+  has none, it is measured through `tool.route` and says `"proxy": "tool.route"`; a proxy is
+  never passed off as a planner measurement.
+- `coverage` is the model's own (not the head-to-head subset's), so a fit check sees what the
+  model actually answered.
+- A category with no rows is `unranked` — never "the first model alphabetically".
+
+### The corpus lock
+
+`corpus.lock.json` records the dataset revisions, row hashes, sampling seed and per-file case
+counts the cases were built from, because `cases/` is gitignored and a ranking that names no
+corpus cannot be rebuilt. `fetch` writes it when absent and errors if the fetched corpus
+disagrees (`--rewrite-lock` is the deliberate override); `run` errors if the cases on disk
+disagree with it. `rank` names the lock in `corpus.lock` and `corpus.sha256`.
 
 ## Datasets
 

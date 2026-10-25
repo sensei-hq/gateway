@@ -5,8 +5,10 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use decision_bench::check::{CheckResult, CheckStatus, check};
 use decision_bench::config::{BenchConfig, resolve_under};
+use decision_bench::corpus::{CorpusLock, verify};
 use decision_bench::fetch::{Hf, default_cache_root};
 use decision_bench::load::{load, parse_scenarios};
+use decision_bench::ranking::{self, CorpusRef, RankingArtifact};
 use decision_bench::report::{cli_name, render};
 use decision_bench::run::{NotRun, Results, RosterEntry, RunPaths, run_saving};
 use decision_bench::scenarios::{FetchOptions, fetch_cases};
@@ -48,6 +50,12 @@ enum Command {
         /// see below).
         #[arg(long)]
         cache_dir: Option<PathBuf>,
+        /// Committed corpus lock, written when absent.
+        #[arg(long, default_value = DEFAULT_LOCK)]
+        corpus_lock: PathBuf,
+        /// Overwrite the lock when it disagrees with the fetched corpus.
+        #[arg(long)]
+        rewrite_lock: bool,
     },
     /// Run the benchmark: `check`, then every reachable model over the cases,
     /// rewriting the results file after each model.
@@ -65,6 +73,9 @@ enum Command {
         /// Results file, rewritten atomically after each model.
         #[arg(long, default_value = "results.json")]
         out: PathBuf,
+        /// Committed corpus lock the cases must match.
+        #[arg(long, default_value = DEFAULT_LOCK)]
+        corpus_lock: PathBuf,
     },
     /// Render the per-scenario ranking report from a results file.
     #[command(after_long_help = REPORT_NOTE)]
@@ -78,7 +89,25 @@ enum Command {
         #[arg(long)]
         seed: Option<u64>,
     },
+    /// Write `ranking.json` — the machine-readable ranking torii seeds from.
+    #[command(after_long_help = RANK_NOTE)]
+    Rank {
+        #[arg(long, default_value = "results.json")]
+        results: PathBuf,
+        #[arg(long, default_value = "ranking.json")]
+        out: PathBuf,
+        /// Bootstrap seed for the CIs (default: the manifest's sampling seed,
+        /// else 2026).
+        #[arg(long)]
+        seed: Option<u64>,
+        /// Corpus lock the results were measured on; named in the artifact.
+        #[arg(long, default_value = DEFAULT_LOCK)]
+        corpus_lock: PathBuf,
+    },
 }
+
+/// The committed corpus lock, relative to the crate directory.
+const DEFAULT_LOCK: &str = "corpus.lock.json";
 
 /// Which config, and which of its models.
 #[derive(clap::Args, Debug, Clone, PartialEq)]
@@ -127,6 +156,15 @@ const REPORT_NOTE: &str = concat!(
      --out ../../docs/benchmarks/<date>-system-one-local.md (or an absolute path)."
 );
 
+/// Path anchoring for `rank`.
+const RANK_NOTE: &str = concat!(
+    "Paths: relative --results, --out and --corpus-lock paths resolve under the \
+     decision-bench crate directory, ",
+    env!("CARGO_MANIFEST_DIR"),
+    ", not the current directory. The artifact is byte-identical on a re-run for the same \
+     results and --seed; its `generated_at` is the run's, not the render's."
+);
+
 /// `p` if absolute, else `p` under the crate directory (see [`PATH_NOTE`]).
 fn resolve(p: &Path) -> PathBuf {
     if p.is_absolute() {
@@ -141,6 +179,8 @@ async fn fetch(
     seed: u64,
     out: PathBuf,
     cache_dir: Option<PathBuf>,
+    corpus_lock: PathBuf,
+    rewrite_lock: bool,
 ) -> anyhow::Result<()> {
     let cache_root = match cache_dir {
         Some(d) => resolve(&d),
@@ -176,6 +216,28 @@ async fn fetch(
         manifest.rand_version,
         cache_root.display()
     );
+    write_lock(&manifest, &resolve(&corpus_lock), rewrite_lock)
+}
+
+/// Write the corpus lock, refusing to replace one that disagrees unless
+/// `rewrite`: a fetch that silently moved the corpus would invalidate every
+/// ranking built from it.
+fn write_lock(
+    manifest: &decision_bench::scenarios::Manifest,
+    path: &Path,
+    rewrite: bool,
+) -> anyhow::Result<()> {
+    if path.exists() && !rewrite {
+        let lock = CorpusLock::read(path)?;
+        verify(manifest, &lock, path)?;
+        eprintln!(
+            "decision-bench: corpus unchanged; {} left as is",
+            path.display()
+        );
+        return Ok(());
+    }
+    CorpusLock::write(path, manifest)?;
+    eprintln!("decision-bench: wrote corpus lock {}", path.display());
     Ok(())
 }
 
@@ -276,6 +338,7 @@ async fn run_command(
     cases: &Path,
     scenarios: Option<&str>,
     out: &Path,
+    corpus_lock: &Path,
     crate_dir: &Path,
 ) -> anyhow::Result<Results> {
     let (cfg, ids, config_path) = load_config(select, crate_dir)?;
@@ -285,11 +348,24 @@ async fn run_command(
     for s in &loaded.missing {
         eprintln!("decision-bench: no cases for {}; skipped", cli_name(*s));
     }
-    if loaded.manifest.is_none() {
-        eprintln!(
+    let lock_path = resolve_under(corpus_lock, crate_dir);
+    match (&loaded.manifest, lock_path.exists()) {
+        (Some(manifest), true) => {
+            verify(manifest, &CorpusLock::read(&lock_path)?, &lock_path)?;
+        }
+        (None, true) => eprintln!(
+            "decision-bench: no manifest.json in {}; cannot check it against {}",
+            cases_dir.display(),
+            lock_path.display()
+        ),
+        (Some(_), false) => eprintln!(
+            "decision-bench: no corpus lock at {}; this run cannot be pinned to a corpus",
+            lock_path.display()
+        ),
+        (None, false) => eprintln!(
             "decision-bench: no manifest.json in {}; the report will not name dataset revisions",
             cases_dir.display()
-        );
+        ),
     }
     let checked = check(&cfg, &ids).await;
     eprint!("{}", check_table(&cfg, &checked));
@@ -365,6 +441,38 @@ fn report_command(
     Ok(out)
 }
 
+/// `rank`: build the artifact from `results`, naming `corpus_lock`.
+fn rank_command(
+    results: &Path,
+    out: &Path,
+    seed: Option<u64>,
+    corpus_lock: &Path,
+    crate_dir: &Path,
+) -> anyhow::Result<RankingArtifact> {
+    let path = resolve_under(results, crate_dir);
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading results {}", path.display()))?;
+    let results: Results =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    let seed = seed
+        .or(results.manifest.as_ref().map(|m| m.seed))
+        .unwrap_or(DEFAULT_SEED);
+    let lock_path = resolve_under(corpus_lock, crate_dir);
+    let lock = lock_path.exists().then_some(lock_path.as_path());
+    if lock.is_none() {
+        eprintln!(
+            "decision-bench: no corpus lock at {}; the artifact names no corpus",
+            lock_path.display()
+        );
+    }
+    let artifact = ranking::build(&results, CorpusRef::from_lock(lock, crate_dir, seed));
+    let out = resolve_under(out, crate_dir);
+    decision_bench::fetch::write_atomic(&out, artifact.to_json().as_bytes())
+        .with_context(|| format!("writing {}", out.display()))?;
+    eprintln!("decision-bench: wrote {}", out.display());
+    Ok(artifact)
+}
+
 /// The bootstrap seed when neither `--seed` nor a manifest gives one.
 const DEFAULT_SEED: u64 = 2026;
 
@@ -377,7 +485,19 @@ async fn main() -> anyhow::Result<()> {
             seed,
             out,
             cache_dir,
-        } => fetch(per_scenario, seed, out, cache_dir).await,
+            corpus_lock,
+            rewrite_lock,
+        } => {
+            fetch(
+                per_scenario,
+                seed,
+                out,
+                cache_dir,
+                corpus_lock,
+                rewrite_lock,
+            )
+            .await
+        }
         // NOT RUN models are a result, not a failure: exit 0.
         Command::Check { select } => check_command(&select, crate_dir).await.map(|_| ()),
         Command::Run {
@@ -385,12 +505,26 @@ async fn main() -> anyhow::Result<()> {
             cases,
             scenarios,
             out,
-        } => run_command(&select, &cases, scenarios.as_deref(), &out, crate_dir)
-            .await
-            .map(|_| ()),
+            corpus_lock,
+        } => run_command(
+            &select,
+            &cases,
+            scenarios.as_deref(),
+            &out,
+            &corpus_lock,
+            crate_dir,
+        )
+        .await
+        .map(|_| ()),
         Command::Report { results, out, seed } => {
             report_command(&results, &out, seed, crate_dir).map(|_| ())
         }
+        Command::Rank {
+            results,
+            out,
+            seed,
+            corpus_lock,
+        } => rank_command(&results, &out, seed, &corpus_lock, crate_dir).map(|_| ()),
     }
 }
 
@@ -508,6 +642,7 @@ mod tests {
             cases,
             scenarios,
             out,
+            corpus_lock,
         } = Cli::parse_from(["decision-bench", "run"]).command
         else {
             panic!("not run")
@@ -521,6 +656,7 @@ mod tests {
         );
         assert_eq!(resolve(&cases), Path::new(CRATE).join("cases"));
         assert_eq!(resolve(&out), Path::new(CRATE).join("results.json"));
+        assert_eq!(resolve(&corpus_lock), Path::new(CRATE).join(DEFAULT_LOCK));
         assert_eq!(scenarios, None);
         let Command::Report { results, out, seed } =
             Cli::parse_from(["decision-bench", "report"]).command
@@ -678,6 +814,7 @@ mod tests {
             Path::new("cases"),
             None,
             Path::new("results.json"),
+            Path::new(DEFAULT_LOCK),
             dir.path(),
         )
         .await
@@ -712,6 +849,7 @@ mod tests {
             Path::new("cases"),
             Some("s4"),
             Path::new("s4.json"),
+            Path::new(DEFAULT_LOCK),
             dir.path(),
         )
         .await
@@ -783,6 +921,7 @@ mod tests {
             Path::new("cases"),
             Some("s3"),
             Path::new("results.json"),
+            Path::new(DEFAULT_LOCK),
             dir.path(),
         )
         .await
@@ -795,6 +934,44 @@ mod tests {
             results.not_run
         );
         assert_eq!(results.completed, ["good"]);
+    }
+
+    /// The lock is enforced before any network call: a run whose cases came
+    /// from a different corpus must not produce a ranking that claims otherwise.
+    #[tokio::test]
+    async fn a_run_refuses_cases_that_disagree_with_the_corpus_lock() {
+        let dir = crate_dir(&[spec("down", "http://127.0.0.1:9")]);
+        // The cases' manifest says seed 2026; the lock says 7.
+        let other = decision_bench::scenarios::Manifest {
+            seed: 7,
+            per_scenario: 3,
+            rand_version: "0.8.5".into(),
+            datasets: vec![],
+            files: vec![],
+        };
+        CorpusLock::write(&dir.path().join(DEFAULT_LOCK), &other).unwrap();
+        let err = run_command(
+            &Select {
+                config: None,
+                models: None,
+            },
+            Path::new("cases"),
+            Some("s3"),
+            Path::new("results.json"),
+            Path::new(DEFAULT_LOCK),
+            dir.path(),
+        )
+        .await
+        .unwrap_err();
+        let err = format!("{:#}", err);
+        assert!(
+            err.contains("sampling seed") && err.contains("--rewrite-lock"),
+            "{err}"
+        );
+        assert!(
+            !dir.path().join("results.json").exists(),
+            "nothing was run, so nothing was written"
+        );
     }
 
     #[tokio::test]

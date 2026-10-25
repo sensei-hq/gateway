@@ -37,6 +37,9 @@ pub enum Scenario {
     S4TestOutput,
     S4ReviewFinding,
     S4FixCheck,
+    /// Which planner agent runs for a goal (`PlannerRef::Select`). Hand-curated,
+    /// not sampled from a public dataset.
+    PlannerSelect,
 }
 
 impl Scenario {
@@ -50,8 +53,21 @@ impl Scenario {
             Scenario::S4TestOutput => 5,
             Scenario::S4ReviewFinding => 6,
             Scenario::S4FixCheck => 7,
+            Scenario::PlannerSelect => 8,
         }
     }
+
+    /// Every variant, in tag order.
+    pub const ALL: [Scenario; 8] = [
+        Scenario::S1aIntentOos,
+        Scenario::S1bBanking77,
+        Scenario::S2Sentiment,
+        Scenario::S3Entailment,
+        Scenario::S4TestOutput,
+        Scenario::S4ReviewFinding,
+        Scenario::S4FixCheck,
+        Scenario::PlannerSelect,
+    ];
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -430,6 +446,7 @@ mod tests {
             (Scenario::S4TestOutput, 5, "s4_test_output"),
             (Scenario::S4ReviewFinding, 6, "s4_review_finding"),
             (Scenario::S4FixCheck, 7, "s4_fix_check"),
+            (Scenario::PlannerSelect, 8, "planner_select"),
         ];
         for (sc, tag, name) in table {
             assert_eq!(sc.tag(), tag, "{name}");

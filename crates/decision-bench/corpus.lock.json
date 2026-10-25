@@ -1,0 +1,70 @@
+{
+  "datasets": [
+    {
+      "config": "plus",
+      "id": "clinc/clinc_oos",
+      "license": "cc-by-3.0",
+      "num_rows": 5500,
+      "rows_sha256": "b514ec6da101cb8a5beaa5ef036a018d4a5a9d08ea761b3c984bae3c4eb967f4",
+      "sha": "155b9c710419136e17307b80d0a13e68cd46b4ec",
+      "split": "test"
+    },
+    {
+      "config": "default",
+      "id": "legacy-datasets/banking77",
+      "license": "cc-by-4.0",
+      "num_rows": 3080,
+      "rows_sha256": "39452c50042155115792548a48604d3d9bf8a21da8bcc6385be3d81da94b1edc",
+      "sha": "f54121560de48f2852f90be299010d1d6dc612ec",
+      "split": "test"
+    },
+    {
+      "config": "default",
+      "id": "Sp1786/multiclass-sentiment-analysis-dataset",
+      "license": "apache-2.0",
+      "num_rows": 5206,
+      "rows_sha256": "f62682c5c7eb95ee042140776c6b0a79997447b055b1851bc76416fc7fc00253",
+      "sha": "a7ede749d4b3e7ef516603cad80bd6b39b0a1fca",
+      "split": "test"
+    },
+    {
+      "config": "plain_text",
+      "id": "stanfordnlp/snli",
+      "license": "cc-by-sa-4.0",
+      "num_rows": 10000,
+      "rows_sha256": "ed6d975701a7ab3cd88d39f3efe70f78578a1d81a97ca44dd75b2ad93df9a312",
+      "sha": "cdb5c3d5eed6ead6e5a341c8e56e669bb666725b",
+      "split": "test"
+    }
+  ],
+  "files": [
+    {
+      "cases": 200,
+      "dataset": "clinc/clinc_oos",
+      "file": "s1a.jsonl",
+      "scenario": "s1a_intent_oos"
+    },
+    {
+      "cases": 200,
+      "dataset": "legacy-datasets/banking77",
+      "file": "s1b.jsonl",
+      "scenario": "s1b_banking77"
+    },
+    {
+      "cases": 200,
+      "dataset": "Sp1786/multiclass-sentiment-analysis-dataset",
+      "file": "s2.jsonl",
+      "scenario": "s2_sentiment"
+    },
+    {
+      "cases": 200,
+      "dataset": "stanfordnlp/snli",
+      "file": "s3.jsonl",
+      "scenario": "s3_entailment"
+    }
+  ],
+  "per_scenario": 200,
+  "rand_version": "0.8.7",
+  "schema": 1,
+  "seed": 2026
+}

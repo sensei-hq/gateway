@@ -63,6 +63,7 @@ pub fn code(s: Scenario) -> &'static str {
         Scenario::S4TestOutput => "S4 test-output",
         Scenario::S4ReviewFinding => "S4 review-finding",
         Scenario::S4FixCheck => "S4 fix-check",
+        Scenario::PlannerSelect => "Planner select",
     }
 }
 
@@ -76,6 +77,7 @@ pub fn cli_name(s: Scenario) -> &'static str {
         Scenario::S4TestOutput => "s4-test-output",
         Scenario::S4ReviewFinding => "s4-review-finding",
         Scenario::S4FixCheck => "s4-fix-check",
+        Scenario::PlannerSelect => "planner",
     }
 }
 
@@ -88,6 +90,7 @@ fn describe(s: Scenario) -> &'static str {
         Scenario::S4TestOutput => "test output → continue / fix_code / retry / fix_environment",
         Scenario::S4ReviewFinding => "review finding → block / follow_up / dismiss",
         Scenario::S4FixCheck => "does the change fix the finding? (yes / no)",
+        Scenario::PlannerSelect => "which planner agent runs for this goal? (choice)",
     }
 }
 

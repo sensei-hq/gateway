@@ -155,6 +155,13 @@ same first-match-wins grammar as `order`; there is no second ordering implementa
 
 ## 5. Phase 1 — the corpus and the ranking artifact (this repo)
 
+**Landed.** `crates/decision-bench/src/category.rs` holds the taxonomy; `ranking.rs` builds
+`ranking.json`; `corpus.rs` reads/writes/verifies `corpus.lock.json`; `main.rs` gains `rank` and
+`--corpus-lock`/`--rewrite-lock`; `check::probe_decision_window` reads Ollama's `num_ctx`. The
+committed corpus lock and a `ranking.json` built from `results-ollama.json` are in the crate.
+`scenarios/planner-select.jsonl` has 60 cases — **synthetic, unreviewed labels** (the header says
+so), so a `planner.select` ranking is still labelled evidence, not a planner measurement.
+
 The gateway measures; it does not decide. Today the measurement stops at a Markdown report and a
 gitignored `results.json`.
 
@@ -183,6 +190,12 @@ cases under `crates/decision-bench/scenarios/planner-*.jsonl`, with the same `la
 header discipline as S4. Until they exist, torii must stand on `tool.route` as a **labelled proxy**
 in the ranking artifact; it must not be passed off as a planner measurement.
 
+60 cases are committed (`planner-select.jsonl`, 12 planner areas). Their labels are generated from
+the goal's `signals.area`, not reviewed: the header carries `labels_reviewed_by: null` and says
+SYNTHETIC, and `tests/planner_files.rs` fails if that changes. A `planner.select` ranking is
+therefore a smoke test until a human reviews the labels; the `tool.route` proxy is recorded with
+`proxy` so a consumer can tell the difference.
+
 ### 5.3 A pinned corpus
 
 `fetch` records each dataset's revision sha and rows sha256 but writes only gitignored directories, so
@@ -204,6 +217,7 @@ field names:
     "planner.select": {
       "verdict": "tie",                       // winner | tie | insufficient | unranked
       "proxy": null,                           // set to "tool.route" when the evidence is a stand-in
+      "order": null,                           // non-null ONLY for a winner
       "ranked": [
         { "model": "strands-decider", "accuracy": 0.945, "ci": [0.910, 0.975], "ece": 0.03,
           "confident_wrong": 0.01, "coverage": 1.0, "p50_ms": 48 },
@@ -224,8 +238,13 @@ Rules it must keep (all already implemented in `rank.rs`, now machine-readable):
 - a model under the 50% coverage floor is not ranked, only reported over its own cases;
 - the roster records the **probed** windows, so a consumer can check fit.
 
+**Landed** with one deviation from the sketch: `order` is an explicit field, present only for a
+`winner`. Without it a consumer could read `ranked`'s order — which exists to make the tie
+inspectable — as a recommendation. `ranked` is the measured table; `order` is the instruction.
+
 **AC:** `rank` is deterministic given `results.json` + `--seed` (byte-identical on re-run); each
 verdict branch has a unit test; a `tie` and an `insufficient` category produce no ordering.
+(All three hold, pinned by `ranking::tests`.)
 
 ### 5.5 Surface the effective window on the probe
 
@@ -307,12 +326,26 @@ is rejected with a message naming both.
 
 **Repo:** torii. **Depends on:** Phase 0 (tag) and Phase 1 (artifact).
 
-- `crates/core/src/config.rs`: add `"decision" => Capability::Decision` to `map_capability`; update the
-  doc comment.
-- `database/import/staging/capabilities.jsonl`: add a `decision` capability row, then `dbd
-  reconcile` / `dbd deploy` per `database/README.md` — never a hand-written migration.
-- Catalog: decision model rows (`catalog.models` + `model_capabilities` + `model_endpoints`) and the
-  `decide` chain, with `context_window` from the probed server value.
+**Landed** for the store and the seed path. The dev database is another matter — see the last
+bullet.
+
+- `services/gateway/src/config_loader.rs` (not `crates/core/src/config.rs`, which no longer exists):
+  `"decision" => Capability::Decision` in `map_capability`; doc comment and test updated.
+- `database/import/staging/capabilities.jsonl`: a `decision` capability row, plus provider `Ollama`,
+  the four decider models, their `model_capabilities` and `model_endpoints`, the `decide` chain and
+  its `chain_models`. All seeded through the existing `dbd import` pipeline (staging JSONL + an
+  `import_*` procedure), never a hand-written migration.
+- `model_rankings` also needed its staging mirrors:
+  `staging.model_rankings` (the rows) and `staging.model_ranking_artifacts` (one row per category,
+  so a category that drops to `unranked` can clear its previous rows instead of leaving them
+  behind). `staging.import_model_rankings()` does the seeding.
+- `catalog.model_rankings.verdict` uses `catalog.verdict`, a new enum (`winner`, `tie`,
+  `insufficient`, `unranked`) rather than a text `CHECK`. A table constraint makes the storage
+  rule explicit: `(verdict = 'winner') = (rank is not null)`.
+- `staging.model_capabilities` gained the five columns its committed seed already carried
+  (`is_supported`, `performance_tier`, `verified_at`, `verified_by`, `notes`), which had made
+  `dbd import` fail before any ranking work; the procedure now records the supported/verified
+  fields.
 - **New: the ranking store**, seeded from `ranking.json` and editable:
 
   ```sql
@@ -344,10 +377,36 @@ is rejected with a message naming both.
   still yields its chain rows with `within_margin` NULL and no order; a card-sized window never
   reaches the config.
 
-**AC:** the `decide` chain and its models are in `GatewayConfig` with server-true windows; a category's
-ranking is readable with its revision and provenance; and `v_ranked_chain(tenant, capability, category)`
-returns an ordered, tenant-scoped candidate list — chain rows always present, ordered where a winner
-exists, with `within_margin` NULL and a status row saying why where it does not.
+Seeding is authoritative per category: a row the new artifact no longer carries is deleted unless
+`edited_by` is set; a retained row is updated and its `revision` bumped only when `artifact_sha`
+changed; a hand-edited row is left alone with a `NOTICE`.
+
+**One deviation:** the read is `catalog.ranked_chain(tenant, capability, category)`, a set-returning
+function, not a view, because the resolver has three arguments and a view cannot take them. Call it
+as `select * from catalog.ranked_chain(t, 'decision', 'planner.select')`. EXECUTE is `service_role`
+only, matching `chains_for_tenant`.
+
+**AC:** the `decide` chain and its models are in `GatewayConfig` with server-true windows (waiting
+on the dev DB, below); a category's ranking is readable with its revision and provenance; and
+`ranked_chain` returns an ordered, tenant-scoped candidate list — chain rows always present,
+ordered where a winner exists, with `within_margin` NULL and no order where none does.
+
+**Verification (2026-10-24).** On a scratch `tori_ranking_verify` database with stub `auth.uid()`
+functions, `dbd apply` built all 205 entities and `dbd import` seeded 15 tables, 14 procedures and
+4 after-scripts. Checked there: the seed wrote 8 ranking rows (4 `tool.route`, 4 `planner.select`,
+all `tie`, `rank` NULL); `ranked_chain` returned the four chain steps in sequence with
+the probed windows; with `laya` ranked 1 and `nimble` 2, `ranked_chain` put `laya` (sequence 4)
+first; a `rank` on a `tie` was rejected by the constraint; a re-call with an unchanged artifact
+left revisions at 1, a changed `artifact_sha` bumped the non-edited rows to 2, a hand-edited row
+stayed at 1 with a NOTICE, and a category removed from the artifact lost its non-edited rows.
+The scratch database was dropped afterwards.
+
+**The dev database is stale, and cannot take this seed yet.** `torii` (localhost) has no `catalog`
+schema at all — its `public.documents` predates the current design, so a full `dbd apply` stops at
+`public.documents` ("column `lifecycle` does not exist"), and `dbd reconcile --allow-destructive`
+would drop columns across the whole schema. That is pre-existing, not ranking work: the ranking
+DDL is applied by the next full apply/reconcile of the design, and the seed needs no change when
+it happens. A pre-change dump is at `/tmp/torii-pre-ranking-*.sql`.
 
 ## 8. Phase 4 — composing and passing the filtered ranking
 
