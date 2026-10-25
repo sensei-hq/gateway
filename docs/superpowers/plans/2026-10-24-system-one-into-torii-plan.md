@@ -5,8 +5,9 @@ promoted to Phase 1; **ranking authority moved to torii**, with the gateway taki
 tenant/user-filtered ranking on each decision call).
 **Base:** gateway `develop` (decision seam uncommitted in the working tree), torii `origin/develop` @
 `dddc38e` (the local `~/developer/torii` checkout is 350 commits behind and has no `crates/cli`).
-**Status:** Phases 0–3 landed (gateway `8a3fcc9`, torii `3ba9610`); the ranking store is seeded in
-  the dev database. Phase 4 is next.
+**Status:** Phases 0–3 landed (gateway `8a3fcc9`, torii `3ba9610`), plus Phase 4's data half
+  (torii `af87a5f`): the store is seeded and the margin resolver is live. Phase 4's wiring has no
+  boot target in either checkout — §8.4.
 
 ## 1. Goal
 
@@ -643,6 +644,65 @@ and why.
 **AC:** `torii run submit` on a `PlannerRef::Select` graph completes; the run's trace shows the
 category, the ranking revision and the filtered-out models; run spend includes exactly one decision
 call; no silent fallback to text selection.
+
+### 8.3 Landed: the data half (2026-10-25, torii `af87a5f`)
+
+The resolver and the margin are in. The wiring in §8.2 is **not** — see the blocker below.
+
+- `catalog.ranking_policies` — the margin per (tenant, category), `tenant_id is null` for the
+  platform default, `check (margin between 0 and 1)`, and two partial unique indexes so "one
+  default per category" and "one override per tenant" are both expressible (`null` never equals
+  itself, so a single composite unique index would not have said either). It joins
+  `catalog.chains`/`catalog.tiers` in the privileged RLS class.
+- `catalog.bump_ranking_policy_revision()` (`before update`) bumps `revision` and `modified_at` on a
+  real change **only**. `revision` is in the snapshot cache key, so a spurious bump would invalidate
+  every cached snapshot, and a missing one would let a cached order outlive the margin it was built
+  from.
+- `catalog.ranked_chain` keeps its shape and gains `accuracy`, `ci_half_width`, `measured`, `proxy`,
+  `effective_margin` and `policy_revision`; `within_margin` changed from the Phase 3 placeholder
+  `numeric` to `boolean`. `effective_margin = greatest(configured margin, top model CI half-width)`,
+  and the top model is the category's, not the tenant's — two tenants share one definition of "good"
+  and differ only in which candidates survive.
+- `catalog.ranking_status(tenant, capability, category)` answers *why*, derived from `ranked_chain`
+  so the two cannot disagree: verdict, effective margin and policy revision, chained/measured/
+  admissible counts, provenance, and a reason that separates "no measurement" from "no chain model
+  is within the margin".
+- Index `model_rankings(category, verdict, rank)` for the resolver's access path.
+- `tests/ranking_margin.sql`, seventh file in `tests/run.sh` — M1 shape/domain/uniqueness, M2 the
+  revision rule, M3 a tie claims nothing, M4 the CI floor and order-is-rank, M5 widening admits more
+  and the tenant row beats the default, M6 status agrees with the resolver, M7 `service_role` only.
+  It runs in a transaction and rolls back: the seeded tie is real measured data.
+
+**One-time migration note.** A changed function RETURN type cannot be `create or replace`d; on a
+pre-release DB that already has the Phase 3 signature, `dbd reconcile` fails on it. The dev DB was
+converged with `drop function catalog.ranked_chain(uuid, text, text)` first (nothing depended on it),
+then `dbd reconcile` → `1 created, 1 altered, 76 re-applied`, then `dbd policies`. A fresh database
+needs neither step; `dbd apply` creates them in order. The same will apply to any other DB that
+already carries the Phase 3 signature, and it must name this order.
+
+**Verified on the dev DB (55322).** `reconcile --dry-run` "already in sync", `dbd diff` no
+structural drift, full `tests/run.sh` green. Behaviourally: the seeded tie returns 4 chain rows with
+`within_margin` NULL and `reason = 'verdict tie: there is no order to claim'`; promoted to a winner
+with the default 0.03 and top CI half-width 0.03, `nimble`/`strands-decider`/`tev1:0.8b` are
+admissible and `laya` (0.865) is not, order unchanged; a configured 0.0001 still yields 0.03; 0.09
+admits all four; a no-op update leaves `revision` alone while a real edit bumps it; and a tenant row
+of 0.0 overrides a platform default of 1.0. Pre-change dump:
+`/tmp/torii-55322-pre-phase4-*.dump`.
+
+### 8.4 The §8.2 blocker: there is no boot target in either checkout
+
+§8.2 wires the selector "after `Executor::new(...)`" in `crates/cli/src/boot.rs`. Neither repository
+has that crate at its current tip: torii's workspace members are `apps/desktop/src-tauri`,
+`crates/tools` and `services/gateway`; nobody depends on `sensei-orchestrator`; and `crates/cli`
+appears only in history (`fix(cli): prune …`), not in the tree. The gateway repo has
+`DecisionPlannerSelector` and `Ranking`/`RankingSource` (Phase 2), but no binary to wire them into.
+
+So the remaining wiring has nothing to attach to yet, and inventing a new binary is a larger decision
+than a plan step. What is needed first: a decision on **where the executor lives** (torii's own
+process again, or an `sensei-orchestrator` consumer that torii hosts), and then §8.2's five bullets —
+the ranking being carried by the selector, the resolve-once-per-run snapshot, fail-loud boot, and the
+four tests — land there. Until then nothing reads `ranked_chain`: seeding and the margin change no
+routing decision.
 
 ## 9. Phase 5 — Seiki visibility
 
