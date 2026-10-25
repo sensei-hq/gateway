@@ -723,6 +723,60 @@ routing decision.
 **AC:** an owner sees the `decide` chain, its models' windows, the ranking behind it and can edit it;
 a run's decision call is distinguishable from a chat call.
 
+### 9.1 Landed: the visibility surface (2026-10-25)
+
+Everything an operator can now see and change, plus the one thing that had to change in the data to
+make an edit honest.
+
+- **`catalog.bump_model_ranking_revision()`** (`before update`) bumps `model_rankings.revision` and
+  `modified_at` on a real change only, comparing every measured value, the verdict, the provenance
+  and `edited_by`. Same reason as the policy trigger: `revision` travels in the resolver cache key and
+  the call trace, so a spurious bump discards every cached ordering and a missing one lets a cached
+  order outlive the measurement behind it. A re-import of the same artifact writes identical values
+  and does not bump — verified in both directions (M8).
+- **`GET /v1/rankings?capability=decision`** (capability `model.manage`) — per **category**, the
+  verdict and the server's own reason, the margin in force, chained/measured/admissible counts, the
+  ranking provenance, and the rows (`rank`, model, CI bounds, `within_margin`, per-row revision).
+  Derived from `ranking_status` + `ranked_chain`, the same functions the resolver reads, so the screen
+  cannot describe a different decision than the gateway makes. An unknown capability is a 400, not an
+  empty page that reads as "nothing measured".
+- **`POST /rpc/rankings/set-margin`** (capability `model.manage`) — upserts this tenant's
+  `ranking_policies` row, audits `rankings.margin.set`, and bumps the tenant's `routing` config
+  snapshot. Unknown category → 404 (a policy row nobody reads is config that lies); out-of-domain →
+  400. **The ranks are not editable**, deliberately: a rank is a measurement, and the resolver's
+  `within_margin`, the CI and the provenance all describe the artifact. What a human may decide is
+  how much accuracy a category trades for availability — which is the margin.
+- **Seiki · Rankings** (`apps/admin`) — one card per category: verdict chip, the reason, the rows with
+  CI and margin standing, the margin editor with the **configured** value (never `effective_margin`,
+  which folds in the CI and would lock the floor in as policy), and a note when the CI, not the
+  policy, is what set the effective margin. Provenance footer carries artifact/corpus digests,
+  ranking revision and the measured/chained counts. Pure logic lives in `lib/rankings.ts` with 16
+  unit tests.
+- **`/v1/routing`** now carries each chain's `capability`; the Routing screen labels the chain (the
+  `decide` chain reads `decision`, not "chat like any other").
+- **`/v1/models`** now carries `chains[]`; the Models screen shows an "Enabled by" column, so a
+  decision model's effective window and the chain that enables it are visible in one place.
+  `/v1/models/available` is untouched — still chat-only, same shape.
+- **Ledger** — `metering.requests_ledger_for_tenant` gains `capability` (appended, so the view stays
+  `create or replace`-able) and `/v1/requests` projects it; the Usage screen chips any non-chat row.
+  **Not done:** the per-call ranking revision. Nothing writes a decision call yet (§8.4), so there is
+  no row to carry it — it lands with the executor wiring, not before.
+
+**Verified.** `tests/ranking_margin.sql` M8 (new). Full `tests/run.sh` green, `cargo build`/`test -p
+torii-gateway` 83 passed, `svelte-check` 0 errors, `bun run test` 202 passed, eslint + prettier clean
+on the touched files. Live dev DB (55322): `/v1/rankings` returns both categories with 4 rows each,
+`reason = 'verdict tie: there is no order to claim'`, `policies: []` (built-in 0.03 in force); the
+margin upsert works and the trigger does not bump on an identical rewrite; the `decide` chain reports
+`capability: decision`; `nimble`/`strands-decider`/`tev1:0.8b`/`laya` report `chains: ["decide"]`.
+Gateway restarted (`make gateway-restart`): `/health` 200 and `/v1/rankings` answers 401 without a
+token, i.e. the route is wired behind auth rather than 404. An authenticated render was not exercised
+— that needs a Supabase session in the admin app.
+
+**Formatting note.** `cargo fmt --all` in this checkout reformats ~35 files that were already
+committed unformatted (rag/*, tools/*, desktop, state/store). Those changes were reverted rather than
+committed, so the tree stays reviewable; format a file you touch, not the workspace, until the repo is
+fmt-clean at HEAD.
+
 ## 10. Phase 6 — tenant-facing decisions (only if still wanted)
 
 `POST /v1/decide`, mirroring `/v1/chat`'s governance: auth + `require_*`; model enablement from
