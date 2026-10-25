@@ -5,7 +5,8 @@ promoted to Phase 1; **ranking authority moved to torii**, with the gateway taki
 tenant/user-filtered ranking on each decision call).
 **Base:** gateway `develop` (decision seam uncommitted in the working tree), torii `origin/develop` @
 `dddc38e` (the local `~/developer/torii` checkout is 350 commits behind and has no `crates/cli`).
-**Status:** plan. No torii code has been written.
+**Status:** Phases 0–3 landed (gateway `8a3fcc9`, torii `3ba9610`); the ranking store is seeded in
+  the dev database. Phase 4 is next.
 
 ## 1. Goal
 
@@ -386,8 +387,8 @@ function, not a view, because the resolver has three arguments and a view cannot
 as `select * from catalog.ranked_chain(t, 'decision', 'planner.select')`. EXECUTE is `service_role`
 only, matching `chains_for_tenant`.
 
-**AC:** the `decide` chain and its models are in `GatewayConfig` with server-true windows (waiting
-on the dev DB, below); a category's ranking is readable with its revision and provenance; and
+**AC:** the `decide` chain and its models are in `GatewayConfig` with server-true windows; a
+category's ranking is readable with its revision and provenance; and
 `ranked_chain` returns an ordered, tenant-scoped candidate list — chain rows always present,
 ordered where a winner exists, with `within_margin` NULL and no order where none does.
 
@@ -401,12 +402,31 @@ left revisions at 1, a changed `artifact_sha` bumped the non-edited rows to 2, a
 stayed at 1 with a NOTICE, and a category removed from the artifact lost its non-edited rows.
 The scratch database was dropped afterwards.
 
-**The dev database is stale, and cannot take this seed yet.** `torii` (localhost) has no `catalog`
-schema at all — its `public.documents` predates the current design, so a full `dbd apply` stops at
-`public.documents` ("column `lifecycle` does not exist"), and `dbd reconcile --allow-destructive`
-would drop columns across the whole schema. That is pre-existing, not ranking work: the ranking
-DDL is applied by the next full apply/reconcile of the design, and the seed needs no change when
-it happens. A pre-change dump is at `/tmp/torii-pre-ranking-*.sql`.
+**The seed is in the dev database (2026-10-24).** The DB the gateway actually runs against is
+torii's own local Supabase, `postgresql://postgres:postgres@127.0.0.1:55322/postgres` (ports from
+`supabase/config.toml`; `services/gateway/.env` points there). An earlier note here blamed
+`database/.env.local`, which points at `localhost:5432/torii` — a stale, empty plain-Postgres
+database with no `catalog` schema and no `auth`/`vault`, so it cannot host this design at all. It
+is not the dev DB; leave it alone.
+
+On 55322, pre-release `dbd reconcile` was a purely additive plan — `catalog.verdict`,
+`catalog.model_rankings`, `staging.model_rankings`, `staging.model_ranking_artifacts`, plus the
+five `staging.model_capabilities` columns the committed seed already carried. Applied:
+`Reconciled — 4 created, 1 altered, 74 re-applied`. `catalog.ranked_chain(uuid, text, text)`
+exists (reconcile does create functions; its dry-run just does not list them). `dbd import` then
+loaded 15 tables, called 14 procedures and ran 4 after-scripts.
+
+Checked on the dev DB: 8 ranking rows (4 `tool.route`, 4 `planner.select`, all `tie`, `rank`
+NULL); `ranked_chain(platform, 'decision', 'planner.select')` returns the four `decide` steps in
+sequence (8194/4096/2048/512) with `verdict = tie`, `rank` and `within_margin` NULL; a `rank` on a
+`tie` is rejected by `model_rankings_order_check`; a second `dbd import` left every revision at
+1; EXECUTE is `service_role` only (`anon`/`authenticated` false). `dbd reconcile --dry-run` now
+reports "already in sync", `dbd diff` shows no structural drift, `tests/check-declared-shape.sh`
+passes, and the full `database/tests/run.sh` suite passes against it. Pre-change dump:
+`/tmp/torii-55322-pre-reconcile-*.dump`.
+
+**Nothing reads the store yet.** No gateway code references `model_rankings` or `ranked_chain`;
+seeding Phase 3 does not change a single routing decision. Phase 4 is what consumes it.
 
 ## 8. Phase 4 — composing and passing the filtered ranking
 
