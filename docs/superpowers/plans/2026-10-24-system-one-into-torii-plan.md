@@ -708,13 +708,26 @@ of 0.0 overrides a platform default of 1.0. Pre-change dump:
 > is tested in the gateway's `executor/tests.rs` with a fake provider.
 >
 > **Tie policy (added after the wiring).** A `tie` is a measured SET with no order to claim, not
-> an absence of information, so the resolver breaks it: local models first, then the chain's
-> authored sequence. The result travels as `ChoiceOrderKind::Policy` → `RoutingPreferences::order`,
+> an absence of information, so the resolver breaks it: local models first, then a turn inside
+> each plane. The result travels as `ChoiceOrderKind::Policy` → `RoutingPreferences::order`,
 > never as a ranking — no artifact revision, no generation time, and the boot line says "no
 > measurement claimed". `insufficient`, an unmeasured category and "nothing within margin" still
 > send nothing: they say the measurement is unusable, which a tie-break cannot repair. Note the
 > seeded `decide` chain is entirely `plane = cloud`, so local-first is a no-op on today's data
-> until a local decision model is added.
+> until a local decision model is added — the turn is what varies the top slot there.
+>
+> **Why the turn is not in the snapshot.** A fixed sequence over a tie sends every decision to
+> the same member ("equal on the measurement" becomes "one of them always answers"), but the
+> snapshot is resolved once per boot, before any decision exists. So `Snapshot` carries an
+> `Ordering` — `Measured(order)` or `Tie(TieRotation)` — and the tie's groups are rotated at
+> selection time, seeded by the goal the decision is asked about. That seed is forced, not
+> chosen: the order is part of the gateway's decision memo key, so a rotation derived from
+> process state (a counter, a clock, a random draw) would give the same call a different order
+> on resume and trip `DeterminismViolation` instead of replaying. A repeated identical question
+> therefore gets the same order, and a run of distinct decisions spreads the first slot. The
+> rotation is applied by a `PlannerSelector` decorator that lends the decision selector a
+> dispatch supplying this decision's order; it is built only for `Ordering::Tie`, so a measured
+> order never passes through it and evidence is never replaced by a rule.
 >
 > **The gateway half of §8.2 is also in:** `ModelDispatch::choose`
 > takes an `Option<&ChoiceOrder>` (the kernel-free mirror of `Ranking`), `SelectorDispatch`
