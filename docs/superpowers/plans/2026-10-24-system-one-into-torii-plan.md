@@ -5,9 +5,9 @@ promoted to Phase 1; **ranking authority moved to torii**, with the gateway taki
 tenant/user-filtered ranking on each decision call).
 **Base:** gateway `develop` (decision seam uncommitted in the working tree), torii `origin/develop` @
 `dddc38e` (the local `~/developer/torii` checkout is 350 commits behind and has no `crates/cli`).
-**Status:** Phases 0–3 landed (gateway `8a3fcc9`, torii `3ba9610`), plus Phase 4's data half
-  (torii `af87a5f`): the store is seeded and the margin resolver is live. Phase 4's wiring has no
-  boot target in either checkout — §8.4.
+**Status:** Phases 0–5 landed — the store, the margin, the wiring and the Seiki surface. Phase 4 is
+  also **verified end to end** on a live `Select` run (§8.4a); what is still open is Phase 5's ledger
+  half, which needs a decision on in-run decision spend, and anything Phase 6 still wants.
 
 ## 1. Goal
 
@@ -750,6 +750,58 @@ process again, or an `sensei-orchestrator` consumer that torii hosts), and then 
 the ranking being carried by the selector, the resolve-once-per-run snapshot, fail-loud boot, and the
 four tests — land there. Until then nothing reads `ranked_chain`: seeding and the margin change no
 routing decision.
+
+### 8.4a Verified: the live `Select` run (2026-10-26)
+
+**The last AC bullet is now measured, not argued.** `crates/cli` came back with the wiring, so the
+run below is the real binary against the real dev catalog and a real Ollama.
+
+Setup: tenant `748e83e6-…` (a `torii-cli-test-*` tenant the CLI's own e2e left behind — the dev
+orgs still have zero agents), `TORII_PLANNER_SELECTOR=decision`, `TORII_DECISION_CHAIN=decide`,
+`TORII_DECISION_CATEGORY=planner.select`, `--budget-tokens 20000`. The graph is one `Expand` node
+with `"planner": "Select"`.
+
+**A single candidate never asks.** `DecisionPlannerSelector::select` returns `[only]` without a
+model call (`selector.rs`), so the first run against a tenant with exactly one `area = planning`
+agent selected `planner` with **no** decision and no `__select__` effect. That is the selector's
+contract, not a wiring failure — but it is why an end-to-end demo needs two planners, and why the
+first attempt's "run spend includes exactly one decision call" looked unmet. With a second planner
+inserted (`registry.agents`, same `def`, `default_planner: false`), the decision happens.
+
+What the three completed runs show:
+
+- boot: `planner_selector=decision, chain "decide", category "planner.select", ordered by
+  policy:local-first-rotation over 4 models, rotating per decision, no measurement claimed
+  (filtered: none)` — the tie path, exactly as designed, with no ranking claimed.
+- the decision is journaled at `plan/__select__`: `model: tev1:0.8b`, `choice: planner`,
+  `confidence: 0.0018`, 143 input tokens, 0 output, and the gateway logs it as
+  `capability=Decision chain=Some("decide")`. `PlannerSelected` follows in the next event.
+- the rotation turns with the goal: `Summ…parser crate…` → `tev1:0.8b`, `Audit the CI workflow…` →
+  `laya`, `Draft a migration plan…` → `tev1:0.8b`. Two of three on one member is what a 4-way turn
+  over 3 samples looks like; the point is that it varies with the goal, not with the clock.
+- the run completes: plan → `investigate` → `summarize`, 5451/20000 tokens, `$0.00`, one decision
+  and four chat calls.
+- `filtered: none` is honest, not accidental: every `decide` member is admissible at a tie, so the
+  filter has nothing to withhold. The withheld-model path stays unit-tested (`ranking.rs`) until a
+  category has a winner.
+
+**Two gaps the run exposed.**
+
+1. **The AC's "trace shows the category and the ranking revision" holds only at boot-log level.**
+   The executor's gateway has no `GatewayStore`, so `metering.execution_traces` stays empty and the
+   per-call `RankingApplied` never becomes durable; the run's record is `runs.journal_events`, which
+   carries the model and the choice but not the category or an order kind. Same root cause as the
+   ledger gap below.
+2. **`run cancel` does not settle the cancelled run's charge.** The reservation stays
+   (`settled = f`, `reserved_micro_usd = 5000000`) and the budget node's whole headroom stays held, so
+   the next `run submit` is refused with "no headroom is left under the hard cap of budget node
+   _Team_". One `torii worker serve --once` settles it (`settle_pending`) and frees the headroom.
+   Anyone scripting runs will hit this; the cancel path should either settle or say so.
+
+**Still open from Phase 5, and now with evidence:** the executor's calls (decision and chat alike)
+write **no** `metering.inference_calls` rows — 0 rows for the tenant after 4 model calls — so the
+per-call ranking revision has nowhere to land until the in-run spend stance is decided. That decision
+is the gate on Phase 5's second AC half, not more wiring.
 
 ## 9. Phase 5 — Seiki visibility
 
