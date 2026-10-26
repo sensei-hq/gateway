@@ -9982,6 +9982,7 @@ impl orchestrator_core::ModelDispatch for FixedDispatch {
         &self,
         _question: &orchestrator_core::ChoiceQuestion,
         _chain: Option<&str>,
+        _order: Option<&orchestrator_core::ChoiceOrder>,
     ) -> Result<orchestrator_core::ChoiceAnswer, OrchestratorError> {
         Ok(orchestrator_core::ChoiceAnswer {
             choice: self.0.clone(),
@@ -13695,6 +13696,197 @@ async fn the_decision_selector_journals_its_spend_to_the_ledger() {
     assert_eq!(
         usage.total_tokens, 70,
         "the ledger records what the decision call really spent"
+    );
+}
+
+/// A measured order fixture: two ranked refs (one router-bound, one model-only, which is
+/// the wildcard-on-router form) and full provenance.
+fn measured_order() -> orchestrator_core::ChoiceOrder {
+    orchestrator_core::ChoiceOrder {
+        category: "planner.select".into(),
+        preferred: vec![
+            orchestrator_core::ChoiceRef {
+                router: Some("d".into()),
+                model: Some("md".into()),
+            },
+            orchestrator_core::ChoiceRef {
+                router: None,
+                model: Some("other".into()),
+            },
+        ],
+        artifact: Some("catalog.model_rankings".into()),
+        revision: Some(7),
+        generated_at: Some(1_760_000_000),
+    }
+}
+
+/// A dispatcher that records the ORDER each decision was asked to run under. These tests
+/// are about the order crossing the port, so the answer is the least one it can give.
+struct OrderRecordingDispatch {
+    seen: Arc<std::sync::Mutex<Vec<Option<orchestrator_core::ChoiceOrder>>>>,
+}
+
+#[async_trait::async_trait]
+impl orchestrator_core::ModelDispatch for OrderRecordingDispatch {
+    async fn complete(
+        &self,
+        _system: &str,
+        _user: &str,
+        _chain: Option<&str>,
+    ) -> Result<String, OrchestratorError> {
+        panic!("the decision selector asks no text question")
+    }
+
+    async fn choose(
+        &self,
+        _question: &orchestrator_core::ChoiceQuestion,
+        _chain: Option<&str>,
+        order: Option<&orchestrator_core::ChoiceOrder>,
+    ) -> Result<orchestrator_core::ChoiceAnswer, OrchestratorError> {
+        self.seen.lock().unwrap().push(order.cloned());
+        Ok(orchestrator_core::ChoiceAnswer {
+            choice: "alpha".into(),
+            confidence: 0.9,
+        })
+    }
+}
+
+/// The order a selector is built with reaches every decision it makes, and one built
+/// without a ranking passes none — the port-level half of "absent is unchanged".
+///
+/// *Mutation:* drop `self.order.as_ref()` from the `choose` call in
+/// `DecisionPlannerSelector::select` and the first assertion observes `None`.
+#[tokio::test]
+async fn the_decision_selector_carries_its_measured_order_onto_each_decision() {
+    let candidates = [AgentRef("alpha".into()), AgentRef("beta".into())];
+    let goal = serde_json::json!({ "goal": "g" });
+
+    let with: Arc<std::sync::Mutex<Vec<Option<orchestrator_core::ChoiceOrder>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let ordered = crate::DecisionPlannerSelector::new(two_planner_registry(), "decide")
+        .with_order(Some(measured_order()));
+    let picked = ordered
+        .select(
+            &goal,
+            &candidates,
+            &OrderRecordingDispatch { seen: with.clone() },
+        )
+        .await
+        .expect("selects");
+    assert_eq!(
+        picked,
+        AgentRef("alpha".into()),
+        "the order changes what runs, not what is answered"
+    );
+    assert_eq!(
+        with.lock().unwrap().as_slice(),
+        &[Some(measured_order())],
+        "the measured order crosses the port with the call"
+    );
+
+    let without: Arc<std::sync::Mutex<Vec<Option<orchestrator_core::ChoiceOrder>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let bare = crate::DecisionPlannerSelector::new(two_planner_registry(), "decide");
+    bare.select(
+        &goal,
+        &candidates,
+        &OrderRecordingDispatch {
+            seen: without.clone(),
+        },
+    )
+    .await
+    .expect("selects");
+    assert_eq!(
+        without.lock().unwrap().as_slice(),
+        &[None],
+        "no ranking sends none, which the gateway reads as the chain's authored order"
+    );
+}
+
+/// A measured order becomes `RoutingPreferences::ranking` — NOT `order` — with its
+/// provenance intact, and provenance the caller cannot name is dropped rather than
+/// invented.
+///
+/// *Mutation:* set `order` instead of `ranking` and the negative assertion reddens; keep
+/// an empty artifact string instead of `None` and the second case does.
+#[test]
+fn a_measured_order_maps_to_a_ranking_with_its_provenance() {
+    let prefs = super::dispatch::routing_for(&measured_order());
+    let ranking = prefs.ranking.expect("a ranking, not an authored order");
+    assert_eq!(ranking.category, "planner.select");
+    assert_eq!(
+        ranking.preferred,
+        vec![
+            kernel::types::request::CandidateRef {
+                router: Some("d".into()),
+                model: Some("md".into()),
+            },
+            kernel::types::request::CandidateRef {
+                router: None,
+                model: Some("other".into()),
+            },
+        ],
+        "best-first, in the caller's sequence, every ref preserved verbatim"
+    );
+    assert_eq!(
+        ranking.source,
+        Some(kernel::types::request::RankingSource {
+            artifact: "catalog.model_rankings".into(),
+            revision: Some(7),
+            generated_at: Some(1_760_000_000),
+        })
+    );
+    assert_eq!(
+        prefs.order, None,
+        "a ranking is not an authored order — the gateway refuses both in one call"
+    );
+
+    let mut anonymous = measured_order();
+    anonymous.artifact = None;
+    assert!(
+        super::dispatch::routing_for(&anonymous)
+            .ranking
+            .expect("still a ranking")
+            .source
+            .is_none(),
+        "'no source' is reported as unknown, never as a placeholder artifact"
+    );
+}
+
+/// A decision's memo key covers the order, and a call with no order hashes exactly what
+/// it always hashed — so a run journaled before orders existed still replays instead of
+/// tripping `DeterminismViolation`.
+///
+/// *Mutation:* hash the order unconditionally and the first assertion fails; drop it from
+/// the hashed value and the last two fail.
+#[test]
+fn the_decision_input_hash_covers_the_order_and_is_unchanged_without_one() {
+    let question = orchestrator_core::ChoiceQuestion {
+        state: serde_json::json!({ "goal": "g" }),
+        instructions: "pick".into(),
+        options: vec![],
+    };
+    let before_orders =
+        super::support::input_hash("decide", &serde_json::to_value(&question).unwrap()).unwrap();
+    assert_eq!(
+        super::dispatch::choice_input_hash("decide", &question, None).unwrap(),
+        before_orders,
+        "no order ⇒ the chain|question hash, byte for byte"
+    );
+
+    let ranked =
+        super::dispatch::choice_input_hash("decide", &question, Some(&measured_order())).unwrap();
+    assert_ne!(
+        ranked, before_orders,
+        "an ordered decision is a different input, so the memo cannot answer across the two"
+    );
+
+    let mut newer = measured_order();
+    newer.revision = Some(8);
+    assert_ne!(
+        super::dispatch::choice_input_hash("decide", &question, Some(&newer)).unwrap(),
+        ranked,
+        "a different artifact revision is a different decision"
     );
 }
 

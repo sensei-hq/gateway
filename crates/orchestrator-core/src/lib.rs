@@ -44,8 +44,8 @@ pub use plan::{
     NodeNeeds, NodePlan, PlanError, PlannedGraph, RESERVED_PLAN_ID, feasible, parse_plan,
 };
 pub use planner::{
-    ChoiceAnswer, ChoiceOption, ChoiceQuestion, ModelDispatch, PLANNER_AREA, Planner,
-    PlannerSelector, RESERVED_SELECT_ID, RulePlannerSelector,
+    ChoiceAnswer, ChoiceOption, ChoiceOrder, ChoiceQuestion, ChoiceRef, ModelDispatch,
+    PLANNER_AREA, Planner, PlannerSelector, RESERVED_SELECT_ID, RulePlannerSelector,
 };
 pub use reconcile::{ReconcileOutcome, ReconcileProvider, idempotency_key};
 pub use redact::{PatternRedactor, Redactor};

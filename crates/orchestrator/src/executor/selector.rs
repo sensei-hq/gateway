@@ -15,8 +15,8 @@
 use std::sync::Arc;
 
 use orchestrator_core::{
-    AgentRef, ChoiceOption, ChoiceQuestion, ModelDispatch, OrchestratorError, PlannerSelector,
-    Registry,
+    AgentRef, ChoiceOption, ChoiceOrder, ChoiceQuestion, ModelDispatch, OrchestratorError,
+    PlannerSelector, Registry,
 };
 
 /// Picks a planner via one metered completion; parses the response content as the chosen
@@ -91,9 +91,18 @@ impl PlannerSelector for LlmPlannerSelector {
 /// A single candidate short-circuits without a call. That is not only cheaper: a
 /// System One choice needs at least two options, so a one-option menu would be an
 /// `InvalidRequest` at the gateway rather than an answer.
+///
+/// **[`with_order`](Self::with_order) is how a measured ranking reaches a decision.**
+/// The chain says which models may answer; the order says which of them answers best for
+/// THIS kind of question, from evidence the gateway does not hold. The order is carried
+/// on the selector rather than resolved per call for two reasons: it is resolved once
+/// per run per category (a decision per step would re-ask a question whose answer cannot
+/// change mid-run), and the selector is where the run's identity lives while the
+/// dispatch port is shared by every producer.
 pub struct DecisionPlannerSelector {
     registry: Arc<Registry>,
     chain: String,
+    order: Option<ChoiceOrder>,
 }
 
 impl DecisionPlannerSelector {
@@ -101,7 +110,20 @@ impl DecisionPlannerSelector {
         Self {
             registry,
             chain: chain.into(),
+            order: None,
         }
+    }
+
+    /// Send `order` — a measured preference over the decision chain's models — with
+    /// every decision this selector makes. `None` reproduces the previous behaviour
+    /// exactly (the chain's authored order stands).
+    ///
+    /// A resolver that could not produce a ranking passes `None` on purpose: the gateway
+    /// must stay fully usable while torii's measurements are unavailable, so an empty
+    /// order is a normal state, not a failure to propagate.
+    pub fn with_order(mut self, order: Option<ChoiceOrder>) -> Self {
+        self.order = order;
+        self
     }
 }
 
@@ -142,7 +164,9 @@ impl PlannerSelector for DecisionPlannerSelector {
                 .into(),
             options,
         };
-        let answer = dispatch.choose(&question, Some(&self.chain)).await?;
+        let answer = dispatch
+            .choose(&question, Some(&self.chain), self.order.as_ref())
+            .await?;
         Ok(AgentRef(answer.choice))
     }
 }
