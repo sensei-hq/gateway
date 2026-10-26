@@ -13703,6 +13703,7 @@ async fn the_decision_selector_journals_its_spend_to_the_ledger() {
 /// the wildcard-on-router form) and full provenance.
 fn measured_order() -> orchestrator_core::ChoiceOrder {
     orchestrator_core::ChoiceOrder {
+        kind: orchestrator_core::ChoiceOrderKind::Measured,
         category: "planner.select".into(),
         preferred: vec![
             orchestrator_core::ChoiceRef {
@@ -13850,6 +13851,42 @@ fn a_measured_order_maps_to_a_ranking_with_its_provenance() {
             .source
             .is_none(),
         "'no source' is reported as unknown, never as a placeholder artifact"
+    );
+}
+
+/// A POLICY order travels as `RoutingPreferences::order`, never as a ranking: nothing
+/// measured it, so nothing in the trace may claim a measurement. The gateway refuses both
+/// in one call, which is why the mapping is a choice rather than a pair.
+///
+/// *Mutation:* map a policy order to `ranking` and both assertions redden.
+#[test]
+fn a_policy_order_maps_to_an_authored_order_and_claims_no_measurement() {
+    let mut order = measured_order();
+    order.kind = orchestrator_core::ChoiceOrderKind::Policy;
+    order.artifact = Some("policy:local-first".into());
+    order.revision = None;
+    order.generated_at = None;
+
+    let prefs = super::dispatch::routing_for(&order);
+    assert!(
+        prefs.ranking.is_none(),
+        "a tie broken by a rule is not evidence"
+    );
+    assert_eq!(
+        prefs.order.as_deref(),
+        Some(
+            &[
+                kernel::types::request::CandidateRef {
+                    router: Some("d".into()),
+                    model: Some("md".into()),
+                },
+                kernel::types::request::CandidateRef {
+                    router: None,
+                    model: Some("other".into()),
+                },
+            ][..]
+        ),
+        "the rule's sequence is the authored order, refs preserved verbatim"
     );
 }
 

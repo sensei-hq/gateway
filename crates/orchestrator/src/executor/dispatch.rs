@@ -45,7 +45,8 @@ use kernel::types::request::{
     RoutingPreferences,
 };
 use orchestrator_core::{
-    ChoiceAnswer, ChoiceOrder, ChoiceQuestion, JournalEvent, NodeId, OrchestratorError, RunId,
+    ChoiceAnswer, ChoiceOrder, ChoiceOrderKind, ChoiceQuestion, JournalEvent, NodeId,
+    OrchestratorError, RunId,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -2066,33 +2067,45 @@ pub(super) fn choice_input_hash(
 
 /// Translate a caller's [`ChoiceOrder`] into the gateway's routing vocabulary.
 ///
-/// The one place the port's kernel-free shape meets `kernel`'s. `preferred` becomes
-/// `RoutingPreferences::ranking` — NOT `order`: an order is an operator's authored
-/// sequence, a ranking is a measured claim with provenance, and the gateway records
-/// which of the two produced a call's sequence.
+/// The one place the port's kernel-free shape meets `kernel`'s, and the place the two
+/// kinds diverge — exactly as the gateway's own contract requires, since sending both in
+/// one call is `InvalidRequest`:
 ///
-/// Provenance is dropped whole when the caller cannot name its artifact, rather than
-/// sent with a placeholder: "no source" is the truth, and an invented artifact string
-/// would make a trace claim a measurement it cannot point at.
+/// - [`ChoiceOrderKind::Measured`] → `RoutingPreferences::ranking`, a claim with provenance;
+/// - [`ChoiceOrderKind::Policy`] → `RoutingPreferences::order`, an authored sequence.
+///
+/// A policy order carries no provenance field, and that is the point: nothing measured it,
+/// so nothing in the trace may say something did. Measured provenance is dropped whole when
+/// the caller cannot name its artifact rather than sent with a placeholder — "no source" is
+/// the truth, and an invented artifact string would make a trace claim a measurement it
+/// cannot point at.
 pub(super) fn routing_for(order: &ChoiceOrder) -> RoutingPreferences {
-    RoutingPreferences {
-        ranking: Some(Ranking {
-            category: order.category.clone(),
-            preferred: order
-                .preferred
-                .iter()
-                .map(|r| CandidateRef {
-                    router: r.router.clone(),
-                    model: r.model.clone(),
-                })
-                .collect(),
-            source: order.artifact.as_ref().map(|artifact| RankingSource {
-                artifact: artifact.clone(),
-                revision: order.revision,
-                generated_at: order.generated_at,
+    let refs: Vec<CandidateRef> = order
+        .preferred
+        .iter()
+        .map(|r| CandidateRef {
+            router: r.router.clone(),
+            model: r.model.clone(),
+        })
+        .collect();
+
+    match order.kind {
+        ChoiceOrderKind::Measured => RoutingPreferences {
+            ranking: Some(Ranking {
+                category: order.category.clone(),
+                preferred: refs,
+                source: order.artifact.as_ref().map(|artifact| RankingSource {
+                    artifact: artifact.clone(),
+                    revision: order.revision,
+                    generated_at: order.generated_at,
+                }),
             }),
-        }),
-        ..Default::default()
+            ..Default::default()
+        },
+        ChoiceOrderKind::Policy => RoutingPreferences {
+            order: Some(refs),
+            ..Default::default()
+        },
     }
 }
 

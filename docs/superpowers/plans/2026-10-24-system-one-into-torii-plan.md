@@ -707,6 +707,15 @@ of 0.0 overrides a platform default of 1.0. Pre-change dump:
 > `require_agents` refuses before the selector is reached; the equivalent decision-selector run
 > is tested in the gateway's `executor/tests.rs` with a fake provider.
 >
+> **Tie policy (added after the wiring).** A `tie` is a measured SET with no order to claim, not
+> an absence of information, so the resolver breaks it: local models first, then the chain's
+> authored sequence. The result travels as `ChoiceOrderKind::Policy` → `RoutingPreferences::order`,
+> never as a ranking — no artifact revision, no generation time, and the boot line says "no
+> measurement claimed". `insufficient`, an unmeasured category and "nothing within margin" still
+> send nothing: they say the measurement is unusable, which a tie-break cannot repair. Note the
+> seeded `decide` chain is entirely `plane = cloud`, so local-first is a no-op on today's data
+> until a local decision model is added.
+>
 > **The gateway half of §8.2 is also in:** `ModelDispatch::choose`
 > takes an `Option<&ChoiceOrder>` (the kernel-free mirror of `Ranking`), `SelectorDispatch`
 > maps it onto `RoutingPreferences::ranking` and folds it into the decision's memo key, and
