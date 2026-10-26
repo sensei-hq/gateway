@@ -691,7 +691,23 @@ of 0.0 overrides a platform default of 1.0. Pre-change dump:
 
 ### 8.4 The §8.2 blocker: there is no boot target in either checkout
 
-> **Partially cleared 2026-10-25.** The gateway half of §8.2 is in: `ModelDispatch::choose`
+> **Cleared 2026-10-25 (torii `crates/cli/src/ranking.rs` + `boot.rs`).** The boot target
+> exists and §8.2 is wired: `TORII_PLANNER_SELECTOR=decision` builds a
+> `DecisionPlannerSelector` carrying the order resolved once at boot from
+> `catalog.ranked_chain` (`TORII_DECISION_CHAIN`, default `decide`; `TORII_DECISION_CATEGORY`,
+> default `planner.select`); absent configuration is still `RulePlannerSelector::new(None)`.
+> The fail-loud checks refuse a missing chain, a non-`Decision` chain, an unknown member model,
+> and a member window smaller than the gateway's own `estimate_input_tokens_pessimistic` of the
+> smallest decision — never a copied constant. A resolver failure logs and sends no ranking
+> rather than failing the boot. Tests cover the order's composition (rank order, filtered-out
+> models reported not sent, a tie claiming nothing, a single admissible model not ordered), the
+> three variables including a typo being refused, the window refusal naming both numbers, and a
+> DB-gated read of the seeded `decide` chain through the real function. **Not covered:** a live
+> `run submit` of a `Select` graph — every tenant in the dev catalog has zero agents, so
+> `require_agents` refuses before the selector is reached; the equivalent decision-selector run
+> is tested in the gateway's `executor/tests.rs` with a fake provider.
+>
+> **The gateway half of §8.2 is also in:** `ModelDispatch::choose`
 > takes an `Option<&ChoiceOrder>` (the kernel-free mirror of `Ranking`), `SelectorDispatch`
 > maps it onto `RoutingPreferences::ranking` and folds it into the decision's memo key, and
 > `DecisionPlannerSelector::with_order(...)` carries it onto every decision it makes. What
