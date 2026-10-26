@@ -785,18 +785,26 @@ What the three completed runs show:
   filter has nothing to withhold. The withheld-model path stays unit-tested (`ranking.rs`) until a
   category has a winner.
 
-**Two gaps the run exposed.**
+**Two gaps the run exposed — one now fixed.**
 
 1. **The AC's "trace shows the category and the ranking revision" holds only at boot-log level.**
    The executor's gateway has no `GatewayStore`, so `metering.execution_traces` stays empty and the
    per-call `RankingApplied` never becomes durable; the run's record is `runs.journal_events`, which
    carries the model and the choice but not the category or an order kind. Same root cause as the
    ledger gap below.
-2. **`run cancel` does not settle the cancelled run's charge.** The reservation stays
-   (`settled = f`, `reserved_micro_usd = 5000000`) and the budget node's whole headroom stays held, so
-   the next `run submit` is refused with "no headroom is left under the hard cap of budget node
-   _Team_". One `torii worker serve --once` settles it (`settle_pending`) and frees the headroom.
-   Anyone scripting runs will hit this; the cancel path should either settle or say so.
+2. **`run cancel` did not settle the cancelled run's charge — fixed.** The reservation stayed
+   (`settled = f`, `reserved_micro_usd = 5000000`) and the budget node's whole headroom stayed held, so
+   the next `run submit` was refused with "no headroom is left under the hard cap of budget node
+   _Team_". One `torii worker serve --once` settled it (`settle_pending`) and freed the headroom, but
+   nothing in the cancel path said so — anyone scripting runs had to know a worker tick was
+   needed. `cmd::run::cancel` now makes the very call that sweep makes, right after the cancel lands:
+   the journal's spend is recorded, and the charge closes — releasing what is left of its reservation —
+   once no drive still claims the run. A cancelled run whose drive *is* still spending keeps its
+   reservation for that drive to settle when it ends; that rule is `settle`'s own (G1-3), not
+   something the command restates. A settle fault is reported beside the cancel rather than raised
+   over it, since the run is cancelled either way. Covered by
+   `cancel_settles_the_charge_so_it_stops_holding_headroom` (Postgres: `settled = t`,
+   `reserved_micro_usd = 0`).
 
 **Still open from Phase 5, and now with evidence:** the executor's calls (decision and chat alike)
 write **no** `metering.inference_calls` rows — 0 rows for the tenant after 4 model calls — so the
