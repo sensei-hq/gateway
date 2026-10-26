@@ -132,6 +132,22 @@ pub struct ChoiceAnswer {
     pub confidence: f64,
 }
 
+/// What a [`ChoiceOrder`] IS: a measured claim, or a rule somebody chose.
+///
+/// The gateway keeps the two apart on the wire — `routing.ranking` is a claim with
+/// provenance, `routing.order` is an authored sequence, and a call sending both is refused
+/// — so an implementor must say which one it holds rather than dressing a tie-break up as
+/// evidence. A `Policy` order is what a tie gets: nothing measured an order, so nothing in
+/// the trace should say one was measured.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ChoiceOrderKind {
+    /// From measurement, with the artifact/revision that produced it.
+    #[default]
+    Measured,
+    /// From a deterministic rule (e.g. local models first), with no measurement behind it.
+    Policy,
+}
+
 /// One position in a [`ChoiceOrder`]: a model reference.
 ///
 /// A ref matches a candidate iff every PRESENT field equals the candidate's; an absent
@@ -161,6 +177,9 @@ pub struct ChoiceRef {
 /// artifact revision, produced this sequence. Nothing in the ordering reads those fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChoiceOrder {
+    /// Evidence or policy (see [`ChoiceOrderKind`]). Defaults to `Measured`.
+    #[serde(default)]
+    pub kind: ChoiceOrderKind,
     /// What this order was measured for, e.g. `"planner.select"`. Free-form here — the
     /// implementor records it and never matches on it.
     pub category: String,
