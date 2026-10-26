@@ -691,6 +691,15 @@ of 0.0 overrides a platform default of 1.0. Pre-change dump:
 
 ### 8.4 The §8.2 blocker: there is no boot target in either checkout
 
+> **Partially cleared 2026-10-25.** The gateway half of §8.2 is in: `ModelDispatch::choose`
+> takes an `Option<&ChoiceOrder>` (the kernel-free mirror of `Ranking`), `SelectorDispatch`
+> maps it onto `RoutingPreferences::ranking` and folds it into the decision's memo key, and
+> `DecisionPlannerSelector::with_order(...)` carries it onto every decision it makes. What
+> the text below still describes correctly is the OTHER half — no boot target existed when
+> this was written; `crates/cli/src/boot.rs` has since returned to torii's tree with the
+> `RulePlannerSelector::new(None)` seam §8.2 names, so the remaining work is the resolver,
+> the fail-loud boot checks and the four tests, in torii.
+
 §8.2 wires the selector "after `Executor::new(...)`" in `crates/cli/src/boot.rs`. Neither repository
 has that crate at its current tip: torii's workspace members are `apps/desktop/src-tauri`,
 `crates/tools` and `services/gateway`; nobody depends on `sensei-orchestrator`; and `crates/cli`

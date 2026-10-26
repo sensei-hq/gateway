@@ -40,9 +40,12 @@
 
 use gateway::GatewayError;
 use kernel::types::decision::{DecisionQuestion, DecisionQuestions};
-use kernel::types::request::{InferenceRequest, InferenceResponse, Payload};
+use kernel::types::request::{
+    CandidateRef, InferenceRequest, InferenceResponse, Payload, Ranking, RankingSource,
+    RoutingPreferences,
+};
 use orchestrator_core::{
-    ChoiceAnswer, ChoiceQuestion, JournalEvent, NodeId, OrchestratorError, RunId,
+    ChoiceAnswer, ChoiceOrder, ChoiceQuestion, JournalEvent, NodeId, OrchestratorError, RunId,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1925,6 +1928,7 @@ impl orchestrator_core::ModelDispatch for SelectorDispatch<'_> {
         &self,
         question: &ChoiceQuestion,
         chain: Option<&str>,
+        order: Option<&ChoiceOrder>,
     ) -> Result<ChoiceAnswer, OrchestratorError> {
         let chain = chain.unwrap_or_default();
         let path = self.select_path();
@@ -1933,7 +1937,7 @@ impl orchestrator_core::ModelDispatch for SelectorDispatch<'_> {
             0,
             self.calls.fetch_add(1, Ordering::Relaxed) as usize,
         );
-        let ih = super::support::input_hash(chain, &serde_json::to_value(question)?)?;
+        let ih = choice_input_hash(chain, question, order)?;
         if let Some((recorded_ih, output)) = self.fold.memo.get(&eid) {
             if recorded_ih != &ih {
                 return Err(self.fatal(OrchestratorError::DeterminismViolation {
@@ -1976,7 +1980,7 @@ impl orchestrator_core::ModelDispatch for SelectorDispatch<'_> {
             consensus: None,
             allow_fallback: true,
             credentials: Default::default(),
-            routing: None,
+            routing: order.map(routing_for),
         };
 
         let response = match self
@@ -2035,6 +2039,63 @@ impl orchestrator_core::ModelDispatch for SelectorDispatch<'_> {
 /// journaling the exact text it later replays. A `noul` or `score` answer where a choice
 /// was asked for is a provider fault, not a value to reinterpret, and a missing answer
 /// map is reported as the same fault so a replay reproduces it exactly.
+/// The memo key's input for a decision: the chain, the question, and the order it ran
+/// under.
+///
+/// The order is part of the INPUT, not a transport detail — two calls that differ only in
+/// the ranking are different decisions, so the memo must not answer one from the other.
+///
+/// The absent case hashes exactly what it hashed before (`chain|question`), so a run
+/// journaled before orders existed still replays on resume instead of tripping
+/// `DeterminismViolation` over a hash that changed shape but not meaning. Adding a
+/// wrapper object unconditionally would have been tidier and would have invalidated
+/// every in-flight run's decision memo for no gain.
+pub(super) fn choice_input_hash(
+    chain: &str,
+    question: &ChoiceQuestion,
+    order: Option<&ChoiceOrder>,
+) -> Result<String, OrchestratorError> {
+    match order {
+        None => super::support::input_hash(chain, &serde_json::to_value(question)?),
+        Some(order) => super::support::input_hash(
+            chain,
+            &serde_json::json!({ "question": question, "order": order }),
+        ),
+    }
+}
+
+/// Translate a caller's [`ChoiceOrder`] into the gateway's routing vocabulary.
+///
+/// The one place the port's kernel-free shape meets `kernel`'s. `preferred` becomes
+/// `RoutingPreferences::ranking` — NOT `order`: an order is an operator's authored
+/// sequence, a ranking is a measured claim with provenance, and the gateway records
+/// which of the two produced a call's sequence.
+///
+/// Provenance is dropped whole when the caller cannot name its artifact, rather than
+/// sent with a placeholder: "no source" is the truth, and an invented artifact string
+/// would make a trace claim a measurement it cannot point at.
+pub(super) fn routing_for(order: &ChoiceOrder) -> RoutingPreferences {
+    RoutingPreferences {
+        ranking: Some(Ranking {
+            category: order.category.clone(),
+            preferred: order
+                .preferred
+                .iter()
+                .map(|r| CandidateRef {
+                    router: r.router.clone(),
+                    model: r.model.clone(),
+                })
+                .collect(),
+            source: order.artifact.as_ref().map(|artifact| RankingSource {
+                artifact: artifact.clone(),
+                revision: order.revision,
+                generated_at: order.generated_at,
+            }),
+        }),
+        ..Default::default()
+    }
+}
+
 fn choice_answer_from(
     output: &serde_json::Value,
     question: &str,

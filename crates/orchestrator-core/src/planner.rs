@@ -81,10 +81,16 @@ pub trait ModelDispatch: Send + Sync {
     /// nobody asks for is a surface with no test behind it. The implementor maps this
     /// onto the full typed question set; extending the port is additive when a consumer
     /// needs another shape.
+    /// `order` is the caller's **measured** preference over the models this call may run
+    /// on — which model answers this kind of question best (see [`ChoiceOrder`]). An
+    /// implementor must APPLY it or fail: answering without it would silently discard the
+    /// caller's evidence, which is a routing decision the caller did not make. `None` is
+    /// the whole of the previous behaviour, byte for byte.
     async fn choose(
         &self,
         question: &ChoiceQuestion,
         chain: Option<&str>,
+        order: Option<&ChoiceOrder>,
     ) -> Result<ChoiceAnswer, OrchestratorError>;
 }
 
@@ -124,6 +130,49 @@ pub struct ChoiceQuestion {
 pub struct ChoiceAnswer {
     pub choice: String,
     pub confidence: f64,
+}
+
+/// One position in a [`ChoiceOrder`]: a model reference.
+///
+/// A ref matches a candidate iff every PRESENT field equals the candidate's; an absent
+/// field is a wildcard, so `ChoiceRef { model: Some("x".into()), .. }` means "x, on
+/// whichever router serves it". This mirrors the gateway's own candidate-ref grammar
+/// for the same reason [`TokenUsage`](crate::budget::TokenUsage) is mirrored here: this
+/// crate depends on no gateway type, so the port speaks the shape and the implementor
+/// translates it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChoiceRef {
+    pub router: Option<String>,
+    pub model: Option<String>,
+}
+
+/// A caller-supplied, **measured** preference over the models a decision may run on:
+/// which one answers this kind of question best, best first.
+///
+/// **It orders survivors; it never admits or resurrects.** Whatever the implementor's
+/// gates skipped — a closed breaker, a cooldown, an exhausted budget, a window too small
+/// — stays skipped however highly it is ranked. A ref naming a model the deployment does
+/// not serve is inert: a measurement's roster drifts from a tenant's availability by
+/// design, and refusing the call over the difference would make the ranking unusable
+/// wherever it is most useful.
+///
+/// It carries provenance because an order without one cannot be explained after the
+/// fact: a run's trace should be able to say which category's measurement, from which
+/// artifact revision, produced this sequence. Nothing in the ordering reads those fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChoiceOrder {
+    /// What this order was measured for, e.g. `"planner.select"`. Free-form here — the
+    /// implementor records it and never matches on it.
+    pub category: String,
+    /// Best first.
+    pub preferred: Vec<ChoiceRef>,
+    /// The artifact the rows came from, e.g. `"catalog.model_rankings"`. `None` means the
+    /// caller does not know, and that is reported as unknown rather than invented.
+    pub artifact: Option<String>,
+    /// The artifact's monotonic revision, when it has one.
+    pub revision: Option<u64>,
+    /// Unix seconds the artifact was generated, when it says.
+    pub generated_at: Option<i64>,
 }
 
 /// Picks WHICH planner agent runs for a goal, from the candidate library (agents
@@ -205,6 +254,7 @@ mod selector_tests {
             &self,
             _question: &ChoiceQuestion,
             _chain: Option<&str>,
+            _order: Option<&ChoiceOrder>,
         ) -> Result<ChoiceAnswer, OrchestratorError> {
             panic!("RulePlannerSelector is pure — it must never dispatch a decision call")
         }
