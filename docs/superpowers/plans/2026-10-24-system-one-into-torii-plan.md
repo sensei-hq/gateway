@@ -2,12 +2,22 @@
 
 **Opened:** 2026-10-24 · **Revised:** 2026-10-24 (roster re-measured on Ollama; the corpus/ranking loop
 promoted to Phase 1; **ranking authority moved to torii**, with the gateway taking a caller-supplied,
-tenant/user-filtered ranking on each decision call).
+tenant/user-filtered ranking on each decision call) · 2026-10-26 (§9.2: the in-run spend stance is
+**decided** — ledger rows, attributed and run-linked) · 2026-10-27 (§9.6: the **trace writer**, the
+last piece of §8.2's AC that Phase 5 could not reach; §9.7: that trace **read** — the category, the
+revision and the filtered-out models, on the run detail).
 **Base:** gateway `develop` (decision seam uncommitted in the working tree), torii `origin/develop` @
 `dddc38e` (the local `~/developer/torii` checkout is 350 commits behind and has no `crates/cli`).
 **Status:** Phases 0–5 landed — the store, the margin, the wiring and the Seiki surface. Phase 4 is
-  also **verified end to end** on a live `Select` run (§8.4a); what is still open is Phase 5's ledger
-  half, which needs a decision on in-run decision spend, and anything Phase 6 still wants.
+  also **verified end to end** on a live `Select` run (§8.4a). Phase 5's two gaps are both closed:
+  the in-run spend stance is **decided** (§9.2) and **landed** (§9.3 — the run metering store,
+  verified against the dev database, with its read side in §9.4 and the run detail in §9.5), and the
+  trace writer §9.2 said its wiring did **not** supply now exists (§9.6 — the engine builds and
+  persists an `ExecutionTrace` per successful call, so a run's category and ranking revision are
+  durable per call rather than only in a boot log) **and is read where the AC says it should be**
+  (§9.7 — the run detail expands a call into the order it was handed, the measurement that order
+  obeyed, and every model that was filtered out). What is still open is the **release mechanics** —
+  a gateway tag and a torii repin (§9.6's own note) — and anything Phase 6 still wants.
 
 ## 1. Goal
 
@@ -41,7 +51,7 @@ The long-term payoff is the engine follow-on (decision-backed gates), not the se
 | `DecisionRequest` | `model`, `state`, `questions`, `images`, `keep_alive` — the **adapter boundary**, built by `to_decision_request` *after* selection; it needs no routing field |
 | Corpus | cases **fetched at run time and gitignored**; only the S4 gates are committed |
 | `DecisionModelStatus` | `Ready` / `ServerTooOld` / `NotPulled` / `NotADecisionModel` — **no effective window**, though the probe already reads `/api/show` |
-| `ModelDispatch::choose` + `DecisionPlannerSelector` | **uncommitted working tree**, unreleased |
+| `ModelDispatch::choose` + `DecisionPlannerSelector` | on `develop`, unreleased |
 
 **torii (`origin/develop`)**
 
@@ -790,8 +800,9 @@ What the three completed runs show:
 1. **The AC's "trace shows the category and the ranking revision" holds only at boot-log level.**
    The executor's gateway has no `GatewayStore`, so `metering.execution_traces` stays empty and the
    per-call `RankingApplied` never becomes durable; the run's record is `runs.journal_events`, which
-   carries the model and the choice but not the category or an order kind. Same root cause as the
-   ledger gap below.
+   carries the model and the choice but not the category or an order kind. The missing store is the
+   proximate cause but not the whole one: even with a store this table stays empty, because the engine
+   builds no `ExecutionTrace` at all (§9.2).
 2. **`run cancel` did not settle the cancelled run's charge — fixed.** The reservation stayed
    (`settled = f`, `reserved_micro_usd = 5000000`) and the budget node's whole headroom stayed held, so
    the next `run submit` was refused with "no headroom is left under the hard cap of budget node
@@ -808,8 +819,8 @@ What the three completed runs show:
 
 **Still open from Phase 5, and now with evidence:** the executor's calls (decision and chat alike)
 write **no** `metering.inference_calls` rows — 0 rows for the tenant after 4 model calls — so the
-per-call ranking revision has nowhere to land until the in-run spend stance is decided. That decision
-is the gate on Phase 5's second AC half, not more wiring.
+per-call ranking revision has nowhere to land. The stance is **decided in §9.2** (ledger rows,
+attributed and run-linked); what is left is that wiring, not another decision.
 
 ## 9. Phase 5 — Seiki visibility
 
@@ -823,9 +834,10 @@ is the gate on Phase 5's second AC half, not more wiring.
 - `/v1/routing`: add each chain's capability and its category; label the `decide` chain.
 - `/v1/models/available`: keep chat-only, or add `?capability=decision`; do not silently change its shape.
 - Requests/ledger: `capability = decision` must render and not be filtered out; show the ranking
-  revision that was in force for the call.
+  revision that was in force for the call — **landed in §9.7**, on the run detail's trace panel,
+  together with the models that were filtered out.
 - In-run decision spend is journaled by the executor, not written as `inference_calls` rows — a
-  pre-existing gap; decide it separately.
+  pre-existing gap, **decided in §9.2**: it becomes ledger rows, attributed and run-linked.
 
 **AC:** an owner sees the `decide` chain, its models' windows, the ranking behind it and can edit it;
 a run's decision call is distinguishable from a chat call.
@@ -884,6 +896,303 @@ committed unformatted (rag/*, tools/*, desktop, state/store). Those changes were
 committed, so the tree stays reviewable; format a file you touch, not the workspace, until the repo is
 fmt-clean at HEAD.
 
+### 9.2 Decision: in-run spend writes the ledger — attributed and run-linked (2026-10-26)
+
+**Stance.** A run's model calls (decision and chat alike) become `metering.inference_calls` rows,
+written **from the call site** by the store the gateway already knows how to use. They are **not**
+projected from the journal at settle, and they are **not** left as run-table state only.
+
+**Why the call site.** Three facts settle it. (1) `dispatch_metered` already holds the whole
+`InferenceResponse` — model, `actual_cost`, usage, attempts — beside the request's chain and
+capability (`Capability::TextChat` at `dispatch.rs:1840`, `Capability::Decision` at `dispatch.rs:1962`),
+so the row is a read rather than new capture, and `capability` is exactly what makes a run's decision
+call distinguishable from a chat call once the row exists at all. (2) The engine already has the seam:
+`Gateway::with_store` (`crates/gateway/src/engine/mod.rs:191`) over
+`store: Option<Arc<dyn GatewayStore>>` (`:54`), and that write is best-effort with a logging `warn!`
+(`engine/mod.rs:582`) bounded at 2 s on the streaming path — the cost chat already pays. (3) Missing it
+is a wiring omission, not a design gap: `boot.rs:1119` still does `Arc::new(facade.gateway)`.
+
+**Rejected: project from the journal at settle.** `EffectRecorded` carries tokens per effect always,
+but cost **only when a money cap was in force** (`TokenUsage::cost_micro_usd`), the model name only
+inside the effect's output payload, and adapter, chain, capability and duration not at all. The journal
+cannot produce a ledger row without new journal fields — permanent ones — and it would make a second,
+after-the-fact writer on the ledger, which is the drift DECISIONS.md's "one authoritative ledger"
+exists to prevent.
+
+**Rejected: keep run spend in the run tables.** `run_charges` and the journal stay the only home and
+`inference_calls` stays chat-only. Cheapest, and it keeps `/v1/requests` and `usage_daily` in trivial
+agreement by keeping runs out of both — but it fails the AC twice: the Requests screen has no
+`capability = decision` row to render, and a tenant's analytics would exclude the dominant source of
+decision spend. It is only defensible against the one number measured so far (§8.4a: one decision and
+four chat calls per run), so it would need re-arguing the moment runs get chatty.
+
+**Rejected inside the chosen stance: rows without attribution.** Hand the executor the store but not
+its identity and every row arrives with `subject_id` NULL — both dispatches set `auth: None`
+(`dispatch.rs:1855`, `:1979`) — and `metering.rollup_apply` takes its early return on an unattributed
+call, so `usage_daily` never moves. The Requests screen would list run calls that analytics refuses to
+count: the "silent capability drop" in §12 with different nouns. Attribution rides with the wiring or
+the wiring does not land. `PgGatewayStore` already binds `subject_id` straight to `org_unit_id` ("the
+resolved cap-bearing unit", `services/gateway/src/store.rs:75`), so the node to stamp is the one
+`run_charges` charged.
+
+**What it costs — the discontinuity, stated once.** From the deploy that lands it, a tenant's
+`usage_daily` includes run spend, so cost and call-count totals move with no pricing change behind
+them and the Usage screen's history has a step in it. That belongs in the release note beside this
+plan — the same class of note SP-ROUTE-1.2 needed. Four smaller consequences, each of which reads as a
+bug unless it is written down:
+
+- **Attribution is one node; the charge is a list.** A run's spend is recorded on every node in
+  `run_charges.node_ids`, while a ledger row carries exactly one `org_unit_id`. Ancestors are fine (the
+  rollup walks `core.org_unit_ancestor_at_level`), but a non-ancestor node in that array — an issuer
+  whose individual and group sit in different branches — will show ledger-derived run spend below what
+  `governance.nodes.spent_amount` says for it. Tenant and charged-node totals agree; the rest can
+  disagree.
+- **`cost_actual` is priced per call; the journal's cost is cap-conditional.** A run admitted with no
+  money cap journals $0 and will now show real dollars. That number is the more accurate one, and every
+  earlier run's "spend" came from the journal, so it will read as a regression.
+- **Traces multiply.** `execution_traces` is the heaviest object per call, so every run turn becomes one
+  more of them. Negligible at §8.4a's volume; it is the number to watch on a chatty graph, and the one
+  condition under which "keep it in the run tables" becomes worth revisiting.
+- **Dev keeps the gap.** `TORII_BACKEND=memory` has no pool, so the store stays optional and the e2e that
+  asserts zero rows stays true there — which means the tests that are today's evidence for the gap must
+  move to the Postgres backend to stay meaningful.
+
+**The delta (additive).** `run_id: Option<Uuid>` on `InferenceCall` (serde-defaulted) and
+`metering.inference_calls.run_id uuid` with a partial index — **no FK**, following `run_charges`'
+precedent that accounting history must not block or cascade with the run. A thin decorator over
+`PgGatewayStore` in torii stamps `subject_id` (the `run_charges` node) and `run_id` on the call before
+delegating, so no gateway behaviour changes and there is no second INSERT to drift from the lateral
+that resolves the catalog FKs. Then `run_id` is projected through `requests_ledger_for_tenant`
+(appended, so the view stays `create or replace`-able), `/v1/requests` and Seiki. The crate field means
+an engine release and a torii repin — routine under §11's pin discipline, not free.
+
+**What it does not close: the trace.** — **cleared 2026-10-27 in §9.6**, where the writer this
+paragraph says is missing now lives. The reasoning below is kept because it is what sequences the
+work: the trace needs the response, a store decorator never sees one, and selection's candidate and
+skip lists never leave the engine.
+
+The AC's "the trace shows the category and the ranking
+revision" is **not** delivered by this wiring, and this plan previously implied it was. The engine
+builds no `ExecutionTrace` at all, and `GatewayStore::insert_execution_trace` has no production caller
+in the gateway crate — its own doc comment says so (`crates/kernel/src/types/trace.rs:166-170`). The
+writer that does exist is torii's route: `build_trace(call.id, capability, &resp, duration_ms,
+recorded_at)` in `routes/chat.rs`, built from `InferenceResponse.routing`. That needs the response,
+which a store decorator never sees, so runs need a second change at the executor's call site — the same
+mapping, plus the ledger id to link by (`insert_inference_call` returns it; the engine's own call
+discards it). Sequence it after; the ledger stance does not depend on it, and `runs.journal_events`
+keeps carrying the model and the choice until it lands.
+
+**What it does not decide.** Where a run's calls are *read* as a run. `run_id` supplies the join, but
+whether that lives on the run detail, as a Requests filter, or both is Seiki's call and Phase 5's UI
+work.
+
+### 9.3 Landed: the run metering store (2026-10-26)
+
+**One deviation from §9.2's delta, for a better reason.** §9.2 proposed a decorator over
+`PgGatewayStore` in torii that stamped the run and its unit. The CLI cannot build that decorator: it
+does not depend on `services/gateway` (the axum service), so the only way to wrap the production store
+would have been to add a second ledger INSERT in the CLI — the drift §9.2 exists to prevent. So the
+STORE moved instead of being wrapped, and the stamping went inside it:
+
+- **engine (`gateway` repo):** `InferenceCall.run_id: Option<Uuid>` (serde-defaulted, skipped when
+  absent, so a store-less payload is byte-identical). The engine never fills it: one `Gateway` serves
+  every run in the process, so "the current run" is not a property of the gateway.
+- **engine:** `orchestrator::metering` — a `tokio::task_local` run scope with `with_run` /
+  `current_run`, entered at the top of `Executor::drive` (the one function every model call of a run,
+  nested bodies included, passes through). Per-poll, so two runs joined into one task cannot read each
+  other's id; `None` outside a drive is the honest answer for chat and the judge.
+- **torii:** `metering.inference_calls.run_id uuid` + a partial index (`where run_id is not null`),
+  no FK — accounting history must not block or cascade with the run, the same rule `run_charges`
+  states.
+- **torii:** `PgGatewayStore` moved to `torii_core::metering` (the API's `services/gateway/src/store.rs`
+  is now a re-export, so every `crate::store::PgGatewayStore` path and its DB test still resolve) and
+  it stamps on insert: `run_id` from the scope, then `subject_id` from the run's charge when the
+  request carried none. Attribution resolves the **deepest** `core.org_units` row among
+  `run_charges.node_ids` — "the most specific unit", rather than an arbitrary array element, with the
+  rollup walking up from it.
+- **torii:** the CLI's heavy boot wires `with_store` from `LightDeps::metering` (`Some` on Postgres,
+  `None` on memory, so a store-less boot stays byte-identical). The engine's own write is
+  best-effort, so a sick store still cannot hold a run.
+
+**Verified.** `crates/cli/tests/run_metering.rs` (new, `DATABASE_URL`-gated via `build.rs`): a real
+`metered_gateway` double on chain `"c"` is driven through `Executor` with the production store, and the
+ledger is read back — exactly one row, `run_id` = the run, `org_unit_id` = the charge's root,
+`input_tokens`/`output_tokens` the reported 12/3. Green against the dev database (55322), after
+`dbd reconcile` added the column. Also green: `sensei-gateway --lib` 476, `sensei-orchestrator` 590
+(the 4 new scope tests among them), `torii-gateway` 72 + its ignored DB test (which now exercises the
+moved store), `torii-core`, clippy on all three torii crates and both engine crates.
+
+**Still open, unchanged by the landing:** the trace writer (§9.2 — runs write no `execution_traces`,
+so the ranking revision is still not durable) — **closed in §9.6** — and the release mechanics: the
+crate field needs a gateway tag and a torii repin before any of this leaves the dev `[patch]`. The
+read side landed in §9.4.
+
+### 9.4 Landed: `run_id` on the read path (2026-10-26)
+
+§9.2 said the join alone is not enough — a run's calls have to be readable as a run. The column now
+travels the whole way out:
+
+- **torii:** `requests_ledger_for_tenant` exposes `run_id`, appended at the end (a view can only grow
+  at the end under `create or replace`); `NULL` for chat, the judge and anything outside a run.
+- **torii:** `/v1/requests` selects it. The page query moved into `requests_page()` so the DB test can
+  assert what the endpoint really returns — the projection is SQL, so a struct-level test would not
+  catch a column missing from the list, which is the way this actually breaks.
+- **Seiki:** `RequestRow.run_id` (optional — a gateway that predates the projection omits the key), a
+  `run <short-id>` chip on a run-attributed exception row (full id on hover), the field in the CSV
+  export's `Run` column, and in the exception search haystack so one run's rows can be pulled up
+  together.
+
+**Verified.** `run_attributed_call_reaches_the_requests_read` (ignored, needs 55322): a call inserted
+inside a run reads back with that `run_id` and the run's charged `budget_node_id`; a call with no run
+reads back `null`; a second tenant's page is empty. `M-s1-9.2` in `database/tests/moves.sql` pins the
+schema half (`uuid`, nullable, **no FK**, shield exposes it). Also green: `torii-gateway` 72 + clippy
+`-D warnings`, Seiki `test` 204, `svelte-check` 0/0, prettier + eslint on the touched files.
+
+**Still open:** nothing here decides where a run is *read as a run*; §9.5 lands that screen. The
+trace writer above remains the other gap — **closed in §9.6**.
+
+### 9.5 Landed: the run detail (2026-10-26)
+
+§9.4 left the join without a place to use it. One run now reads as one run, at one URL:
+
+- **torii:** `GET /v1/runs/{id}` (`routes/ledger.rs`, capability `audit.read`), serving `{ run, calls }`.
+  `runs.run_charges` anchors it — the run's accounting identity, always present, and the only home of
+  `node_ids` — with `runs.runs` and `runs.scheduled_runs` LEFT JOINed, so a charge is legible before or
+  after its driver writes a schedule (a null status is "no schedule", not an error). `attributed_to`
+  repeats the store's own rule (the DEEPEST charged `core.org_units`, labelled from the tenant's
+  `core.unit_levels` rather than a hardcoded tier name), so the unit the screen names is the unit the
+  calls were stamped with. `totals` aggregates over the same ledger predicate as the call list, so the
+  header cannot disagree with the table under it. The call list reuses one `LEDGER_COLUMNS` const with
+  `/v1/requests` — same row, two scopes — and is deliberately uncapped: a page limit would truncate the
+  very number the screen exists to get right.
+- **the stance made visible:** `booked_usd` (`run_charges.recorded_micro_usd`) and `totals.cost_usd`
+  are both served, and Seiki says why they differ in one sentence (`spendNote`) instead of picking one.
+  The alternative — one "spend" figure — would have hidden §9.4's discontinuity on the only screen that
+  shows a run's spend, moving the surprise to the budget page.
+- **Seiki:** `/runs/[id]` — lifecycle chip, four tiles (calls, call spend, booked, limit), the ledger
+  rows, and an attribution card (unit + tier label, booked/limit meter, settled, id, timestamps, the
+  scheduler's reason). Entered from a selected call's run chip on Usage patterns, where HTML nesting
+  forbids a second control inside the row button; `$lib/runs.ts` holds the pure bits.
+
+**Verified.** `run_detail_reads_its_calls_and_attribution` (ignored, 55322): a run's charge carries
+root + team, its two calls (one failed) come back and the chat call does not, attribution resolves to
+**the team** with the tenant's `Team` label, `booked_usd` 0.75 vs `totals.cost_usd` 0.25 (the two
+figures, pinned), and another tenant gets neither header nor calls. Green: `torii-gateway` 72 + clippy
+`-D warnings`, Seiki 213 (+9), `svelte-check` 0/0, prettier + eslint on the touched files.
+
+**Still open:** the trace writer (§9.2) — **closed in §9.6** — and the release mechanics, which §9.6
+leaves exactly as they were: the crate field still needs a gateway tag and a torii repin.
+
+### 9.6 Landed: the trace writer (2026-10-27)
+
+§9.2 said the ledger wiring does not close the trace, and §8.2's AC is the reason that mattered:
+"the run's trace shows the category, the ranking revision and the filtered-out models." The writer
+exists now, in the engine, at the one site that holds both halves it needs.
+
+- **engine:** `attempt_candidate` hands the row it persisted back to `execute`, which — immediately
+after attaching `result.decision` to the response — builds an `ExecutionTrace` and persists it
+best-effort through the same store (`record_trace`, the sibling of `record_call`). The site is forced
+rather than chosen: the trace needs the routing decision, which `attempt_candidate` cannot know (it
+sees one candidate and not why it came first), and the id of the row to link by, which only the walk
+generates.
+- **What it fills that the API's writer cannot.** torii's `routes::chat::build_trace` leaves
+`candidates` and `skipped` EMPTY, because selection's internal detail never reaches a route. The
+engine has both: `skipped` is the withheld candidates with their reasons — the "filtered-out models"
+half of the AC — and `routing.ranking` carries the category, the artifact revision and the refs no
+admitted candidate answered (`unmatched`).
+- **The AC's own wording, qualified once.** For a category whose verdict is a `tie` — §8.4a's live
+run, and today's seeded `decide` chain — no ranking is sent, so the trace records the order kind and
+`ranking: null`, honestly. The revision is on the trace exactly when a measurement was claimed for
+it, which is what "the ranking revision in force" means.
+- **`request_id` is the call's id**, matching `build_trace`'s convention, and `inference_call_id`
+links trace to row. Run linkage is transitive on purpose: no `run_id` on the trace, because the call
+row it names already carries one (§9.3).
+- **Success only.** An exhausted walk writes a `Failed` call row and no trace: there is no response,
+and no ranking was in force for a call that reached no candidate. Its record is the attempts on the
+error.
+- **In production it fires on the run path, and only there.** `with_store` is called by nothing but
+torii's CLI heavy boot (`boot.rs:1139`) and one test, so the API service — whose routes persist their
+own calls and traces — is untouched: no duplicate rows, and no second writer to drift from.
+
+**Verified.** Two new engine tests:
+`a_recorded_trace_carries_the_ranking_revision_and_the_filtered_models` (a ranked decision call on a
+96-token window: category `planner.select`, revision 7, `unmatched = ["*:nimble"]`, the window-gate
+skip with its reason, `inference_call_id` equal to the ledger row's id, and `candidates` equal to the
+decision's own `order`) and `a_failing_trace_write_cannot_fail_the_call` (a store that refuses the
+trace still returns the response and still lands the call row). `RecordingStore` gained a trace
+recorder with them: a double that panics on `insert_execution_trace` fails every test that attaches it.
+Green: `sensei-gateway --lib` 478 passed / 0 failed, `sensei-orchestrator` 590 / 0, clippy
+`-D warnings` clean on both.
+
+**Verified against the dev database (55322) — the half only Postgres can prove.**
+`a_runs_model_call_lands_in_the_ledger_attributed_to_its_run` (`crates/cli/tests/run_metering.rs`) now
+asserts the TRACE as well as the row: exactly one `metering.execution_traces` row, its
+`inference_call_id` equal to the ledger row's id, `request_id` that same id, `capability` `text_chat`,
+`status` `success`, a numeric `duration_ms`, and a non-null `routing`. Driven through the executor and
+the production `PgGatewayStore`, so `executor → gateway → store → ledger + traces` is exercised with
+only the model faked. The category/revision CONTENT stays in the engine test deliberately: a run's
+graph builds its requests with `routing: None`, so nothing reaching the executor can claim a
+measurement.
+
+**Readable, not merely durable:** `GET /v1/requests/{id}/trace` serves it (`get_traces_by_call`,
+tenant-scoped), which is where an operator reads the ranking a run's call was ordered by.
+
+**Corrected with it, because the landing makes them false:** `ExecutionTrace::routing`'s "FORWARD
+PROVISION — nothing in this workspace builds one in production" note, the same claim on
+`InferenceResponse::routing`, and the two feature docs that repeated it
+(`observability/tracing-and-attempts.md`, `routing/provider-preferences.md`). SP-ROUTE-1's own ledger
+row for that gap is a separate plan's file and still reads ⬜ OPEN.
+
+**Still open, unchanged:** the release mechanics (§9.3) — an added trait-visible field and a new
+module in the crate mean a gateway tag and a torii repin in one wave. §9.6 needs the same wave the
+rest of the run-metering work does, and nothing more.
+
+### 9.7 Landed: the run's trace, read (2026-10-27)
+
+§8.2's AC asks for three things a person can *look at* — "the run's trace shows the category, the
+ranking revision and the filtered-out models" — and §9.6 landed only the writing of them; Phase 5's own
+UI bullet ("show the ranking revision that was in force for the call") was still open. Both now read
+on the run detail's expanded trace panel:
+
+- **What the panel shows**, in the order an operator asks it: what was tried and why it fell back
+  (`summarizeTrace` and the attempt chain, unchanged); WHAT ORDER was in force (`routing.strategy`,
+  whether it degraded, and the order the walk was handed); and WHO never got a chance (`skipped`, each
+  withheld model with its gate's own reason — "estimated 12000 input tokens exceeds the model's
+  8192-token context window", "router cooling down").
+- **A measurement is named as one.** When the trace records a ranking, the panel names the category it
+  was measured for and the artifact revision that was in force, plus the refs no admitted candidate
+  answered (`unmatched` — the roster-drift half). When the trace records none it says exactly that
+  ("No measured ranking was in force for this call") rather than naming a category it does not have.
+  That is the tie path §8.4a ran, and it now reads as itself on screen instead of as a missing value.
+  The copy claims nothing about *where* the order came from, because `RoutingDecision` cannot: an
+  authored policy `order` re-ranks the candidates and shows up in `order`, with `ranking: None` — the
+  same trace shape as no order at all.
+- **Why the run detail and not Requests.** A trace is per call, and a run is where a call's cost and
+  its routing decision already sit on one screen (§9.5), with `run_id` (§9.3/§9.4) as the join that put
+  them there. The Requests screen's panel is deliberately left attempts-only: one explanation in two
+  places is two things that can drift, and the run path is the one this AC is about.
+- **No new read and no new writer.** The panel fetches the same `GET /v1/requests/{id}/trace` that
+  already served the attempts, and reads fields the endpoint had been returning all along.
+- **The client type was the actual gap.** Seiki's `RoutingTrace` was typed as attempts-only, with a
+  note that `candidates`/`skipped` were "empty from the chat path today" — true of the API's own writer,
+  false of a run's calls since §9.6. It now mirrors the server's `ExecutionTrace`, and four pure
+  derivations in `lib/requests.ts` decide what the panel says (`rankingInForce`, `rankingLine`,
+  `routeOrder`, `filteredOut`).
+
+**Verified.** Seiki `test` 226 passed (42 in `requests.spec.ts`, 6 new: the absent-order and
+unmeasured-order cases, the category/artifact/revision line with its singular and plural ref counts,
+the order as endpoints, and the withheld reasons); `svelte-check` 0 errors / 0 warnings. The `runs` e2e
+passes 7/7 against the live gateway and the seeded dev database, and its expand-a-call test now also
+asserts what the panel renders: `grouped_weighted`, the order
+`openai:gpt-4o-mini → anthropic:claude-sonnet-4-5`, `planner.select` with `revision 7`, the unmatched
+`ollama:qwen3:8b`, and both withheld models with their reasons. The fixture's served call became the
+run's decision call (`capability` `decision`, chain `decide`), because a measured ranking is a claim
+about a decision order — `dispatch::routing_for` maps the executor's measured `ChoiceOrder` into
+`RoutingPreferences::ranking`, and only that mapping carries a category and an artifact revision.
+
+**Still open, unchanged:** the release mechanics (§9.3/§9.6) — a gateway tag and a torii repin. §9.7
+depends on neither: it reads fields the trace it consumes already has.
+
 ## 10. Phase 6 — tenant-facing decisions (only if still wanted)
 
 `POST /v1/decide`, mirroring `/v1/chat`'s governance: auth + `require_*`; model enablement from
@@ -918,7 +1227,7 @@ decision chains; budget reserve/commit on an input-only estimate; redaction, tra
 | Torii copies the token estimator | a hardcoded minimum decision size (182) drifts from the gateway's prompt overhead | call the gateway's own estimator via the crate |
 | The `planner.select` proxy | no committed cases yet, so `tool.route` would stand in | label the proxy in the artifact and in Seiki |
 | Merging torii code before the tag | CI strips `[patch]`, compiles against v0.12.0 | Phase 0 first |
-| Decision spend inside runs | the executor journals its own usage | decide the ledger stance explicitly (Phase 5) |
+| Decision spend inside runs | the executor journals its own usage | ledger rows from the call site, attributed and run-linked (§9.2); tenant totals move on landing — release note |
 | Silent capability drops | `map_capability` returns `None` with a `warn!` | assert the mapping, not the absence of errors |
 | The resolver becomes a hard dependency | a view outage or a bad join would stop decisions entirely, even though the chain alone is sufficient | ranking is advisory: resolver failure ⇒ no ranking, chain order, logged; a test that a decision works with the resolver down |
 
