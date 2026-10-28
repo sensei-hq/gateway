@@ -146,9 +146,11 @@ a fully-failed request yields a lossy flattened string. Note this is distinct
 from the richer `ExecutionTrace` type in `trace.rs` (which also holds a
 `Vec<Attempt>` plus candidates/skipped/costs) — `Gateway::execute` fills the
 response's `attempts` and, since System One §9.6, also **persists** one
-`ExecutionTrace` per successful call when it was built with a `GatewayStore` (see
-the `RoutingDecision` section below). The failure path still gets neither: an
-exhausted walk's record is the flattened error plus a `Failed` call row.
+`ExecutionTrace` for every call it records when built with a `GatewayStore` — a
+candidate that answered and an exhausted chain alike (see the `RoutingDecision`
+section below). A failed request still has no response, so the flattened error on
+the `GatewayError` is all a caller gets; the structured per-attempt record is in
+the trace.
 
 ## `RoutingDecision` — why the candidates were in that order
 
@@ -192,18 +194,22 @@ condition included.
 
 **The trace carries it too, since System One §9.6.** `RoutingDecision` used to
 reach only the two response surfaces above; `Gateway::execute` now also builds an
-`ExecutionTrace` for a successful call and persists it through the store the
-gateway was built with, so `ExecutionTrace::routing` is populated in production.
-That is what makes a *run's* decision durable: the executor's gateway is the
-store-attached one, and the trace is where the ranking's category and revision
-are readable after the boot log is gone. Two boundaries worth stating, because
-both read as bugs otherwise:
+`ExecutionTrace` for every call it records — a candidate that answered, and a
+chain that exhausted — and persists it through the store the gateway was built
+with, so `ExecutionTrace::routing` is populated in production. That is what makes
+a *run's* decision durable: the executor's gateway is the store-attached one, and
+the trace is where the ranking's category and revision are readable after the boot
+log is gone. Two boundaries worth stating, because both read as bugs otherwise:
 
 - **No store, no trace.** A gateway built without one (every embedder, and the
   API service, whose routes persist their own traces) writes nothing.
-- **Success only.** A call that exhausted its chain records a `Failed` call row
-  and no trace — there is no response to describe, and no ranking was in force
-  for a call that never reached a candidate.
+- **A failure is traced with what it has, not with what it lacks.** An exhausted
+  chain gets a `failed` trace carrying the attempts it made, the order it was
+  handed (`routing`, with the same category and revision when a ranking was in
+  force), and every model the gates withheld. It carries no cost: nothing was
+  served, so `estimated_cost` and `actual_cost` are absent rather than `0` — "this
+  failed call cost $0.00" would be a different, wrong statement. Read `status`
+  first: a failed trace is the only one whose attempts are all failures.
 
 **Where a human reads it.** `GET /v1/requests/{id}/trace` serves one call's
 persisted trace, and Seiki's run detail expands a call into it: the attempt

@@ -10,7 +10,7 @@ use crate::types::config::{
 use crate::types::decision::{DecisionAnswer, DecisionQuestion, DecisionQuestions};
 use crate::types::io::{DecisionRequest, DecisionResponse};
 use crate::types::request::{CandidateRef, Payload, Ranking, RankingSource, RoutingPreferences};
-use crate::types::trace::{RoutingDecision, TraceStatus};
+use crate::types::trace::{AttemptStatus, RoutingDecision, TraceStatus};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Mutex;
@@ -946,8 +946,8 @@ async fn a_request_without_a_ranking_records_none() {
 // `ExecutionTrace` had no production writer in this workspace, so
 // `ExecutionTrace::routing` was forward provision for three plans and a run's
 // decision call was durable nowhere: the AC's "the trace shows the category and
-// the ranking revision" held only in a boot log. `execute` writes one per
-// successful call now. These pin what lands on it.
+// the ranking revision" held only in a boot log. `execute` writes one per call
+// it records now — served or exhausted. These pin what lands on it.
 
 /// The AC, at the writer's boundary: a ranked decision call's persisted trace
 /// names the ranking in force — category AND revision — and both kinds of "not
@@ -1057,5 +1057,122 @@ async fn a_recorded_trace_carries_the_ranking_revision_and_the_filtered_models()
             .map(|c| c.endpoint.clone())
             .collect::<Vec<_>>(),
         "`candidates` is the order the engine would have tried"
+    );
+}
+
+/// The other half of the writer: an exhausted walk is a call too.
+///
+/// Before this, only a served candidate produced a trace, so a failed run's call
+/// read as "no trace recorded" — the one case where the question is hardest to
+/// answer, because the ledger row names only the last error and the walk's order
+/// and withheld models were durable nowhere. Asserted here at the writer's
+/// boundary: the attempts, the order it was handed, and the measurement that order
+/// obeyed all land on a `failed` trace, and the fields that describe a served call
+/// are absent rather than faked.
+#[tokio::test]
+async fn an_exhausted_walk_records_its_attempts_and_the_order_it_was_handed() {
+    let store = Arc::new(super::tests::RecordingStore::default());
+    let gw = gateway_with(8192).with_store(store.clone());
+    let ollama = Decider::failing("ollama", 500);
+    let openrouter = Decider::failing("openrouter", 503);
+    gw.adapters.register_decision(ollama.clone()).await;
+    gw.adapters.register_decision(openrouter.clone()).await;
+
+    let mut req = decision_request(json!({"ticket": "charged twice"}), questions());
+    // A measured order, to pin that the ranking travels with a FAILED call too —
+    // "which order was this walk given" is not a claim about its outcome.
+    req.routing = ranked_to("jev");
+    let err = gw
+        .execute(&req)
+        .await
+        .expect_err("every candidate refused the call");
+
+    // The row and its trace name each other. The row is attributed to the LAST
+    // attempted candidate — the ranking put jev first, so nimble failed last.
+    let calls = store.calls_for("ollama");
+    assert_eq!(calls.len(), 1, "the failed terminal call is still recorded");
+    assert_eq!(calls[0].status, CallStatus::Failed);
+    let traces = store.traces();
+    assert_eq!(traces.len(), 1, "and a failed call keeps its trace");
+    let stored = &traces[0];
+    assert_eq!(
+        stored.inference_call_id,
+        Some(calls[0].id),
+        "one join from the failed ledger row to its explanation"
+    );
+
+    let trace = &stored.trace;
+    assert!(
+        matches!(trace.status, TraceStatus::Failed),
+        "the trace states the outcome rather than leaving it to the attempts: {trace:?}"
+    );
+    assert_eq!(trace.request_id, calls[0].id.to_string());
+    assert_eq!(
+        trace.duration_ms, calls[0].duration_ms,
+        "the trace and the row it describes cannot disagree about the call"
+    );
+    assert_eq!(trace.attempts.len(), 2, "every step of the walk, in order");
+    assert!(
+        trace
+            .attempts
+            .iter()
+            .all(|a| matches!(a.status, AttemptStatus::Failed)),
+        "a failed trace has no winner among its attempts: {:?}",
+        trace.attempts
+    );
+    assert_eq!(trace.attempts[0].adapter, "openrouter", "the ranked order");
+    assert!(
+        trace.attempts[0]
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("not supported")),
+        "the provider's own refusal travels: {:?}",
+        trace.attempts[0].error
+    );
+
+    // THE REQUEST: the order it was handed, readable on a failed call exactly as on
+    // a served one. Absent this, the screen could only list failures.
+    let routing = trace
+        .routing
+        .as_ref()
+        .expect("a chain ran, so an order was handed to the walk");
+    assert_eq!(routing.strategy, "grouped_weighted");
+    assert_eq!(
+        routing
+            .order
+            .iter()
+            .map(|c| c.endpoint.clone())
+            .collect::<Vec<_>>(),
+        vec!["openrouter:jev".to_string(), "ollama:nimble".to_string()],
+        "the measured ranking still leads the order it was handed"
+    );
+
+    // And the measurement itself, so "which ranking was in force" is answerable
+    // from a failed call — a ranking is a claim about the order, not the outcome.
+    let applied = routing
+        .ranking
+        .as_ref()
+        .expect("the measured ranking was in force for this walk");
+    assert_eq!(applied.category, "planner.select");
+    assert_eq!(
+        applied.source.as_ref().and_then(|s| s.revision),
+        Some(7),
+        "the revision is what lets a past failed order be re-derived"
+    );
+
+    // Nothing was served, so there is no cost to claim. A zero would read as
+    // "the failed call was free", which is a different and wrong statement.
+    assert!(
+        trace.actual_cost.is_none() && trace.estimated_cost.is_none(),
+        "an exhausted walk reports no cost: {trace:?}"
+    );
+    // 8192 admits both candidates, so nothing was withheld — an empty list is the
+    // honest answer here, and the field is written rather than omitted.
+    assert!(trace.skipped.is_empty());
+
+    // Tracing did not change what the caller hears.
+    assert!(
+        matches!(err, GatewayError::AllAttemptsFailed { attempts: 2, .. }),
+        "got {err:?}"
     );
 }
