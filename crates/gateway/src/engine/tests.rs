@@ -6067,8 +6067,9 @@ impl RecordingStore {
     }
 
     /// Every trace persisted, in insertion order. Recorded rather than
-    /// `unimplemented!()` because `execute` writes one per successful call — an
-    /// unrecorded write would be a panic in every test that attaches this store.
+    /// `unimplemented!()` because `execute` writes one per call it records — served
+    /// or exhausted — so an unrecorded write would be a panic in every test that
+    /// attaches this store.
     pub(super) fn traces(&self) -> Vec<crate::store::StoredTrace> {
         self.traces.lock().unwrap().clone()
     }

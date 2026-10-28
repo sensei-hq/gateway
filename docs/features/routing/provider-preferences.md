@@ -582,13 +582,16 @@ correctly and could not report *why*; that gap is closed.
 ### The trace (a gap until System One §9.6)
 
 - **`ExecutionTrace::routing` is now written in production.** `Gateway::execute`
-  builds one trace per successful call — filling `candidates` and `skipped` from
-  selection, which nothing else can see — and persists it through the store the
-  gateway was built with. `insert_execution_trace` therefore has a production
-  caller. The qualification is the store: a gateway built without one writes no
-  trace, and the API's own routes persist theirs separately. For a run this is
-  the artefact that makes the ordering durable, and it is the only place the
-  ranking's category and revision can be read back after the boot log is gone.
+  builds one trace per call it records — served or exhausted — filling
+  `candidates` and `skipped` from selection, which nothing else can see, and
+  persists it through the store the gateway was built with.
+  `insert_execution_trace` therefore has a production caller. The qualification is
+  the store: a gateway built without one writes no trace, and the API's own routes
+  persist theirs separately. For a run this is the artefact that makes the
+  ordering durable, and it is the only place the ranking's category and revision
+  can be read back after the boot log is gone. A failed call's trace is the same
+  record of the order it was handed — it simply has no cost, because nothing was
+  served.
 
 ---
 

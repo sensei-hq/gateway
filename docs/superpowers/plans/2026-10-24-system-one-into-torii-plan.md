@@ -5,7 +5,8 @@ promoted to Phase 1; **ranking authority moved to torii**, with the gateway taki
 tenant/user-filtered ranking on each decision call) · 2026-10-26 (§9.2: the in-run spend stance is
 **decided** — ledger rows, attributed and run-linked) · 2026-10-27 (§9.6: the **trace writer**, the
 last piece of §8.2's AC that Phase 5 could not reach; §9.7: that trace **read** — the category, the
-revision and the filtered-out models, on the run detail).
+revision and the filtered-out models, on the run detail) · 2026-10-28 (§9.8: a **failed call** is
+traced too — the attempts, the order it was handed and the withheld models survive an exhausted walk).
 **Base:** gateway `develop` (decision seam uncommitted in the working tree), torii `origin/develop` @
 `dddc38e` (the local `~/developer/torii` checkout is 350 commits behind and has no `crates/cli`).
 **Status:** Phases 0–5 landed — the store, the margin, the wiring and the Seiki surface. Phase 4 is
@@ -13,8 +14,9 @@ revision and the filtered-out models, on the run detail).
   the in-run spend stance is **decided** (§9.2) and **landed** (§9.3 — the run metering store,
   verified against the dev database, with its read side in §9.4 and the run detail in §9.5), and the
   trace writer §9.2 said its wiring did **not** supply now exists (§9.6 — the engine builds and
-  persists an `ExecutionTrace` per successful call, so a run's category and ranking revision are
-  durable per call rather than only in a boot log) **and is read where the AC says it should be**
+  persists an `ExecutionTrace` per call it records, served or exhausted, so a run's category and
+  ranking revision are durable per call rather than only in a boot log) **and is read where the AC
+  says it should be**
   (§9.7 — the run detail expands a call into the order it was handed, the measurement that order
   obeyed, and every model that was filtered out). What is still open is the **release mechanics** —
   a gateway tag and a torii repin (§9.6's own note) — and anything Phase 6 still wants.
@@ -1106,10 +1108,11 @@ run, and today's seeded `decide` chain — no ranking is sent, so the trace reco
 it, which is what "the ranking revision in force" means.
 - **`request_id` is the call's id**, matching `build_trace`'s convention, and `inference_call_id`
 links trace to row. Run linkage is transitive on purpose: no `run_id` on the trace, because the call
-row it names already carries one (§9.3).
-- **Success only.** An exhausted walk writes a `Failed` call row and no trace: there is no response,
-and no ranking was in force for a call that reached no candidate. Its record is the attempts on the
-error.
+row it names already carries one (§9.3).- **A failure is traced too, with what it has.** An exhausted walk writes a `Failed` call row
+  **and** a `failed` trace: the attempts it made, the order it was handed (`routing`, with the same
+  category and revision when a ranking was in force) and the withheld candidates. It carries no
+  cost — nothing was served — so `estimated_cost`/`actual_cost` are absent rather than `0`; a zero
+  would read as "the failed call was free".
 - **In production it fires on the run path, and only there.** `with_store` is called by nothing but
 torii's CLI heavy boot (`boot.rs:1139`) and one test, so the API service — whose routes persist their
 own calls and traces — is untouched: no duplicate rows, and no second writer to drift from.
@@ -1192,6 +1195,44 @@ about a decision order — `dispatch::routing_for` maps the executor's measured 
 
 **Still open, unchanged:** the release mechanics (§9.3/§9.6) — a gateway tag and a torii repin. §9.7
 depends on neither: it reads fields the trace it consumes already has.
+
+### 9.8 Landed: a failed call's trace (2026-10-28)
+
+§9.6 traced only the call that produced a response, and said so; §9.7 then read it. That left the one
+call where the explanation matters most with none: an exhausted walk wrote a `Failed` call row and
+nothing else, so a failed run's call read as "No routing trace recorded" on the very screen built to
+explain it — while the ledger row names only the last error. The engine now writes a trace for both
+outcomes a walk can reach:
+
+- **What a failed trace carries.** The attempts the walk made, each with the provider's own refusal;
+  the order selection handed it (`routing` — same `strategy`/`degraded`/`order`, and `routing.ranking`
+  with the category and revision when a measurement was in force); and `candidates`/`skipped`, so
+  "who never got a chance" stays answerable on a call that reached no candidate.
+- **What it does not carry, and why.** No cost: nothing was served, so `estimated_cost`/`actual_cost`
+  are absent rather than `0` — a zero would read as "the failed call was free". `status: failed` is
+  the field to read first; it is the only trace whose attempts are all failures.
+- **The writer's shape.** `build_trace` now takes a `TraceOutcome` (status, attempts, costs, routing)
+  instead of an `InferenceResponse`, because an exhausted walk has no response to read them from.
+  Reusing one builder over a fabricated response was the alternative, and it would have put a zero
+  next to `failed` and invited a reader to trust the rest of its fields.
+- **Left untraced on purpose.** A `ModelNotReady` exhaustion returns before any call row is written,
+  so there is nothing for a trace to link to; and the streaming path writes no trace for any call,
+  success or failure — §9.6's boundary, unchanged.
+
+**Verified.** `an_exhausted_walk_records_its_attempts_and_the_order_it_was_handed` (two failing
+decision adapters on a ranked chain): one `failed` trace linked to the `Failed` call row, both attempts
+with their errors, `order = ["openrouter:jev", "ollama:nimble"]` under `grouped_weighted` with
+`planner.select` revision 7, absent costs, and the caller's `AllAttemptsFailed` unchanged. Green:
+`sensei-gateway --lib` 479 passed / 0 failed, clippy `-D warnings` and `fmt --check` clean.
+
+**On screen.** The run detail needed no new reader — it renders any trace it is handed — but its e2e
+fixture's failed trace predated the writer (empty `candidates`, no `routing`), so it now carries the
+shape the engine writes. `a failed call opens to its attempts and the order it was handed` opens the
+failed run's call and asserts the two attempts, both provider errors, the order
+`openai:gpt-4o-mini → anthropic:claude-sonnet-4-5`, and the honest absence of a measurement on that
+call (an authored order with `ranking: null`) — the case the copy must not fill in.
+
+**Still open, unchanged:** the release mechanics (§9.3/§9.6) — a gateway tag and a torii repin.
 
 ## 10. Phase 6 — tenant-facing decisions (only if still wanted)
 

@@ -22,7 +22,7 @@ use crate::types::config::{GatewayConfig, QuotaLimit, Window};
 use crate::types::cost::{Cost, TokenUsage};
 use crate::types::error::GatewayError;
 use crate::types::request::{InferenceRequest, InferenceResponse, StreamEvent};
-use crate::types::trace::{Attempt, AttemptStatus};
+use crate::types::trace::AttemptStatus;
 
 mod consensus;
 mod dispatch;

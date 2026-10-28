@@ -1,7 +1,10 @@
 use super::*;
 use crate::selection::{SelectedModel, SelectionResult};
 use crate::types::config::FallbackTrigger;
-use crate::types::trace::{CandidateInfo, ExecutionTrace, SkippedInfo, TraceStatus};
+use crate::types::cost::{Cost, CostEstimate};
+use crate::types::trace::{
+    Attempt, CandidateInfo, ExecutionTrace, RoutingDecision, SkippedInfo, TraceStatus,
+};
 
 /// Outcome of one per-attempt step in the fallback-chain walk — the seam a
 /// later plan extends. Lets the top-level `execute` loop read as: for each
@@ -169,14 +172,24 @@ impl super::Gateway {
                     response.routing = result.decision.clone();
                     // The trace, written here for the same reason the decision is
                     // attached here: it needs that decision AND the row the walk just
-                    // recorded, and this is the only place both exist. Only a call
-                    // that produced a response is traced — an exhausted walk's record
-                    // is the attempts on its error plus the `Failed` call row, and it
-                    // has no candidate, so no ranking was in force to name.
-                    // Pinned by
+                    // recorded, and this is the only place both exist. Pinned by
                     // `decision_tests::a_recorded_trace_carries_the_ranking_revision_and_the_filtered_models`.
-                    self.record_trace(build_trace(&call, &result, &response))
-                        .await;
+                    self.record_trace(build_trace(
+                        &call,
+                        &result,
+                        TraceOutcome {
+                            status: if response.success {
+                                TraceStatus::Success
+                            } else {
+                                TraceStatus::Failed
+                            },
+                            attempts: &response.attempts,
+                            estimated_cost: response.estimated_cost.clone(),
+                            actual_cost: response.actual_cost.clone(),
+                            routing: response.routing.clone(),
+                        },
+                    ))
+                    .await;
                     return Ok(response);
                 }
                 StepOutcome::FallBack => continue,
@@ -240,9 +253,15 @@ impl super::Gateway {
         );
 
         // Best-effort record of the failed terminal call (observability + request
-        // counting), attributed to the last attempted candidate.
+        // counting), attributed to the last attempted candidate — and its trace,
+        // because a call that never reached a candidate is the one whose
+        // explanation is hardest to reconstruct afterwards: the ledger row names
+        // only the last error, `order` is what it WOULD have tried, and the
+        // withheld list is the only record of what the gates refused. Both lists
+        // are the walk's own outcome, not a response's — an exhausted walk has no
+        // response to read them from (see [`TraceOutcome`]).
         if let Some(last) = attempts.last() {
-            self.record_call(&InferenceCall {
+            let call = InferenceCall {
                 id: Uuid::new_v4(),
                 session_id: None,
                 project_id: None,
@@ -263,7 +282,22 @@ impl super::Gateway {
                 subject_id: request.auth.as_ref().map(|a| a.subject_id),
                 tier: request.auth.as_ref().and_then(|a| a.tier.clone()),
                 run_id: None,
-            })
+            };
+            self.record_call(&call).await;
+            self.record_trace(build_trace(
+                &call,
+                &result,
+                TraceOutcome {
+                    status: TraceStatus::Failed,
+                    attempts: &attempts,
+                    // Nothing was served, so there is no cost to report: the walk's
+                    // per-attempt costs stay on `attempts`, where a failed attempt's
+                    // own `cost` is `None` too. A zero here would read as "free".
+                    estimated_cost: None,
+                    actual_cost: None,
+                    routing: result.decision.clone(),
+                },
+            ))
             .await;
         }
 
@@ -530,7 +564,35 @@ impl super::Gateway {
     }
 }
 
-/// Snapshot one completed call as an [`ExecutionTrace`], linked to the ledger row
+/// What a call's own record contributes to its trace, beyond the selection detail
+/// [`build_trace`] reads from `result`.
+///
+/// Two callers, and they cannot share one value: a served call has an
+/// [`InferenceResponse`] (its attempts, its costs, the routing decision attached to
+/// it), while an exhausted walk has attempts and the order it was handed but **no
+/// response at all**. Reusing one builder over a fabricated response would put a
+/// zero next to `TraceStatus::Failed` — "this failed call cost $0.00" — and invite a
+/// reader to trust the rest of its fields.
+struct TraceOutcome<'a> {
+    /// Whether a candidate answered. The trace's own statement, and the reader's
+    /// first question: a failed trace is the only one whose `attempts` are all
+    /// failures.
+    status: TraceStatus,
+    /// Every step the walk took, in order — the record "what did it try" as
+    /// opposed to `routing.order`'s "what would it try".
+    attempts: &'a [Attempt],
+    /// The pre-call estimate selection priced, when a response carried one.
+    estimated_cost: Option<CostEstimate>,
+    /// What the provider actually charged. `None` for an exhausted walk: nothing
+    /// was served, so there is no cost — not a zero cost.
+    actual_cost: Option<Cost>,
+    /// The order selection handed the walk. `None` when no strategy ran (a direct
+    /// router+model call orders nothing); kept `None` rather than invented, because
+    /// a `Some` here claims a strategy made a decision about this call.
+    routing: Option<RoutingDecision>,
+}
+
+/// Snapshot one recorded call as an [`ExecutionTrace`], linked to the ledger row
 /// `call` names.
 ///
 /// **The production writer `ExecutionTrace` did not have.** Every field of that
@@ -543,6 +605,10 @@ impl super::Gateway {
 /// the ranking's CATEGORY and REVISION durable per call rather than only in a boot
 /// log.
 ///
+/// Called for BOTH outcomes a walk can reach: a served candidate, and an exhausted
+/// chain. A failed call is not a lesser trace — it is the one where the order and
+/// the attempts are all a reader has, since there is no winner to ask about.
+///
 /// `request_id` is the call's own id, matching the API's
 /// `routes::chat::build_trace`: this describes deliberately the same call the
 /// sibling ledger row records, not a second event. The two are linked explicitly
@@ -550,17 +616,13 @@ impl super::Gateway {
 fn build_trace(
     call: &InferenceCall,
     result: &SelectionResult,
-    response: &InferenceResponse,
+    outcome: TraceOutcome<'_>,
 ) -> StoredTrace {
     let created_at = call.recorded_at;
     let trace = ExecutionTrace {
         request_id: call.id.to_string(),
         capability: call.capability.clone(),
-        status: if response.success {
-            TraceStatus::Success
-        } else {
-            TraceStatus::Failed
-        },
+        status: outcome.status,
         // The call's own figure rather than a second measurement, so the trace and
         // the row it describes cannot disagree about how long the call took.
         duration_ms: call.duration_ms,
@@ -582,11 +644,11 @@ fn build_trace(
                 reason: s.reason.to_string(),
             })
             .collect(),
-        attempts: response.attempts.clone(),
-        estimated_cost: response.estimated_cost.clone(),
-        actual_cost: response.actual_cost.clone(),
+        attempts: outcome.attempts.to_vec(),
+        estimated_cost: outcome.estimated_cost,
+        actual_cost: outcome.actual_cost,
         // PROPAGATE, never default: this is the field's whole reason to exist.
-        routing: response.routing.clone(),
+        routing: outcome.routing,
         created_at,
     };
     StoredTrace {
