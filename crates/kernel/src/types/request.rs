@@ -731,10 +731,12 @@ pub struct InferenceResponse {
     /// caller ASKED for, this one is what the router actually did with it. `None`
     /// when no strategy ran — a direct router+model request orders nothing.
     ///
-    /// Carried on the response rather than only on an [`ExecutionTrace`]
-    /// because nothing in this workspace builds an `ExecutionTrace` in
-    /// production today; the response is the one artefact a caller reporting
-    /// "why did it pick the expensive one" actually has in hand.
+    /// Carried on the response AND on the [`ExecutionTrace`] the engine
+    /// persists beside the call row (System One §9.6), because the two are read
+    /// by different audiences: a store-less embedder has only the response in
+    /// hand, while a recorded trace is where the explanation is durable per call
+    /// — and, for a run, the only place its category and ranking revision can be
+    /// read back at all.
     ///
     /// **Not available on the streaming path.** `Gateway::execute_stream`
     /// selects with the full preferences — `only`/`ignore` filtering and every

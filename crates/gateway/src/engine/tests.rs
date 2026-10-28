@@ -5034,6 +5034,7 @@ fn seed_request_call(subject: Uuid) -> crate::store::InferenceCall {
         recorded_at: Utc::now(),
         subject_id: Some(subject),
         tier: Some("free".to_string()),
+        run_id: None,
     }
 }
 
@@ -6048,13 +6049,14 @@ async fn the_same_generation_rate_reports_the_same_throughput_streaming_or_not()
 /// The reads are `unimplemented!()` rather than empty so a future test that
 /// leans on one fails loudly instead of silently asserting over nothing.
 #[derive(Default)]
-struct RecordingStore {
+pub(super) struct RecordingStore {
     calls: std::sync::Mutex<Vec<crate::store::InferenceCall>>,
+    traces: std::sync::Mutex<Vec<crate::store::StoredTrace>>,
 }
 
 impl RecordingStore {
     /// The rows persisted for `adapter`, in insertion order.
-    fn calls_for(&self, adapter: &str) -> Vec<crate::store::InferenceCall> {
+    pub(super) fn calls_for(&self, adapter: &str) -> Vec<crate::store::InferenceCall> {
         self.calls
             .lock()
             .unwrap()
@@ -6062,6 +6064,13 @@ impl RecordingStore {
             .filter(|c| c.adapter == adapter)
             .cloned()
             .collect()
+    }
+
+    /// Every trace persisted, in insertion order. Recorded rather than
+    /// `unimplemented!()` because `execute` writes one per successful call — an
+    /// unrecorded write would be a panic in every test that attaches this store.
+    pub(super) fn traces(&self) -> Vec<crate::store::StoredTrace> {
+        self.traces.lock().unwrap().clone()
     }
 }
 
@@ -6103,9 +6112,10 @@ impl crate::store::GatewayStore for RecordingStore {
 
     async fn insert_execution_trace(
         &self,
-        _trace: &crate::store::StoredTrace,
+        trace: &crate::store::StoredTrace,
     ) -> Result<Uuid, GatewayError> {
-        unimplemented!("RecordingStore records inference calls only")
+        self.traces.lock().unwrap().push(trace.clone());
+        Ok(trace.id)
     }
 
     async fn get_execution_trace(
@@ -7748,5 +7758,108 @@ async fn a_direct_streamed_request_carries_no_routing_decision() {
         done_routing(&events).is_none(),
         "a direct router+model request orders nothing, so there is no decision \
          to report — reporting an empty one would claim a strategy ran"
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// §9.6 of the System One plan — the execution-trace writer
+// ───────────────────────────────────────────────────────────────────────────
+
+/// A store that takes the ledger row and REFUSES every trace — the shape the real
+/// one produces when Postgres is unhappy (torii's `db_err`: `GatewayError` has no
+/// Storage variant).
+struct TraceFailingStore {
+    calls: std::sync::Mutex<Vec<crate::store::InferenceCall>>,
+}
+
+#[async_trait::async_trait]
+impl crate::store::GatewayStore for TraceFailingStore {
+    async fn insert_inference_call(
+        &self,
+        call: &crate::store::InferenceCall,
+    ) -> Result<Uuid, GatewayError> {
+        self.calls.lock().unwrap().push(call.clone());
+        Ok(call.id)
+    }
+
+    async fn insert_execution_trace(
+        &self,
+        _trace: &crate::store::StoredTrace,
+    ) -> Result<Uuid, GatewayError> {
+        Err(GatewayError::ProviderError {
+            adapter: "postgres".into(),
+            message: "the trace table is unreachable".into(),
+            status: None,
+        })
+    }
+
+    async fn get_inference_calls_by_session(
+        &self,
+        _session_id: Uuid,
+    ) -> Result<Vec<crate::store::InferenceCall>, GatewayError> {
+        unimplemented!("TraceFailingStore exists to refuse a trace write")
+    }
+
+    async fn get_spend_since(&self, _since: chrono::DateTime<Utc>) -> Result<f64, GatewayError> {
+        unimplemented!("TraceFailingStore exists to refuse a trace write")
+    }
+
+    async fn get_spend_by_model_since(
+        &self,
+        _since: chrono::DateTime<Utc>,
+    ) -> Result<Vec<(String, f64)>, GatewayError> {
+        unimplemented!("TraceFailingStore exists to refuse a trace write")
+    }
+
+    async fn get_usage_since(
+        &self,
+        _subject_id: Uuid,
+        _since: chrono::DateTime<Utc>,
+    ) -> Result<crate::store::UsageTotals, GatewayError> {
+        unimplemented!("TraceFailingStore exists to refuse a trace write")
+    }
+
+    async fn get_execution_trace(
+        &self,
+        _id: Uuid,
+    ) -> Result<Option<crate::store::StoredTrace>, GatewayError> {
+        unimplemented!("TraceFailingStore exists to refuse a trace write")
+    }
+
+    async fn get_traces_by_call(
+        &self,
+        _inference_call_id: Uuid,
+    ) -> Result<Vec<crate::store::StoredTrace>, GatewayError> {
+        unimplemented!("TraceFailingStore exists to refuse a trace write")
+    }
+}
+
+/// A trace is observability, so a store that cannot take one must not fail the
+/// call it describes.
+///
+/// The sibling `record_call` has had this property for as long as it has
+/// existed, and `the_persisted_duration_excludes_a_failed_candidates_span`'s
+/// doc records what happens when a metering write is treated as a precondition.
+/// The trace write is a SECOND round trip on the same hot path — the one place a
+/// `?` would turn an observability outage into an inference outage — so it is
+/// pinned rather than assumed.
+#[tokio::test]
+async fn a_failing_trace_write_cannot_fail_the_call() {
+    let store = Arc::new(TraceFailingStore {
+        calls: std::sync::Mutex::new(Vec::new()),
+    });
+    let gw = test_gateway().with_store(store.clone());
+    register_noop(&gw).await;
+
+    let resp = gw
+        .execute(&chat_request())
+        .await
+        .expect("a refused trace write must not fail the call");
+
+    assert_eq!(resp.attempts.len(), 1, "the call ran and returned");
+    assert_eq!(
+        store.calls.lock().unwrap().len(),
+        1,
+        "and the ledger row lands: the two writes are independent"
     );
 }

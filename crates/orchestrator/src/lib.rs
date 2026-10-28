@@ -8,6 +8,7 @@
 
 pub mod agent;
 pub mod executor;
+pub mod metering;
 pub mod scheduler;
 
 // Dev-only: `test` for this crate's own tests, `feature = "test-support"` for ANOTHER

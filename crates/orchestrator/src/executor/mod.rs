@@ -1512,6 +1512,23 @@ impl Executor {
         fold: &Fold,
         nested: bool,
     ) -> Result<RunOutcome, OrchestratorError> {
+        // The metering scope (see `crate::metering`). Entered HERE, at the one function
+        // every model call of a run passes through — including every nested
+        // `drive_nested` body, which re-enters with the same id — so no dispatch site has
+        // to remember it and a call outside a run (`None`) is the only other case. A
+        // store reads it to stamp `InferenceCall::run_id`; without it a run's ledger row
+        // has no way to name its run, because the gateway (and so the store) is shared by
+        // every run in the process.
+        crate::metering::with_run(run, self.drive_inner(run, graph, fold, nested)).await
+    }
+
+    async fn drive_inner(
+        &self,
+        run: RunId,
+        graph: &Graph,
+        fold: &Fold,
+        nested: bool,
+    ) -> Result<RunOutcome, OrchestratorError> {
         let mut state = DriveState::default();
         loop {
             let ready = ready_nodes(graph, &state.completed, &state.terminal);

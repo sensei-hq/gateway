@@ -402,6 +402,7 @@ impl super::Gateway {
                                     recorded_at: Utc::now(),
                                     subject_id: request.auth.as_ref().map(|a| a.subject_id),
                                     tier: request.auth.as_ref().and_then(|a| a.tier.clone()),
+                                    run_id: None,
                                 });
                                 record_call_bounded(&store, failed_call).await;
                                 // Mid-stream failure: bytes already sent, so no
@@ -496,6 +497,7 @@ impl super::Gateway {
                         recorded_at: Utc::now(),
                         subject_id: request.auth.as_ref().map(|a| a.subject_id),
                         tier: request.auth.as_ref().and_then(|a| a.tier.clone()),
+                        run_id: None,
                     });
                     // Before the `yield`, for the reason spelled out above the
                     // completion dispatch: a consumer that stops polling at the
@@ -620,6 +622,7 @@ impl super::Gateway {
                     recorded_at: Utc::now(),
                     subject_id: request.auth.as_ref().map(|a| a.subject_id),
                     tier: request.auth.as_ref().and_then(|a| a.tier.clone()),
+                    run_id: None,
                 });
                 record_call_bounded(&store, exhausted_call).await;
 
