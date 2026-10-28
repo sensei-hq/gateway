@@ -579,15 +579,16 @@ re-derived where the event is built. Every reading above applies unchanged,
 `None` condition included. Before SP-ROUTE-1.2 a streamed request routed
 correctly and could not report *why*; that gap is closed.
 
-### One known gap
+### The trace (a gap until System One §9.6)
 
-- **`ExecutionTrace::routing` is forward provision only.** The field exists and
-  round-trips, but **nothing in this workspace builds an `ExecutionTrace` in
-  production** — the type is constructed in one test helper, and
-  `GatewayStore::insert_execution_trace` has no production caller. Every field
-  of that struct is equally unfilled. `InferenceResponse::routing` is the
-  delivered surface; treat the trace field as reserved for the day something
-  produces one.
+- **`ExecutionTrace::routing` is now written in production.** `Gateway::execute`
+  builds one trace per successful call — filling `candidates` and `skipped` from
+  selection, which nothing else can see — and persists it through the store the
+  gateway was built with. `insert_execution_trace` therefore has a production
+  caller. The qualification is the store: a gateway built without one writes no
+  trace, and the API's own routes persist theirs separately. For a run this is
+  the artefact that makes the ordering durable, and it is the only place the
+  ranking's category and revision can be read back after the boot log is gone.
 
 ---
 
