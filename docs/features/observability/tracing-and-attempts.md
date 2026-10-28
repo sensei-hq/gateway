@@ -144,8 +144,11 @@ Everything else — per-attempt `duration_ms`, `sequence`, `status`,
 structured post-mortem can only get one when the request ultimately *succeeds*;
 a fully-failed request yields a lossy flattened string. Note this is distinct
 from the richer `ExecutionTrace` type in `trace.rs` (which also holds a
-`Vec<Attempt>` plus candidates/skipped/costs) — `Gateway::execute` does not
-build an `ExecutionTrace`; it only fills `InferenceResponse.attempts`.
+`Vec<Attempt>` plus candidates/skipped/costs) — `Gateway::execute` fills the
+response's `attempts` and, since System One §9.6, also **persists** one
+`ExecutionTrace` per successful call when it was built with a `GatewayStore` (see
+the `RoutingDecision` section below). The failure path still gets neither: an
+exhausted walk's record is the flattened error plus a `Failed` call row.
 
 ## `RoutingDecision` — why the candidates were in that order
 
@@ -187,13 +190,32 @@ carrying the decision the selection produced rather than one re-derived at the
 yield site. Read it exactly as you read `InferenceResponse::routing`, `None`
 condition included.
 
-One gap worth knowing before you go looking:
+**The trace carries it too, since System One §9.6.** `RoutingDecision` used to
+reach only the two response surfaces above; `Gateway::execute` now also builds an
+`ExecutionTrace` for a successful call and persists it through the store the
+gateway was built with, so `ExecutionTrace::routing` is populated in production.
+That is what makes a *run's* decision durable: the executor's gateway is the
+store-attached one, and the trace is where the ranking's category and revision
+are readable after the boot log is gone. Two boundaries worth stating, because
+both read as bugs otherwise:
 
-- **`ExecutionTrace::routing` is forward provision only.** The field exists and
-  round-trips through serde, but nothing in this workspace builds an
-  `ExecutionTrace` in production (see above — every field of that struct is
-  equally unfilled), so no writer populates it today. The response is the
-  delivered surface.
+- **No store, no trace.** A gateway built without one (every embedder, and the
+  API service, whose routes persist their own traces) writes nothing.
+- **Success only.** A call that exhausted its chain records a `Failed` call row
+  and no trace — there is no response to describe, and no ranking was in force
+  for a call that never reached a candidate.
+
+**Where a human reads it.** `GET /v1/requests/{id}/trace` serves one call's
+persisted trace, and Seiki's run detail expands a call into it: the attempt
+chain, the order selection handed the walk (`strategy`, `degraded`, `order`), the
+ranking's category and artifact revision when one was in force (`routing.ranking`,
+with the `unmatched` refs no admitted candidate answered), and every withheld
+candidate with its gate's own reason (`skipped`) — the "filtered-out models" half,
+which no other surface carries. `order` and `attempts` are read side by side and
+never merged, because the walk can stop before the tail of `order` is reached:
+"what it would have tried" and "what it did try" are two different statements.
+Field shapes for that screen live in the admin portal's `lib/api.ts`, which
+mirrors this `ExecutionTrace`.
 
 ## `StreamEvent` — the streaming trace surface
 
