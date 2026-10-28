@@ -58,13 +58,12 @@ pub struct SkippedInfo {
 /// production — two identical requests may legitimately route differently, so
 /// there is nothing to re-run and compare against.
 ///
-/// Delivered on the two artefacts a caller actually holds: on
-/// [`InferenceResponse::routing`] for a unary call, and — since SP-ROUTE-1.2 —
-/// on [`StreamEvent::Done`] for a streamed one, which is the same decision
-/// value rather than a second derivation of it. One gap remains before going
-/// looking for it:
-///
-/// - **[`ExecutionTrace::routing`] is forward provision.** See that field.
+/// Delivered on the three artefacts that carry it: on
+/// [`InferenceResponse::routing`] for a unary call, on [`StreamEvent::Done`] for
+/// a streamed one — since SP-ROUTE-1.2, the same decision value rather than a
+/// second derivation of it — and, since System One §9.6, on
+/// [`ExecutionTrace::routing`], which the engine persists alongside the call
+/// row. The one qualification is a store: no `GatewayStore`, no trace.
 ///
 /// [`InferenceResponse::routing`]: super::request::InferenceResponse::routing
 /// [`StreamEvent::Done`]: super::request::StreamEvent#variant.Done
@@ -163,14 +162,19 @@ pub struct ExecutionTrace {
     pub actual_cost: Option<Cost>,
     /// Why the candidates came out in this order (SP-ROUTE-1 AC10).
     ///
-    /// **FORWARD PROVISION, not a delivered surface.** The field exists and is
-    /// guarded by persistence round-trip tests, but **nothing in this workspace
-    /// builds an `ExecutionTrace` in production** — the type is constructed in
-    /// exactly one test helper, and `GatewayStore::insert_execution_trace` has no
-    /// production caller at all. Every field of this struct is equally unfilled.
-    /// Do not write "the trace records the routing decision" without that
-    /// qualifier, or a reader goes hunting for a writer that does not exist.
-    /// [`InferenceResponse::routing`] is the delivered surface.
+    /// **Written by the engine since System One §9.6 (2026-10-27).** `Gateway`
+    /// builds the trace beside the call row it records
+    /// (`engine/execute.rs::build_trace`) and persists it best-effort through the
+    /// store it was built with, so this field is a delivered surface — that is
+    /// the writer SP-ROUTE-1 could not find, and both halves of this field's
+    /// earlier "forward provision" note are now false: the type IS constructed in
+    /// production, and `insert_execution_trace` HAS a production caller.
+    ///
+    /// One qualification replaces it, and it is the honest boundary: only a
+    /// gateway built with a store writes one, and the API's own routes persist
+    /// their traces themselves rather than sharing this writer. A store-less
+    /// embedder still reads the decision from [`InferenceResponse::routing`],
+    /// which is what a caller has in hand.
     ///
     /// `default` is belt-and-braces, not load-bearing: serde already resolves a
     /// missing field for an `Option<T>` to `None` via `missing_field`. Stated

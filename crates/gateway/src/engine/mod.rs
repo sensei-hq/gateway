@@ -16,7 +16,7 @@ use crate::dispatch::{
 };
 use crate::pruning::{Availability, ChainWarning};
 use crate::selection::{ModelSelectionService, SelectionCriteria};
-use crate::store::{CallStatus, GatewayStore, InferenceCall, UsageTotals};
+use crate::store::{CallStatus, GatewayStore, InferenceCall, StoredTrace, UsageTotals};
 use crate::types::capability::Capability;
 use crate::types::config::{GatewayConfig, QuotaLimit, Window};
 use crate::types::cost::{Cost, TokenUsage};
@@ -577,11 +577,33 @@ impl Gateway {
 
     /// Best-effort persist a recorded call. Metering must never take down the
     /// hot path, so a store error is logged and swallowed. No-op without a store.
-    async fn record_call(&self, call: InferenceCall) {
+    ///
+    /// The call is taken by REFERENCE so the caller can keep it: `execute` writes
+    /// the call's trace after its walk, and the trace names this row
+    /// ([`Self::record_trace`]).
+    async fn record_call(&self, call: &InferenceCall) {
         if let Some(store) = &self.store
-            && let Err(e) = store.insert_inference_call(&call).await
+            && let Err(e) = store.insert_inference_call(call).await
         {
             tracing::warn!(error = %e, "failed to record inference call (metering is best-effort)");
+        }
+    }
+
+    /// Best-effort persist a call's execution trace, linked to its ledger row by
+    /// [`StoredTrace::inference_call_id`].
+    ///
+    /// Same stance as [`Self::record_call`] — a store error is logged and
+    /// swallowed, because observability must not fail the call it describes, and
+    /// no store means no write, so every store-less configuration is unchanged.
+    /// Deliberately without a budget of its own: `record_call` on this path has
+    /// none, and a second timeout policy for the same class of write would be a
+    /// rule nobody asked for. The number to watch is `execution_traces`' size (one
+    /// object per call), not this write's latency.
+    async fn record_trace(&self, trace: StoredTrace) {
+        if let Some(store) = &self.store
+            && let Err(e) = store.insert_execution_trace(&trace).await
+        {
+            tracing::warn!(error = %e, "failed to record execution trace (metering is best-effort)");
         }
     }
 

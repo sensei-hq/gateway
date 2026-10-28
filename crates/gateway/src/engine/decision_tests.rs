@@ -10,7 +10,7 @@ use crate::types::config::{
 use crate::types::decision::{DecisionAnswer, DecisionQuestion, DecisionQuestions};
 use crate::types::io::{DecisionRequest, DecisionResponse};
 use crate::types::request::{CandidateRef, Payload, Ranking, RankingSource, RoutingPreferences};
-use crate::types::trace::RoutingDecision;
+use crate::types::trace::{RoutingDecision, TraceStatus};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Mutex;
@@ -938,5 +938,124 @@ async fn a_request_without_a_ranking_records_none() {
     assert!(
         routing(&resp).ranking.is_none(),
         "no ranking in, no ranking recorded: the pre-feature behaviour"
+    );
+}
+
+// ── the recorded trace (System One §9.6) ──────────────────────────────────────
+//
+// `ExecutionTrace` had no production writer in this workspace, so
+// `ExecutionTrace::routing` was forward provision for three plans and a run's
+// decision call was durable nowhere: the AC's "the trace shows the category and
+// the ranking revision" held only in a boot log. `execute` writes one per
+// successful call now. These pin what lands on it.
+
+/// The AC, at the writer's boundary: a ranked decision call's persisted trace
+/// names the ranking in force — category AND revision — and both kinds of "not
+/// used": the candidate a gate withheld, and the ranked ref this deployment
+/// cannot answer.
+#[tokio::test]
+async fn a_recorded_trace_carries_the_ranking_revision_and_the_filtered_models() {
+    let store = Arc::new(super::tests::RecordingStore::default());
+    // 96 tokens is below the minimum decision, so `nimble` is withheld by the
+    // context-window gate and `jev` serves. That is the one fixture with BOTH
+    // kinds of rejection on one call, which is why it is this one and not 8192.
+    let gw = gateway_with(96).with_store(store.clone());
+    let ollama = Decider::ok("ollama");
+    let openrouter = Decider::ok("openrouter");
+    gw.adapters.register_decision(ollama.clone()).await;
+    gw.adapters.register_decision(openrouter.clone()).await;
+
+    let mut req = decision_request(json!({"ticket": "charged twice"}), questions());
+    req.routing = ranked_to("nimble");
+    gw.execute(&req).await.expect("falls through to jev");
+    assert_eq!(
+        openrouter.calls(),
+        1,
+        "the ranked ref was gated, jev served"
+    );
+
+    let calls = store.calls_for("openrouter");
+    assert_eq!(calls.len(), 1, "the call this trace describes");
+    let traces = store.traces();
+    assert_eq!(traces.len(), 1, "one successful call, exactly one trace");
+    let stored = &traces[0];
+    let trace = &stored.trace;
+
+    assert_eq!(
+        stored.inference_call_id,
+        Some(calls[0].id),
+        "the trace names the ledger row it describes, so a run's call and its \
+         trace are one join apart"
+    );
+    assert_eq!(trace.capability, Capability::Decision);
+    assert!(
+        matches!(trace.status, TraceStatus::Success),
+        "a served decision is not a failed call: {trace:?}"
+    );
+    assert_eq!(
+        trace.duration_ms, calls[0].duration_ms,
+        "one call cannot have two durations"
+    );
+    assert_eq!(
+        trace.request_id,
+        calls[0].id.to_string(),
+        "same convention as the API's `routes::chat::build_trace`"
+    );
+    assert_eq!(
+        trace.attempts.len(),
+        1,
+        "which model answered, and how long it took, travel with the trace"
+    );
+    assert_eq!(trace.attempts[0].adapter, "openrouter");
+
+    // THE AC. Absent this, the trace records a model and nothing about why.
+    let applied = trace
+        .routing
+        .as_ref()
+        .and_then(|d| d.ranking.as_ref())
+        .expect("the ranking in force is recorded, not just the winner");
+    assert_eq!(applied.category, "planner.select");
+    assert_eq!(
+        applied.source.as_ref().and_then(|s| s.revision),
+        Some(7),
+        "the revision is what makes a past order re-derivable"
+    );
+    assert_eq!(
+        applied.unmatched,
+        vec!["*:nimble".to_string()],
+        "a ranked ref this deployment cannot answer is recorded, not dropped"
+    );
+
+    // The other half of "filtered out": a candidate a GATE withheld, with its
+    // reason — an absence from the candidate list alone would say nothing.
+    let withheld = trace
+        .skipped
+        .iter()
+        .find(|s| s.model == "nimble")
+        .expect("the window gate withheld nimble");
+    assert_eq!(withheld.router, "ollama");
+    assert!(
+        withheld.reason.contains("context window"),
+        "the reason travels with the name: {}",
+        withheld.reason
+    );
+
+    // The two halves of the trace describe the same order. A trace whose
+    // candidate list and stated order disagreed would be worse than either.
+    assert_eq!(
+        trace
+            .candidates
+            .iter()
+            .map(|c| format!("{}:{}", c.router, c.model))
+            .collect::<Vec<_>>(),
+        trace
+            .routing
+            .as_ref()
+            .expect("a chain ran, so a decision exists")
+            .order
+            .iter()
+            .map(|c| c.endpoint.clone())
+            .collect::<Vec<_>>(),
+        "`candidates` is the order the engine would have tried"
     );
 }

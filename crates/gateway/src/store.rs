@@ -51,6 +51,19 @@ pub struct InferenceCall {
     /// Subscription tier label at call time, for attribution/reporting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<String>,
+    /// The orchestrator run this call was made inside, when it was made inside one.
+    ///
+    /// The engine cannot fill this: a `Gateway` is shared by every run in the process, so
+    /// the process has no single "current run" — the identity is per TASK. The engine
+    /// therefore leaves it `None` and builds the row as it always did, and a store that
+    /// serves the executor stamps it from the orchestrator's run scope
+    /// (`orchestrator::metering::current_run`). A chat call, made outside any run, stays
+    /// `None`.
+    ///
+    /// `serde(default)` keeps an older payload decodable, and `skip_serializing_if` keeps
+    /// a store-less configuration byte-identical on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -247,6 +260,7 @@ mod tests {
             recorded_at,
             subject_id: None,
             tier: None,
+            run_id: None,
         }
     }
 

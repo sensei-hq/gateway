@@ -1,6 +1,7 @@
 use super::*;
-use crate::selection::SelectedModel;
+use crate::selection::{SelectedModel, SelectionResult};
 use crate::types::config::FallbackTrigger;
+use crate::types::trace::{CandidateInfo, ExecutionTrace, SkippedInfo, TraceStatus};
 
 /// Outcome of one per-attempt step in the fallback-chain walk — the seam a
 /// later plan extends. Lets the top-level `execute` loop read as: for each
@@ -8,9 +9,13 @@ use crate::types::config::FallbackTrigger;
 /// return the response, continue to the next candidate, or break to exhaustion
 /// handling.
 pub(super) enum StepOutcome {
-    /// The candidate produced a terminal response; `execute` returns it.
+    /// The candidate produced a terminal response, together with the ledger row it
+    /// recorded. `execute` returns the response — filling in the routing decision
+    /// and writing the row's trace, neither of which this step can know — and the
+    /// row travels WITH the outcome rather than through a side channel, so the two
+    /// cannot disagree about which call is being described.
     /// Boxed to keep the enum small (the other variants carry no data).
-    Done(Box<InferenceResponse>),
+    Done(Box<(InferenceResponse, InferenceCall)>),
     /// The candidate failed in a way that permits stepping down the chain (no
     /// adapter registered, or an error whose `should_trigger_fallback` is true);
     /// `execute` continues to the next candidate.
@@ -152,7 +157,8 @@ impl super::Gateway {
                 )
                 .await
             {
-                StepOutcome::Done(mut response) => {
+                StepOutcome::Done(boxed) => {
+                    let (mut response, call) = *boxed;
                     // AC10 — carry the routing decision out to the caller.
                     // `attempt_candidate` sees one candidate and cannot know why
                     // that candidate came first, so the attachment belongs here,
@@ -161,7 +167,17 @@ impl super::Gateway {
                     // and read by nobody. Pinned by
                     // `tests::the_routing_decision_reaches_the_inference_response`.
                     response.routing = result.decision.clone();
-                    return Ok(*response);
+                    // The trace, written here for the same reason the decision is
+                    // attached here: it needs that decision AND the row the walk just
+                    // recorded, and this is the only place both exist. Only a call
+                    // that produced a response is traced — an exhausted walk's record
+                    // is the attempts on its error plus the `Failed` call row, and it
+                    // has no candidate, so no ranking was in force to name.
+                    // Pinned by
+                    // `decision_tests::a_recorded_trace_carries_the_ranking_revision_and_the_filtered_models`.
+                    self.record_trace(build_trace(&call, &result, &response))
+                        .await;
+                    return Ok(response);
                 }
                 StepOutcome::FallBack => continue,
                 StepOutcome::Stop => break,
@@ -226,7 +242,7 @@ impl super::Gateway {
         // Best-effort record of the failed terminal call (observability + request
         // counting), attributed to the last attempted candidate.
         if let Some(last) = attempts.last() {
-            self.record_call(InferenceCall {
+            self.record_call(&InferenceCall {
                 id: Uuid::new_v4(),
                 session_id: None,
                 project_id: None,
@@ -246,6 +262,7 @@ impl super::Gateway {
                 recorded_at: Utc::now(),
                 subject_id: request.auth.as_ref().map(|a| a.subject_id),
                 tier: request.auth.as_ref().and_then(|a| a.tier.clone()),
+                run_id: None,
             })
             .await;
         }
@@ -278,6 +295,11 @@ impl super::Gateway {
     /// to the next candidate or stop. Pushes each attempt onto `attempts` in the
     /// same order/content the inline loop did. The per-attempt seam a later plan
     /// extends.
+    ///
+    /// `StepOutcome::Done` carries the row a successful attempt persisted, because
+    /// `execute` — not this function — writes the call's trace: the trace needs the
+    /// routing decision, which does not exist until the walk is over (see
+    /// [`build_trace`]).
     pub(super) async fn attempt_candidate(
         &self,
         request: &InferenceRequest,
@@ -419,7 +441,7 @@ impl super::Gateway {
                 // Best-effort record of the successful terminal call so
                 // burn-rate/spend (and, on the AUTH track, quota) have data.
                 let usage = response.usage.as_ref();
-                self.record_call(InferenceCall {
+                let call = InferenceCall {
                     id: Uuid::new_v4(),
                     session_id: None,
                     project_id: None,
@@ -439,10 +461,13 @@ impl super::Gateway {
                     recorded_at: Utc::now(),
                     subject_id: request.auth.as_ref().map(|a| a.subject_id),
                     tier: request.auth.as_ref().and_then(|a| a.tier.clone()),
-                })
-                .await;
+                    run_id: None,
+                };
+                self.record_call(&call).await;
 
-                StepOutcome::Done(Box::new(response))
+                // The row rides the outcome so `execute` can link this call's trace
+                // to it — see the variant's own note.
+                StepOutcome::Done(Box::new((response, call)))
             }
             Err(err) => {
                 let duration_ms = start.elapsed().as_millis() as u64;
@@ -502,5 +527,72 @@ impl super::Gateway {
                 }
             }
         }
+    }
+}
+
+/// Snapshot one completed call as an [`ExecutionTrace`], linked to the ledger row
+/// `call` names.
+///
+/// **The production writer `ExecutionTrace` did not have.** Every field of that
+/// struct was previously unfilled because nothing in the workspace built one
+/// outside a test helper; SP-ROUTE-1 shipped `ExecutionTrace::routing` as forward
+/// provision and said so. The engine is the only place that can fill it: the
+/// `candidates` and `skipped` lists are selection's own detail (a store decorator
+/// and an API route both never see them), and `routing` is the decision `execute`
+/// attaches to the response immediately before calling this — which is what makes
+/// the ranking's CATEGORY and REVISION durable per call rather than only in a boot
+/// log.
+///
+/// `request_id` is the call's own id, matching the API's
+/// `routes::chat::build_trace`: this describes deliberately the same call the
+/// sibling ledger row records, not a second event. The two are linked explicitly
+/// by `inference_call_id` for the readers that walk from a call to its trace.
+fn build_trace(
+    call: &InferenceCall,
+    result: &SelectionResult,
+    response: &InferenceResponse,
+) -> StoredTrace {
+    let created_at = call.recorded_at;
+    let trace = ExecutionTrace {
+        request_id: call.id.to_string(),
+        capability: call.capability.clone(),
+        status: if response.success {
+            TraceStatus::Success
+        } else {
+            TraceStatus::Failed
+        },
+        // The call's own figure rather than a second measurement, so the trace and
+        // the row it describes cannot disagree about how long the call took.
+        duration_ms: call.duration_ms,
+        candidates: result
+            .all_candidates
+            .iter()
+            .map(|c| CandidateInfo {
+                model: c.model.clone(),
+                router: c.router.clone(),
+                priority: c.priority,
+            })
+            .collect(),
+        skipped: result
+            .skipped
+            .iter()
+            .map(|s| SkippedInfo {
+                model: s.model.clone(),
+                router: s.router.clone(),
+                reason: s.reason.to_string(),
+            })
+            .collect(),
+        attempts: response.attempts.clone(),
+        estimated_cost: response.estimated_cost.clone(),
+        actual_cost: response.actual_cost.clone(),
+        // PROPAGATE, never default: this is the field's whole reason to exist.
+        routing: response.routing.clone(),
+        created_at,
+    };
+    StoredTrace {
+        id: Uuid::new_v4(),
+        inference_call_id: Some(call.id),
+        trace,
+        created_at,
     }
 }
